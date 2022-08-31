@@ -34,3 +34,15 @@ from .multi_channel import DualChannelDDR3_2133
 from .multi_channel import DualChannelDDR4_2400
 from .multi_channel import DualChannelLPDDR3_1600
 from .hbm import HBM2Stack
+
+try:
+    from .dramsys import DRAMSysMem
+    from .dramsys import DRAMSysDDR4_1866
+    from .dramsys import DRAMSysDDR3_1600
+    from .dramsys import DRAMSysLPDDR4_3200
+    from .dramsys import DRAMSysHBM2
+except:
+    # In the case that DRAMSys is not compiled into the gem5 binary, importing
+    # DRAMSys components will fail. This try-exception statement is needed to
+    # ignore these imports in this case.
+    pass
