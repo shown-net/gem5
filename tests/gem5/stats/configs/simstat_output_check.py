@@ -26,7 +26,6 @@
 
 import argparse
 import sys
-from typing import Union
 
 import m5
 from m5.objects import (
@@ -42,24 +41,18 @@ against the expected JSON output and that produced by the SimStats module.
 """
 
 parser = argparse.ArgumentParser(description="Tests the output of a SimStat.")
-subparsers = parser.add_subparsers(
-    dest="statistic", help="SimStats statistic to test", required=True
-)
 
-scalar_parser = subparsers.add_parser(
-    "scalar", help="Test a scalar statistic."
-)
-scalar_parser.add_argument(
+parser.add_argument(
     "value", type=float, help="The value of the scalar statistic."
 )
-scalar_parser.add_argument(
+parser.add_argument(
     "--name",
     type=str,
     default="scalar",
     required=False,
     help="The name of the scalar statistic.",
 )
-scalar_parser.add_argument(
+parser.add_argument(
     "--description",
     type=str,
     default="",
@@ -69,27 +62,21 @@ scalar_parser.add_argument(
 
 args = parser.parse_args()
 
-expected_output = None
-stat_tester = None
-if args.statistic == "scalar":
-    stat_tester = ScalarStatTester()
-    stat_tester.name = args.name
-    stat_tester.description = args.description
-    stat_tester.value = args.value
-    expected_output = {
-        "type": "Group",
-        "time_conversion": None,
-        args.name: {
-            "value": args.value,
-            "type": "Scalar",
-            "unit": "Count",
-            "description": args.description,
-            "datatype": "f64",
-        },
-    }
-
-assert stat_tester is not None
-assert expected_output is not None
+stat_tester = ScalarStatTester()
+stat_tester.name = args.name
+stat_tester.description = args.description
+stat_tester.value = args.value
+expected_output = {
+    "type": "Group",
+    "time_conversion": None,
+    args.name: {
+        "value": args.value,
+        "type": "Scalar",
+        "unit": "Count",
+        "description": args.description,
+        "datatype": "f64",
+    },
+}
 
 root = Root(full_system=False, system=stat_tester)
 
