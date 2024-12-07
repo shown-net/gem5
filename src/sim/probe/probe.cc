@@ -41,7 +41,6 @@
 #include "sim/probe/probe.hh"
 
 #include "debug/ProbeVerbose.hh"
-#include "params/ProbeListenerObject.hh"
 
 namespace gem5
 {
@@ -52,21 +51,6 @@ ProbePoint::ProbePoint(ProbeManager *manager, const std::string& _name)
     if (manager) {
         manager->addPoint(*this);
     }
-}
-
-ProbeListenerObject::ProbeListenerObject(
-        const ProbeListenerObjectParams &params)
-    : SimObject(params),
-      manager(params.manager->getProbeManager())
-{
-}
-
-ProbeListenerObject::~ProbeListenerObject()
-{
-    for (auto l = listeners.begin(); l != listeners.end(); ++l) {
-        delete (*l);
-    }
-    listeners.clear();
 }
 
 ProbeListener::ProbeListener(ProbeManager *_manager, const std::string &_name)
