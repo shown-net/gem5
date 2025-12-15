@@ -10,8 +10,19 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 
 * **New branch predictor.**  A gshare branch predictor model has been added to the CPU library, providing a configurable alternative to the existing predictors ([#2303](https://github.com/gem5/gem5/pull/2303)).
 
-* **Full support for Arm SVE2 and related features.**  The AArch64 decoder and ISA have been extended to include the SVE2 and SVE2p1 extensions, including bit‑permutation and B16B16 instructions.
-  A separate change adds the crypto subset of SVE/SVE2, introducing AES, SHA3, SM3 and SM4 vector instructions.
+* **Towards Armv9 support with a full FEAT_SVE2 implementation.**  The Arm ISA has been extended to include the SVE2 and SVE2p1 extensions, including bit‑permutation and B16B16 instructions.
+  A separate change adds the crypto subset of SVE/SVE2, introducing AES, SHA3, SM3 and SM4 vector instructions. This is a major stepping stone towards full Armv9 support.
+  The main difference between SVE2 and SVE is the functional coverage of the instruction set. SVE was designed for HPC and ML applications. SVE2 extends the SVE instruction set to enable data-processing domains beyond HPC and ML.
+  The SVE2 instruction set can also accelerate the common algorithms that are used in the following applications:
+
+    Computer vision
+    Multimedia
+    Long-Term Evolution (LTE) baseband processing
+    Genomics
+    In-memory database
+    Web serving
+    General-purpose software
+
   Users can now enable SVE2 on Armv9 platforms and execute these vector and crypto instructions in both timing and atomic modes ([#2656](https://github.com/gem5/gem5/pull/2656), [#2765](https://github.com/gem5/gem5/pull/2765)).
 
 * **Decoupled front end and Fetch‑directed prefetcher (FDP).**
@@ -23,17 +34,26 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 * **Distributed instruction/issue queue.**  The O3 CPU can now be configured with multiple instruction‑queue units; a new `IQUnit` SimObject allows the front end to dispatch micro‑ops into several independent queues tied to specific functional‑unit pools.
   This enables more realistic modelling of modern out‑of‑order processors ([#2652](https://github.com/gem5/gem5/pull/2652)).
 
-* **Improved table‑walk machinery.**  The Arm page‑table walker has been reworked so that the number of outstanding walks is configurable and no longer limited to one.
-  Existing table walkers have been renamed as `WalkUnit` objects, and a new `SingleTableWalker` retains legacy behaviour.
-  The memory walk caches are now created only when the CPU exposes a walker port and are shared when a single walker services both instruction and data requests.
-  In addition, the caches can be disabled entirely from Python configurations, and an exception is raised if a CPU advertises more than two walker ports ([#2650](https://github.com/gem5/gem5/pull/2650), [#2716](https://github.com/gem5/gem5/pull/2716)).
+* **Improved Arm table‑walk machinery.**  The Arm page‑table walker has been reworked so that the number of outstanding walks is configurable and no longer limited to one therefore theoretically increasing MLP.
+  Existing table walkers have been renamed as `ArmWalkUnit` objects, and the new `ArmTableWalker` orchestrates the formers. For example:
 
-* **Extended Arm floating‑point architecture.**  Support for the FEAT_AFP extension has been added.
-  This extension introduces the FPCR.AH, FPCR.FIZ and FPCR.NEP control bits, enabling alternate handling of denormal inputs and corner‑case values for Advanced SIMD instructions.
-  gem5 now models these control bits and their effect on floating‑point operations ([#2393](https://github.com/gem5/gem5/pull/2393)).
-
-* **RCpc memory model and LRCPC2 instructions.**  The Armv8.4 RCpc memory model can now be simulated.
-  The LRCPC2 instructions, used to enforce release consistency ordering on conditional loads, have been added to the AArch64 ISA and are treated as RCsc instructions in the pipeline ([#2632](https://github.com/gem5/gem5/pull/2632)).
+```python
+class ArmTableWalker(ClockedObject):
+    walk_units = VectorParam.ArmWalkUnit(
+        [
+            ArmWalkUnit(walk_type="instruction"),
+            ArmWalkUnit(walk_type="data"),
+            ArmWalkUnit(walk_type="unified"),
+            ArmWalkUnit(walk_type="unified"),
+            ArmWalkUnit(walk_type="instruction", is_stage2=True),
+            ArmWalkUnit(walk_type="data", is_stage2=True),
+            ArmWalkUnit(walk_type="unified", is_stage2=True),
+            ArmWalkUnit(walk_type="unified", is_stage2=True),
+        ],
+        "Walk Units",
+    )
+```
+  With this setup the PTW is configured to allow 4 outstanding stage-1 and 4 outstanding stage-2 walks([#2650](https://github.com/gem5/gem5/pull/2650)).
 
 * **Multiple GPUs and configurable GPU memory size.**  The GPU model now allows users to specify the GPU framebuffer size rather than using a fixed 16 GiB allocation.
   Additional ROM regions have been added so that the GPU can expose its PCI configuration and firmware to the host, and miscellaneous MMIO regions have been mapped for multiple GPU devices.
@@ -53,6 +73,12 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 
 * **Optional limit on pending transactions.**  The standard library’s TLM generator can now throttle its issue rate by setting `max_pending_tran` in Python configurations.
   Completed transactions are removed from the pending list so that the count accurately reflects outstanding operations, preventing unrealistic backlog growth.
+
+* **Explicit handling of Walk Caches** The memory walk caches are now created only when the CPU exposes a walker port and are shared when a single walker services both instruction and data requests.
+  stdlib is now treating walk caches as an integral part of the CPU cache hierarchy and as such their presence should be explicitly requested by choosing the proper configuration file.
+  Prior to this release, a walk cache was always silently included downstream of the MMU. This is not happening anymore: for instamce, PrivateL1PrivateL2 won't instantiate a walk cache.
+  If willing to generate one, the PrivateL1PrivateL2WalkCacheHierarchy should be used instead.
+  Additionally, an exception is raised if a CPU advertises more than two walker ports ([#2716](https://github.com/gem5/gem5/pull/2716)).
 
 * **Fetch‑directed instruction prefetch and prefetcher parameters.**  The fetch‑directed prefetcher can prefetch all blocks spanned by a fetch target and provides a `cache_snoop` parameter to determine whether prefetch requests snoop the cache hierarchy.
   These parameters improve instruction‑side prefetching efficacy.
