@@ -10,8 +10,19 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 
 * **New branch predictor.**  A gshare branch predictor model has been added to the CPU library, providing a configurable alternative to the existing predictors ([#2303](https://github.com/gem5/gem5/pull/2303)).
 
-* **Full support for Arm SVE2 and related features.**  The AArch64 decoder and ISA have been extended to include the SVE2 and SVE2p1 extensions, including bit‑permutation and B16B16 instructions.
-  A separate change adds the crypto subset of SVE/SVE2, introducing AES, SHA3, SM3 and SM4 vector instructions.
+* **Towards Armv9 support with a full FEAT_SVE2 implementation.**  The Arm ISA has been extended to include the SVE2 and SVE2p1 extensions, including bit‑permutation and B16B16 instructions.
+  A separate change adds the crypto subset of SVE/SVE2, introducing AES, SHA3, SM3 and SM4 vector instructions. This is a major stepping stone towards full Armv9 support.
+  The main difference between SVE2 and SVE is the functional coverage of the instruction set. SVE was designed for HPC and ML applications. SVE2 extends the SVE instruction set to enable data-processing domains beyond HPC and ML.
+  The SVE2 instruction set can also accelerate the common algorithms that are used in the following applications:
+
+    Computer vision
+    Multimedia
+    Long-Term Evolution (LTE) baseband processing
+    Genomics
+    In-memory database
+    Web serving
+    General-purpose software
+
   Users can now enable SVE2 on Armv9 platforms and execute these vector and crypto instructions in both timing and atomic modes ([#2656](https://github.com/gem5/gem5/pull/2656), [#2765](https://github.com/gem5/gem5/pull/2765)).
 
 * **Decoupled front end and Fetch‑directed prefetcher (FDP).**
@@ -23,17 +34,26 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 * **Distributed instruction/issue queue.**  The O3 CPU can now be configured with multiple instruction‑queue units; a new `IQUnit` SimObject allows the front end to dispatch micro‑ops into several independent queues tied to specific functional‑unit pools.
   This enables more realistic modelling of modern out‑of‑order processors ([#2652](https://github.com/gem5/gem5/pull/2652)).
 
-* **Improved table‑walk machinery.**  The Arm page‑table walker has been reworked so that the number of outstanding walks is configurable and no longer limited to one.
-  Existing table walkers have been renamed as `WalkUnit` objects, and a new `SingleTableWalker` retains legacy behaviour.
-  The memory walk caches are now created only when the CPU exposes a walker port and are shared when a single walker services both instruction and data requests.
-  In addition, the caches can be disabled entirely from Python configurations, and an exception is raised if a CPU advertises more than two walker ports ([#2650](https://github.com/gem5/gem5/pull/2650), [#2716](https://github.com/gem5/gem5/pull/2716)).
+* **Improved Arm table‑walk machinery.**  The Arm page‑table walker has been reworked so that the number of outstanding walks is configurable and no longer limited to one therefore theoretically increasing MLP.
+  Existing table walkers have been renamed as `ArmWalkUnit` objects, and the new `ArmTableWalker` orchestrates the formers. For example:
 
-* **Extended Arm floating‑point architecture.**  Support for the FEAT_AFP extension has been added.
-  This extension introduces the FPCR.AH, FPCR.FIZ and FPCR.NEP control bits, enabling alternate handling of denormal inputs and corner‑case values for Advanced SIMD instructions.
-  gem5 now models these control bits and their effect on floating‑point operations ([#2393](https://github.com/gem5/gem5/pull/2393)).
-
-* **RCpc memory model and LRCPC2 instructions.**  The Armv8.4 RCpc memory model can now be simulated.
-  The LRCPC2 instructions, used to enforce release consistency ordering on conditional loads, have been added to the AArch64 ISA and are treated as RCsc instructions in the pipeline ([#2632](https://github.com/gem5/gem5/pull/2632)).
+```python
+class ArmTableWalker(ClockedObject):
+    walk_units = VectorParam.ArmWalkUnit(
+        [
+            ArmWalkUnit(walk_type="instruction"),
+            ArmWalkUnit(walk_type="data"),
+            ArmWalkUnit(walk_type="unified"),
+            ArmWalkUnit(walk_type="unified"),
+            ArmWalkUnit(walk_type="instruction", is_stage2=True),
+            ArmWalkUnit(walk_type="data", is_stage2=True),
+            ArmWalkUnit(walk_type="unified", is_stage2=True),
+            ArmWalkUnit(walk_type="unified", is_stage2=True),
+        ],
+        "Walk Units",
+    )
+```
+  With this setup the PTW is configured to allow 4 outstanding stage-1 and 4 outstanding stage-2 walks([#2650](https://github.com/gem5/gem5/pull/2650)).
 
 * **Multiple GPUs and configurable GPU memory size.**  The GPU model now allows users to specify the GPU framebuffer size rather than using a fixed 16 GiB allocation.
   Additional ROM regions have been added so that the GPU can expose its PCI configuration and firmware to the host, and miscellaneous MMIO regions have been mapped for multiple GPU devices.
@@ -51,8 +71,11 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
   The decoder and disassembler have been hardened, and numerous bugs in vector instructions—such as incorrect pinned register counts, indexing in `vslideup`/`vslidedown`, and mask handling in `vred*` instructions—have been fixed.
   New RVV instructions (`vandn`, `vwsll`, `vror`, `vrol`, `vcompress`, `vclmul` and `vclmulh`) are supported ([#2619](https://github.com/gem5/gem5/pull/2619)).
 
-* **Optional limit on pending transactions.**  The standard library’s TLM generator can now throttle its issue rate by setting `max_pending_tran` in Python configurations.
-  Completed transactions are removed from the pending list so that the count accurately reflects outstanding operations, preventing unrealistic backlog growth.
+* **Explicit handling of Walk Caches** The memory walk caches are now created only when the CPU exposes a walker port and are shared when a single walker services both instruction and data requests.
+  stdlib is now treating walk caches as an integral part of the CPU cache hierarchy and as such their presence should be explicitly requested by choosing the proper configuration file.
+  Prior to this release, a walk cache was always silently included downstream of the MMU. This is not happening anymore: for instamce, PrivateL1PrivateL2 won't instantiate a walk cache.
+  If willing to generate one, the PrivateL1PrivateL2WalkCacheHierarchy should be used instead.
+  Additionally, an exception is raised if a CPU advertises more than two walker ports ([#2716](https://github.com/gem5/gem5/pull/2716)).
 
 * **Fetch‑directed instruction prefetch and prefetcher parameters.**  The fetch‑directed prefetcher can prefetch all blocks spanned by a fetch target and provides a `cache_snoop` parameter to determine whether prefetch requests snoop the cache hierarchy.
   These parameters improve instruction‑side prefetching efficacy.
@@ -60,8 +83,7 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 * **Branch predictor fix.**  A bug in the simple BTB’s set‑index calculation has been corrected to ensure the branch predictor receives the proper number of sets.
   Users employing custom branch‑predictor configurations should rebuild against the new code.
 
-* **Miscellaneous improvements.**  The Ruby CHI‑TLM interface now uses a proper CHI‑TLM port to connect components via ports rather than pointers ([#2689](https://github.com/gem5/gem5/pull/2689)).
-  Software prefetches in Ruby return an early response to avoid stalling the memory hierarchy ([#2311](https://github.com/gem5/gem5/pull/2311)).
+* **Miscellaneous improvements.**  Software prefetches in Ruby return an early response to avoid stalling the memory hierarchy ([#2311](https://github.com/gem5/gem5/pull/2311)).
   Several configuration scripts have been updated to default to the new Arm Neoverse V2 model and to make MMU walk caches optional.
 
 ## ArmISA changes/improvements
@@ -98,6 +120,17 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 * **Multiple GPU support and configurable memory size.**  The GPU model now allows the framebuffer size to be set by the user and supports multiple GPU devices by adding additional ROM and MMIO regions to expose PCI configuration and firmware to the host.
   This makes it possible to model systems with several discrete GPUs ([#2633](https://github.com/gem5/gem5/pull/2633)).
 
+## AMBA CHI changes/improvements
+
+* **CHI-TLM interface.** The Ruby CHI‑TLM interface now uses a proper CHI‑TLM port to connect components via ports rather than pointers ([#2689](https://github.com/gem5/gem5/pull/2689)).
+
+* **CHI-TLM generator as a CPU.**  The programing interface of the CHI-TLM generator has been amended for greater flexibility.
+  Rather than scheduling CHI transactions at a predetermined time, the interface now allows to inject transactions even after m5.instantiate has been
+  called, with no issuing time specified, and let the generator handle the issuing time according to several parameters, like the generator frequency and the  maximum number of pending transactions allowed.
+  While the initial version of the TlmGenerator was conceiving it as a simple CHI transaction testing tool, the new interface enables a user to treat it as a  CPU-like generator, with configurable freqyency; therefore allowing to write unit-tests where performance as well can be properly analysed
+  [2780](https://github.com/gem5/gem5/pull/2780)
+
+
 ## Statistics and Instrumentation
 
 * **Statistics groups.**  `m5_stats.Group` objects are now processed during statistics dumping, preserving the hierarchical grouping of related counters ([#2761](https://github.com/gem5/gem5/pull/2761)).
@@ -107,8 +140,6 @@ This release consists of 649 commits git commits contributed to gem5 via 291 mer
 ## Miscellaneous
 
 * **Software prefetch handling.**  Ruby returns an immediate response to software prefetch requests to prevent them from clogging the memory system.
-
-* **Optional pending‑transaction limit.**  A new parameter allows the TLM generator to cap the number of pending transactions, preventing runaway queue growth and modelling backpressure.
 
 * **Improved debugging and testing.**  The addition of Neoverse V2 and fetch‑directed prefetcher demonstration scripts provides out‑of‑the‑box examples for new CPU features.
   Many unit tests have been updated or extended to exercise the new branch predictor, prefetcher and page‑table walker functionality.
