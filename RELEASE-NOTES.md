@@ -71,9 +71,6 @@ class ArmTableWalker(ClockedObject):
   The decoder and disassembler have been hardened, and numerous bugs in vector instructions—such as incorrect pinned register counts, indexing in `vslideup`/`vslidedown`, and mask handling in `vred*` instructions—have been fixed.
   New RVV instructions (`vandn`, `vwsll`, `vror`, `vrol`, `vcompress`, `vclmul` and `vclmulh`) are supported ([#2619](https://github.com/gem5/gem5/pull/2619)).
 
-* **Optional limit on pending transactions.**  The standard library’s TLM generator can now throttle its issue rate by setting `max_pending_tran` in Python configurations.
-  Completed transactions are removed from the pending list so that the count accurately reflects outstanding operations, preventing unrealistic backlog growth.
-
 * **Explicit handling of Walk Caches** The memory walk caches are now created only when the CPU exposes a walker port and are shared when a single walker services both instruction and data requests.
   stdlib is now treating walk caches as an integral part of the CPU cache hierarchy and as such their presence should be explicitly requested by choosing the proper configuration file.
   Prior to this release, a walk cache was always silently included downstream of the MMU. This is not happening anymore: for instamce, PrivateL1PrivateL2 won't instantiate a walk cache.
@@ -86,8 +83,7 @@ class ArmTableWalker(ClockedObject):
 * **Branch predictor fix.**  A bug in the simple BTB’s set‑index calculation has been corrected to ensure the branch predictor receives the proper number of sets.
   Users employing custom branch‑predictor configurations should rebuild against the new code.
 
-* **Miscellaneous improvements.**  The Ruby CHI‑TLM interface now uses a proper CHI‑TLM port to connect components via ports rather than pointers ([#2689](https://github.com/gem5/gem5/pull/2689)).
-  Software prefetches in Ruby return an early response to avoid stalling the memory hierarchy ([#2311](https://github.com/gem5/gem5/pull/2311)).
+* **Miscellaneous improvements.**  Software prefetches in Ruby return an early response to avoid stalling the memory hierarchy ([#2311](https://github.com/gem5/gem5/pull/2311)).
   Several configuration scripts have been updated to default to the new Arm Neoverse V2 model and to make MMU walk caches optional.
 
 ## ArmISA changes/improvements
@@ -124,6 +120,17 @@ class ArmTableWalker(ClockedObject):
 * **Multiple GPU support and configurable memory size.**  The GPU model now allows the framebuffer size to be set by the user and supports multiple GPU devices by adding additional ROM and MMIO regions to expose PCI configuration and firmware to the host.
   This makes it possible to model systems with several discrete GPUs ([#2633](https://github.com/gem5/gem5/pull/2633)).
 
+## AMBA CHI changes/improvements
+
+* **CHI-TLM interface.** The Ruby CHI‑TLM interface now uses a proper CHI‑TLM port to connect components via ports rather than pointers ([#2689](https://github.com/gem5/gem5/pull/2689)).
+
+* **CHI-TLM generator as a CPU.**  The programing interface of the CHI-TLM generator has been amended for greater flexibility.
+  Rather than scheduling CHI transactions at a predetermined time, the interface now allows to inject transactions even after m5.instantiate has been
+  called, with no issuing time specified, and let the generator handle the issuing time according to several parameters, like the generator frequency and the  maximum number of pending transactions allowed.
+  While the initial version of the TlmGenerator was conceiving it as a simple CHI transaction testing tool, the new interface enables a user to treat it as a  CPU-like generator, with configurable freqyency; therefore allowing to write unit-tests where performance as well can be properly analysed
+  [2780](https://github.com/gem5/gem5/pull/2780)
+
+
 ## Statistics and Instrumentation
 
 * **Statistics groups.**  `m5_stats.Group` objects are now processed during statistics dumping, preserving the hierarchical grouping of related counters ([#2761](https://github.com/gem5/gem5/pull/2761)).
@@ -133,8 +140,6 @@ class ArmTableWalker(ClockedObject):
 ## Miscellaneous
 
 * **Software prefetch handling.**  Ruby returns an immediate response to software prefetch requests to prevent them from clogging the memory system.
-
-* **Optional pending‑transaction limit.**  A new parameter allows the TLM generator to cap the number of pending transactions, preventing runaway queue growth and modelling backpressure.
 
 * **Improved debugging and testing.**  The addition of Neoverse V2 and fetch‑directed prefetcher demonstration scripts provides out‑of‑the‑box examples for new CPU features.
   Many unit tests have been updated or extended to exercise the new branch predictor, prefetcher and page‑table walker functionality.
