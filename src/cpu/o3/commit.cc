@@ -838,6 +838,10 @@ Commit::commit()
                 if (toIEW->commitInfo[tid].mispredictInst->isUncondCtrl()) {
                      toIEW->commitInfo[tid].branchTaken = true;
                 }
+                if (toIEW->commitInfo[tid].mispredictInst->traceData) {
+                    toIEW->commitInfo[tid].mispredictInst->traceData->setTAOBranchTarget(
+                        fromIEW->pc[tid]->instAddr());
+                }
                 ++stats.branchMispredicts;
             }
 
@@ -957,6 +961,30 @@ Commit::commitInsts()
 
             DPRINTF(Commit, "Retiring squashed instruction from "
                     "ROB.\n");
+
+            if (head_inst->traceData) {
+                head_inst->traceData->setFetchSeq(head_inst->seqNum);
+                head_inst->traceData->setCPSeq(thread[tid]->numOp);
+                const Tick fetch = head_inst->fetchTick;
+                const Tick base_fetch = fetch == Tick(-1) ? curTick() : fetch;
+                auto stage_tick = [base_fetch](int32_t delta) -> Tick {
+                    return delta == -1 ? 0 : base_fetch + delta;
+                };
+                head_inst->traceData->setTAOStageTicks(
+                    base_fetch,
+                    stage_tick(head_inst->decodeTick),
+                    stage_tick(head_inst->renameTick),
+                    stage_tick(head_inst->dispatchTick),
+                    stage_tick(head_inst->issueTick),
+                    stage_tick(head_inst->completeTick),
+                    curTick(),
+                    stage_tick(head_inst->storeTick));
+                head_inst->traceData->setTAOSquashed(true);
+                head_inst->traceData->setTAOBranchMispred(false);
+                head_inst->traceData->dump();
+                delete head_inst->traceData;
+                head_inst->traceData = NULL;
+            }
 
             rob->retireHead(commit_thread);
 
@@ -1230,12 +1258,29 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         if (head_inst->traceData) {
             // We ignore ReExecution "faults" here as they are not real
             // (architectural) faults but signal flush/replays.
-            if (debug::ExecFaulting
-                && dynamic_cast<ReExec*>(inst_fault.get()) == nullptr) {
+            if (debug::ExecFaulting &&
+                dynamic_cast<ReExec*>(inst_fault.get()) == nullptr) {
 
                 head_inst->traceData->setFaulting(true);
                 head_inst->traceData->setFetchSeq(head_inst->seqNum);
                 head_inst->traceData->setCPSeq(thread[tid]->numOp);
+                const Tick fetch = head_inst->fetchTick;
+                const Tick base_fetch = fetch == Tick(-1) ? curTick() : fetch;
+                auto stage_tick = [base_fetch](int32_t delta) -> Tick {
+                    return delta == -1 ? 0 : base_fetch + delta;
+                };
+                head_inst->traceData->setTAOStageTicks(
+                    base_fetch,
+                    stage_tick(head_inst->decodeTick),
+                    stage_tick(head_inst->renameTick),
+                    stage_tick(head_inst->dispatchTick),
+                    stage_tick(head_inst->issueTick),
+                    stage_tick(head_inst->completeTick),
+                    curTick(),
+                    stage_tick(head_inst->storeTick));
+                head_inst->traceData->setTAOSquashed(false);
+                head_inst->traceData->setTAOBranchMispred(
+                    head_inst->isControl() && head_inst->mispredicted());
                 head_inst->traceData->dump();
             }
             delete head_inst->traceData;
@@ -1278,9 +1323,41 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     if (head_inst->traceData) {
         head_inst->traceData->setFetchSeq(head_inst->seqNum);
         head_inst->traceData->setCPSeq(thread[tid]->numOp);
-        head_inst->traceData->dump();
-        delete head_inst->traceData;
-        head_inst->traceData = NULL;
+        const Tick fetch = head_inst->fetchTick;
+        const Tick base_fetch = fetch == Tick(-1) ? curTick() : fetch;
+        auto stage_tick = [base_fetch](int32_t delta) -> Tick {
+            return delta == -1 ? 0 : base_fetch + delta;
+        };
+        head_inst->traceData->setTAOStageTicks(
+            base_fetch,
+            stage_tick(head_inst->decodeTick),
+            stage_tick(head_inst->renameTick),
+            stage_tick(head_inst->dispatchTick),
+            stage_tick(head_inst->issueTick),
+            stage_tick(head_inst->completeTick),
+            curTick(),
+            stage_tick(head_inst->storeTick));
+        head_inst->traceData->setTAOSquashed(false);
+        head_inst->traceData->setTAOBranchMispred(
+            head_inst->isControl() && head_inst->mispredicted());
+        if (head_inst->isControl() && !head_inst->traceData->getTAOBranchTargetValid()) {
+            if (head_inst->isDirectCtrl()) {
+                std::unique_ptr<PCStateBase> target = head_inst->branchTarget();
+                head_inst->traceData->setTAOBranchTarget(target->instAddr());
+            } else {
+                head_inst->traceData->setTAOBranchTarget(
+                    head_inst->readPredTarg().instAddr());
+            }
+        }
+        if (head_inst->isStore() || head_inst->isAtomic() ||
+            head_inst->isStoreConditional()) {
+            // Stores receive their data-cache hierarchy label only when the
+            // writeback response returns, so LSQ owns the final dump/delete.
+        } else {
+            head_inst->traceData->dump();
+            delete head_inst->traceData;
+            head_inst->traceData = NULL;
+        }
     }
 
     // If this was a store, record it for this cycle.

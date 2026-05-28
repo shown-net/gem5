@@ -109,18 +109,19 @@ class Fetch
     {
       protected:
         Fetch *fetch;
+        bool delayed = false;
 
       public:
         FetchTranslation(Fetch *_fetch) : fetch(_fetch) {}
 
-        void markDelayed() {}
+        void markDelayed() override { delayed = true; }
 
         void
         finish(const Fault &fault, const RequestPtr &req,
             gem5::ThreadContext *tc, BaseMMU::Mode mode)
         {
             assert(mode == BaseMMU::Execute);
-            fetch->finishTranslation(fault, req);
+            fetch->finishTranslation(fault, req, delayed);
             delete this;
         }
     };
@@ -149,7 +150,7 @@ class Fetch
         process()
         {
             assert(fetch->numInst < fetch->fetchWidth);
-            fetch->finishTranslation(fault, req);
+            fetch->finishTranslation(fault, req, false);
         }
 
         const char *
@@ -297,7 +298,8 @@ class Fetch
      * @return Any fault that occured.
      */
     bool fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc);
-    void finishTranslation(const Fault &fault, const RequestPtr &mem_req);
+    void finishTranslation(const Fault &fault, const RequestPtr &mem_req,
+                           bool delayed);
 
 
     /** Check if an interrupt is pending and that we need to handle
@@ -509,6 +511,10 @@ class Fetch
 
     /** Whether or not the fetch buffer data is valid. */
     bool fetchBufferValid[MaxThreads];
+
+    /** Exact front-end miss labels associated with the current fetch buffer. */
+    bool taoFetchICacheMiss[MaxThreads];
+    bool taoFetchTLBMiss[MaxThreads];
 
     /** Size of instructions. */
     int instSize;

@@ -526,7 +526,11 @@ class Request : public Extensible<Request>
           _pc(other._pc), _reqInstSeqNum(other._reqInstSeqNum),
           _localAccessor(other._localAccessor),
           translateDelta(other.translateDelta),
-          accessDelta(other.accessDelta), depth(other.depth)
+          accessDelta(other.accessDelta), depth(other.depth),
+          taoCacheLevelValid(other.taoCacheLevelValid),
+          taoCacheLevel(other.taoCacheLevel),
+          taoTlbMissValid(other.taoTlbMissValid),
+          taoTlbMiss(other.taoTlbMiss)
     {
         atomicOpFunctor.reset(other.atomicOpFunctor ?
                                 other.atomicOpFunctor->clone() : nullptr);
@@ -596,6 +600,10 @@ class Request : public Extensible<Request>
         depth = 0;
         accessDelta = 0;
         translateDelta = 0;
+        taoCacheLevelValid = false;
+        taoCacheLevel = 0;
+        taoTlbMissValid = false;
+        taoTlbMiss = false;
         atomicOpFunctor = std::move(amo_op);
         _localAccessor = nullptr;
     }
@@ -689,6 +697,15 @@ class Request : public Extensible<Request>
      * (e.g. 0 = L1; 1 = L2).
      */
     mutable int depth = 0;
+
+    /**
+     * TAO exact labels attached by the active memory system and TLB.
+     * Cache level uses TAO classes: 0 = L1, 1 = L2, 2 = MEM.
+     */
+    mutable bool taoCacheLevelValid = false;
+    mutable uint8_t taoCacheLevel = 0;
+    mutable bool taoTlbMissValid = false;
+    mutable bool taoTlbMiss = false;
 
     /**
      *  Accessor for size.
@@ -981,6 +998,24 @@ class Request : public Extensible<Request>
      */
     void incAccessDepth() const { depth++; }
     int getAccessDepth() const { return depth; }
+
+    void setTAOCacheLevel(uint8_t level) const
+    {
+        taoCacheLevel = level;
+        taoCacheLevelValid = true;
+    }
+
+    bool hasTAOCacheLevel() const { return taoCacheLevelValid; }
+    uint8_t getTAOCacheLevel() const { return taoCacheLevel; }
+
+    void setTAOTLBMiss(bool miss) const
+    {
+        taoTlbMiss = miss;
+        taoTlbMissValid = true;
+    }
+
+    bool hasTAOTLBMiss() const { return taoTlbMissValid; }
+    bool getTAOTLBMiss() const { return taoTlbMiss; }
 
     /**
      * Set/Get the time taken for this request to be successfully translated.

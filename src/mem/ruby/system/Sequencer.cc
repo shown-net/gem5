@@ -41,6 +41,8 @@
 
 #include "mem/ruby/system/Sequencer.hh"
 
+#include <cstdint>
+
 #include "base/logging.hh"
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "debug/LLSC.hh"
@@ -61,6 +63,24 @@ namespace gem5
 
 namespace ruby
 {
+
+namespace
+{
+
+uint8_t
+taoCacheLevelFromRubyResponse(bool externalHit, MachineType mach)
+{
+    if (!externalHit)
+        return 0;
+    if (mach == MachineType_NUM || mach == MachineType_NULL ||
+        mach == MachineType_L0Cache)
+        return 0;
+    if (mach == MachineType_L1Cache)
+        return 1;
+    return 2;
+}
+
+} // anonymous namespace
 
 Sequencer::Sequencer(const Params &p)
     : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
@@ -711,6 +731,10 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
     PacketPtr pkt = srequest->pkt;
     Addr request_address(pkt->getAddr());
     RubyRequestType type = srequest->m_type;
+    if (pkt && pkt->req) {
+        pkt->req->setTAOCacheLevel(
+            taoCacheLevelFromRubyResponse(externalHit, mach));
+    }
 
     if (was_coalesced) {
         // Notify the controller about a coalesced request so it can properly

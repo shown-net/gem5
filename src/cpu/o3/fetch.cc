@@ -168,6 +168,8 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
         fetchBuffer[i] = NULL;
         fetchBufferPC[i] = 0;
         fetchBufferValid[i] = false;
+        taoFetchICacheMiss[i] = false;
+        taoFetchTLBMiss[i] = false;
         lastIcacheStall[i] = 0;
         issuePipelinedIfetch[i] = false;
     }
@@ -305,6 +307,8 @@ Fetch::clearStates(ThreadID tid)
     stalls[tid].drain = false;
     fetchBufferPC[tid] = 0;
     fetchBufferValid[tid] = false;
+    taoFetchICacheMiss[tid] = false;
+    taoFetchTLBMiss[tid] = false;
     fetchQueue[tid].clear();
 
     // TODO not sure what to do with priorityList for now
@@ -342,6 +346,8 @@ Fetch::resetStage()
 
         fetchBufferPC[tid] = 0;
         fetchBufferValid[tid] = false;
+        taoFetchICacheMiss[tid] = false;
+        taoFetchTLBMiss[tid] = false;
 
         fetchQueue[tid].clear();
 
@@ -371,6 +377,8 @@ Fetch::processCacheCompletion(PacketPtr pkt)
 
     memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
     fetchBufferValid[tid] = true;
+    taoFetchICacheMiss[tid] = pkt->req->hasTAOCacheLevel() ?
+        pkt->req->getTAOCacheLevel() > 0 : pkt->req->getAccessDepth() > 0;
 
     // Wake up the CPU (if it went to sleep and was waiting on
     // this completion event).
@@ -575,7 +583,8 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
 }
 
 void
-Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
+Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req,
+                         bool delayed)
 {
     ThreadID tid = cpu->contextToThread(mem_req->contextId());
     Addr fetchBufferBlockPC = mem_req->getVaddr();
@@ -596,6 +605,8 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
 
     // If translation was successful, attempt to read the icache block.
     if (fault == NoFault) {
+        taoFetchTLBMiss[tid] = mem_req->hasTAOTLBMiss() ?
+            mem_req->getTAOTLBMiss() : delayed;
         // Check that we're not going off into random memory
         // If we have, just wait around for commit to squash something and put
         // us on the right track
@@ -638,6 +649,8 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
             ppFetchRequestSent->notify(mem_req);
         }
     } else {
+        taoFetchTLBMiss[tid] = mem_req->hasTAOTLBMiss() ?
+            mem_req->getTAOTLBMiss() : delayed;
         // Don't send an instruction to decode if we can't handle it.
         if (!(numInst < fetchWidth) ||
                 !(fetchQueue[tid].size() < fetchQueueSize)) {
@@ -732,6 +745,8 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
                 tid);
         memReq[tid] = NULL;
     }
+    taoFetchICacheMiss[tid] = false;
+    taoFetchTLBMiss[tid] = false;
 
     // Get rid of the retrying packet if it was from this thread.
     if (retryTid == tid) {
@@ -1031,6 +1046,10 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
         instruction->traceData = cpu->getTracer()->getInstRecord(
             curTick(), cpu->tcBase(tid), instruction.get(),
             instruction->staticInst, this_pc, curMacroop);
+        if (instruction->traceData) {
+            instruction->traceData->setTAOICacheMiss(taoFetchICacheMiss[tid]);
+            instruction->traceData->setTAOITLBMiss(taoFetchTLBMiss[tid]);
+        }
     }
 #else
     instruction->traceData = NULL;

@@ -1,0 +1,78 @@
+syntax = "proto2";
+
+package ProtoMessage;
+
+message TaoTraceHeader {
+  optional uint32 version = 1 [default = 1];
+  optional string trace_kind = 2;
+  optional string schema_name = 3;
+  optional uint32 batch_size = 4;
+}
+
+message TaoFunctionalBatch {
+  repeated uint64 pc = 1 [packed = true];
+  repeated uint32 micro_pc = 2 [packed = true];
+  repeated uint64 seq = 3 [packed = true];
+  repeated uint64 commit_seq = 4 [packed = true];
+  repeated string opcode_text = 5;
+  repeated uint64 src_reg_bitmap = 6 [packed = true];
+  repeated uint64 dst_reg_bitmap = 7 [packed = true];
+  repeated bool is_branch = 8 [packed = true];
+  repeated bool is_cond_branch = 9 [packed = true];
+  repeated bool is_load = 10 [packed = true];
+  repeated bool is_store = 11 [packed = true];
+  repeated uint64 mem_addr = 12 [packed = true];
+  repeated uint64 branch_target = 13 [packed = true];
+  repeated string boundary_type = 14;
+  repeated bool branch_taken = 43 [packed = true];
+  repeated bool is_indirect_branch = 46 [packed = true];
+  optional uint32 row_count = 100;
+}
+
+message TaoDetailedBatch {
+  repeated uint64 pc = 1 [packed = true];
+  repeated uint32 micro_pc = 2 [packed = true];
+  repeated uint64 seq = 3 [packed = true];
+  repeated uint64 commit_seq = 4 [packed = true];
+  repeated string opcode_text = 5;
+  repeated uint64 src_reg_bitmap = 6 [packed = true];
+  repeated uint64 dst_reg_bitmap = 7 [packed = true];
+  repeated bool is_branch = 8 [packed = true];
+  repeated bool is_cond_branch = 9 [packed = true];
+  repeated bool is_load = 10 [packed = true];
+  repeated bool is_store = 11 [packed = true];
+  repeated uint64 mem_addr = 12 [packed = true];
+  repeated uint64 branch_target = 13 [packed = true];
+  repeated string boundary_type = 14;
+  repeated uint64 tick = 15 [packed = true];
+  repeated string disasm = 16;
+  repeated string op_class = 17;
+  repeated uint32 mem_size = 18 [packed = true];
+  repeated uint32 mem_flags = 19 [packed = true];
+  repeated uint64 fetch_tick = 20 [packed = true];
+  repeated uint64 decode_tick = 21 [packed = true];
+  repeated uint64 rename_tick = 22 [packed = true];
+  repeated uint64 dispatch_tick = 23 [packed = true];
+  repeated uint64 issue_tick = 24 [packed = true];
+  repeated uint64 complete_tick = 25 [packed = true];
+  repeated uint64 commit_tick = 26 [packed = true];
+  repeated uint64 store_tick = 27 [packed = true];
+  repeated bool is_squashed = 28 [packed = true];
+  repeated bool is_nop = 29 [packed = true];
+  repeated bool branch_mispred = 30 [packed = true];
+  repeated uint32 data_access_level = 31 [packed = true];
+  repeated bool icache_miss = 32 [packed = true];
+  repeated bool tlb_miss = 33 [packed = true];
+  repeated bool branch_mispred_exact = 34 [packed = true];
+  repeated uint32 data_access_level_exact = 35 [packed = true];
+  repeated bool icache_miss_exact = 36 [packed = true];
+  repeated bool tlb_miss_exact = 37 [packed = true];
+  repeated bool itlb_miss_exact = 38 [packed = true];
+  repeated bool dtlb_miss_exact = 39 [packed = true];
+  repeated bool predicate = 40 [packed = true];
+  repeated bool faulting = 41 [packed = true];
+  repeated bool in_user_mode = 42 [packed = true];
+  repeated bool branch_taken = 43 [packed = true];
+  repeated bool is_indirect_branch = 46 [packed = true];
+  optional uint32 row_count = 100;
+}

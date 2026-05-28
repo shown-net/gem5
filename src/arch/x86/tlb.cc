@@ -328,6 +328,7 @@ TLB::translate(const RequestPtr &req,
     bool storeCheck = flags & Request::READ_MODIFY_WRITE;
 
     delayedResponse = false;
+    req->setTAOTLBMiss(false);
 
     // If this is true, we're dealing with a request to a non-memory address
     // space.
@@ -417,6 +418,7 @@ TLB::translate(const RequestPtr &req,
 
             pageAlignedVaddr = concAddrPcid(pageAlignedVaddr, pcid);
             TlbEntry *entry = lookup(pageAlignedVaddr);
+            req->setTAOTLBMiss(entry == nullptr);
 
             switch (mode) {
                 case BaseMMU::Read:

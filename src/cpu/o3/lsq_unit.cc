@@ -41,6 +41,9 @@
 
 #include "cpu/o3/lsq_unit.hh"
 
+#include <cstdint>
+#include <string>
+
 #include "arch/generic/debugfaults.hh"
 #include "base/str.hh"
 #include "cpu/checker/cpu.hh"
@@ -60,6 +63,70 @@ namespace gem5
 namespace o3
 {
 
+namespace
+{
+
+std::string
+taoDataAccessLevelFromClass(uint8_t level)
+{
+    if (level == 0)
+        return "L1";
+    if (level == 1)
+        return "L2";
+    return "MEM";
+}
+
+std::string
+taoDataAccessLevelFromDepth(int depth)
+{
+    if (depth <= 0)
+        return "L1";
+    if (depth == 1)
+        return "L2";
+    return "MEM";
+}
+
+int
+taoDataAccessRank(const std::string &level)
+{
+    if (level == "L1")
+        return 0;
+    if (level == "L2")
+        return 1;
+    return 2;
+}
+
+void
+taoSetDataAccessLevelFromPacket(const DynInstPtr &inst, PacketPtr pkt)
+{
+    if (!inst || inst->isSquashed() || !inst->traceData || !pkt || !pkt->req)
+        return;
+
+    const std::string level = pkt->req->hasTAOCacheLevel() ?
+        taoDataAccessLevelFromClass(pkt->req->getTAOCacheLevel()) :
+        taoDataAccessLevelFromDepth(pkt->req->getAccessDepth());
+    if (!inst->traceData->getTAODataAccessLevelValid() ||
+        taoDataAccessRank(level) >
+        taoDataAccessRank(inst->traceData->getTAODataAccessLevel())) {
+        inst->traceData->setTAODataAccessLevel(level);
+    }
+}
+
+void
+taoDumpAndDeleteStoreTrace(const DynInstPtr &inst)
+{
+    if (!inst || !inst->traceData || inst->traceData->getTAODumped())
+        return;
+    if (!(inst->isStore() || inst->isAtomic() || inst->isStoreConditional()))
+        return;
+
+    inst->traceData->dump();
+    delete inst->traceData;
+    inst->traceData = nullptr;
+}
+
+} // anonymous namespace
+
 LSQUnit::WritebackEvent::WritebackEvent(const DynInstPtr &_inst,
         PacketPtr _pkt, LSQUnit *lsq_ptr)
     : Event(Default_Pri, AutoDelete),
@@ -74,7 +141,9 @@ LSQUnit::WritebackEvent::process()
 {
     assert(!lsqPtr->cpu->switchedOut());
 
+    taoSetDataAccessLevelFromPacket(inst, pkt);
     lsqPtr->writeback(inst, pkt);
+    taoDumpAndDeleteStoreTrace(inst);
 
     assert(inst->savedRequest);
     inst->savedRequest->writebackDone();
@@ -161,6 +230,8 @@ LSQUnit::completeDataAccess(PacketPtr pkt)
 
     cpu->ppDataAccessComplete->notify(std::make_pair(inst, pkt));
 
+    taoSetDataAccessLevelFromPacket(inst, pkt);
+
     assert(!cpu->switchedOut());
     if (!inst->isSquashed()) {
         if (request->needWBToRegister()) {
@@ -178,11 +249,13 @@ LSQUnit::completeDataAccess(PacketPtr pkt)
             writeback(inst, request->mainPacket());
             if (inst->isStore() || inst->isAtomic()) {
                 request->writebackDone();
+                taoDumpAndDeleteStoreTrace(inst);
                 completeStore(request->instruction()->sqIt);
             }
         } else if (inst->isStore()) {
             // This is a regular store (i.e., not store conditionals and
             // atomics), so it can complete without writing back
+            taoDumpAndDeleteStoreTrace(inst);
             completeStore(request->instruction()->sqIt);
         }
     }
@@ -832,6 +905,10 @@ LSQUnit::writebackStores()
         // Store didn't write any data so no need to write it back to
         // memory.
         if (storeWBIt->size() == 0) {
+            if (storeWBIt->instruction()->traceData) {
+                storeWBIt->instruction()->traceData->setTAODataAccessLevel("L1");
+                taoDumpAndDeleteStoreTrace(storeWBIt->instruction());
+            }
             /* It is important that the preincrement happens at (or before)
              * the call, as the the code of completeStore checks
              * storeWBIt. */
@@ -921,6 +998,10 @@ LSQUnit::writebackStores()
             main_pkt->dataStatic(inst->memData);
             request->mainReq()->localAccessor(thread, main_pkt);
             delete main_pkt;
+            if (inst->traceData) {
+                inst->traceData->setTAODataAccessLevel("L1");
+                taoDumpAndDeleteStoreTrace(inst);
+            }
             completeStore(storeWBIt);
             storeWBIt++;
             continue;

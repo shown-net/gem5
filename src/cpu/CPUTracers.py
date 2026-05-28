@@ -46,3 +46,17 @@ class NativeTrace(ExeTracer):
     type = "NativeTrace"
     cxx_class = "gem5::trace::NativeTrace"
     cxx_header = "cpu/nativetrace.hh"
+
+
+class TAOTracer(InstTracer):
+    type = "TAOTracer"
+    cxx_class = "gem5::trace::TAOTracer"
+    cxx_header = "cpu/taotrace.hh"
+    trace_kind = Param.String(
+        "functional", "TAO trace kind: functional or detailed"
+    )
+    trace_format = Param.String(
+        "jsonl", "TAO trace format: jsonl or protobuf_batch"
+    )
+    trace_file = Param.String("tao_trace.pb", "TAO protobuf trace output file")
+    batch_size = Param.UInt32(2048, "TAO protobuf records per batch")

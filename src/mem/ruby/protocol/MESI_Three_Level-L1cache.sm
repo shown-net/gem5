@@ -762,6 +762,22 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       cache.setMRU(address);
   }
 
+  action(h_data_mem_to_l0, "hm", desc="Send data sourced below L1 to the L0 cache.") {
+      enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
+          assert(is_valid(cache_entry));
+
+          out_msg.addr := address;
+          out_msg.Class := CoherenceClass:DATA;
+          out_msg.Sender := machineID;
+          out_msg.Dest := createMachineID(MachineType:L0Cache, version);
+          out_msg.TAOResponseMachine := MachineType:L2Cache;
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+
+      cache.setMRU(address);
+  }
+
   action(hh_xdata_to_l0, "\h", desc="If not prefetch, notify sequencer that store completed.") {
       enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
           assert(is_valid(cache_entry));
@@ -780,6 +796,23 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       cache.setMRU(address);
   }
 
+  action(hh_xdata_mem_to_l0, "\hm", desc="Send exclusive data sourced below L1 to the L0 cache.") {
+      enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
+          assert(is_valid(cache_entry));
+
+          out_msg.addr := address;
+          out_msg.Class := CoherenceClass:DATA_EXCLUSIVE;
+          out_msg.Sender := machineID;
+          out_msg.Dest := createMachineID(MachineType:L0Cache, version);
+          out_msg.TAOResponseMachine := MachineType:L2Cache;
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := cache_entry.Dirty;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+
+      cache.setMRU(address);
+  }
+
   action(h_stale_data_to_l0, "hs", desc="If not prefetch, send data to the L0 cache.") {
       enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
           assert(is_valid(cache_entry));
@@ -788,6 +821,21 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
           out_msg.Class := CoherenceClass:STALE_DATA;
           out_msg.Sender := machineID;
           out_msg.Dest := createMachineID(MachineType:L0Cache, version);
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.Dirty := cache_entry.Dirty;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+       }
+   }
+
+  action(h_stale_data_mem_to_l0, "hsm", desc="Send stale data sourced below L1 to the L0 cache.") {
+      enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
+          assert(is_valid(cache_entry));
+
+          out_msg.addr := address;
+          out_msg.Class := CoherenceClass:STALE_DATA;
+          out_msg.Sender := machineID;
+          out_msg.Dest := createMachineID(MachineType:L0Cache, version);
+          out_msg.TAOResponseMachine := MachineType:L2Cache;
           out_msg.DataBlk := cache_entry.DataBlk;
           out_msg.Dirty := cache_entry.Dirty;
           out_msg.MessageSize := MessageSizeType:Response_Data;
@@ -1077,7 +1125,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   transition(IS, Data_all_Acks, S) {
     u_writeDataFromL2Response;
-    h_data_to_l0;
+    h_data_mem_to_l0;
     s_deallocateTBE;
     o_popL2ResponseQueue;
     kd_wakeUpDependents;
@@ -1085,7 +1133,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   transition(IS_I, Data_all_Acks, I) {
     u_writeDataFromL2Response;
-    h_stale_data_to_l0;
+    h_stale_data_mem_to_l0;
     s_deallocateTBE;
     ff_deallocateCacheBlock;
     o_popL2ResponseQueue;
@@ -1095,7 +1143,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   transition(IS, DataS_fromL1, S) {
     u_writeDataFromL2Response;
     j_sendUnblock;
-    h_data_to_l0;
+    h_data_mem_to_l0;
     s_deallocateTBE;
     o_popL2ResponseQueue;
     kd_wakeUpDependents;
@@ -1104,7 +1152,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   transition(IS_I, DataS_fromL1, I) {
     u_writeDataFromL2Response;
     j_sendUnblock;
-    h_stale_data_to_l0;
+    h_stale_data_mem_to_l0;
     s_deallocateTBE;
     ff_deallocateCacheBlock;
     o_popL2ResponseQueue;
@@ -1114,7 +1162,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   // directory is blocked when sending exclusive data
   transition({IS,IS_I}, Data_Exclusive, E) {
     u_writeDataFromL2Response;
-    hh_xdata_to_l0;
+    hh_xdata_mem_to_l0;
     jj_sendExclusiveUnblock;
     s_deallocateTBE;
     o_popL2ResponseQueue;
@@ -1135,7 +1183,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   transition(IM, Data_all_Acks, M) {
     u_writeDataFromL2Response;
-    hh_xdata_to_l0;
+    hh_xdata_mem_to_l0;
     jj_sendExclusiveUnblock;
     s_deallocateTBE;
     o_popL2ResponseQueue;
@@ -1149,7 +1197,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   transition(SM, Ack_all, M) {
     jj_sendExclusiveUnblock;
-    hh_xdata_to_l0;
+    hh_xdata_mem_to_l0;
     s_deallocateTBE;
     o_popL2ResponseQueue;
     kd_wakeUpDependents;

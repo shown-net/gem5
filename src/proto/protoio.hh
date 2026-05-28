@@ -114,6 +114,11 @@ class ProtoOutputStream : public ProtoStream
      */
     void write(const google::protobuf::Message& msg);
 
+    /**
+     * Flush buffered protobuf and file output to the underlying file.
+     */
+    void flush();
+
   private:
 
     /// Underlying file output stream

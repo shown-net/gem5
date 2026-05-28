@@ -42,6 +42,7 @@
 #define __INSTRECORD_HH__
 
 #include <memory>
+#include <string>
 
 #include "arch/generic/pcstate.hh"
 #include "base/types.hh"
@@ -155,6 +156,40 @@ class InstRecord
      * to be enabled)
      */
     bool faulting = false;
+
+    Tick tao_fetch_tick = 0;
+    Tick tao_decode_tick = 0;
+    Tick tao_rename_tick = 0;
+    Tick tao_dispatch_tick = 0;
+    Tick tao_issue_tick = 0;
+    Tick tao_complete_tick = 0;
+    Tick tao_commit_tick = 0;
+    Tick tao_store_tick = 0;
+    bool tao_stage_ticks_valid = false;
+
+    uint64_t tao_src_reg_bitmap = 0;
+    uint64_t tao_dst_reg_bitmap = 0;
+    uint64_t tao_src_reg_bitmap_high = 0;
+    uint64_t tao_dst_reg_bitmap_high = 0;
+    bool tao_reg_bitmap_valid = false;
+
+    bool tao_branch_mispred = false;
+    bool tao_branch_mispred_valid = false;
+    Addr tao_branch_target = 0;
+    bool tao_branch_target_valid = false;
+    bool tao_squashed = false;
+    bool tao_squashed_valid = false;
+    std::string tao_data_access_level;
+    bool tao_data_access_level_valid = false;
+    bool tao_icache_miss = false;
+    bool tao_icache_miss_valid = false;
+    bool tao_tlb_miss = false;
+    bool tao_tlb_miss_valid = false;
+    bool tao_itlb_miss = false;
+    bool tao_itlb_miss_valid = false;
+    bool tao_dtlb_miss = false;
+    bool tao_dtlb_miss_valid = false;
+    bool tao_dumped = false;
 
   public:
     InstRecord(Tick _when, ThreadContext *_thread,
@@ -284,6 +319,103 @@ class InstRecord
 
     void setFaulting(bool val) { faulting = val; }
 
+    void
+    setTAOStageTicks(Tick fetch, Tick decode, Tick rename, Tick dispatch,
+                     Tick issue, Tick complete, Tick commit, Tick store)
+    {
+        tao_fetch_tick = fetch;
+        tao_decode_tick = decode;
+        tao_rename_tick = rename;
+        tao_dispatch_tick = dispatch;
+        tao_issue_tick = issue;
+        tao_complete_tick = complete;
+        tao_commit_tick = commit;
+        tao_store_tick = store;
+        tao_stage_ticks_valid = true;
+    }
+
+    void
+    setTAORegBitmaps(uint64_t src_bitmap, uint64_t dst_bitmap)
+    {
+        tao_src_reg_bitmap = src_bitmap;
+        tao_dst_reg_bitmap = dst_bitmap;
+        tao_src_reg_bitmap_high = 0;
+        tao_dst_reg_bitmap_high = 0;
+        tao_reg_bitmap_valid = true;
+    }
+
+    void
+    setTAORegBitmaps(uint64_t src_bitmap, uint64_t src_bitmap_high,
+                     uint64_t dst_bitmap, uint64_t dst_bitmap_high)
+    {
+        tao_src_reg_bitmap = src_bitmap;
+        tao_src_reg_bitmap_high = src_bitmap_high;
+        tao_dst_reg_bitmap = dst_bitmap;
+        tao_dst_reg_bitmap_high = dst_bitmap_high;
+        tao_reg_bitmap_valid = true;
+    }
+
+    void
+    setTAOBranchMispred(bool val)
+    {
+        tao_branch_mispred = val;
+        tao_branch_mispred_valid = true;
+    }
+
+    void
+    setTAOBranchTarget(Addr target)
+    {
+        tao_branch_target = target;
+        tao_branch_target_valid = true;
+    }
+
+    void
+    setTAOSquashed(bool val)
+    {
+        tao_squashed = val;
+        tao_squashed_valid = true;
+    }
+
+    void
+    setTAODataAccessLevel(const std::string &level)
+    {
+        tao_data_access_level = level;
+        tao_data_access_level_valid = true;
+    }
+
+    void
+    setTAOICacheMiss(bool val)
+    {
+        tao_icache_miss = val;
+        tao_icache_miss_valid = true;
+    }
+
+    void
+    setTAOTLBMiss(bool val)
+    {
+        tao_tlb_miss = val;
+        tao_tlb_miss_valid = true;
+    }
+
+    void
+    setTAOITLBMiss(bool val)
+    {
+        tao_itlb_miss = val;
+        tao_itlb_miss_valid = true;
+        setTAOTLBMiss(tao_tlb_miss || val);
+    }
+
+    void
+    setTAODTLBMiss(bool val)
+    {
+        tao_dtlb_miss = val;
+        tao_dtlb_miss_valid = true;
+        setTAOTLBMiss(tao_tlb_miss || val);
+    }
+
+    void setTAODumped() { tao_dumped = true; }
+    bool getTAODumped() const { return tao_dumped; }
+
     virtual void dump() = 0;
 
   public:
@@ -309,6 +441,40 @@ class InstRecord
     bool getCpSeqValid() const { return cp_seq_valid; }
 
     bool getFaulting() const { return faulting; }
+    bool getPredicate() const { return predicate; }
+
+    bool getTAOStageTicksValid() const { return tao_stage_ticks_valid; }
+    Tick getTAOFetchTick() const { return tao_fetch_tick; }
+    Tick getTAODecodeTick() const { return tao_decode_tick; }
+    Tick getTAORenameTick() const { return tao_rename_tick; }
+    Tick getTAODispatchTick() const { return tao_dispatch_tick; }
+    Tick getTAOIssueTick() const { return tao_issue_tick; }
+    Tick getTAOCompleteTick() const { return tao_complete_tick; }
+    Tick getTAOCommitTick() const { return tao_commit_tick; }
+    Tick getTAOStoreTick() const { return tao_store_tick; }
+
+    bool getTAORegBitmapValid() const { return tao_reg_bitmap_valid; }
+    uint64_t getTAOSrcRegBitmap() const { return tao_src_reg_bitmap; }
+    uint64_t getTAODstRegBitmap() const { return tao_dst_reg_bitmap; }
+    uint64_t getTAOSrcRegBitmapHigh() const { return tao_src_reg_bitmap_high; }
+    uint64_t getTAODstRegBitmapHigh() const { return tao_dst_reg_bitmap_high; }
+
+    bool getTAOBranchMispredValid() const { return tao_branch_mispred_valid; }
+    bool getTAOBranchMispred() const { return tao_branch_mispred; }
+    bool getTAOBranchTargetValid() const { return tao_branch_target_valid; }
+    Addr getTAOBranchTarget() const { return tao_branch_target; }
+    bool getTAOSquashedValid() const { return tao_squashed_valid; }
+    bool getTAOSquashed() const { return tao_squashed; }
+    bool getTAODataAccessLevelValid() const { return tao_data_access_level_valid; }
+    const std::string &getTAODataAccessLevel() const { return tao_data_access_level; }
+    bool getTAOICacheMissValid() const { return tao_icache_miss_valid; }
+    bool getTAOICacheMiss() const { return tao_icache_miss; }
+    bool getTAOTLBMissValid() const { return tao_tlb_miss_valid; }
+    bool getTAOTLBMiss() const { return tao_tlb_miss; }
+    bool getTAOITLBMissValid() const { return tao_itlb_miss_valid; }
+    bool getTAOITLBMiss() const { return tao_itlb_miss; }
+    bool getTAODTLBMissValid() const { return tao_dtlb_miss_valid; }
+    bool getTAODTLBMiss() const { return tao_dtlb_miss; }
 };
 
 /**

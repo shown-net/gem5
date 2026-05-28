@@ -496,6 +496,12 @@ def config_embedded_python(env):
 
     print(f"Info: Using Python config: {python_config}")
 
+    # SCons may place Python libraries before the probe object during
+    # Configure/TryRun, and the global --as-needed setting can then drop
+    # libpython from the link line. Force python embedding probes to keep the
+    # library so pybind11::scoped_interpreter links reliably.
+    env.Append(LINKFLAGS=['-Wl,--no-as-needed'])
+
     cmd = [python_config, '--ldflags', '--includes']
 
     # Starting in Python 3.8 the --embed flag is required. Use it if supported.

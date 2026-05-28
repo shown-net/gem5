@@ -853,6 +853,10 @@ LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
         squashTranslation();
     } else {
         _inst->strictlyOrdered(request->isStrictlyOrdered());
+        if (_inst->traceData) {
+            _inst->traceData->setTAODTLBMiss(request->hasTAOTLBMiss() ?
+                request->getTAOTLBMiss() : isDelayed());
+        }
 
         flags.set(Flag::TranslationFinished);
         if (fault == NoFault) {
@@ -892,6 +896,16 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
             squashTranslation();
         } else {
             _inst->strictlyOrdered(_mainReq->isStrictlyOrdered());
+            if (_inst->traceData) {
+                bool tao_tlb_miss = isDelayed();
+                for (const auto &request : _reqs) {
+                    if (request->hasTAOTLBMiss()) {
+                        tao_tlb_miss = tao_tlb_miss ||
+                            request->getTAOTLBMiss();
+                    }
+                }
+                _inst->traceData->setTAODTLBMiss(tao_tlb_miss);
+            }
             flags.set(Flag::TranslationFinished);
             _inst->translationCompleted(true);
 

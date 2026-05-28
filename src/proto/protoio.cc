@@ -98,6 +98,19 @@ ProtoOutputStream::write(const Message& msg)
 
     // Write the message itself to the stream
     msg.SerializeWithCachedSizes(&codedStream);
+    // Flush any partially used coded-stream buffer back into the shared
+    // zero-copy stream so a final short batch is not left buffered.
+    codedStream.Trim();
+}
+
+void
+ProtoOutputStream::flush()
+{
+    if (gzipStream != NULL)
+        gzipStream->Flush();
+    fileStream.flush();
+    if (!fileStream.good())
+        panic("Unable to flush protobuf output stream\n");
 }
 
 ProtoInputStream::ProtoInputStream(const std::string& filename) :

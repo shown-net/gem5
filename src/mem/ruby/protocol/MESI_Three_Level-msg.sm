@@ -81,6 +81,7 @@ structure(CoherenceMsg, desc="...", interface="Message") {
   RubyAccessMode AccessMode,    desc="user/supervisor access type";
   MachineID Sender,             desc="What component sent this message";
   MachineID Dest,        desc="What machine receives this message";
+  MachineType TAOResponseMachine, default="MachineType_NULL", desc="Observed TAO data source; does not affect protocol routing";
   MessageSizeType MessageSize,  desc="size category of the message";
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
   bool Dirty, default="false",  desc="Dirty bit";

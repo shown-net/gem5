@@ -171,6 +171,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     DataBlock DataBlk,       desc="data for the block";
     bool Dirty, default="false",   desc="data is dirty";
     bool isPrefetched, default="false", desc="Set if this block was prefetched";
+    MachineType TAOResponseMachine, default="MachineType_NULL", desc="Ruby source used for TAO cache-level labels";
   }
 
   // TBE fields
@@ -762,7 +763,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
     Dcache.setMRU(cache_entry);
-    sequencer.readCallback(address, cache_entry.DataBlk, true);
+    sequencer.readCallback(address, cache_entry.DataBlk, true,
+                           cache_entry.TAOResponseMachine);
   }
 
   // The action name uses a counterintuitive _hit prefix when it is only
@@ -772,7 +774,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
     Icache.setMRU(cache_entry);
-    sequencer.readCallback(address, cache_entry.DataBlk, true);
+    sequencer.readCallback(address, cache_entry.DataBlk, true,
+                           cache_entry.TAOResponseMachine);
   }
 
   action(hh_store_hit, "\h", desc="Notify sequencer that store completed (cache hit)") {
@@ -790,7 +793,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
     Dcache.setMRU(cache_entry);
-    sequencer.writeCallback(address, cache_entry.DataBlk, true);
+    sequencer.writeCallback(address, cache_entry.DataBlk, true,
+                            cache_entry.TAOResponseMachine);
     cache_entry.Dirty := true;
   }
 
@@ -838,6 +842,11 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     peek(messgeBuffer_in, CoherenceMsg) {
       assert(is_valid(cache_entry));
       cache_entry.DataBlk := in_msg.DataBlk;
+      if (in_msg.TAOResponseMachine == MachineType:NULL) {
+        cache_entry.TAOResponseMachine := machineIDToMachineType(in_msg.Sender);
+      } else {
+        cache_entry.TAOResponseMachine := in_msg.TAOResponseMachine;
+      }
     }
   }
 
@@ -845,6 +854,11 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     peek(messgeBuffer_in, CoherenceMsg) {
       assert(is_valid(cache_entry));
       cache_entry.DataBlk := in_msg.DataBlk;
+      if (in_msg.TAOResponseMachine == MachineType:NULL) {
+        cache_entry.TAOResponseMachine := machineIDToMachineType(in_msg.Sender);
+      } else {
+        cache_entry.TAOResponseMachine := in_msg.TAOResponseMachine;
+      }
     }
   }
 

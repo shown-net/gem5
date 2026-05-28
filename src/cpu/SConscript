@@ -66,6 +66,7 @@ DebugFlag('Fetch')
 DebugFlag('HtmCpu', 'Hardware Transactional Memory (CPU side)')
 DebugFlag('InvalidReg')
 DebugFlag('O3PipeView')
+DebugFlag('TAOTrace')
 DebugFlag('PCEvent')
 DebugFlag('Quiesce')
 DebugFlag('Mwait')
@@ -98,7 +99,7 @@ if env['CONF']['HAVE_PROTOBUF']:
 SimObject('BaseCPU.py', sim_objects=['BaseCPU'])
 SimObject('CpuCluster.py', sim_objects=['CpuCluster'])
 SimObject('CPUTracers.py', sim_objects=[
-    'ExeTracer', 'IntelTrace', 'NativeTrace'])
+    'ExeTracer', 'IntelTrace', 'NativeTrace', 'TAOTracer'])
 SimObject('TimingExpr.py', sim_objects=[
     'TimingExpr', 'TimingExprLiteral', 'TimingExprSrcReg', 'TimingExprLet',
     'TimingExprRef', 'TimingExprUn', 'TimingExprBin', 'TimingExprIf'],
@@ -109,6 +110,7 @@ Source('base.cc')
 Source('exetrace.cc')
 Source('inteltrace.cc')
 Source('nativetrace.cc')
+Source('taotrace.cc')
 Source('nop_static_inst.cc')
 Source('null_static_inst.cc')
 Source('profile.cc')
