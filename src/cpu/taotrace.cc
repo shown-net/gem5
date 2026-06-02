@@ -173,8 +173,8 @@ TAOTracer::ensureProtoStream()
     header.set_version(1);
     header.set_trace_kind(_traceKind);
     header.set_schema_name(_traceKind == "detailed" ?
-                           "tao_detailed_minimal_v2" :
-                           "tao_functional_minimal_v2");
+                           "tao_detailed_minimal_v3" :
+                           "tao_functional_minimal_v3");
     header.set_batch_size(_batchSize);
     _protoStream->write(header);
     _protoStream->flush();
@@ -236,6 +236,8 @@ TAOTracer::writeRecord(
             batch->add_opcode_text(opcode_text);
             batch->add_src_reg_bitmap(src_bitmap);
             batch->add_dst_reg_bitmap(dst_bitmap);
+            batch->add_src_reg_bitmap_high(src_bitmap_high);
+            batch->add_dst_reg_bitmap_high(dst_bitmap_high);
             batch->add_is_branch(inst->isControl());
             batch->add_is_cond_branch(inst->isCondCtrl());
             batch->add_is_load(inst->isLoad());
@@ -268,6 +270,8 @@ TAOTracer::writeRecord(
             batch->add_opcode_text(opcode_text);
             batch->add_src_reg_bitmap(src_bitmap);
             batch->add_dst_reg_bitmap(dst_bitmap);
+            batch->add_src_reg_bitmap_high(src_bitmap_high);
+            batch->add_dst_reg_bitmap_high(dst_bitmap_high);
             batch->add_is_branch(inst->isControl());
             batch->add_is_cond_branch(inst->isCondCtrl());
             batch->add_is_load(inst->isLoad());
