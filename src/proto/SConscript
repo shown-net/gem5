@@ -37,10 +37,13 @@
 
 Import('*')
 
-# Only build if we have protobuf support
 if env['CONF']['HAVE_PROTOBUF']:
     ProtoBuf('inst_dep_record.proto', tags=['protobuf'])
     ProtoBuf('packet.proto', tags=['protobuf'])
     ProtoBuf('inst.proto', tags=['protobuf'])
+    ProtoBuf('peregrine_trace.proto', tags=['protobuf'])
     Source('protobuf.cc', tags=['protobuf'])
     Source('protoio.cc', tags=['protobuf'])
+    if not env['CONF'].get('HAVE_ZSTD', False):
+        error('Peregrine protobuf trace support requires zstd')
+    Source('zstd_protoio.cc', tags=['protobuf'])

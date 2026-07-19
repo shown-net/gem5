@@ -64,6 +64,12 @@ with gem5_scons.Configure(main) as conf:
             conf.CheckLibWithHeader('protobuf', 'google/protobuf/message.h',
                                     'C++', call='GOOGLE_PROTOBUF_VERIFY_VERSION;'))
     )
+    conf.env['CONF']['HAVE_ZSTD'] = bool(
+        (conf.env['HAVE_PKG_CONFIG'] and
+        conf.CheckPkgConfig('libzstd', '--cflags', '--libs')) or
+        conf.CheckLibWithHeader('zstd', 'zstd.h', 'C++',
+                                call='ZSTD_versionNumber();')
+    )
 
 # If we have the compiler but not the library, print another warning.
 if main['HAVE_PROTOC'] and not main['CONF']['HAVE_PROTOBUF']:
@@ -77,3 +83,7 @@ if main['CONF']['HAVE_PROTOBUF']:
     # warnings.
     main.Append(CCFLAGS='-DPROTOBUF_INLINE_NOT_IN_HEADERS=0')
     main.Append(CCFLAGS='-DPROTOBUF_ENABLE_DEBUG_LOGGING_MAY_LEAK_PII=0')
+
+if not main['CONF']['HAVE_ZSTD']:
+    warning('Did not find zstd library and headers.\n'
+            'Peregrine protobuf trace support requires libzstd-dev.')

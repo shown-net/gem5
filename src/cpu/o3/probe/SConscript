@@ -46,6 +46,13 @@ if env['CONF']['BUILD_ISA']:
     Source('instruction_tracer.cc')
 
     if env['CONF']['HAVE_PROTOBUF']:
+        if env['CONF']['USE_ARM_ISA']:
+            SimObject(
+                'PeregrineTrace.py',
+                sim_objects=['PeregrineTrace'],
+                tags=['protobuf']
+            )
+            Source('peregrine_trace.cc', tags=['protobuf'])
         SimObject(
             'ElasticTrace.py',
             sim_objects=['ElasticTrace'],

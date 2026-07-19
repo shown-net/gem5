@@ -1,0 +1,47 @@
+syntax = "proto2";
+
+package ProtoMessage;
+
+message AnamolTraceChunk {
+  repeated uint32 ids = 1 [packed = true];
+  repeated uint64 ips = 2 [packed = true];
+  repeated uint32 class_flags = 3 [packed = true];
+  repeated uint32 branch_types = 4 [packed = true];
+  repeated bool branch_taken = 5 [packed = true];
+  repeated uint64 branch_target_addrs = 6 [packed = true];
+  repeated uint32 dep_offsets = 7 [packed = true];
+  repeated uint32 dep_ids = 8 [packed = true];
+  repeated uint32 read_offsets = 9 [packed = true];
+  repeated uint64 read_addresses = 10 [packed = true];
+  repeated uint32 read_sizes = 11 [packed = true];
+  repeated uint32 write_offsets = 12 [packed = true];
+  repeated uint64 write_addresses = 13 [packed = true];
+  repeated uint32 write_sizes = 14 [packed = true];
+  optional uint32 section_index = 15;
+  repeated uint32 committed_control_ops = 16 [packed = true];
+  repeated uint32 committed_memory_ops = 17 [packed = true];
+  repeated uint32 committed_micro_ops = 18 [packed = true];
+  repeated uint32 fixed_execution_latencies = 19 [packed = true];
+  repeated uint32 committed_int_alu_ops = 20 [packed = true];
+  repeated uint32 committed_int_mult_ops = 21 [packed = true];
+  repeated uint32 committed_int_div_ops = 22 [packed = true];
+  repeated uint32 committed_fp_alu_ops = 23 [packed = true];
+  repeated uint32 committed_fp_mult_div_ops = 24 [packed = true];
+  repeated uint32 committed_simd_ops = 25 [packed = true];
+  repeated uint32 committed_matrix_ops = 26 [packed = true];
+  repeated uint32 committed_load_ops = 27 [packed = true];
+  repeated uint32 committed_store_ops = 28 [packed = true];
+  repeated uint32 committed_system_ops = 29 [packed = true];
+  repeated uint32 micro_op_offsets = 30 [packed = true];
+  repeated uint32 micro_op_ids = 31 [packed = true];
+  repeated uint32 micro_op_class_flags = 32 [packed = true];
+  repeated uint32 micro_op_fixed_execution_latencies = 33 [packed = true];
+  repeated uint32 micro_op_dep_offsets = 34 [packed = true];
+  repeated uint32 micro_op_dep_ids = 35 [packed = true];
+  repeated uint32 micro_op_read_offsets = 36 [packed = true];
+  repeated uint64 micro_op_read_addresses = 37 [packed = true];
+  repeated uint32 micro_op_read_sizes = 38 [packed = true];
+  repeated uint32 micro_op_write_offsets = 39 [packed = true];
+  repeated uint64 micro_op_write_addresses = 40 [packed = true];
+  repeated uint32 micro_op_write_sizes = 41 [packed = true];
+}
