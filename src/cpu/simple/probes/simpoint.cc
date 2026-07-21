@@ -45,12 +45,15 @@ namespace gem5
 SimPoint::SimPoint(const SimPointParams &p)
     : ProbeListenerObject(p),
       intervalSize(p.interval),
+      profiling(p.profile_scope == "whole_process"),
       intervalCount(0),
       intervalDrift(0),
       simpointStream(NULL),
       currentBBV(0, 0),
       currentBBVInstCount(0)
 {
+    fatal_if(p.profile_scope != "whole_process" && p.profile_scope != "roi",
+             "SimPoint profile_scope must be 'whole_process' or 'roi'");
     simpointStream = simout.create(p.profile_file, false);
     if (!simpointStream)
         fatal("unable to open SimPoint profile_file");
@@ -74,10 +77,52 @@ SimPoint::regProbeListeners()
 }
 
 void
+SimPoint::startProfiling()
+{
+    profiling = true;
+}
+
+void
+SimPoint::stopProfiling()
+{
+    profiling = false;
+    if (intervalCount || intervalDrift)
+        dumpInterval();
+}
+
+void
+SimPoint::dumpInterval()
+{
+    std::vector<std::pair<uint64_t, uint64_t> > counts;
+    for (auto map_itr = bbMap.begin(); map_itr != bbMap.end(); ++map_itr) {
+        BBInfo& info = map_itr->second;
+        if (info.count != 0) {
+            counts.push_back(std::make_pair(info.id, info.count));
+            info.count = 0;
+        }
+    }
+    std::sort(counts.begin(), counts.end());
+
+    *simpointStream->stream() << "T";
+    for (auto cnt_itr = counts.begin(); cnt_itr != counts.end(); ++cnt_itr) {
+        *simpointStream->stream() << ":" << cnt_itr->first
+                        << ":" << cnt_itr->second << " ";
+    }
+    *simpointStream->stream() << "\n";
+
+    intervalDrift = (intervalCount + intervalDrift) > intervalSize ?
+        (intervalCount + intervalDrift) - intervalSize : 0;
+    intervalCount = 0;
+}
+
+void
 SimPoint::profile(const std::pair<SimpleThread*, const StaticInstPtr>& p)
 {
     SimpleThread* thread = p.first;
     const StaticInstPtr &inst = p.second;
+
+    if (!profiling)
+        return;
 
     if (inst->isMicroop() && !inst->isLastMicroop())
         return;
@@ -114,29 +159,7 @@ SimPoint::profile(const std::pair<SimpleThread*, const StaticInstPtr>& p)
         // (intervalCount) and the excessive inst count from the previous
         // interval (intervalDrift) is greater than/equal to the interval size.
         if (intervalCount + intervalDrift >= intervalSize) {
-            // summarize interval and display BBV info
-            std::vector<std::pair<uint64_t, uint64_t> > counts;
-            for (auto map_itr = bbMap.begin(); map_itr != bbMap.end();
-                    ++map_itr) {
-                BBInfo& info = map_itr->second;
-                if (info.count != 0) {
-                    counts.push_back(std::make_pair(info.id, info.count));
-                    info.count = 0;
-                }
-            }
-            std::sort(counts.begin(), counts.end());
-
-            // Print output BBV info
-            *simpointStream->stream() << "T";
-            for (auto cnt_itr = counts.begin(); cnt_itr != counts.end();
-                    ++cnt_itr) {
-                *simpointStream->stream() << ":" << cnt_itr->first
-                                << ":" << cnt_itr->second << " ";
-            }
-            *simpointStream->stream() << "\n";
-
-            intervalDrift = (intervalCount + intervalDrift) - intervalSize;
-            intervalCount = 0;
+            dumpInterval();
         }
     }
 }

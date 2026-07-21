@@ -17,7 +17,7 @@ message AnamolTraceChunk {
   repeated uint32 write_offsets = 12 [packed = true];
   repeated uint64 write_addresses = 13 [packed = true];
   repeated uint32 write_sizes = 14 [packed = true];
-  optional uint32 section_index = 15;
+  reserved 15;
   repeated uint32 committed_control_ops = 16 [packed = true];
   repeated uint32 committed_memory_ops = 17 [packed = true];
   repeated uint32 committed_micro_ops = 18 [packed = true];

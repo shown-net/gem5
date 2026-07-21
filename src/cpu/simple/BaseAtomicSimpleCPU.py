@@ -62,7 +62,8 @@ class BaseAtomicSimpleCPU(BaseSimpleCPU):
     simulate_data_stalls = Param.Bool(False, "Simulate dcache stall cycles")
     simulate_inst_stalls = Param.Bool(False, "Simulate icache stall cycles")
 
-    def addSimPointProbe(self, interval):
+    def addSimPointProbe(self, interval, profile_scope="whole_process"):
         simpoint = SimPoint()
         simpoint.interval = interval
+        simpoint.profile_scope = profile_scope
         self.probeListener = simpoint

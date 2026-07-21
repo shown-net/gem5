@@ -17,10 +17,9 @@
 namespace gem5
 {
 
-// PeregrineTrace records every committed instruction between construction and
-// simulation exit. It has no internal ROI/window gate: the capture region is
-// defined externally, by only instantiating this probe for the desired ROI
-// run. Instantiating it for a full-program run traces the entire program.
+// PeregrineTrace records committed instructions only between startTracing()
+// and stopTracing(). The capture region is defined by the config script that
+// drives those calls.
 class PeregrineTrace : public ProbeListenerObject
 {
   public:
@@ -28,11 +27,12 @@ class PeregrineTrace : public ProbeListenerObject
     ~PeregrineTrace();
 
     void regProbeListeners() override;
+    void startTracing();
+    void stopTracing();
 
   private:
     void closeStream();
     void flushChunk();
-    void onStatsDump();
     void onExecute(const o3::DynInstPtr &inst);
     void onDataAccess(const o3::DynInstPtr &inst, PacketPtr pkt);
     void onCommit(const o3::DynInstPtr &inst);
@@ -43,7 +43,9 @@ class PeregrineTrace : public ProbeListenerObject
 
     ZstdProtoOutputStream *traceStream;
     const unsigned chunkRecords;
-    uint32_t sectionIndex = 0;
+    bool tracing = false;
+    bool everStarted = false;
+    bool stopped = false;
     // Memory dependencies are tracked over a finite lookback window (in
     // committed instructions). Writers older than this horizon are evicted,
     // bounding the address map to the recent working set instead of growing

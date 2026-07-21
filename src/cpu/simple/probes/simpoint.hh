@@ -88,6 +88,8 @@ class SimPoint : public ProbeListenerObject
     virtual void init();
 
     virtual void regProbeListeners();
+    void startProfiling();
+    void stopProfiling();
 
     /**
      * Profile basic blocks for SimPoints.
@@ -99,6 +101,7 @@ class SimPoint : public ProbeListenerObject
   private:
     /** SimPoint profiling interval size in instructions */
     const uint64_t intervalSize;
+    bool profiling;
 
     /** Inst count in current basic block */
     uint64_t intervalCount;
@@ -124,6 +127,8 @@ class SimPoint : public ProbeListenerObject
     BasicBlockRange currentBBV;
     /** inst count in current basic block */
     uint64_t currentBBVInstCount;
+
+    void dumpInterval();
 };
 
 } // namespace gem5

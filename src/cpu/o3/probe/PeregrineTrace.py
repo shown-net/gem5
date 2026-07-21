@@ -1,10 +1,15 @@
 from m5.objects.Probe import *
+from m5.util.pybind import *
 
 
 class PeregrineTrace(ProbeListenerObject):
     type = "PeregrineTrace"
     cxx_class = "gem5::PeregrineTrace"
     cxx_header = "cpu/o3/probe/peregrine_trace.hh"
+    cxx_exports = [
+        PyBindMethod("startTracing"),
+        PyBindMethod("stopTracing"),
+    ]
 
     output_file = Param.String(
         "peregrine.trace.pb.zst", "Peregrine zstd protobuf trace output file"

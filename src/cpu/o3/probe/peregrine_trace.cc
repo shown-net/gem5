@@ -111,7 +111,6 @@ PeregrineTrace::PeregrineTrace(const PeregrineTraceParams &p)
 {
     traceStream = new ZstdProtoOutputStream(
         simout.resolve(p.output_file), p.zstd_level);
-    statistics::registerDumpCallback([this]() { onStatsDump(); });
     registerExitCallback([this]() { closeStream(); });
 }
 
@@ -123,6 +122,7 @@ PeregrineTrace::~PeregrineTrace()
 void
 PeregrineTrace::closeStream()
 {
+    fatal_if(tracing, "PeregrineTrace closed while tracing is still active.");
     flushChunk();
     delete traceStream;
     traceStream = nullptr;
@@ -134,7 +134,6 @@ PeregrineTrace::flushChunk()
     if (!traceStream || records.empty())
         return;
     ProtoMessage::AnamolTraceChunk chunk;
-    chunk.set_section_index(sectionIndex);
     chunk.add_dep_offsets(0);
     chunk.add_read_offsets(0);
     chunk.add_write_offsets(0);
@@ -207,12 +206,22 @@ PeregrineTrace::flushChunk()
 }
 
 void
-PeregrineTrace::onStatsDump()
+PeregrineTrace::startTracing()
 {
-    if (!traceStream)
-        return;
+    fatal_if(everStarted,
+             "PeregrineTrace supports exactly one startTracing().");
+    fatal_if(stopped, "PeregrineTrace cannot restart after stopTracing().");
+    tracing = true;
+    everStarted = true;
+}
+
+void
+PeregrineTrace::stopTracing()
+{
+    fatal_if(!tracing, "PeregrineTrace stopTracing() called while inactive.");
+    tracing = false;
+    stopped = true;
     flushChunk();
-    ++sectionIndex;
 }
 
 void
@@ -236,6 +245,8 @@ PeregrineTrace::regProbeListeners()
 void
 PeregrineTrace::traceExecute(const o3::DynInstPtr &inst)
 {
+    if (!tracing)
+        return;
     onExecute(inst);
 }
 
@@ -243,12 +254,16 @@ void
 PeregrineTrace::traceDataAccess(
         const std::pair<o3::DynInstPtr, PacketPtr> &arg)
 {
+    if (!tracing)
+        return;
     onDataAccess(arg.first, arg.second);
 }
 
 void
 PeregrineTrace::traceCommit(const o3::DynInstPtr &inst)
 {
+    if (!tracing)
+        return;
     onCommit(inst);
 }
 

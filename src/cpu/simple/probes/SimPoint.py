@@ -35,6 +35,7 @@
 
 from m5.objects.Probe import ProbeListenerObject
 from m5.params import *
+from m5.util.pybind import *
 
 
 class SimPoint(ProbeListenerObject):
@@ -43,6 +44,15 @@ class SimPoint(ProbeListenerObject):
     type = "SimPoint"
     cxx_header = "cpu/simple/probes/simpoint.hh"
     cxx_class = "gem5::SimPoint"
+    cxx_exports = [
+        PyBindMethod("startProfiling"),
+        PyBindMethod("stopProfiling"),
+    ]
 
     interval = Param.UInt64(100000000, "Interval Size (insts)")
     profile_file = Param.String("simpoint.bb.gz", "BBV (output) file")
+    profile_scope = Param.String(
+        "whole_process",
+        "Profile scope: whole_process starts immediately; roi starts only "
+        "after startProfiling() is called by the config script",
+    )
