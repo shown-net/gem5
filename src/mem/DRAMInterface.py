@@ -70,6 +70,11 @@ class DRAMInterface(MemInterface):
     # performance being lower when enabled
     enable_dram_powerdown = Param.Bool(False, "Enable powerdown states")
 
+    enable_dram_power_stats = Param.Bool(
+        True,
+        "Enable DRAMPower command replay and energy/power statistics",
+    )
+
     # For power modelling we need to know if the DRAM has a DLL or not
     dll = Param.Bool(True, "DRAM has DLL or not")
 

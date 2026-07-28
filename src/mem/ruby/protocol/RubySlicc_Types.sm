@@ -235,6 +235,8 @@ structure (CacheMemory, external = "yes") {
 
   void profileDemandHit();
   void profileDemandMiss();
+  void profileDemandHit(RubyRequestType);
+  void profileDemandMiss(RubyRequestType);
   void profilePrefetchHit();
   void profilePrefetchMiss();
 }

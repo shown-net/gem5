@@ -567,6 +567,8 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(m_demand_misses, "Number of cache demand misses"),
       ADD_STAT(m_demand_accesses, "Number of cache demand accesses",
                m_demand_hits + m_demand_misses),
+      ADD_STAT(m_demand_hits_by_type, "Demand hits by Ruby request type"),
+      ADD_STAT(m_demand_misses_by_type, "Demand misses by Ruby request type"),
       ADD_STAT(m_prefetch_hits, "Number of cache prefetch hits"),
       ADD_STAT(m_prefetch_misses, "Number of cache prefetch misses"),
       ADD_STAT(m_prefetch_accesses, "Number of cache prefetch accesses",
@@ -619,6 +621,14 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
 
     m_prefetch_hits
         .flags(statistics::nozero);
+
+    m_demand_hits_by_type.init(RubyRequestType_NUM);
+    m_demand_misses_by_type.init(RubyRequestType_NUM);
+    for (int i = 0; i < RubyRequestType_NUM; ++i) {
+        const auto name = RubyRequestType_to_string(RubyRequestType(i));
+        m_demand_hits_by_type.subname(i, name).flags(statistics::nozero);
+        m_demand_misses_by_type.subname(i, name).flags(statistics::nozero);
+    }
 
     m_prefetch_misses
         .flags(statistics::nozero);
@@ -801,9 +811,23 @@ CacheMemory::profileDemandHit()
 }
 
 void
+CacheMemory::profileDemandHit(RubyRequestType type)
+{
+    profileDemandHit();
+    cacheMemoryStats.m_demand_hits_by_type[type]++;
+}
+
+void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+void
+CacheMemory::profileDemandMiss(RubyRequestType type)
+{
+    profileDemandMiss();
+    cacheMemoryStats.m_demand_misses_by_type[type]++;
 }
 
 void
