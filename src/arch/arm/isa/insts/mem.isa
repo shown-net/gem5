@@ -47,7 +47,8 @@ let {{
 
         def fillTemplates(self, name, Name, codeBlobs, memFlags, instFlags,
                           base='Memory', wbDecl=None, pcDecl=None,
-                          rasPop=False, size=4, sign=False, faCode=None):
+                          rasPop=False, size=4, sign=False, faCode=None,
+                          fixedMemorySize=None):
             # Make sure flags are in lists (convert to lists if not).
             memFlags = makeList(memFlags)
             instFlags = makeList(instFlags)
@@ -109,6 +110,10 @@ let {{
 
             iop = ArmInstObjParams(name, Name, base,
                                    codeBlobsCopy, instFlagsCopy)
+            if fixedMemorySize is not None:
+                iop.constructor += (
+                    '\nsetFixedMemoryAccessSize(%d);' % fixedMemorySize
+                )
             if 'memacc_epilog_code' in codeBlobs:
                 iop.snippets['memacc_code'] += codeBlobs['memacc_epilog_code']
             header_output = self.declareTemplate.subst(iop)

@@ -1068,6 +1068,16 @@ faccessatFunc(SyscallDesc *desc, ThreadContext *tc,
     return accessImpl(desc, tc, path, mode);
 }
 
+/// Target faccessat2() handler
+template <class OS>
+SyscallReturn
+faccessat2Func(SyscallDesc *desc, ThreadContext *tc,
+               int dirfd, VPtr<> pathname, int mode, int flags)
+{
+    warn_if(flags != 0, "faccessat2: Flag bits %#x not supported.", flags);
+    return faccessatFunc<OS>(desc, tc, dirfd, pathname, mode);
+}
+
 /// Target readlinkat() handler
 template <class OS>
 SyscallReturn

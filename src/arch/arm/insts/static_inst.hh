@@ -67,6 +67,13 @@ class ArmStaticInst : public StaticInst
   protected:
     bool aarch64;
     uint8_t intWidth;
+    uint32_t _fixedMemoryAccessSize = 0;
+
+    void
+    setFixedMemoryAccessSize(uint32_t size)
+    {
+        _fixedMemoryAccessSize = size;
+    }
 
     int32_t shift_rm_imm(uint32_t base, uint32_t shamt,
                          uint32_t type, uint32_t cfval) const;
@@ -564,6 +571,12 @@ class ArmStaticInst : public StaticInst
                                     ExceptionLevel pstateEL) const;
 
   public:
+    uint32_t
+    fixedMemoryAccessSize() const
+    {
+        return _fixedMemoryAccessSize;
+    }
+
     virtual void
     annotateFault(ArmFault *fault) {}
 

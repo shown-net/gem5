@@ -45,6 +45,9 @@ if env['CONF']['BUILD_ISA']:
     SimObject('InstructionTracer.py', sim_objects=['InstructionTracer'])
     Source('instruction_tracer.cc')
 
+    SimObject('RoiRetireWindow.py', sim_objects=['RoiRetireWindow'])
+    Source('roi_retire_window.cc')
+
     if env['CONF']['HAVE_PROTOBUF']:
         if env['CONF']['USE_ARM_ISA']:
             SimObject(

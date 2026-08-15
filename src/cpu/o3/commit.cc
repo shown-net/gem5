@@ -161,6 +161,8 @@ Commit::regProbePoints()
             cpu->getProbeManager(), "Commit");
     ppCommitStall = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "CommitStall");
+    ppArchitecturalRetire = new ProbePointArg<DynInstPtr>(
+            cpu->getProbeManager(), "ArchitecturalRetire");
     ppSquash = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Squash");
 }
@@ -1218,6 +1220,10 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
                       head_inst->staticInst);
+        if (head_inst->isSyscall() && cpu->inUserMode(tid) &&
+            (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
+            ppArchitecturalRetire->notify(head_inst);
+        }
 
         // Exit state update mode to avoid accidental updating.
         thread[tid]->noSquashFromTC = false;
@@ -1248,6 +1254,10 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     }
 
     updateComInstStats(head_inst);
+    if (cpu->inUserMode(tid) &&
+        (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
+        ppArchitecturalRetire->notify(head_inst);
+    }
 
     DPRINTF(Commit,
             "[tid:%i] [sn:%llu] Committing instruction with PC %s\n",

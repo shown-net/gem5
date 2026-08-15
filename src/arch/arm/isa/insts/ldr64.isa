@@ -52,6 +52,7 @@ let {{
             self.name = mnem
             self.Name = Name
             self.size = size
+            self.requestSize = size
             self.sign = sign
             self.user = user
             self.literal = literal
@@ -171,7 +172,8 @@ let {{
             (newHeader, newDecoder, newExec) = \
                 self.fillTemplates(self.name, self.Name, self.codeBlobs,
                                    self.memFlags, self.instFlags,
-                                   base, wbDecl, faCode=fa_code)
+                                   base, wbDecl, faCode=fa_code,
+                                   fixedMemorySize=self.requestSize)
 
             header_output += newHeader
             decoder_output += newDecoder
@@ -259,6 +261,10 @@ let {{
             self.emitHelper(self.base, wbDecl)
 
     class LoadDouble64(LoadInst64):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.requestSize = self.size * 2
+
         def emit(self):
             self.buildEACode()
 
