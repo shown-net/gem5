@@ -14,7 +14,7 @@ namespace gem5
 {
 namespace
 {
-constexpr std::array<uint8_t, 8> Magic{'R','O','I','P','C','T','R',0};
+constexpr std::array<uint8_t, 8> Magic{'R','O','I','P','C','T','2',0};
 template <class T> void le(std::vector<uint8_t> &o, T v) { for(size_t i=0;i<sizeof(T);++i)o.push_back(static_cast<uint8_t>(v>>(8*i))); }
 void bytes(std::vector<uint8_t>&o,const uint8_t*p,size_t n){o.insert(o.end(),p,p+n);}
 void write(std::ofstream &out,const std::vector<uint8_t>&v){out.write(reinterpret_cast<const char*>(v.data()),v.size());if(!out)panic("ROI trace write failed");}
