@@ -760,6 +760,13 @@ TimingSimpleCPU::advanceInst(const Fault &fault)
         return;
 
     if (fault != NoFault) {
+        if (curStaticInst &&
+            threadInfo[curThread]->thread->getIsaPtr()->inUserMode() &&
+            curStaticInst->isSyscall() &&
+            std::dynamic_pointer_cast<SESyscallFault>(fault)) {
+            probeArchitecturalRetire(curStaticInst,
+                                     threadInfo[curThread]->thread->pcState().instAddr());
+        }
         // hardware transactional memory
         // If a fault occurred within a transaction
         // ensure that the transaction aborts

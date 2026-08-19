@@ -442,7 +442,7 @@
                         0xffffffffffffff80:
                             SyscallInst::int80({{
                                 return std::make_shared<SESyscallFault>();
-                            }});
+                            }}, IsSyscall);
                     }
 
                     default: decode MODE_MODE {

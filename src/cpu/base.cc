@@ -398,6 +398,9 @@ BaseCPU::regProbePoints()
 
     ppRetiredInsts = pmuProbePoint("RetiredInsts");
     ppRetiredInstsPC = pmuProbePoint("RetiredInstsPC");
+    ppArchitecturalRetire =
+        new ProbePointArg<std::pair<StaticInstPtr, Addr>>(
+            getProbeManager(), "ArchitecturalRetire");
     ppRetiredLoads = pmuProbePoint("RetiredLoads");
     ppRetiredStores = pmuProbePoint("RetiredStores");
     ppRetiredBranches = pmuProbePoint("RetiredBranches");
@@ -422,6 +425,12 @@ BaseCPU::probeInstCommit(const StaticInstPtr &inst, Addr pc)
 
     if (inst->isControl())
         ppRetiredBranches->notify(1);
+}
+
+void
+BaseCPU::probeArchitecturalRetire(const StaticInstPtr &inst, Addr pc)
+{
+    ppArchitecturalRetire->notify(std::make_pair(inst, pc));
 }
 
 BaseCPU::

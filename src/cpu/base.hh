@@ -43,6 +43,7 @@
 #define __CPU_BASE_HH__
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "arch/generic/interrupts.hh"
@@ -524,6 +525,15 @@ class BaseCPU : public ClockedObject
      */
     virtual void probeInstCommit(const StaticInstPtr &inst, Addr pc);
 
+    /**
+     * Notify a user-mode architectural instruction retirement.
+     *
+     * Unlike probeInstCommit(), this is exactly once per architectural
+     * instruction.  It includes the SE syscall pseudo-fault after the
+     * instruction has reached its architectural transition point.
+     */
+    void probeArchitecturalRetire(const StaticInstPtr &inst, Addr pc);
+
    protected:
     /**
      * Helper method to instantiate probe points belonging to this
@@ -543,6 +553,9 @@ class BaseCPU : public ClockedObject
      * instructions may call notify once for the entire bundle.
      */
     probing::PMUUPtr ppRetiredInsts;
+
+    /** User-mode architectural instruction retirement probe. */
+    ProbePointArg<std::pair<StaticInstPtr, Addr>> *ppArchitecturalRetire;
     probing::PMUUPtr ppRetiredInstsPC;
 
     /** Retired load instructions */

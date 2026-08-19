@@ -688,6 +688,9 @@ AtomicSimpleCPU::tick()
                     postExecute();
                     countInst();
                     ppCommit->notify(std::make_pair(thread, curStaticInst));
+                } else if (curStaticInst->isSyscall() &&
+                           std::dynamic_pointer_cast<SESyscallFault>(fault)) {
+                    probeArchitecturalRetire(curStaticInst, pc.instAddr());
                 } else if (traceData) {
                     traceFault();
                 }

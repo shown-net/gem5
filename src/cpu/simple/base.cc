@@ -518,6 +518,10 @@ BaseSimpleCPU::postExecute()
 
     // Call CPU instruction commit probes
     probeInstCommit(curStaticInst, instAddr);
+    if (t_info.thread->getIsaPtr()->inUserMode() &&
+        (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop())) {
+        probeArchitecturalRetire(curStaticInst, instAddr);
+    }
 }
 
 void

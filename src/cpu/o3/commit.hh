@@ -125,7 +125,6 @@ class Commit
     /** Probe Points. */
     ProbePointArg<DynInstPtr> *ppCommit;
     ProbePointArg<DynInstPtr> *ppCommitStall;
-    ProbePointArg<DynInstPtr> *ppArchitecturalRetire;
     /** To probe when an instruction is squashed */
     ProbePointArg<DynInstPtr> *ppSquash;
 

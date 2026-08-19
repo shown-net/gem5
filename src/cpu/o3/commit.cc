@@ -161,8 +161,6 @@ Commit::regProbePoints()
             cpu->getProbeManager(), "Commit");
     ppCommitStall = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "CommitStall");
-    ppArchitecturalRetire = new ProbePointArg<DynInstPtr>(
-            cpu->getProbeManager(), "ArchitecturalRetire");
     ppSquash = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Squash");
 }
@@ -1217,13 +1215,15 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         // needed to update the state as soon as possible.  This
         // prevents external agents from changing any specific state
         // that the trap need.
+        if (head_inst->isSyscall() && cpu->inUserMode(tid) &&
+            std::dynamic_pointer_cast<SESyscallFault>(inst_fault) &&
+            (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
+            cpu->probeArchitecturalRetire(head_inst->staticInst,
+                                          head_inst->pcState().instAddr());
+        }
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
                       head_inst->staticInst);
-        if (head_inst->isSyscall() && cpu->inUserMode(tid) &&
-            (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
-            ppArchitecturalRetire->notify(head_inst);
-        }
 
         // Exit state update mode to avoid accidental updating.
         thread[tid]->noSquashFromTC = false;
@@ -1256,7 +1256,8 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     updateComInstStats(head_inst);
     if (cpu->inUserMode(tid) &&
         (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
-        ppArchitecturalRetire->notify(head_inst);
+        cpu->probeArchitecturalRetire(head_inst->staticInst,
+                                      head_inst->pcState().instAddr());
     }
 
     DPRINTF(Commit,
