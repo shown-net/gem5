@@ -16,4 +16,5 @@ class RoiRetireWindow(ProbeListenerObject):
 
     begin_pc = Param.Addr("ROI begin marker PC")
     end_pc = Param.Addr("ROI end marker PC")
-    interval_insts = Param.UInt64("Target retired-instruction interval")
+    window_insts = VectorParam.UInt64("Ordered retired-instruction window targets")
+    start_active = Param.Bool(False, "Start collection immediately on the detailed core")

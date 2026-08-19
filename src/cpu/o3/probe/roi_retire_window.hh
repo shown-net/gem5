@@ -3,9 +3,12 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "base/statistics.hh"
-#include "cpu/o3/dyn_inst_ptr.hh"
+#include "base/types.hh"
+#include "cpu/static_inst_fwd.hh"
 #include "params/RoiRetireWindow.hh"
 #include "sim/probe/probe_listener_object.hh"
 
@@ -39,21 +42,21 @@ class RoiRetireWindow : public ProbeListenerObject
         End
     };
 
-    void retire(const o3::DynInstPtr &inst);
+    void retire(const std::pair<StaticInstPtr, Addr> &inst);
     void signal(Event event);
 
     using RetireListener =
-        ProbeListenerArg<RoiRetireWindow, o3::DynInstPtr>;
+        ProbeListenerArg<RoiRetireWindow, std::pair<StaticInstPtr, Addr>>;
 
     const Addr beginPc;
     const Addr endPc;
-    const uint64_t intervalInsts;
+    const std::vector<uint64_t> windowInsts;
     State state = State::WaitingForBegin;
     Event pendingEvent = Event::None;
+    bool skipInitialBeginPc = false;
     uint64_t roiInstructions = 0;
     uint64_t nextBoundary = 0;
     uint64_t windows = 0;
-
     struct WindowStats : public statistics::Group
     {
         WindowStats(statistics::Group *parent);
