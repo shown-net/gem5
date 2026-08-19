@@ -48,6 +48,13 @@ if env['CONF']['BUILD_ISA']:
     SimObject('RoiRetireWindow.py', sim_objects=['RoiRetireWindow'])
     Source('roi_retire_window.cc')
 
+    if env['CONF'].get('HAVE_ZSTD', False):
+        SimObject(
+            'RoiInstructionTrace.py',
+            sim_objects=['RoiInstructionTrace']
+        )
+        Source('roi_instruction_trace.cc')
+
     if env['CONF']['HAVE_PROTOBUF']:
         if env['CONF']['USE_ARM_ISA']:
             SimObject(

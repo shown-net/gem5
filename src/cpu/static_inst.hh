@@ -198,6 +198,14 @@ class StaticInst : public RefCounted, public StaticInstFlags
 
     bool isInvalid() const { return flags[IsInvalid]; }
 
+    /** Raw gem5 StaticInstFlags bitmap; bit positions are the enum values. */
+    uint64_t flagsValue() const
+    {
+        static_assert(Num_Flags <= 64,
+                      "trace format stores at most 64 StaticInst flags");
+        return flags.to_ullong();
+    }
+
     bool
     isHtmCmd() const
     {
