@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -47,9 +46,6 @@ class RoiInstructionTrace : public ProbeListenerObject
     std::vector<Addr> pcs;
     std::vector<uint64_t> flags;
     std::vector<uint32_t> sizes;
-    std::vector<std::string> opcodes;
-    std::vector<std::string> disassemblies;
-    std::unordered_set<Addr> describedPcs;
 };
 
 } // namespace gem5
