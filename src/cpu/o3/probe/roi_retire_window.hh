@@ -21,6 +21,8 @@ class RoiRetireWindow : public ProbeListenerObject
     RoiRetireWindow(const RoiRetireWindowParams &params);
 
     void regProbeListeners() override;
+    void start();
+    void stop();
     std::string eventKind() const;
     void acknowledge();
     uint64_t totalInstructions() const;

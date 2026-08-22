@@ -41,6 +41,25 @@ RoiRetireWindow::regProbeListeners()
 }
 
 void
+RoiRetireWindow::start()
+{
+    fatal_if(state == State::Ended, "ROI retire listener cannot restart");
+    if (state == State::Active)
+        return;
+    state = State::Active;
+    nextBoundary = windowInsts.empty() ? 0 : windowInsts.front();
+    skipInitialBeginPc = false;
+}
+
+void
+RoiRetireWindow::stop()
+{
+    if (state == State::Ended)
+        return;
+    signal(Event::End);
+}
+
+void
 RoiRetireWindow::retire(const std::pair<StaticInstPtr, Addr> &inst)
 {
     const Addr pc = inst.second;
