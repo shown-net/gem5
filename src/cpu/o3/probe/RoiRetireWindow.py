@@ -12,12 +12,13 @@ class RoiRetireWindow(ProbeListenerObject):
         PyBindMethod("stop"),
         PyBindMethod("eventKind"),
         PyBindMethod("acknowledge"),
-        PyBindMethod("totalInstructions"),
         PyBindMethod("completeWindows"),
     ]
 
     begin_pc = Param.Addr("ROI begin marker PC")
     end_pc = Param.Addr("ROI end marker PC")
+    target_exec_start = Param.Addr("Target ELF executable range start")
+    target_exec_end = Param.Addr("Target ELF executable range end")
     window_insts = VectorParam.UInt64(
         "Ordered retired-instruction window targets"
     )

@@ -318,6 +318,9 @@ class DynInst : public ExecContext, public RefCounted
     /** The thread this instruction is from. */
     ThreadID threadNumber = 0;
 
+    /** Privilege level at fetch, before the instruction can change CPL. */
+    uint8_t fetchedCpl = 0;
+
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
 

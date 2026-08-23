@@ -70,6 +70,13 @@ class CheckerCPU;
 class ThreadContext;
 class System;
 
+struct SystemRetireRecord
+{
+    StaticInstPtr inst;
+    Addr pc;
+    uint8_t cpl;
+};
+
 struct AddressMonitor
 {
     AddressMonitor();
@@ -533,6 +540,14 @@ class BaseCPU : public ClockedObject
      * instruction has reached its architectural transition point.
      */
     void probeArchitecturalRetire(const StaticInstPtr &inst, Addr pc);
+    void probeSystemRetire(const StaticInstPtr &inst, Addr pc, uint8_t cpl);
+
+    /** Stop the current O3 commit bundle after the retiring instruction. */
+    void requestRetireCommitStop() { retireCommitStopRequested = true; }
+    bool consumeRetireCommitStopRequest()
+    {
+        return std::exchange(retireCommitStopRequested, false);
+    }
 
    protected:
     /**
@@ -556,6 +571,8 @@ class BaseCPU : public ClockedObject
 
     /** User-mode architectural instruction retirement probe. */
     ProbePointArg<std::pair<StaticInstPtr, Addr>> *ppArchitecturalRetire;
+    ProbePointArg<SystemRetireRecord> *ppSystemRetire;
+    bool retireCommitStopRequested = false;
     probing::PMUUPtr ppRetiredInstsPC;
 
     /** Retired load instructions */

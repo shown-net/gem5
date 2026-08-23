@@ -86,10 +86,16 @@ RoiInstructionTrace::RoiInstructionTrace(
       output(new std::ofstream(simout.resolve(params.output_file),
                                std::ios::binary | std::ios::trunc)),
       chunkRecords(params.chunk_records), zstdLevel(params.zstd_level),
-      loadBias(params.load_bias), endPc(params.end_pc)
+      targetExecStart(params.target_exec_start),
+      targetExecEnd(params.target_exec_end), startPc(params.start_pc),
+      endPc(params.end_pc)
 {
     fatal_if(!output->good() || !chunkRecords || zstdLevel < -5 || zstdLevel > 22,
              "cannot initialize ROI binary trace");
+    fatal_if(targetExecStart >= targetExecEnd,
+             "target executable range is invalid");
+    fatal_if(!startPc || !endPc || startPc == endPc,
+             "ROI trace start/end PCs are invalid");
     std::vector<uint8_t> header(Magic.begin(), Magic.end());
     header.push_back(1);
     header.push_back(1);
@@ -98,8 +104,8 @@ RoiInstructionTrace::RoiInstructionTrace(
     bytes(header, identity.data(), identity.size());
     write(*output, header);
     pcs.reserve(chunkRecords);
-    flags.reserve(chunkRecords);
     sizes.reserve(chunkRecords);
+    targetExecUserOrdinals.reserve(chunkRecords);
 }
 
 RoiInstructionTrace::~RoiInstructionTrace()
@@ -111,7 +117,7 @@ void
 RoiInstructionTrace::regProbeListeners()
 {
     connectListener<RetireListener>(
-        this, "ArchitecturalRetire", &RoiInstructionTrace::retire);
+        this, "SystemRetire", &RoiInstructionTrace::retire);
 }
 
 void
@@ -120,6 +126,7 @@ RoiInstructionTrace::startTracing()
     fatal_if(finalized, "ROI instruction trace cannot restart after finalize");
     fatal_if(tracing, "ROI instruction trace is already active");
     tracing = true;
+    bodyActive = false;
 }
 
 void
@@ -138,14 +145,28 @@ RoiInstructionTrace::recordCount() const
 }
 
 void
-RoiInstructionTrace::retire(const std::pair<StaticInstPtr, Addr> &retired)
+RoiInstructionTrace::retire(const SystemRetireRecord &retired)
 {
-    if (!tracing || retired.second == endPc)
+    if (!tracing)
         return;
-    const auto pc = retired.second - loadBias;
-    pcs.push_back(pc);
-    flags.push_back(retired.first->flagsValue());
-    sizes.push_back(retired.first->size());
+    if (!bodyActive) {
+        if (retired.pc == startPc)
+            bodyActive = true;
+        return;
+    }
+    if (retired.pc == endPc) {
+        tracing = false;
+        finalize();
+        return;
+    }
+    if (retired.cpl != 3)
+        return;
+    if (retired.pc < targetExecStart || retired.pc >= targetExecEnd)
+        return;
+    ++targetExecUserOrdinal;
+    pcs.push_back(retired.pc - targetExecStart);
+    sizes.push_back(retired.inst->size());
+    targetExecUserOrdinals.push_back(targetExecUserOrdinal);
     ++records;
     if (pcs.size() == chunkRecords)
         flushChunk();
@@ -156,7 +177,8 @@ RoiInstructionTrace::flushChunk()
 {
     if (pcs.empty())
         return;
-    fatal_if(pcs.size() != flags.size() || pcs.size() != sizes.size(),
+    fatal_if(pcs.size() != sizes.size() ||
+             pcs.size() != targetExecUserOrdinals.size(),
              "ROI trace columns lost alignment");
     struct Section
     {
@@ -175,9 +197,9 @@ RoiInstructionTrace::flushChunk()
     auto &size = add(2);
     for (auto value : sizes)
         size.raw.push_back(value);
-    auto &gem5Flags = add(4);
-    for (auto value : flags)
-        le<uint64_t>(gem5Flags.raw, value);
+    auto &ordinal = add(5);
+    for (auto value : targetExecUserOrdinals)
+        le<uint64_t>(ordinal.raw, value);
     for (auto &section : sections)
         section.compressed = pack(section.raw, zstdLevel);
     std::vector<uint8_t> header{'B', 'L', 'K', 0};
@@ -194,8 +216,8 @@ RoiInstructionTrace::flushChunk()
         write(*output, section.compressed);
     ++chunks;
     pcs.clear();
-    flags.clear();
     sizes.clear();
+    targetExecUserOrdinals.clear();
 }
 
 void

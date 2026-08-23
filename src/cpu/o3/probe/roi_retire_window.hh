@@ -3,11 +3,10 @@
 
 #include <cstdint>
 #include <string>
-#include <utility>
 #include <vector>
 
-#include "base/statistics.hh"
 #include "base/types.hh"
+#include "cpu/base.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "params/RoiRetireWindow.hh"
 #include "sim/probe/probe_listener_object.hh"
@@ -25,7 +24,6 @@ class RoiRetireWindow : public ProbeListenerObject
     void stop();
     std::string eventKind() const;
     void acknowledge();
-    uint64_t totalInstructions() const;
     uint64_t completeWindows() const;
 
   private:
@@ -44,27 +42,24 @@ class RoiRetireWindow : public ProbeListenerObject
         End
     };
 
-    void retire(const std::pair<StaticInstPtr, Addr> &inst);
+    void retire(const SystemRetireRecord &record);
     void signal(Event event);
 
     using RetireListener =
-        ProbeListenerArg<RoiRetireWindow, std::pair<StaticInstPtr, Addr>>;
+        ProbeListenerArg<RoiRetireWindow, SystemRetireRecord>;
 
     const Addr beginPc;
     const Addr endPc;
+    const Addr targetExecStart;
+    const Addr targetExecEnd;
     const std::vector<uint64_t> windowInsts;
+    BaseCPU *const cpu;
     State state = State::WaitingForBegin;
     Event pendingEvent = Event::None;
     bool skipInitialBeginPc = false;
-    uint64_t roiInstructions = 0;
+    uint64_t targetExecUserInstructions = 0;
     uint64_t nextBoundary = 0;
     uint64_t windows = 0;
-    struct WindowStats : public statistics::Group
-    {
-        WindowStats(statistics::Group *parent);
-
-        statistics::Scalar instructions;
-    } stats;
 };
 
 } // namespace gem5

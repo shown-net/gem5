@@ -4,9 +4,9 @@
 #include <cstdint>
 #include <fstream>
 #include <string>
-#include <utility>
 #include <vector>
 
+#include "cpu/base.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "params/RoiInstructionTrace.hh"
 #include "sim/probe/probe_listener_object.hh"
@@ -26,26 +26,30 @@ class RoiInstructionTrace : public ProbeListenerObject
     uint64_t recordCount() const;
 
   private:
-    void retire(const std::pair<StaticInstPtr, Addr> &inst);
+    void retire(const SystemRetireRecord &record);
     void finalize();
 
     using RetireListener = ProbeListenerArg<
-        RoiInstructionTrace, std::pair<StaticInstPtr, Addr>>;
+        RoiInstructionTrace, SystemRetireRecord>;
 
     void flushChunk();
 
     std::ofstream *output;
     const unsigned chunkRecords;
     const int zstdLevel;
-    const Addr loadBias;
+    const Addr targetExecStart;
+    const Addr targetExecEnd;
+    const Addr startPc;
     const Addr endPc;
     bool tracing = false;
+    bool bodyActive = false;
     bool finalized = false;
     uint64_t records = 0;
     uint64_t chunks = 0;
+    uint64_t targetExecUserOrdinal = 0;
     std::vector<Addr> pcs;
-    std::vector<uint64_t> flags;
     std::vector<uint32_t> sizes;
+    std::vector<uint64_t> targetExecUserOrdinals;
 };
 
 } // namespace gem5

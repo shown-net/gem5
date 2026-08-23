@@ -8,26 +8,24 @@
 namespace gem5
 {
 
-RoiRetireWindow::WindowStats::WindowStats(statistics::Group *parent)
-    : statistics::Group(parent),
-      ADD_STAT(instructions, statistics::units::Count::get(),
-               "User architectural instructions retired in the ROI window")
-{
-}
-
 RoiRetireWindow::RoiRetireWindow(const RoiRetireWindowParams &params)
     : ProbeListenerObject(params),
       beginPc(params.begin_pc),
       endPc(params.end_pc),
+      targetExecStart(params.target_exec_start),
+      targetExecEnd(params.target_exec_end),
       windowInsts(params.window_insts.begin(), params.window_insts.end()),
-      state(params.start_active ? State::Active : State::WaitingForBegin),
-      stats(this)
+      cpu(dynamic_cast<BaseCPU *>(params.manager)),
+      state(params.start_active ? State::Active : State::WaitingForBegin)
 {
+    fatal_if(!cpu, "ROI retire listener manager must be a BaseCPU");
     fatal_if(std::any_of(windowInsts.begin(), windowInsts.end(),
                          [](uint64_t count) { return count == 0; }),
              "ROI retired-instruction window targets must be positive");
     fatal_if(!params.start_active && beginPc == endPc,
              "ROI begin and end marker PCs must differ");
+    fatal_if(targetExecStart >= targetExecEnd,
+             "ROI target executable range must be non-empty");
     if (params.start_active && !windowInsts.empty())
         nextBoundary = windowInsts.front();
     skipInitialBeginPc = params.start_active;
@@ -37,7 +35,7 @@ void
 RoiRetireWindow::regProbeListeners()
 {
     connectListener<RetireListener>(
-        this, "ArchitecturalRetire", &RoiRetireWindow::retire);
+        this, "SystemRetire", &RoiRetireWindow::retire);
 }
 
 void
@@ -60,9 +58,9 @@ RoiRetireWindow::stop()
 }
 
 void
-RoiRetireWindow::retire(const std::pair<StaticInstPtr, Addr> &inst)
+RoiRetireWindow::retire(const SystemRetireRecord &inst)
 {
-    const Addr pc = inst.second;
+    const Addr pc = inst.pc;
     if (state == State::WaitingForBegin) {
         if (pc == beginPc && pendingEvent == Event::None) {
             signal(Event::Begin);
@@ -82,15 +80,16 @@ RoiRetireWindow::retire(const std::pair<StaticInstPtr, Addr> &inst)
         signal(Event::End);
         return;
     }
-    ++roiInstructions;
-    stats.instructions++;
-    if (windows < windowInsts.size() && roiInstructions >= nextBoundary) {
+    if (inst.cpl != 3)
+        return;
+    if (pc < targetExecStart || pc >= targetExecEnd)
+        return;
+    ++targetExecUserInstructions;
+    if (windows < windowInsts.size() &&
+        targetExecUserInstructions >= nextBoundary) {
         ++windows;
         if (windows < windowInsts.size())
             nextBoundary += windowInsts[windows];
-        // The exit event is handled after the current O3 tick. Any remaining
-        // same-cycle commits stay in this raw window and are reflected by the
-        // listener's instruction stat.
         signal(Event::Window);
     }
 }
@@ -107,6 +106,7 @@ RoiRetireWindow::signal(Event event)
     if (pendingEvent != Event::None)
         return;
     pendingEvent = event;
+    cpu->requestRetireCommitStop();
     exitSimLoopNow("roi retired-instruction event");
 }
 
@@ -138,12 +138,6 @@ RoiRetireWindow::acknowledge()
         state = State::Ended;
     }
     pendingEvent = Event::None;
-}
-
-uint64_t
-RoiRetireWindow::totalInstructions() const
-{
-    return roiInstructions;
 }
 
 uint64_t

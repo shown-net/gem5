@@ -1090,6 +1090,11 @@ Commit::commitInsts()
                 if (!interrupt && avoidQuiesceLiveLock &&
                     onInstBoundary && cpu->checkInterrupts(0))
                     squashAfter(tid, head_inst);
+
+                // ROI window exits must cut the commit bundle at the exact
+                // architectural instruction that raised the event.
+                if (cpu->consumeRetireCommitStopRequest())
+                    break;
             } else {
                 DPRINTF(Commit, "Unable to commit head instruction PC:%s "
                         "[tid:%i] [sn:%llu].\n",
@@ -1215,11 +1220,15 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         // needed to update the state as soon as possible.  This
         // prevents external agents from changing any specific state
         // that the trap need.
-        if (head_inst->isSyscall() && cpu->inUserMode(tid) &&
-            std::dynamic_pointer_cast<SESyscallFault>(inst_fault) &&
+        if (head_inst->isSyscall() && head_inst->fetchedCpl != 0 &&
+            !std::dynamic_pointer_cast<SyscallRetryFault>(inst_fault) &&
             (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
-            cpu->probeArchitecturalRetire(head_inst->staticInst,
-                                          head_inst->pcState().instAddr());
+            cpu->probeSystemRetire(head_inst->staticInst,
+                                   head_inst->pcState().instAddr(), 3);
+            if (std::dynamic_pointer_cast<SESyscallFault>(inst_fault)) {
+                cpu->probeArchitecturalRetire(head_inst->staticInst,
+                                              head_inst->pcState().instAddr());
+            }
         }
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
@@ -1254,7 +1263,13 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     }
 
     updateComInstStats(head_inst);
-    if (cpu->inUserMode(tid) &&
+    if (!head_inst->isMicroop() || head_inst->isLastMicroop()) {
+        cpu->probeSystemRetire(
+            head_inst->staticInst,
+            head_inst->pcState().instAddr(),
+            head_inst->fetchedCpl);
+    }
+    if (head_inst->fetchedCpl != 0 &&
         (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
         cpu->probeArchitecturalRetire(head_inst->staticInst,
                                       head_inst->pcState().instAddr());

@@ -716,10 +716,12 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     set(pc[tid], new_pc);
     fetchOffset[tid] = 0;
     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
-        !squashInst->isLastMicroop())
+        !squashInst->isLastMicroop()) {
         macroop[tid] = squashInst->macroop;
-    else
+        macroopCpl[tid] = squashInst->fetchedCpl;
+    } else {
         macroop[tid] = NULL;
+    }
     decoder[tid]->reset();
 
     // Clear the icache miss if it's outstanding.
@@ -1017,6 +1019,7 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
     instruction->setTid(tid);
+    instruction->fetchedCpl = cpu->inUserMode(tid) ? 3 : 0;
 
     instruction->setThreadState(cpu->thread[tid]);
 
@@ -1166,6 +1169,8 @@ Fetch::fetch(bool &status_change)
 
     StaticInstPtr staticInst = NULL;
     StaticInstPtr curMacroop = macroop[tid];
+    uint8_t curMacroopCpl = curMacroop ? macroopCpl[tid] :
+        (cpu->inUserMode(tid) ? 3 : 0);
 
     // If the read of the first instruction was successful, then grab the
     // instructions from the rest of the cache line and put them into the
@@ -1250,6 +1255,7 @@ Fetch::fetch(bool &status_change)
 
                     if (staticInst->isMacroop()) {
                         curMacroop = staticInst;
+                        curMacroopCpl = cpu->inUserMode(tid) ? 3 : 0;
                     } else {
                         pcOffset = 0;
                     }
@@ -1275,6 +1281,8 @@ Fetch::fetch(bool &status_change)
 
             DynInstPtr instruction = buildInst(
                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
+            if (curMacroop)
+                instruction->fetchedCpl = curMacroopCpl;
 
             ppFetch->notify(instruction);
             numInst++;
@@ -1381,6 +1389,7 @@ Fetch::fetch(bool &status_change)
     }
 
     macroop[tid] = curMacroop;
+    macroopCpl[tid] = curMacroopCpl;
     fetchOffset[tid] = pcOffset;
 
     if (numInst > 0) {
