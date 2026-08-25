@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "base/statistics.hh"
 #include "base/types.hh"
 #include "cpu/base.hh"
 #include "cpu/static_inst_fwd.hh"
@@ -25,6 +26,7 @@ class RoiRetireWindow : public ProbeListenerObject
     std::string eventKind() const;
     void acknowledge();
     uint64_t completeWindows() const;
+    uint64_t systemInstructions() const;
 
   private:
     enum class State
@@ -60,6 +62,12 @@ class RoiRetireWindow : public ProbeListenerObject
     uint64_t targetExecUserInstructions = 0;
     uint64_t nextBoundary = 0;
     uint64_t windows = 0;
+    struct WindowStats : public statistics::Group
+    {
+        WindowStats(statistics::Group *parent);
+
+        statistics::Scalar instructions;
+    } stats;
 };
 
 } // namespace gem5

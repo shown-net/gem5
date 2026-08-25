@@ -8,6 +8,13 @@
 namespace gem5
 {
 
+RoiRetireWindow::WindowStats::WindowStats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(instructions, statistics::units::Count::get(),
+               "Architectural instructions retired in the ROI window")
+{
+}
+
 RoiRetireWindow::RoiRetireWindow(const RoiRetireWindowParams &params)
     : ProbeListenerObject(params),
       beginPc(params.begin_pc),
@@ -16,7 +23,8 @@ RoiRetireWindow::RoiRetireWindow(const RoiRetireWindowParams &params)
       targetExecEnd(params.target_exec_end),
       windowInsts(params.window_insts.begin(), params.window_insts.end()),
       cpu(dynamic_cast<BaseCPU *>(params.manager)),
-      state(params.start_active ? State::Active : State::WaitingForBegin)
+      state(params.start_active ? State::Active : State::WaitingForBegin),
+      stats(this)
 {
     fatal_if(!cpu, "ROI retire listener manager must be a BaseCPU");
     fatal_if(std::any_of(windowInsts.begin(), windowInsts.end(),
@@ -80,6 +88,7 @@ RoiRetireWindow::retire(const SystemRetireRecord &inst)
         signal(Event::End);
         return;
     }
+    ++stats.instructions;
     if (inst.cpl != 3)
         return;
     if (pc < targetExecStart || pc >= targetExecEnd)
@@ -144,6 +153,12 @@ uint64_t
 RoiRetireWindow::completeWindows() const
 {
     return windows;
+}
+
+uint64_t
+RoiRetireWindow::systemInstructions() const
+{
+    return cpu->totalInsts();
 }
 
 } // namespace gem5

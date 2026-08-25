@@ -45,11 +45,7 @@ class RoiInstructionTrace : public ProbeListenerObject
     bool bodyActive = false;
     bool finalized = false;
     uint64_t records = 0;
-    uint64_t chunks = 0;
-    uint64_t targetExecUserOrdinal = 0;
     std::vector<Addr> pcs;
-    std::vector<uint32_t> sizes;
-    std::vector<uint64_t> targetExecUserOrdinals;
 };
 
 } // namespace gem5

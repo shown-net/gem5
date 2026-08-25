@@ -13,6 +13,7 @@ class RoiRetireWindow(ProbeListenerObject):
         PyBindMethod("eventKind"),
         PyBindMethod("acknowledge"),
         PyBindMethod("completeWindows"),
+        PyBindMethod("systemInstructions"),
     ]
 
     begin_pc = Param.Addr("ROI begin marker PC")

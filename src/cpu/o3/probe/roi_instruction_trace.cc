@@ -98,14 +98,10 @@ RoiInstructionTrace::RoiInstructionTrace(
              "ROI trace start/end PCs are invalid");
     std::vector<uint8_t> header(Magic.begin(), Magic.end());
     header.push_back(1);
-    header.push_back(1);
-    le<uint32_t>(header, chunkRecords);
     const auto identity = sha(params.elf_sha256);
     bytes(header, identity.data(), identity.size());
     write(*output, header);
     pcs.reserve(chunkRecords);
-    sizes.reserve(chunkRecords);
-    targetExecUserOrdinals.reserve(chunkRecords);
 }
 
 RoiInstructionTrace::~RoiInstructionTrace()
@@ -163,10 +159,7 @@ RoiInstructionTrace::retire(const SystemRetireRecord &retired)
         return;
     if (retired.pc < targetExecStart || retired.pc >= targetExecEnd)
         return;
-    ++targetExecUserOrdinal;
     pcs.push_back(retired.pc - targetExecStart);
-    sizes.push_back(retired.inst->size());
-    targetExecUserOrdinals.push_back(targetExecUserOrdinal);
     ++records;
     if (pcs.size() == chunkRecords)
         flushChunk();
@@ -177,47 +170,17 @@ RoiInstructionTrace::flushChunk()
 {
     if (pcs.empty())
         return;
-    fatal_if(pcs.size() != sizes.size() ||
-             pcs.size() != targetExecUserOrdinals.size(),
-             "ROI trace columns lost alignment");
-    struct Section
-    {
-        uint8_t id;
-        std::vector<uint8_t> raw;
-        std::vector<uint8_t> compressed;
-    };
-    std::vector<Section> sections;
-    auto add = [&](uint8_t id) -> Section & {
-        sections.push_back({id, {}, {}});
-        return sections.back();
-    };
-    auto &pc = add(1);
+    std::vector<uint8_t> raw;
+    raw.reserve(pcs.size() * sizeof(uint64_t));
     for (auto value : pcs)
-        le<uint64_t>(pc.raw, value);
-    auto &size = add(2);
-    for (auto value : sizes)
-        size.raw.push_back(value);
-    auto &ordinal = add(5);
-    for (auto value : targetExecUserOrdinals)
-        le<uint64_t>(ordinal.raw, value);
-    for (auto &section : sections)
-        section.compressed = pack(section.raw, zstdLevel);
+        le<uint64_t>(raw, value);
+    const auto compressed = pack(raw, zstdLevel);
     std::vector<uint8_t> header{'B', 'L', 'K', 0};
-    le<uint64_t>(header, records - pcs.size());
     le<uint32_t>(header, pcs.size());
-    header.push_back(sections.size());
-    for (const auto &section : sections) {
-        header.push_back(section.id);
-        le<uint32_t>(header, section.raw.size());
-        le<uint32_t>(header, section.compressed.size());
-    }
+    le<uint32_t>(header, compressed.size());
     write(*output, header);
-    for (const auto &section : sections)
-        write(*output, section.compressed);
-    ++chunks;
+    write(*output, compressed);
     pcs.clear();
-    sizes.clear();
-    targetExecUserOrdinals.clear();
 }
 
 void
@@ -228,8 +191,6 @@ RoiInstructionTrace::finalize()
     fatal_if(tracing, "ROI instruction trace finalized while active");
     flushChunk();
     std::vector<uint8_t> footer{'E', 'N', 'D', 0};
-    le<uint64_t>(footer, records);
-    le<uint64_t>(footer, chunks);
     write(*output, footer);
     output->close();
     delete output;
