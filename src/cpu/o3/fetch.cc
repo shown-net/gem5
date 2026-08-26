@@ -718,7 +718,7 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
         !squashInst->isLastMicroop()) {
         macroop[tid] = squashInst->macroop;
-        macroopCpl[tid] = squashInst->fetchedCpl;
+        macroopFromUser[tid] = squashInst->fetchedFromUser;
     } else {
         macroop[tid] = NULL;
     }
@@ -1019,7 +1019,7 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
     instruction->setTid(tid);
-    instruction->fetchedCpl = cpu->inUserMode(tid) ? 3 : 0;
+    instruction->fetchedFromUser = cpu->inUserMode(tid);
 
     instruction->setThreadState(cpu->thread[tid]);
 
@@ -1169,8 +1169,8 @@ Fetch::fetch(bool &status_change)
 
     StaticInstPtr staticInst = NULL;
     StaticInstPtr curMacroop = macroop[tid];
-    uint8_t curMacroopCpl = curMacroop ? macroopCpl[tid] :
-        (cpu->inUserMode(tid) ? 3 : 0);
+    bool curMacroopFromUser = curMacroop ? macroopFromUser[tid] :
+        cpu->inUserMode(tid);
 
     // If the read of the first instruction was successful, then grab the
     // instructions from the rest of the cache line and put them into the
@@ -1255,7 +1255,7 @@ Fetch::fetch(bool &status_change)
 
                     if (staticInst->isMacroop()) {
                         curMacroop = staticInst;
-                        curMacroopCpl = cpu->inUserMode(tid) ? 3 : 0;
+                        curMacroopFromUser = cpu->inUserMode(tid);
                     } else {
                         pcOffset = 0;
                     }
@@ -1282,7 +1282,7 @@ Fetch::fetch(bool &status_change)
             DynInstPtr instruction = buildInst(
                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
             if (curMacroop)
-                instruction->fetchedCpl = curMacroopCpl;
+                instruction->fetchedFromUser = curMacroopFromUser;
 
             ppFetch->notify(instruction);
             numInst++;
@@ -1389,7 +1389,7 @@ Fetch::fetch(bool &status_change)
     }
 
     macroop[tid] = curMacroop;
-    macroopCpl[tid] = curMacroopCpl;
+    macroopFromUser[tid] = curMacroopFromUser;
     fetchOffset[tid] = pcOffset;
 
     if (numInst > 0) {

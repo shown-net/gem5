@@ -398,11 +398,8 @@ BaseCPU::regProbePoints()
 
     ppRetiredInsts = pmuProbePoint("RetiredInsts");
     ppRetiredInstsPC = pmuProbePoint("RetiredInstsPC");
-    ppArchitecturalRetire =
-        new ProbePointArg<std::pair<StaticInstPtr, Addr>>(
-            getProbeManager(), "ArchitecturalRetire");
-    ppSystemRetire = new ProbePointArg<SystemRetireRecord>(
-        getProbeManager(), "SystemRetire");
+    ppArchitecturalRetire = new ProbePointArg<ArchitecturalRetireRecord>(
+        getProbeManager(), "ArchitecturalRetire");
     ppRetiredLoads = pmuProbePoint("RetiredLoads");
     ppRetiredStores = pmuProbePoint("RetiredStores");
     ppRetiredBranches = pmuProbePoint("RetiredBranches");
@@ -430,15 +427,9 @@ BaseCPU::probeInstCommit(const StaticInstPtr &inst, Addr pc)
 }
 
 void
-BaseCPU::probeArchitecturalRetire(const StaticInstPtr &inst, Addr pc)
+BaseCPU::probeArchitecturalRetire(Addr pc, bool origin_user)
 {
-    ppArchitecturalRetire->notify(std::make_pair(inst, pc));
-}
-
-void
-BaseCPU::probeSystemRetire(const StaticInstPtr &inst, Addr pc, uint8_t cpl)
-{
-    ppSystemRetire->notify({inst, pc, cpl});
+    ppArchitecturalRetire->notify({pc, origin_user});
 }
 
 BaseCPU::

@@ -1,14 +1,12 @@
-#ifndef __CPU_O3_PROBE_ROI_RETIRE_WINDOW_HH__
-#define __CPU_O3_PROBE_ROI_RETIRE_WINDOW_HH__
+#ifndef __CPU_PROBES_ROI_RETIRE_WINDOW_HH__
+#define __CPU_PROBES_ROI_RETIRE_WINDOW_HH__
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
 #include "base/statistics.hh"
-#include "base/types.hh"
 #include "cpu/base.hh"
-#include "cpu/static_inst_fwd.hh"
 #include "params/RoiRetireWindow.hh"
 #include "sim/probe/probe_listener_object.hh"
 
@@ -26,29 +24,17 @@ class RoiRetireWindow : public ProbeListenerObject
     std::string eventKind() const;
     void acknowledge();
     uint64_t completeWindows() const;
-    uint64_t systemInstructions() const;
+    uint64_t retiredInstructions() const;
 
   private:
-    enum class State
-    {
-        WaitingForBegin,
-        Active,
-        Ended
-    };
+    enum class State { WaitingForBegin, Active, Ended };
+    enum class Event { None, Begin, Window, End };
 
-    enum class Event
-    {
-        None,
-        Begin,
-        Window,
-        End
-    };
-
-    void retire(const SystemRetireRecord &record);
+    void retire(const ArchitecturalRetireRecord &record);
     void signal(Event event);
 
-    using RetireListener =
-        ProbeListenerArg<RoiRetireWindow, SystemRetireRecord>;
+    using RetireListener = ProbeListenerArg<
+        RoiRetireWindow, ArchitecturalRetireRecord>;
 
     const Addr beginPc;
     const Addr endPc;
@@ -59,17 +45,17 @@ class RoiRetireWindow : public ProbeListenerObject
     State state = State::WaitingForBegin;
     Event pendingEvent = Event::None;
     bool skipInitialBeginPc = false;
+    uint64_t retired = 0;
     uint64_t targetExecUserInstructions = 0;
     uint64_t nextBoundary = 0;
     uint64_t windows = 0;
     struct WindowStats : public statistics::Group
     {
         WindowStats(statistics::Group *parent);
-
         statistics::Scalar instructions;
     } stats;
 };
 
 } // namespace gem5
 
-#endif // __CPU_O3_PROBE_ROI_RETIRE_WINDOW_HH__
+#endif // __CPU_PROBES_ROI_RETIRE_WINDOW_HH__

@@ -1,14 +1,13 @@
-#include "cpu/o3/probe/roi_instruction_trace.hh"
-
-#include <algorithm>
-#include <array>
-#include <stdexcept>
+#include "cpu/probes/roi_pc_trace.hh"
 
 #include <zstd.h>
 
+#include <array>
+#include <stdexcept>
+
 #include "base/logging.hh"
 #include "base/output.hh"
-#include "cpu/static_inst.hh"
+#include "cpu/probes/roi_retire.hh"
 
 namespace gem5
 {
@@ -20,9 +19,8 @@ template <class T>
 void
 le(std::vector<uint8_t> &out, T value)
 {
-    for (size_t index = 0; index < sizeof(T); ++index) {
+    for (size_t index = 0; index < sizeof(T); ++index)
         out.push_back(static_cast<uint8_t>(value >> (8 * index)));
-    }
 }
 
 void
@@ -48,9 +46,8 @@ pack(const std::vector<uint8_t> &raw, int level)
     std::vector<uint8_t> out(ZSTD_compressBound(raw.size()));
     size_t status = ZSTD_CCtx_setParameter(
         context, ZSTD_c_compressionLevel, level);
-    if (!ZSTD_isError(status)) {
+    if (!ZSTD_isError(status))
         status = ZSTD_CCtx_setParameter(context, ZSTD_c_checksumFlag, 1);
-    }
     if (!ZSTD_isError(status)) {
         status = ZSTD_compress2(
             context, out.data(), out.size(), raw.data(), raw.size());
@@ -78,10 +75,9 @@ sha(const std::string &text)
     }
     return identity;
 }
-}
+} // namespace
 
-RoiInstructionTrace::RoiInstructionTrace(
-    const RoiInstructionTraceParams &params)
+RoiPcTrace::RoiPcTrace(const RoiPcTraceParams &params)
     : ProbeListenerObject(params),
       output(new std::ofstream(simout.resolve(params.output_file),
                                std::ios::binary | std::ios::trunc)),
@@ -90,8 +86,9 @@ RoiInstructionTrace::RoiInstructionTrace(
       targetExecEnd(params.target_exec_end), startPc(params.start_pc),
       endPc(params.end_pc)
 {
-    fatal_if(!output->good() || !chunkRecords || zstdLevel < -5 || zstdLevel > 22,
-             "cannot initialize ROI binary trace");
+    fatal_if(
+        !output->good() || !chunkRecords || zstdLevel < -5 || zstdLevel > 22,
+        "cannot initialize ROI binary trace");
     fatal_if(targetExecStart >= targetExecEnd,
              "target executable range is invalid");
     fatal_if(!startPc || !endPc || startPc == endPc,
@@ -104,29 +101,29 @@ RoiInstructionTrace::RoiInstructionTrace(
     pcs.reserve(chunkRecords);
 }
 
-RoiInstructionTrace::~RoiInstructionTrace()
+RoiPcTrace::~RoiPcTrace()
 {
     finalize();
 }
 
 void
-RoiInstructionTrace::regProbeListeners()
+RoiPcTrace::regProbeListeners()
 {
     connectListener<RetireListener>(
-        this, "SystemRetire", &RoiInstructionTrace::retire);
+        this, "ArchitecturalRetire", &RoiPcTrace::retire);
 }
 
 void
-RoiInstructionTrace::startTracing()
+RoiPcTrace::startTracing()
 {
-    fatal_if(finalized, "ROI instruction trace cannot restart after finalize");
-    fatal_if(tracing, "ROI instruction trace is already active");
+    fatal_if(finalized, "ROI PC trace cannot restart after finalize");
+    fatal_if(tracing, "ROI PC trace is already active");
     tracing = true;
     bodyActive = false;
 }
 
 void
-RoiInstructionTrace::stopTracing()
+RoiPcTrace::stopTracing()
 {
     if (!tracing)
         return;
@@ -135,38 +132,36 @@ RoiInstructionTrace::stopTracing()
 }
 
 uint64_t
-RoiInstructionTrace::recordCount() const
+RoiPcTrace::recordCount() const
 {
     return records;
 }
 
 void
-RoiInstructionTrace::retire(const SystemRetireRecord &retired)
+RoiPcTrace::retire(const ArchitecturalRetireRecord &record)
 {
     if (!tracing)
         return;
     if (!bodyActive) {
-        if (retired.pc == startPc)
+        if (record.pc == startPc)
             bodyActive = true;
         return;
     }
-    if (retired.pc == endPc) {
+    if (record.pc == endPc) {
         tracing = false;
         finalize();
         return;
     }
-    if (retired.cpl != 3)
+    if (!isTargetUserRetire(record, targetExecStart, targetExecEnd))
         return;
-    if (retired.pc < targetExecStart || retired.pc >= targetExecEnd)
-        return;
-    pcs.push_back(retired.pc - targetExecStart);
+    pcs.push_back(record.pc - targetExecStart);
     ++records;
     if (pcs.size() == chunkRecords)
         flushChunk();
 }
 
 void
-RoiInstructionTrace::flushChunk()
+RoiPcTrace::flushChunk()
 {
     if (pcs.empty())
         return;
@@ -184,11 +179,11 @@ RoiInstructionTrace::flushChunk()
 }
 
 void
-RoiInstructionTrace::finalize()
+RoiPcTrace::finalize()
 {
     if (finalized || !output)
         return;
-    fatal_if(tracing, "ROI instruction trace finalized while active");
+    fatal_if(tracing, "ROI PC trace finalized while active");
     flushChunk();
     std::vector<uint8_t> footer{'E', 'N', 'D', 0};
     write(*output, footer);
@@ -197,4 +192,5 @@ RoiInstructionTrace::finalize()
     output = nullptr;
     finalized = true;
 }
+
 } // namespace gem5

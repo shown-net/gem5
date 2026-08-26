@@ -356,6 +356,7 @@ BaseSimpleCPU::preExecute()
     // decode the instruction
     set(preExecuteTempPC, thread->pcState());
     auto &pc_state = *preExecuteTempPC;
+    preExecuteIsRomMicroop = isRomMicroPC(pc_state.microPC());
 
     auto &decoder = thread->decoder;
 
@@ -401,6 +402,10 @@ BaseSimpleCPU::preExecute()
 
     //If we decoded an instruction this "tick", record information about it.
     if (curStaticInst) {
+        if (!preExecuteOriginValid) {
+            preExecuteInUserMode = t_info.thread->getIsaPtr()->inUserMode();
+            preExecuteOriginValid = true;
+        }
 #if TRACING_ON
         traceData = tracer->getInstRecord(curTick(), thread->getTC(),
                 curStaticInst, thread->pcState(), curMacroStaticInst);
@@ -518,9 +523,11 @@ BaseSimpleCPU::postExecute()
 
     // Call CPU instruction commit probes
     probeInstCommit(curStaticInst, instAddr);
-    if (t_info.thread->getIsaPtr()->inUserMode() &&
-        (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop())) {
-        probeArchitecturalRetire(curStaticInst, instAddr);
+    if (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop()) {
+        if (!preExecuteIsRomMicroop)
+            probeArchitecturalRetire(instAddr, preExecuteInUserMode);
+        preExecuteOriginValid = false;
+        consumeRetireCommitStopRequest();
     }
 }
 

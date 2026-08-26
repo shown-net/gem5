@@ -3,17 +3,17 @@ from m5.params import *
 from m5.util.pybind import *
 
 
-class RoiInstructionTrace(ProbeListenerObject):
-    type = "RoiInstructionTrace"
-    cxx_header = "cpu/o3/probe/roi_instruction_trace.hh"
-    cxx_class = "gem5::RoiInstructionTrace"
+class RoiPcTrace(ProbeListenerObject):
+    type = "RoiPcTrace"
+    cxx_header = "cpu/probes/roi_pc_trace.hh"
+    cxx_class = "gem5::RoiPcTrace"
     cxx_exports = [
         PyBindMethod("startTracing"),
         PyBindMethod("stopTracing"),
         PyBindMethod("recordCount"),
     ]
 
-    output_file = Param.String("", "ROI instruction trace output")
+    output_file = Param.String("", "ROI PC trace output")
     chunk_records = Param.Unsigned(65536, "Records per compressed trace chunk")
     zstd_level = Param.Int(1, "Zstd compression level")
     elf_sha256 = Param.String("", "Executable SHA-256 for trace identity")

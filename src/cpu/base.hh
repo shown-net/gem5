@@ -70,11 +70,10 @@ class CheckerCPU;
 class ThreadContext;
 class System;
 
-struct SystemRetireRecord
+struct ArchitecturalRetireRecord
 {
-    StaticInstPtr inst;
     Addr pc;
-    uint8_t cpl;
+    bool originUser;
 };
 
 struct AddressMonitor
@@ -532,15 +531,8 @@ class BaseCPU : public ClockedObject
      */
     virtual void probeInstCommit(const StaticInstPtr &inst, Addr pc);
 
-    /**
-     * Notify a user-mode architectural instruction retirement.
-     *
-     * Unlike probeInstCommit(), this is exactly once per architectural
-     * instruction.  It includes the SE syscall pseudo-fault after the
-     * instruction has reached its architectural transition point.
-     */
-    void probeArchitecturalRetire(const StaticInstPtr &inst, Addr pc);
-    void probeSystemRetire(const StaticInstPtr &inst, Addr pc, uint8_t cpl);
+    /** Notify one architectural macro-instruction retirement. */
+    void probeArchitecturalRetire(Addr pc, bool origin_user);
 
     /** Stop the current O3 commit bundle after the retiring instruction. */
     void requestRetireCommitStop() { retireCommitStopRequested = true; }
@@ -569,9 +561,8 @@ class BaseCPU : public ClockedObject
      */
     probing::PMUUPtr ppRetiredInsts;
 
-    /** User-mode architectural instruction retirement probe. */
-    ProbePointArg<std::pair<StaticInstPtr, Addr>> *ppArchitecturalRetire;
-    ProbePointArg<SystemRetireRecord> *ppSystemRetire;
+    /** Cross-model architectural instruction retirement probe. */
+    ProbePointArg<ArchitecturalRetireRecord> *ppArchitecturalRetire;
     bool retireCommitStopRequested = false;
     probing::PMUUPtr ppRetiredInstsPC;
 

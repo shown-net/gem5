@@ -35,6 +35,13 @@ Source("pc_count_tracker_manager.cc")
 
 DebugFlag("PcCountTracker")
 
+SimObject("RoiRetireWindow.py", sim_objects=["RoiRetireWindow"])
+Source("roi_retire_window.cc")
+
+if env["CONF"].get("HAVE_ZSTD", False):
+    SimObject("RoiPcTrace.py", sim_objects=["RoiPcTrace"])
+    Source("roi_pc_trace.cc")
+
 SimObject(
     "InstTracker.py",
     sim_objects=["GlobalInstTracker", "LocalInstTracker"],

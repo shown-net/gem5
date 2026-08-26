@@ -1,8 +1,9 @@
-#include "cpu/o3/probe/roi_retire_window.hh"
+#include "cpu/probes/roi_retire_window.hh"
 
 #include <algorithm>
 
 #include "base/logging.hh"
+#include "cpu/probes/roi_retire.hh"
 #include "sim/sim_exit.hh"
 
 namespace gem5
@@ -17,8 +18,7 @@ RoiRetireWindow::WindowStats::WindowStats(statistics::Group *parent)
 
 RoiRetireWindow::RoiRetireWindow(const RoiRetireWindowParams &params)
     : ProbeListenerObject(params),
-      beginPc(params.begin_pc),
-      endPc(params.end_pc),
+      beginPc(params.begin_pc), endPc(params.end_pc),
       targetExecStart(params.target_exec_start),
       targetExecEnd(params.target_exec_end),
       windowInsts(params.window_insts.begin(), params.window_insts.end()),
@@ -43,7 +43,7 @@ void
 RoiRetireWindow::regProbeListeners()
 {
     connectListener<RetireListener>(
-        this, "SystemRetire", &RoiRetireWindow::retire);
+        this, "ArchitecturalRetire", &RoiRetireWindow::retire);
 }
 
 void
@@ -60,19 +60,17 @@ RoiRetireWindow::start()
 void
 RoiRetireWindow::stop()
 {
-    if (state == State::Ended)
-        return;
-    signal(Event::End);
+    if (state != State::Ended)
+        signal(Event::End);
 }
 
 void
-RoiRetireWindow::retire(const SystemRetireRecord &inst)
+RoiRetireWindow::retire(const ArchitecturalRetireRecord &record)
 {
-    const Addr pc = inst.pc;
+    const Addr pc = record.pc;
     if (state == State::WaitingForBegin) {
-        if (pc == beginPc && pendingEvent == Event::None) {
+        if (pc == beginPc && pendingEvent == Event::None)
             signal(Event::Begin);
-        }
         return;
     }
     if (state != State::Active)
@@ -83,15 +81,14 @@ RoiRetireWindow::retire(const SystemRetireRecord &inst)
         if (pc == beginPc)
             return;
     }
-
     if (pc == endPc) {
         signal(Event::End);
         return;
     }
+
+    ++retired;
     ++stats.instructions;
-    if (inst.cpl != 3)
-        return;
-    if (pc < targetExecStart || pc >= targetExecEnd)
+    if (!isTargetUserRetire(record, targetExecStart, targetExecEnd))
         return;
     ++targetExecUserInstructions;
     if (windows < windowInsts.size() &&
@@ -123,14 +120,10 @@ std::string
 RoiRetireWindow::eventKind() const
 {
     switch (pendingEvent) {
-      case Event::Begin:
-        return "begin";
-      case Event::Window:
-        return "window";
-      case Event::End:
-        return "end";
-      case Event::None:
-        return "none";
+      case Event::Begin: return "begin";
+      case Event::Window: return "window";
+      case Event::End: return "end";
+      case Event::None: return "none";
     }
     return "none";
 }
@@ -156,9 +149,9 @@ RoiRetireWindow::completeWindows() const
 }
 
 uint64_t
-RoiRetireWindow::systemInstructions() const
+RoiRetireWindow::retiredInstructions() const
 {
-    return cpu->totalInsts();
+    return retired;
 }
 
 } // namespace gem5

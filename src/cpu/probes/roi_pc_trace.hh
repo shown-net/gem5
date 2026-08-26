@@ -1,5 +1,5 @@
-#ifndef __CPU_O3_PROBE_ROI_INSTRUCTION_TRACE_HH__
-#define __CPU_O3_PROBE_ROI_INSTRUCTION_TRACE_HH__
+#ifndef __CPU_PROBES_ROI_PC_TRACE_HH__
+#define __CPU_PROBES_ROI_PC_TRACE_HH__
 
 #include <cstdint>
 #include <fstream>
@@ -7,18 +7,17 @@
 #include <vector>
 
 #include "cpu/base.hh"
-#include "cpu/static_inst_fwd.hh"
-#include "params/RoiInstructionTrace.hh"
+#include "params/RoiPcTrace.hh"
 #include "sim/probe/probe_listener_object.hh"
 
 namespace gem5
 {
 
-class RoiInstructionTrace : public ProbeListenerObject
+class RoiPcTrace : public ProbeListenerObject
 {
   public:
-    RoiInstructionTrace(const RoiInstructionTraceParams &params);
-    ~RoiInstructionTrace() override;
+    RoiPcTrace(const RoiPcTraceParams &params);
+    ~RoiPcTrace() override;
 
     void regProbeListeners() override;
     void startTracing();
@@ -26,13 +25,12 @@ class RoiInstructionTrace : public ProbeListenerObject
     uint64_t recordCount() const;
 
   private:
-    void retire(const SystemRetireRecord &record);
+    void retire(const ArchitecturalRetireRecord &record);
+    void flushChunk();
     void finalize();
 
     using RetireListener = ProbeListenerArg<
-        RoiInstructionTrace, SystemRetireRecord>;
-
-    void flushChunk();
+        RoiPcTrace, ArchitecturalRetireRecord>;
 
     std::ofstream *output;
     const unsigned chunkRecords;
@@ -50,4 +48,4 @@ class RoiInstructionTrace : public ProbeListenerObject
 
 } // namespace gem5
 
-#endif // __CPU_O3_PROBE_ROI_INSTRUCTION_TRACE_HH__
+#endif // __CPU_PROBES_ROI_PC_TRACE_HH__

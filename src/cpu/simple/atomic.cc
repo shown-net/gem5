@@ -689,11 +689,18 @@ AtomicSimpleCPU::tick()
                     countInst();
                     ppCommit->notify(std::make_pair(thread, curStaticInst));
                 } else if (curStaticInst->isSyscall() &&
-                           std::dynamic_pointer_cast<SESyscallFault>(fault)) {
-                    probeArchitecturalRetire(curStaticInst, pc.instAddr());
+                           !std::dynamic_pointer_cast<
+                               SyscallRetryFault>(fault) &&
+                           (!curStaticInst->isMicroop() ||
+                            curStaticInst->isLastMicroop())) {
+                    probeArchitecturalRetire(
+                        pc.instAddr(), preExecuteInUserMode);
                 } else if (traceData) {
                     traceFault();
                 }
+
+                if (fault != NoFault)
+                    preExecuteOriginValid = false;
 
                 if (fault != NoFault &&
                     std::dynamic_pointer_cast<SyscallRetryFault>(fault)) {
