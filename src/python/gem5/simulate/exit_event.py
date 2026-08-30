@@ -50,7 +50,6 @@ class ExitEvent(Enum):
     )
     SIMPOINT_BEGIN = "simpoint begins"
     MAX_INSTS = "number of instructions reached"
-    ROI_RETIRE = "ROI retired-instruction event"
     PERF_COUNTER_ENABLE = "performance counter enabled"
     PERF_COUNTER_DISABLE = "performance counter disabled"
     PERF_COUNTER_RESET = "performance counter reset"
@@ -99,8 +98,6 @@ class ExitEvent(Enum):
             return ExitEvent.SIMPOINT_BEGIN
         elif exit_string == "a thread reached the max instruction count":
             return ExitEvent.MAX_INSTS
-        elif exit_string == "roi retired-instruction event":
-            return ExitEvent.ROI_RETIRE
         elif exit_string == "performance counter enabled":
             return ExitEvent.PERF_COUNTER_ENABLE
         elif exit_string == "performance counter disabled":
