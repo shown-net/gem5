@@ -132,6 +132,7 @@ class BaseSimpleCPU : public BaseCPU
 
     std::unique_ptr<PCStateBase> preExecuteTempPC;
     bool preExecuteInUserMode = false;
+    uint64_t preExecuteAddressSpaceId = 0;
     bool preExecuteOriginValid = false;
     bool preExecuteIsRomMicroop = false;
 

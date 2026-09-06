@@ -74,6 +74,7 @@ struct ArchitecturalRetireRecord
 {
     Addr pc;
     bool originUser;
+    uint64_t addressSpaceId;
 };
 
 struct AddressMonitor
@@ -532,7 +533,8 @@ class BaseCPU : public ClockedObject
     virtual void probeInstCommit(const StaticInstPtr &inst, Addr pc);
 
     /** Notify one architectural macro-instruction retirement. */
-    void probeArchitecturalRetire(Addr pc, bool origin_user);
+    void probeArchitecturalRetire(Addr pc, bool origin_user,
+                                  uint64_t address_space_id);
 
     /** Stop the current O3 commit bundle after the retiring instruction. */
     void requestRetireCommitStop() { retireCommitStopRequested = true; }

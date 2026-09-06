@@ -23,9 +23,10 @@ class RoiRetireCollector : public ProbeListenerObject
     void regProbeListeners() override;
     void acknowledge();
     uint64_t retiredInstructions() const;
+    uint64_t workloadUserInstructions() const;
 
   private:
-    enum class State { WaitingForBodyStart, Collecting, Ended };
+    enum class State { WaitingForBegin, Collecting, Ended };
     enum class Event { None, Begin, Window, End };
 
     void retire(const ArchitecturalRetireRecord &record);
@@ -36,18 +37,20 @@ class RoiRetireCollector : public ProbeListenerObject
     using RetireListener = ProbeListenerArg<
         RoiRetireCollector, ArchitecturalRetireRecord>;
 
-    const Addr bodyStartPc;
+    const Addr beginPc;
     const Addr endPc;
-    const Addr targetExecStart;
-    const Addr targetExecEnd;
-    const std::vector<uint64_t> windowInsts;
+    const Addr traceImageBase;
+    const std::vector<Addr> traceExecSegments;
+    const uint64_t windowInsts;
+    const std::vector<uint64_t> windowSchedule;
     BaseCPU *const cpu;
-    State state = State::WaitingForBodyStart;
+    State state = State::WaitingForBegin;
     Event pendingEvent = Event::None;
     uint64_t retired = 0;
-    uint64_t targetExecUserInstructions = 0;
+    uint64_t ownerAddressSpaceId = 0;
+    uint64_t workloadUserInstructions_ = 0;
     uint64_t nextBoundary = 0;
-    uint64_t windows = 0;
+    size_t windowIndex = 0;
 
     std::ofstream *traceOutput = nullptr;
     const unsigned traceChunkRecords;
@@ -59,6 +62,7 @@ class RoiRetireCollector : public ProbeListenerObject
     {
         WindowStats(statistics::Group *parent);
         statistics::Scalar instructions;
+        statistics::Scalar workloadUserInstructions;
     } stats;
 };
 

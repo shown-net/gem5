@@ -10,13 +10,25 @@ class RoiRetireCollector(ProbeListenerObject):
     cxx_exports = [
         PyBindMethod("acknowledge"),
         PyBindMethod("retiredInstructions"),
+        PyBindMethod("workloadUserInstructions"),
     ]
 
-    body_start_pc = Param.Addr("Excluded ROI body-start sentinel PC")
-    end_pc = Param.Addr("Excluded ROI end-entry sentinel PC")
-    target_exec_start = Param.Addr("Target ELF executable range start")
-    target_exec_end = Param.Addr("Target ELF executable range end")
-    window_insts = VectorParam.UInt64("Ordered target-user window sizes")
+    begin_pc = Param.Addr("Excluded ROI begin sentinel PC")
+    end_pc = Param.Addr("Excluded ROI end sentinel PC")
+    trace_image_base = Param.Addr(
+        "Target ELF image base for PC trace normalization"
+    )
+    trace_exec_segments = VectorParam.Addr(
+        "Target ELF executable segment start/end pairs for PC trace normalization"
+    )
+    window_insts = Param.UInt64(
+        0,
+        "Fixed workload-user instruction window size; zero disables fixed windows",
+    )
+    window_schedule = VectorParam.UInt64(
+        [],
+        "Ordered workload-user window sizes; mutually exclusive with window_insts",
+    )
     trace_output_file = Param.String("", "Optional ROI PC trace output")
     trace_elf_sha256 = Param.String(
         "", "Executable SHA-256 for trace identity"

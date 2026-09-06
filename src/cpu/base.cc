@@ -427,9 +427,10 @@ BaseCPU::probeInstCommit(const StaticInstPtr &inst, Addr pc)
 }
 
 void
-BaseCPU::probeArchitecturalRetire(Addr pc, bool origin_user)
+BaseCPU::probeArchitecturalRetire(Addr pc, bool origin_user,
+                                  uint64_t address_space_id)
 {
-    ppArchitecturalRetire->notify({pc, origin_user});
+    ppArchitecturalRetire->notify({pc, origin_user, address_space_id});
 }
 
 BaseCPU::

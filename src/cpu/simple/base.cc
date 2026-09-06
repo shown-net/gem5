@@ -42,6 +42,7 @@
 #include "cpu/simple/base.hh"
 
 #include "arch/generic/decoder.hh"
+#include "arch/x86/regs/misc.hh"
 #include "base/cprintf.hh"
 #include "base/inifile.hh"
 #include "base/loader/symtab.hh"
@@ -404,6 +405,9 @@ BaseSimpleCPU::preExecute()
     if (curStaticInst) {
         if (!preExecuteOriginValid) {
             preExecuteInUserMode = t_info.thread->getIsaPtr()->inUserMode();
+            preExecuteAddressSpaceId =
+                t_info.thread->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
+                ~uint64_t(0xfff);
             preExecuteOriginValid = true;
         }
 #if TRACING_ON
@@ -525,7 +529,8 @@ BaseSimpleCPU::postExecute()
     probeInstCommit(curStaticInst, instAddr);
     if (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop()) {
         if (!preExecuteIsRomMicroop)
-            probeArchitecturalRetire(instAddr, preExecuteInUserMode);
+            probeArchitecturalRetire(
+                instAddr, preExecuteInUserMode, preExecuteAddressSpaceId);
         preExecuteOriginValid = false;
         consumeRetireCommitStopRequest();
     }

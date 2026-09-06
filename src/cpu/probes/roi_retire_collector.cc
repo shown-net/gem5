@@ -4,10 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 
 #include "base/logging.hh"
 #include "base/output.hh"
-#include "cpu/probes/roi_retire.hh"
 #include "sim/sim_exit.hh"
 
 namespace gem5
@@ -16,7 +16,7 @@ namespace
 {
 constexpr uint64_t RoiRetireExitHandlerId = 8;
 constexpr std::array<uint8_t, 8> TraceMagic{
-    'R', 'O', 'I', 'F', 'L', 'O', 'W', 0};
+    'R', 'O', 'I', 'F', 'L', 'W', '3', 0};
 
 template <class T>
 void
@@ -83,28 +83,44 @@ decodeSha256(const std::string &text)
 RoiRetireCollector::WindowStats::WindowStats(statistics::Group *parent)
     : statistics::Group(parent),
       ADD_STAT(instructions, statistics::units::Count::get(),
-               "Architectural instructions retired in the ROI window")
+               "All-privilege architectural instructions retired by the core "
+               "between workload-user window boundaries"),
+      ADD_STAT(workloadUserInstructions, statistics::units::Count::get(),
+               "Owner-address-space CPL3 instructions used for workload "
+               "progress")
 {
 }
 
 RoiRetireCollector::RoiRetireCollector(
     const RoiRetireCollectorParams &params)
-    : ProbeListenerObject(params), bodyStartPc(params.body_start_pc),
-      endPc(params.end_pc), targetExecStart(params.target_exec_start),
-      targetExecEnd(params.target_exec_end),
-      windowInsts(params.window_insts.begin(), params.window_insts.end()),
+    : ProbeListenerObject(params), beginPc(params.begin_pc),
+      endPc(params.end_pc), traceImageBase(params.trace_image_base),
+      traceExecSegments(params.trace_exec_segments.begin(),
+                        params.trace_exec_segments.end()),
+      windowInsts(params.window_insts),
+      windowSchedule(params.window_schedule.begin(),
+                     params.window_schedule.end()),
       cpu(dynamic_cast<BaseCPU *>(params.manager)),
       traceChunkRecords(params.trace_chunk_records),
       traceZstdLevel(params.trace_zstd_level), stats(this)
 {
     fatal_if(!cpu, "ROI retire collector manager must be a BaseCPU");
-    fatal_if(!bodyStartPc || !endPc || bodyStartPc == endPc,
-             "ROI body-start and end PCs are invalid");
-    fatal_if(targetExecStart >= targetExecEnd,
-             "ROI target executable range must be non-empty");
-    fatal_if(std::any_of(windowInsts.begin(), windowInsts.end(),
+    fatal_if(!beginPc || !endPc || beginPc == endPc,
+             "ROI begin and end PCs are invalid");
+    fatal_if(!traceImageBase || traceExecSegments.empty() ||
+             traceExecSegments.size() % 2,
+             "ROI PC trace executable segments are invalid");
+    for (size_t index = 0; index < traceExecSegments.size(); index += 2)
+        fatal_if(traceExecSegments[index] >= traceExecSegments[index + 1],
+                 "ROI PC trace executable segment is invalid");
+    fatal_if(windowInsts && !windowSchedule.empty(),
+             "ROI fixed window and dynamic schedule are mutually exclusive");
+    fatal_if(std::any_of(windowSchedule.begin(), windowSchedule.end(),
                          [](uint64_t count) { return count == 0; }),
-             "ROI retired-instruction window targets must be positive");
+             "ROI dynamic window sizes must be positive");
+    fatal_if(!windowInsts && windowSchedule.empty() &&
+                 params.trace_output_file.empty(),
+             "ROI collector requires trace output or a window schedule");
     if (!params.trace_output_file.empty()) {
         fatal_if(!traceChunkRecords || traceZstdLevel < -5 ||
                      traceZstdLevel > 22,
@@ -142,14 +158,18 @@ void
 RoiRetireCollector::retire(const ArchitecturalRetireRecord &record)
 {
     const Addr pc = record.pc;
-    if (state == State::WaitingForBodyStart) {
-        if (pc == bodyStartPc && pendingEvent == Event::None)
+    if (state == State::WaitingForBegin) {
+        if (pc == beginPc && record.originUser &&
+            record.addressSpaceId && pendingEvent == Event::None) {
+            ownerAddressSpaceId = record.addressSpaceId;
             signal(Event::Begin);
+        }
         return;
     }
     if (state != State::Collecting)
         return;
-    if (pc == endPc) {
+    if (record.originUser && record.addressSpaceId == ownerAddressSpaceId &&
+        pc == endPc) {
         finalizeTrace();
         signal(Event::End);
         return;
@@ -157,19 +177,41 @@ RoiRetireCollector::retire(const ArchitecturalRetireRecord &record)
 
     ++retired;
     ++stats.instructions;
-    if (!isTargetUserRetire(record, targetExecStart, targetExecEnd))
+    if (!record.originUser || record.addressSpaceId != ownerAddressSpaceId)
         return;
-    ++targetExecUserInstructions;
+    ++workloadUserInstructions_;
+    ++stats.workloadUserInstructions;
     if (traceOutput) {
-        tracePcs.push_back(pc - targetExecStart);
+        bool targetPc = false;
+        for (size_t index = 0; index < traceExecSegments.size(); index += 2) {
+            if (pc >= traceExecSegments[index] &&
+                pc < traceExecSegments[index + 1]) {
+                targetPc = true;
+                break;
+            }
+        }
+        tracePcs.push_back(targetPc ? pc - traceImageBase
+                                    : std::numeric_limits<uint64_t>::max());
         if (tracePcs.size() == traceChunkRecords)
             flushTraceChunk();
     }
-    if (windows < windowInsts.size() &&
-        targetExecUserInstructions >= nextBoundary) {
-        ++windows;
-        if (windows < windowInsts.size())
-            nextBoundary += windowInsts[windows];
+    if (nextBoundary && workloadUserInstructions_ >= nextBoundary) {
+        if (!windowSchedule.empty()) {
+            ++windowIndex;
+            if (windowIndex < windowSchedule.size()) {
+                fatal_if(nextBoundary > std::numeric_limits<uint64_t>::max() -
+                             windowSchedule[windowIndex],
+                         "ROI dynamic window schedule overflow");
+                nextBoundary += windowSchedule[windowIndex];
+            } else {
+                nextBoundary = 0;
+            }
+        } else {
+            fatal_if(nextBoundary > std::numeric_limits<uint64_t>::max() -
+                         windowInsts,
+                     "ROI fixed window schedule overflow");
+            nextBoundary += windowInsts;
+        }
         signal(Event::Window);
     }
 }
@@ -199,7 +241,9 @@ RoiRetireCollector::acknowledge()
              "ROI retire collector has no pending event");
     if (pendingEvent == Event::Begin) {
         state = State::Collecting;
-        nextBoundary = windowInsts.empty() ? 0 : windowInsts.front();
+        windowIndex = 0;
+        nextBoundary =
+            !windowSchedule.empty() ? windowSchedule.front() : windowInsts;
     } else if (pendingEvent == Event::End) {
         state = State::Ended;
     }
@@ -210,6 +254,12 @@ uint64_t
 RoiRetireCollector::retiredInstructions() const
 {
     return retired;
+}
+
+uint64_t
+RoiRetireCollector::workloadUserInstructions() const
+{
+    return workloadUserInstructions_;
 }
 
 void
