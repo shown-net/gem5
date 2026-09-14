@@ -693,8 +693,9 @@ AtomicSimpleCPU::tick()
                                SyscallRetryFault>(fault) &&
                            (!curStaticInst->isMicroop() ||
                             curStaticInst->isLastMicroop())) {
-                    probeArchitecturalRetire(
-                        pc.instAddr(), preExecuteInUserMode);
+                    probeArchitecturalRetire(pc.instAddr(),
+                                             preExecuteInUserMode,
+                                             preExecuteAddressSpaceId);
                 } else if (traceData) {
                     traceFault();
                 }

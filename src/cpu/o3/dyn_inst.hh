@@ -320,6 +320,8 @@ class DynInst : public ExecContext, public RefCounted
 
     /** User-mode state at fetch, before the instruction can change it. */
     bool fetchedFromUser = false;
+    /** Page-table root at fetch, excluding x86 CR3 control/PCID bits. */
+    uint64_t fetchedAddressSpaceId = 0;
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;

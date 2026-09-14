@@ -1223,8 +1223,9 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         if (head_inst->isSyscall() &&
             !std::dynamic_pointer_cast<SyscallRetryFault>(inst_fault) &&
             (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
-            cpu->probeArchitecturalRetire(
-                head_inst->pcState().instAddr(), head_inst->fetchedFromUser);
+            cpu->probeArchitecturalRetire(head_inst->pcState().instAddr(),
+                                          head_inst->fetchedFromUser,
+                                          head_inst->fetchedAddressSpaceId);
         }
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
@@ -1260,8 +1261,9 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
 
     updateComInstStats(head_inst);
     if (!head_inst->isMicroop() || head_inst->isLastMicroop()) {
-        cpu->probeArchitecturalRetire(
-            head_inst->pcState().instAddr(), head_inst->fetchedFromUser);
+        cpu->probeArchitecturalRetire(head_inst->pcState().instAddr(),
+                                      head_inst->fetchedFromUser,
+                                      head_inst->fetchedAddressSpaceId);
     }
 
     DPRINTF(Commit,

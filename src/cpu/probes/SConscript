@@ -36,8 +36,10 @@ Source("pc_count_tracker_manager.cc")
 DebugFlag("PcCountTracker")
 
 if env["CONF"].get("HAVE_ZSTD", False):
-    SimObject("RoiRetireCollector.py", sim_objects=["RoiRetireCollector"])
-    Source("roi_retire_collector.cc")
+    SimObject(
+        "MarkerRetireCollector.py", sim_objects=["MarkerRetireCollector"]
+    )
+    Source("marker_retire_collector.cc")
 
 SimObject(
     "InstTracker.py",

@@ -765,7 +765,7 @@ TimingSimpleCPU::advanceInst(const Fault &fault)
             (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop())) {
             probeArchitecturalRetire(
                 threadInfo[curThread]->thread->pcState().instAddr(),
-                preExecuteInUserMode);
+                preExecuteInUserMode, preExecuteAddressSpaceId);
         }
         preExecuteOriginValid = false;
         // hardware transactional memory
