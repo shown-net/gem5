@@ -85,6 +85,9 @@ class RubyRequest : public Message
     bool m_isGLCSet;
     bool m_isSLCSet;
     bool m_isSecure;
+    bool m_traceIdentityValid = false;
+    int m_traceContextId = -1;
+    Addr m_traceInstSeqNum = 0;
 
     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
         uint64_t _paddr, int _len,
@@ -117,6 +120,7 @@ class RubyRequest : public Message
             m_isGLCSet = 0;
             m_isSLCSet = 0;
         }
+        captureTraceIdentity();
     }
 
     /** RubyRequest for memory management commands */
@@ -148,6 +152,7 @@ class RubyRequest : public Message
             m_isGLCSet = 0;
             m_isSLCSet = 0;
         }
+        captureTraceIdentity();
     }
 
     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
@@ -185,6 +190,7 @@ class RubyRequest : public Message
             m_isGLCSet = 0;
             m_isSLCSet = 0;
         }
+        captureTraceIdentity();
     }
 
     RubyRequest(Tick curTime, int block_size, RubySystem *rs,
@@ -224,6 +230,7 @@ class RubyRequest : public Message
             m_isGLCSet = 0;
             m_isSLCSet = 0;
         }
+        captureTraceIdentity();
     }
 
     RubyRequest(Tick curTime, int block_size, RubySystem *rs)
@@ -243,6 +250,9 @@ class RubyRequest : public Message
     const int& getSize() const { return m_Size; }
     const PrefetchBit& getPrefetch() const { return m_Prefetch; }
     RequestPtr getRequestPtr() const { return m_pkt->req; }
+    bool traceIdentityValid() const { return m_traceIdentityValid; }
+    int traceContextId() const { return m_traceContextId; }
+    Addr traceInstSeqNum() const { return m_traceInstSeqNum; }
 
     void setWriteMask(uint32_t offset, uint32_t len,
         std::vector< std::pair<int,AtomicOpFunctor*>> atomicOps);
@@ -250,6 +260,19 @@ class RubyRequest : public Message
     bool functionalRead(Packet *pkt);
     bool functionalRead(Packet *pkt, WriteMask &mask);
     bool functionalWrite(Packet *pkt);
+
+  private:
+    void
+    captureTraceIdentity()
+    {
+        if (!m_pkt || !m_pkt->req || !m_pkt->req->hasContextId() ||
+            !m_pkt->req->hasInstSeqNum()) {
+            return;
+        }
+        m_traceIdentityValid = true;
+        m_traceContextId = int(m_pkt->req->contextId());
+        m_traceInstSeqNum = Addr(m_pkt->req->getReqInstSeqNum());
+    }
 };
 
 inline std::ostream&

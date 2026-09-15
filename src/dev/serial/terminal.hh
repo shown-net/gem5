@@ -46,6 +46,7 @@
 #define __DEV_TERMINAL_HH__
 
 #include <iostream>
+#include <string>
 
 #include "base/callback.hh"
 #include "base/circlebuf.hh"
@@ -110,6 +111,8 @@ class Terminal : public SerialDevice
     CircleBuf<char> txbuf;
     CircleBuf<char> rxbuf;
     OutputStream *outfile;
+    std::string markerLine;
+    bool workbeginMarkerSeen = false;
 #if TRACING_ON == 1
     CircleBuf<char> linebuf;
 #endif

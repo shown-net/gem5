@@ -47,4 +47,11 @@ class KvmVM(SimObject):
         [], "memory ranges for coalesced MMIO"
     )
 
+    memoryRanges = VectorParam.AddrRange(
+        [],
+        "Optional guest ranges for sequentially mapping KVM-usable "
+        "physical-memory backing bytes. When empty, backing stores retain "
+        "their native addresses.",
+    )
+
     system = Param.System(Parent.any, "system this VM belongs to")

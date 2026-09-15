@@ -74,6 +74,9 @@ structure(RequestMsg, desc="...", interface="Message") {
   int Len;
   bool Dirty, default="false",  desc="Dirty bit";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
+  bool TraceValid, default="false", desc="Oracle trace identity is valid";
+  int TraceContextId, default="-1", desc="Oracle CPU context identity";
+  Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
 
   bool functionalRead(Packet *pkt) {
     // Only PUTX messages contains the data block

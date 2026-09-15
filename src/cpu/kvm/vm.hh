@@ -534,6 +534,14 @@ class KvmVM : public SimObject
 
     System *system;
 
+    /**
+     * Optional guest-visible ranges onto which KVM-usable PhysicalMemory
+     * backing bytes are mapped sequentially. This permits an architecture's
+     * MMIO hole to remain absent from KVM while memory controllers retain a
+     * compact internal backing store.
+     */
+    const std::vector<AddrRange> memoryRanges;
+
     /** KVM VM file descriptor */
     int vmFD;
 

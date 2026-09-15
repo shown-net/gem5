@@ -68,10 +68,12 @@
 #include "base/output.hh"
 #include "base/socket.hh"
 #include "base/trace.hh"
+#include "cpu/o3/probe/tao_trace.hh"
 #include "debug/Terminal.hh"
 #include "debug/TerminalVerbose.hh"
 #include "dev/platform.hh"
 #include "dev/serial/uart.hh"
+#include "sim/sim_exit.hh"
 
 namespace gem5
 {
@@ -322,6 +324,23 @@ Terminal::console_in()
 void
 Terminal::writeData(uint8_t c)
 {
+    if (c == '\n' || c == '\r') {
+        if (!workbeginMarkerSeen &&
+            markerLine.find(
+                "[gem5-roi] marker=") != std::string::npos &&
+            markerLine.find(
+                " operation=workbegin-serial ") != std::string::npos) {
+            workbeginMarkerSeen = true;
+            gem5::o3::TaoTrace::traceMeasurementBegin();
+            exitSimLoop("workbegin");
+        }
+        markerLine.clear();
+    } else if (markerLine.size() < 1024) {
+        markerLine.push_back(static_cast<char>(c));
+    } else {
+        markerLine.clear();
+    }
+
 #if TRACING_ON == 1
     if (debug::Terminal) {
         static char last = '\0';

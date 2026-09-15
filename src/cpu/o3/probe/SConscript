@@ -38,12 +38,20 @@
 Import('*')
 
 if env['CONF']['BUILD_ISA']:
+    SimObject('BranchEvents.py', sim_objects=['BranchEvents'])
+    Source('branch_events.cc')
+    DebugFlag('BranchEvents')
+
     SimObject('SimpleTrace.py', sim_objects=['SimpleTrace'])
     Source('simple_trace.cc')
     DebugFlag('SimpleTrace')
 
     SimObject('InstructionTracer.py', sim_objects=['InstructionTracer'])
     Source('instruction_tracer.cc')
+
+    SimObject('TaoTrace.py', sim_objects=['TaoTrace'])
+    Source('tao_trace.cc')
+    DebugFlag('TaoTrace')
 
     if env['CONF']['HAVE_PROTOBUF']:
         if env['CONF']['USE_ARM_ISA']:

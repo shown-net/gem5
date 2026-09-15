@@ -176,6 +176,7 @@ class DynInst : public ExecContext, public RefCounted
         NotAnInst,
         TranslationStarted,
         TranslationCompleted,
+        DataTlbMissObserved,
         PossibleLoadViolation,
         HitExternalSnoop,
         EffAddrValid,
@@ -183,6 +184,7 @@ class DynInst : public ExecContext, public RefCounted
         Predicate,
         MemAccPredicate,
         PredTaken,
+        BranchPredMispredicted,
         IsStrictlyOrdered,
         ReqMade,
         MemOpDone,
@@ -425,6 +427,15 @@ class DynInst : public ExecContext, public RefCounted
     }
     void translationCompleted(bool f) { instFlags[TranslationCompleted] = f; }
 
+    /** True when at least one data-translation fragment required a hardware
+     * page-table walk. Unlike isTranslationDelayed(), this sticky retirement
+     * fact remains available after translation completes. */
+    bool dataTlbMissObserved() const
+    {
+        return instFlags[DataTlbMissObserved];
+    }
+    void dataTlbMissObserved(bool f) { instFlags[DataTlbMissObserved] = f; }
+
     /** True if this address was found to match a previous load and they issued
      * out of order. If that happend, then it's only a problem if an incoming
      * snoop invalidate modifies the line, in which case we need to squash.
@@ -533,6 +544,25 @@ class DynInst : public ExecContext, public RefCounted
     setPredTaken(bool predicted_taken)
     {
         instFlags[PredTaken] = predicted_taken;
+    }
+
+    /** Remember that the original fetch prediction caused a redirect.
+     *
+     * Decode may repair a direct target in predPC before this instruction
+     * retires. DynInst::mispredicted() is therefore a current-PC comparison,
+     * not persistent branch-predictor history. This sticky bit preserves the
+     * original BPred miss until retirement.
+     */
+    bool
+    branchPredMispredicted() const
+    {
+        return instFlags[BranchPredMispredicted];
+    }
+
+    void
+    setBranchPredMispredicted()
+    {
+        instFlags[BranchPredMispredicted] = true;
     }
 
     /** Returns whether the instruction mispredicted. */

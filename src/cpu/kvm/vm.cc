@@ -45,6 +45,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <memory>
 
@@ -316,8 +317,8 @@ Kvm::createVM()
 KvmVM::KvmVM(const KvmVMParams &params)
     : SimObject(params),
       kvm(new Kvm()), system(params.system),
-      vmFD(kvm->createVM()),
-      started(false),
+      memoryRanges(params.memoryRanges.begin(), params.memoryRanges.end()),
+      vmFD(kvm->createVM()), started(false),
       _hasKernelIRQChip(false),
       nextVCPUID(0)
 {
@@ -369,6 +370,76 @@ KvmVM::delayedStartup()
 {
     const std::vector<memory::BackingStoreEntry> &memories(
         system->getPhysMem().getBackingStore());
+
+    if (!memoryRanges.empty()) {
+        uint64_t backingSize = 0;
+        for (const auto &memory : memories) {
+            if (memory.kvmMap && memory.pmem)
+                backingSize += memory.range.size();
+        }
+
+        uint64_t guestSize = 0;
+        Addr previousEnd = 0;
+        bool first = true;
+        for (const auto &range : memoryRanges) {
+            panic_if(range.interleaved(),
+                     "KVM guest memory range must not be interleaved: %s\n",
+                     range.to_string());
+            panic_if(!first && range.start() < previousEnd,
+                     "KVM guest memory ranges overlap or are unsorted\n");
+            first = false;
+            previousEnd = range.end();
+            guestSize += range.size();
+        }
+        panic_if(backingSize != guestSize,
+                 "KVM remapped guest ranges contain 0x%llx bytes but "
+                 "KVM-usable backing stores contain 0x%llx bytes\n",
+                 (unsigned long long)guestSize,
+                 (unsigned long long)backingSize);
+
+        size_t backingIndex = 0;
+        uint64_t backingOffset = 0;
+        auto advanceBacking = [&]() {
+            while (backingIndex < memories.size() &&
+                   (!memories[backingIndex].kvmMap ||
+                    !memories[backingIndex].pmem)) {
+                ++backingIndex;
+            }
+        };
+        advanceBacking();
+
+        DPRINTF(Kvm, "Remapping %i guest memory region(s) over 0x%llx "
+                "backing bytes\n", memoryRanges.size(), backingSize);
+        for (const auto &guestRange : memoryRanges) {
+            Addr guest = guestRange.start();
+            uint64_t remaining = guestRange.size();
+            while (remaining) {
+                panic_if(backingIndex >= memories.size(),
+                         "KVM backing store exhausted during remap\n");
+                const auto &backing = memories[backingIndex];
+                const uint64_t available =
+                    backing.range.size() - backingOffset;
+                const uint64_t chunk = std::min(remaining, available);
+                auto *host = static_cast<uint8_t *>(backing.pmem) +
+                             backingOffset;
+
+                DPRINTF(Kvm, "Mapping remapped region: 0x%p -> 0x%llx "
+                        "[size: 0x%llx]\n", host, guest, chunk);
+                const MemSlot slot = allocMemSlot(chunk);
+                setupMemSlot(slot, host, guest, 0/* flags */);
+
+                guest += chunk;
+                remaining -= chunk;
+                backingOffset += chunk;
+                if (backingOffset == backing.range.size()) {
+                    backingOffset = 0;
+                    ++backingIndex;
+                    advanceBacking();
+                }
+            }
+        }
+        return;
+    }
 
     DPRINTF(Kvm, "Mapping %i memory region(s)\n", memories.size());
     for (int slot(0); slot < memories.size(); ++slot) {

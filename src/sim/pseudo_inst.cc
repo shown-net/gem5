@@ -42,6 +42,9 @@
 
 #include "sim/pseudo_inst.hh"
 
+// TAOGEN_ROI_HOOK: m5_work_begin/end -> TaoTrace::traceWorkBegin/End
+#include "cpu/o3/probe/tao_trace.hh"
+
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -361,6 +364,10 @@ m5checkpoint(ThreadContext *tc, Tick delay, Tick period)
         return;
 
     if (DistIface::readyToCkpt(delay, period)) {
+        // Bind source-level ROI checkpoints to the exact address space that
+        // executed the marker. System serializes this identity before the
+        // KVM checkpoint is restored under a detailed CPU.
+        gem5::o3::TaoTrace::traceSourceRoiCheckpoint(tc);
         Tick when = curTick() + delay * sim_clock::as_int::ns;
         Tick repeat = period * sim_clock::as_int::ns;
         exitSimLoop("checkpoint", 0, when, repeat);
@@ -497,6 +504,9 @@ void
 workbegin(ThreadContext *tc, uint64_t workid, uint64_t threadid)
 {
     DPRINTF(PseudoInst, "pseudo_inst::workbegin(%i, %i)\n", workid, threadid);
+    // TAOGEN_ROI_HOOK_EARLY
+    gem5::o3::TaoTrace::traceWorkBegin(
+        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
     System *sys = tc->getSystemPtr();
     const System::Params &params = sys->params();
 
@@ -560,6 +570,9 @@ void
 workend(ThreadContext *tc, uint64_t workid, uint64_t threadid)
 {
     DPRINTF(PseudoInst, "pseudo_inst::workend(%i, %i)\n", workid, threadid);
+    // TAOGEN_ROI_HOOK_EARLY
+    gem5::o3::TaoTrace::traceWorkEnd(
+        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
     System *sys = tc->getSystemPtr();
     const System::Params &params = sys->params();
 

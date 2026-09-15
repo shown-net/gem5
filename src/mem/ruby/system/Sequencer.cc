@@ -49,6 +49,7 @@
 #include "debug/RubySequencer.hh"
 #include "debug/RubyStats.hh"
 #include "mem/packet.hh"
+#include "mem/taotrace_response.hh"
 #include "mem/ruby/profiler/Profiler.hh"
 #include "mem/ruby/protocol/PrefetchBit.hh"
 #include "mem/ruby/protocol/RubyAccessMode.hh"
@@ -709,6 +710,14 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
               "in .sm files!");
 
     PacketPtr pkt = srequest->pkt;
+    if (pkt->req) {
+        // In this Sequencer API externalHit=true denotes a controller miss;
+        // preserve the protocol-native spelling in the sideband so the event
+        // dictionary, not this observer, decides its eventual PMU mapping.
+        TaoTraceNativeAccessRegistry::noteResponse(
+            pkt->req, externalHit, was_coalesced,
+            mach == MachineType_NUM ? -1 : int(mach));
+    }
     Addr request_address(pkt->getAddr());
     RubyRequestType type = srequest->m_type;
 
@@ -1077,6 +1086,14 @@ Sequencer::makeRequest(PacketPtr pkt)
     // It is OK to receive RequestStatus_Aliased, it can be considered Issued
     if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
         return status;
+    // Only requests accepted into the Sequencer request table are native
+    // Ruby line admissions. Buffer-full and locked-line retries return above;
+    // MemSyncReq is an uninserted alias and is outside the retired data-UOP
+    // population.
+    if (pkt->cmd != MemCmd::MemSyncReq) {
+        TaoTraceNativeAccessRegistry::noteAdmission(
+            pkt->req, status == RequestStatus_Aliased);
+    }
     // non-aliased with any existing request in the request table, just issue
     // to the cache
     if (status != RequestStatus_Aliased)
@@ -1173,6 +1190,11 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
     assert(latency > 0);
 
     assert(m_mandatory_q_ptr != NULL);
+    // Count the exact request population that enters the Ruby hierarchy.
+    // RequestStatus_Aliased alone cannot identify this population: a merged
+    // read may share its parent's lookup, while an aliased write can be
+    // reissued here after the parent response.
+    TaoTraceNativeAccessRegistry::noteHierarchyRequest(pkt->req);
     m_mandatory_q_ptr->enqueue(msg, clockEdge(), latency,
                                m_ruby_system->getRandomization(),
                                m_ruby_system->getWarmupEnabled());

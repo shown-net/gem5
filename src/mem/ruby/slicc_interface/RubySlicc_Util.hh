@@ -52,6 +52,7 @@
 #include "debug/RubyProtocol.hh"
 #include "debug/RubySlicc.hh"
 #include "mem/packet.hh"
+#include "mem/taotrace_response.hh"
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/common/BoolVec.hh"
 #include "mem/ruby/common/DataBlock.hh"
@@ -64,6 +65,37 @@ namespace gem5
 
 namespace ruby
 {
+
+inline void
+taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
+                               int level, int outcome)
+{
+    if (!valid || context_id < 0 ||
+        level < 0 || level >= int(TaoTraceNativeHierarchyFacts::Levels) ||
+        outcome < int(TaoTraceNativeCacheOutcome::Hit) ||
+        outcome > int(TaoTraceNativeCacheOutcome::RemoteSupply)) {
+        return;
+    }
+    TaoTraceNativeAccessRegistry::noteHierarchy(
+        uint32_t(context_id), uint64_t(seq_num), unsigned(level),
+        TaoTraceNativeCacheOutcome(outcome));
+}
+
+inline void
+taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num)
+{
+    if (!valid || context_id < 0) return;
+    TaoTraceNativeAccessRegistry::noteUniqueFill(
+        uint32_t(context_id), uint64_t(seq_num));
+}
+
+inline void
+taotraceRubyMemoryFetchByIdentity(bool valid, int context_id, Addr seq_num)
+{
+    if (!valid || context_id < 0) return;
+    TaoTraceNativeAccessRegistry::noteRubyMemoryFetch(
+        uint32_t(context_id), uint64_t(seq_num));
+}
 
 inline Cycles zero_time() { return Cycles(0); }
 

@@ -54,6 +54,7 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/thread_state.hh"
 #include "cpu/timebuf.hh"
 #include "debug/Activity.hh"
@@ -157,12 +158,16 @@ std::string Commit::name() const { return cpu->name() + ".commit"; }
 void
 Commit::regProbePoints()
 {
+    ppPreCommit = new ProbePointArg<DynInstPtr>(
+            cpu->getProbeManager(), "PreCommit");
     ppCommit = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Commit");
     ppCommitStall = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "CommitStall");
     ppSquash = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Squash");
+    ppKernelEntry = new ProbePointArg<KernelEntryEvent>(
+            cpu->getProbeManager(), "KernelEntry");
 }
 
 Commit::CommitStats::CommitStats(CPU *cpu, Commit *commit)
@@ -695,10 +700,15 @@ Commit::handleInterrupt()
             cpu->checker->handlePendingInt();
         }
 
-        // CPU will handle interrupt. Note that we ignore the local copy of
-        // interrupt. This is because the local copy may no longer be the
-        // interrupt that the interrupt controller thinks is being handled.
-        cpu->processInterrupts(cpu->getInterrupts());
+        // Re-read the interrupt at the acceptance point. Besides avoiding a
+        // stale local copy, this gives probes the exact event that is about
+        // to enter privileged execution.
+        Fault accepted_interrupt = cpu->getInterrupts();
+        ppKernelEntry->notify(KernelEntryEvent{
+            uint32_t(cpu->cpuId()), 0, accepted_interrupt,
+            KernelEntrySource::ExternalInterrupt, curTick(),
+            cpu->clockPeriod(), cpu->inUserMode(0)});
+        cpu->processInterrupts(accepted_interrupt);
 
         thread[0]->noSquashFromTC = false;
 
@@ -807,11 +817,27 @@ Commit::commit()
 
             // If we want to include the squashing instruction in the squash,
             // then use one older sequence number.
-            InstSeqNum squashed_inst = fromIEW->squashedSeqNum[tid];
+            const InstSeqNum cause_seq = fromIEW->squashedSeqNum[tid];
+            const InstSeqNum rob_youngest_seq = youngestSeqNum[tid];
+            DynInstPtr oracle_cause_inst = fromIEW->mispredictInst[tid];
+            if (!oracle_cause_inst) {
+                oracle_cause_inst = rob->findInst(tid, cause_seq);
+            }
+            InstSeqNum squashed_inst = cause_seq;
 
             if (fromIEW->includeSquashInst[tid]) {
                 squashed_inst--;
             }
+
+            TaoTrace::traceSquashEpisode(
+                cpu, uint32_t(tid),
+                bool(fromIEW->mispredictInst[tid]),
+                fromIEW->includeSquashInst[tid], uint64_t(cause_seq),
+                uint64_t(squashed_inst), uint64_t(rob_youngest_seq),
+                oracle_cause_inst
+                    ? uint64_t(oracle_cause_inst->pcState().instAddr()) : 0,
+                fromIEW->pc[tid]
+                    ? uint64_t(fromIEW->pc[tid]->instAddr()) : 0);
 
             // All younger instructions will be squashed. Set the sequence
             // number as the youngest instruction in the ROB.
@@ -979,6 +1005,12 @@ Commit::commitInsts()
                   enums::OpClassStrings[head_inst->opClass()]);
         } else {
             set(pc[tid], head_inst->pcState());
+
+            // Notify before commitHead updates the committed rename map.  A
+            // privilege-return consumer can therefore sample the syscall
+            // return register before the first user instruction overwrites
+            // it.  This probe is observational and must not mutate state.
+            ppPreCommit->notify(head_inst);
 
             // Try to commit the head instruction.
             bool commit_success = commitHead(head_inst, num_committed);
@@ -1227,6 +1259,10 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
                                           head_inst->fetchedFromUser,
                                           head_inst->fetchedAddressSpaceId);
         }
+        ppKernelEntry->notify(KernelEntryEvent{
+            uint32_t(cpu->cpuId()), tid, inst_fault,
+            KernelEntrySource::SynchronousFault, curTick(),
+            cpu->clockPeriod(), cpu->inUserMode(tid)});
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
                       head_inst->staticInst);

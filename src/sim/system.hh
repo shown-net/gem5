@@ -116,6 +116,12 @@ class System : public SimObject, public PCEventScope
     // to be coherent addresses, not I/O or device addresses
     AddrRangeList externalMemRanges;
 
+    // Address-space identity captured by a source-level ROI checkpoint.
+    // This is serialized with the checkpoint so detailed tracing can bind
+    // to the workload that emitted the marker instead of guessing from the
+    // first userspace instruction scheduled after restore.
+    Addr sourceRoiAddressSpaceId = 0;
+
   public:
 
     class Threads
@@ -576,6 +582,18 @@ class System : public SimObject, public PCEventScope
      * an invalid/empty range if disabled.
      */
     const AddrRange &m5opRange() const { return _m5opRange; }
+
+    void
+    setSourceRoiAddressSpaceId(Addr address_space_id)
+    {
+        sourceRoiAddressSpaceId = address_space_id;
+    }
+
+    Addr
+    getSourceRoiAddressSpaceId() const
+    {
+        return sourceRoiAddressSpaceId;
+    }
 
   public:
 

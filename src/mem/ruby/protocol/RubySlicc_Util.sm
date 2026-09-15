@@ -62,3 +62,8 @@ structure(BoolVec, external="yes") {
 }
 int countBoolVec(BoolVec bVec);
 RequestorID getRequestorID(RequestPtr req);
+void taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
+                                    int level, int outcome);
+void taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num);
+void taotraceRubyMemoryFetchByIdentity(bool valid, int context_id,
+                                       Addr seq_num);
