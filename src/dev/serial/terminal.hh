@@ -111,8 +111,6 @@ class Terminal : public SerialDevice
     CircleBuf<char> txbuf;
     CircleBuf<char> rxbuf;
     OutputStream *outfile;
-    std::string markerLine;
-    bool workbeginMarkerSeen = false;
 #if TRACING_ON == 1
     CircleBuf<char> linebuf;
 #endif

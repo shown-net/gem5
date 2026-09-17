@@ -131,10 +131,6 @@ class BaseSimpleCPU : public BaseCPU
     void traceFault();
 
     std::unique_ptr<PCStateBase> preExecuteTempPC;
-    bool preExecuteInUserMode = false;
-    uint64_t preExecuteAddressSpaceId = 0;
-    bool preExecuteOriginValid = false;
-    bool preExecuteIsRomMicroop = false;
 
   public:
     void checkForInterrupts();

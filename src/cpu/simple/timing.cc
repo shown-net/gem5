@@ -760,14 +760,6 @@ TimingSimpleCPU::advanceInst(const Fault &fault)
         return;
 
     if (fault != NoFault) {
-        if (curStaticInst && curStaticInst->isSyscall() &&
-            !std::dynamic_pointer_cast<SyscallRetryFault>(fault) &&
-            (!curStaticInst->isMicroop() || curStaticInst->isLastMicroop())) {
-            probeArchitecturalRetire(
-                threadInfo[curThread]->thread->pcState().instAddr(),
-                preExecuteInUserMode, preExecuteAddressSpaceId);
-        }
-        preExecuteOriginValid = false;
         // hardware transactional memory
         // If a fault occurred within a transaction
         // ensure that the transaction aborts

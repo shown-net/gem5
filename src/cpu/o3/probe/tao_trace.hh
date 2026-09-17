@@ -32,11 +32,12 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/probe/taogen_shared/lru_banked.hh"
+#include "cpu/o3/probe/taogen_shared/uarch_profile.hh"
+#include "cpu/probes/marker_pc_trace.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
 #include "params/TaoTrace.hh"
 #include "sim/probe/probe_listener_object.hh"
-#include "cpu/o3/probe/taogen_shared/uarch_profile.hh"
 
 // The producer owns the shared cache/TLB model headers in-tree.
 
@@ -76,6 +77,12 @@ class TaoTrace : public ProbeListenerObject
     ~TaoTrace() override;
 
     void regProbeListeners() override;
+    void startMarkerCapture(const std::string &directory);
+    void selectMarkerWindow(uint64_t begin, uint64_t end);
+    void acknowledgeMarker();
+    void resumeMarkerWarmup();
+    static void closeMarkerMeasurement();
+    static void traceMarkerWarmup(gem5::ThreadContext *tc);
 
     std::string name() const override
     {
@@ -220,6 +227,8 @@ class TaoTrace : public ProbeListenerObject
     void onRename(const DynInstPtr &dynInst);
     void onDispatch(const DynInstPtr &dynInst);
     void onCommit(const DynInstPtr &dynInst);
+    void recordCommit(const DynInstPtr &dynInst);
+    void observeMarkerCommit(const DynInstPtr &dynInst);
     void onPreCommit(const DynInstPtr &dynInst);
     void onCommitStall(const DynInstPtr &dynInst);
     void onSquash(const DynInstPtr &dynInst);
@@ -630,6 +639,20 @@ private:
     uint64_t functional_measurement_user_record_count_ = 0;
     uint64_t functional_measurement_user_instruction_count_ = 0;
     bool functional_measurement_started_ = false;
+    const bool marker_controlled_;
+    const bool control_only_;
+    bool marker_capture_started_ = false;
+    Addr marker_pc_ = 0;
+    CPU *marker_cpu_ = nullptr;
+    uint64_t marker_ordinal_ = 0, marker_begin_ = 1, marker_end_ = 2;
+    uint64_t marker_address_space_ = 0;
+    unsigned marker_state_ = 0;
+    bool marker_pending_ = false;
+    std::unique_ptr<MarkerPcTrace> marker_pc_trace_;
+    static TaoTrace *marker_owner_;
+    static uint64_t marker_address_root_;
+    static gem5::ThreadContext *marker_warmup_context_;
+    static std::unordered_set<TaoTrace *> marker_instances_;
     bool initial_pte_root_checked_ = false;
     bool initial_pte_root_mismatch_warned_ = false;
     gem5::ThreadContext *pte_snapshot_tc_ = nullptr;

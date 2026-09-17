@@ -134,6 +134,10 @@ std::unordered_map<uint64_t, FunctionalPtePath>
     TaoTrace::initial_pte_paths_;
 std::vector<FunctionalPteRange> TaoTrace::initial_pte_ranges_;
 bool TaoTrace::measurement_pte_state_captured_ = false;
+TaoTrace *TaoTrace::marker_owner_ = nullptr;
+uint64_t TaoTrace::marker_address_root_ = 0;
+gem5::ThreadContext *TaoTrace::marker_warmup_context_ = nullptr;
+std::unordered_set<TaoTrace *> TaoTrace::marker_instances_;
 uint64_t TaoTrace::measurement_pte_root_ = 0;
 std::unordered_map<uint64_t, bool> TaoTrace::measurement_pte_present_;
 std::unordered_map<uint64_t, FunctionalPtePath>
@@ -831,12 +835,35 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_include_kernel_(params.functional_include_kernel),
       functional_warmup_(params.functional_warmup),
       functional_user_target_(params.functional_user_target),
+      marker_controlled_(params.marker_controlled),
+      control_only_(params.control_only),
       require_roi_param_(params.require_roi),
       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
       output_dir_(params.output_dir),
       uarch_profile_path_(params.uarch_profile_path)
 {
     live_instances_ += 1;
+    if (control_only_) {
+        fatal_if(
+            !marker_controlled_ || emit_micro_ || emit_macro_ ||
+                emit_mem_events_ || measure_cpl_ ||
+                emit_native_response_jsonl_ || emit_wrong_path_oracle_ ||
+                functionalTraceEnabled() || functional_warmup_ ||
+                functional_user_target_ || require_roi_param_,
+            "TaoTrace control-only mode permits Marker boundary control only");
+    }
+    if (marker_controlled_) {
+        marker_pc_ = params.marker_pc;
+        marker_cpu_ = dynamic_cast<CPU *>(params.manager);
+        fatal_if(!marker_pc_,
+                 "TaoTrace Marker mode requires a common Marker PC");
+        marker_instances_.insert(this);
+        if (!params.marker_pc_trace_file.empty()) {
+            marker_pc_trace_ = std::make_unique<MarkerPcTrace>(
+                params.marker_image_base, params.marker_exec_segments,
+                params.marker_pc_trace_file, params.marker_elf_sha256);
+        }
+    }
     wrong_path_core_id_ = parseFstCoreIdFromName(name());
     if (functional_user_only_ && functional_include_kernel_) {
         throw std::runtime_error(
@@ -865,7 +892,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     }
     if (functional_warmup_) {
         if (!functionalTraceEnabled() || !emit_micro_ ||
-            functional_user_target_ == 0) {
+            (!marker_controlled_ && functional_user_target_ == 0)) {
             throw std::runtime_error(
                 "TaoTrace functional_warmup requires a functional trace mode, "
                 "emit_micro, and a non-zero functional_user_target");
@@ -886,14 +913,166 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     if (functional_include_kernel_) {
         fst_feature_flags_ |= kFstFeaturePrivilege;
     }
-    openOutput();
+    if (!marker_controlled_) {
+        openOutput();
+    }
     if (functionalTraceEnabled()) {
         registerExitCallback([this]() { writeFunctionalBoundary(); });
     }
 }
 
+void
+TaoTrace::startMarkerCapture(const std::string &directory)
+{
+    fatal_if(!marker_controlled_ || marker_capture_started_,
+             "invalid Marker capture initialization");
+    output_dir_ = directory;
+    if (functionalTraceEnabled()) {
+        openOutput();
+    }
+    marker_capture_started_ = true;
+    if (marker_cpu_) {
+        cpl_core_id_ = parseFstCoreIdFromName(name());
+        cpl_clock_period_ticks_ = marker_cpu_->clockPeriod();
+    }
+}
+
+void
+TaoTrace::traceMarkerWarmup(gem5::ThreadContext *tc)
+{
+    if (marker_instances_.empty()) {
+        return;
+    }
+    // This also establishes the source address-space identity used by the
+    // Marker owner. Control-only mode suppresses writers and commit observers,
+    // but still needs this one warmup snapshot for correct process matching.
+    traceSourceRoiCheckpoint(tc);
+    marker_address_root_ = tc->getSystemPtr()->getSourceRoiAddressSpaceId();
+    if (simQuantum && !marker_owner_) {
+        // Parallel KVM hypercalls exit at the next safe global boundary.
+        // Hold the triggering context so adjacent START/END instructions
+        // cannot execute in KVM before the machine is forked.
+        fatal_if(marker_warmup_context_, "overlapping Marker warmup hooks");
+        marker_warmup_context_ = tc;
+        // Halt is explicitly resumed by the handler; unlike suspend it
+        // cannot be undone by an interrupt during the KVM quantum.
+        tc->halt();
+    }
+}
+
+void
+TaoTrace::resumeMarkerWarmup()
+{
+    if (!marker_warmup_context_) {
+        return;
+    }
+    auto *tc = marker_warmup_context_;
+    marker_warmup_context_ = nullptr;
+    // CPU takeover replaces the System's context for the same context ID.
+    tc->getSystemPtr()->threads[tc->contextId()]->activate();
+}
+
+void
+TaoTrace::selectMarkerWindow(uint64_t begin, uint64_t end)
+{
+    fatal_if(!marker_controlled_ || marker_owner_ || !begin || end <= begin,
+             "invalid TaoTrace Marker window selection");
+    marker_owner_ = this;
+    fatal_if(!marker_address_root_,
+             "TaoTrace warmup lacks target address space");
+    marker_address_space_ = marker_address_root_;
+    marker_begin_ = begin;
+    marker_end_ = end;
+}
+
+void
+TaoTrace::acknowledgeMarker()
+{
+    fatal_if(marker_owner_ != this || !marker_pending_,
+             "no pending TaoTrace Marker boundary");
+    if (marker_state_ == 1 && marker_pc_trace_) {
+        marker_pc_trace_->initializeTrace();
+    }
+    marker_pending_ = false;
+}
+
+void
+TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
+{
+    auto *owner = marker_owner_;
+    if (!owner || !marker_capture_started_ || owner->marker_state_ == 2 ||
+        (inst->isMicroop() && !inst->isLastMicroop()) ||
+        !inst->fetchedFromUser || !inst->fetchedAddressSpaceId) {
+        return;
+    }
+    if (owner->marker_address_space_ &&
+        owner->marker_address_space_ != inst->fetchedAddressSpaceId) {
+        return;
+    }
+    const Addr pc = inst->pcState().instAddr();
+    if (owner->marker_state_ == 1 && owner->marker_pc_trace_) {
+        owner->marker_pc_trace_->append(pc);
+    }
+    if (pc != marker_pc_) {
+        return;
+    }
+    owner->marker_address_space_ = inst->fetchedAddressSpaceId;
+    ++owner->marker_ordinal_;
+    bool begin = owner->marker_ordinal_ == owner->marker_begin_;
+    bool end = owner->marker_ordinal_ == owner->marker_end_;
+    if (!begin && !end) {
+        return;
+    }
+    fatal_if(owner->marker_pending_,
+             "TaoTrace Marker boundary was not acknowledged");
+    owner->marker_pending_ = true;
+    owner->marker_state_ = begin ? 1 : 2;
+    if (owner->functionalTraceEnabled()) {
+        if (begin) {
+            traceMeasurementBegin();
+        } else {
+            closeMarkerMeasurement();
+        }
+    }
+    if (end && owner->marker_pc_trace_) {
+        owner->marker_pc_trace_->finalizeTrace();
+    }
+    for (auto *trace : marker_instances_) {
+        auto *cpu = trace->marker_cpu_;
+        fatal_if(!cpu, "TaoTrace Marker participant is not an O3 CPU");
+        cpu->requestTraceCommitStop();
+    }
+    exitSimulationLoopNow(8, {{"kind", begin ? "begin" : "end"}});
+}
+
+void
+TaoTrace::closeMarkerMeasurement()
+{
+    fatal_if(functional_warmup_instances_.empty() ||
+                 functional_target_exit_scheduled_,
+             "invalid Marker measurement close");
+    functional_common_end_tick_ = curTick();
+    functional_target_exit_scheduled_ = true;
+    traceMeasurementEnd();
+    for (auto *trace : functional_warmup_instances_) {
+        fatal_if(!trace->marker_capture_started_ ||
+                     !trace->functional_measurement_started_,
+                 "Marker END before capture START");
+        const int32_t core = parseFstCoreIdFromName(trace->name());
+        trace->cpl_measurement_end_tick_ = curTick();
+        if (core >= 0) {
+            cpl_measurement_end_tick_per_core_[core] = curTick();
+            TaoTraceNativeAccessRegistry::disableContext(core);
+            TaoTraceFrontendRegistry::disableContext(core);
+        }
+        trace->finalizeCplMeasurement();
+    }
+    scheduleFunctionalTargetDrain(*functional_warmup_instances_.begin());
+}
+
 TaoTrace::~TaoTrace()
 {
+    marker_instances_.erase(this);
     for (auto it = wrong_path_instances_.begin();
          it != wrong_path_instances_.end();) {
         if (it->second == this) {
@@ -1440,11 +1619,15 @@ TaoTrace::getL1iMshr(uint32_t cid)
 void
 TaoTrace::regProbeListeners()
 {
+    using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
+    if (marker_controlled_ && !functionalTraceEnabled()) {
+        connectListener<DynInstListener>(this, "Commit", &TaoTrace::onCommit);
+        return;
+    }
     // 在第一个 callback 触发之前装载 uarch_profile.json：保证后续 LRU/TLB/walker
     // 视图均按 schema v2 配置。
     ensureUarchLoaded(output_dir_, uarch_profile_path_);
 
-    using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
     using PktListener = ProbeListenerArg<
         TaoTrace, std::pair<DynInstPtr, PacketPtr>>;
     using PktOnly = ProbeListenerArg<TaoTrace, PacketPtr>;
@@ -2163,6 +2346,9 @@ TaoTrace::maybeCompleteFunctionalSyscall(const DynInstPtr &inst)
 bool
 TaoTrace::functionalCaptureActive() const
 {
+    if (marker_controlled_) {
+        return marker_capture_started_;
+    }
     return functional_warmup_ || cplMeasurementActive();
 }
 
@@ -2177,7 +2363,8 @@ TaoTrace::functionalTargetReached() const
 {
     // One committed user target closes every participant at the same event.
     // Local progress is recorded separately in functional_target_reached_.
-    return functional_user_target_ > 0 && functional_target_exit_scheduled_;
+    return (marker_controlled_ || functional_user_target_ > 0) &&
+           functional_target_exit_scheduled_;
 }
 
 void
@@ -2239,7 +2426,10 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
     // instructions. A non-trigger core can end between micro-ops of a macro;
     // its FST keeps those real UOPs and counts only completed macros.
     for (auto *trace : functional_warmup_instances_) {
-        if (!trace || trace->functional_user_target_ == 0) continue;
+        if (!trace || (!trace->marker_controlled_ &&
+                       trace->functional_user_target_ == 0)) {
+            continue;
+        }
         const int32_t context_id = trace->cpl_core_id_ >= 0
             ? trace->cpl_core_id_ : parseFstCoreIdFromName(trace->name());
         trace->cpl_measurement_end_tick_ = functional_common_end_tick_;
@@ -2284,7 +2474,10 @@ TaoTrace::pollFunctionalTargetDrain()
     ++functional_target_drain_polls_;
     bool complete = true;
     for (auto *trace : functional_warmup_instances_) {
-        if (!trace || trace->functional_user_target_ == 0) continue;
+        if (!trace || (!trace->marker_controlled_ &&
+                       trace->functional_user_target_ == 0)) {
+            continue;
+        }
         if (!trace->nativeResponseDrainComplete()) complete = false;
     }
     if (complete) {
@@ -2308,7 +2501,8 @@ TaoTrace::pollFunctionalTargetDrain()
          (functional_target_drain_polls_ - 1)) == 0;
     if (diagnostic_poll) {
         for (auto *trace : functional_warmup_instances_) {
-            if (!trace || trace->functional_user_target_ == 0) {
+            if (!trace || (!trace->marker_controlled_ &&
+                           trace->functional_user_target_ == 0)) {
                 continue;
             }
             trace->logNativeResponsePending(functional_target_drain_polls_);
@@ -2328,6 +2522,9 @@ TaoTrace::pollFunctionalTargetDrain()
 void
 TaoTrace::writeFunctionalBoundary()
 {
+    if (marker_controlled_ && !marker_capture_started_) {
+        return;
+    }
     if (!functionalTraceEnabled()) return;
     char path[1024];
     const int32_t core_id = fst_core_id_ >= 0
@@ -2340,7 +2537,8 @@ TaoTrace::writeFunctionalBoundary()
         warn("TaoTrace: failed to open %s", path);
         return;
     }
-    std::fprintf(file,
+    std::fprintf(
+        file,
         "{\"schema\":\"tcsim-functional-boundary-v1\","
         "\"core_id\":%d,\"functional_warmup_enabled\":%s,"
         "\"measurement_started\":%s,"
@@ -2353,8 +2551,9 @@ TaoTrace::writeFunctionalBoundary()
         "\"trace_scope\":\"%s\","
         "\"total_records\":%lu,\"total_instructions\":%lu,"
         "\"target_records\":%lu,\"target_reached\":%s,"
-        "\"measurement_policy\":\"first-core-target-common-end-v1\","
-        "\"measurement_closed\":%s,\"common_end_tick\":%lu,"
+        "\"measurement_policy\":\"%s\","
+        "\"measurement_closed\":%s,\"common_begin_tick\":%lu,\"common_end_"
+        "tick\":%lu,"
         "\"trigger_core\":%d,\"participant_count\":%u,"
         "\"stop_reason\":\"%s\"}\n",
         core_id, functional_warmup_ ? "true" : "false",
@@ -2372,10 +2571,16 @@ TaoTrace::writeFunctionalBoundary()
         (unsigned long)functional_instruction_count_,
         (unsigned long)functional_user_target_,
         functional_target_reached_.count(this) ? "true" : "false",
+        marker_controlled_ ? "marker-window"
+                           : "first-core-target-common-end-v1",
         functional_target_exit_scheduled_ ? "true" : "false",
+        (unsigned long)cpl_measurement_begin_tick_,
         (unsigned long)functional_common_end_tick_, functional_trigger_core_,
-        unsigned(functional_target_instances_),
-        functional_target_exit_scheduled_ ? "first-core-user-target" : "incomplete");
+        unsigned(marker_controlled_ ? functional_warmup_instances_.size()
+                                    : functional_target_instances_),
+        functional_target_exit_scheduled_
+            ? (marker_controlled_ ? "marker-end" : "first-core-user-target")
+            : "incomplete");
     std::fclose(file);
 }
 
@@ -6661,6 +6866,17 @@ TaoTrace::onPreCommit(const DynInstPtr &inst)
 
 void
 TaoTrace::onCommit(const DynInstPtr &inst)
+{
+    if (!marker_controlled_ || functionalTraceEnabled()) {
+        recordCommit(inst);
+    }
+    if (marker_controlled_) {
+        observeMarkerCommit(inst);
+    }
+}
+
+void
+TaoTrace::recordCommit(const DynInstPtr &inst)
 {
     eraseWrongPathCommitted(inst);
     if (functional_warmup_ && !functional_measurement_started_ &&

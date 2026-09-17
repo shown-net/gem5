@@ -1125,8 +1125,9 @@ Commit::commitInsts()
 
                 // ROI window exits must cut the commit bundle at the exact
                 // architectural instruction that raised the event.
-                if (cpu->consumeRetireCommitStopRequest())
+                if (cpu->consumeTraceCommitStopRequest()) {
                     break;
+                }
             } else {
                 DPRINTF(Commit, "Unable to commit head instruction PC:%s "
                         "[tid:%i] [sn:%llu].\n",
@@ -1252,13 +1253,6 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         // needed to update the state as soon as possible.  This
         // prevents external agents from changing any specific state
         // that the trap need.
-        if (head_inst->isSyscall() &&
-            !std::dynamic_pointer_cast<SyscallRetryFault>(inst_fault) &&
-            (!head_inst->isMicroop() || head_inst->isLastMicroop())) {
-            cpu->probeArchitecturalRetire(head_inst->pcState().instAddr(),
-                                          head_inst->fetchedFromUser,
-                                          head_inst->fetchedAddressSpaceId);
-        }
         ppKernelEntry->notify(KernelEntryEvent{
             uint32_t(cpu->cpuId()), tid, inst_fault,
             KernelEntrySource::SynchronousFault, curTick(),
@@ -1296,11 +1290,6 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     }
 
     updateComInstStats(head_inst);
-    if (!head_inst->isMicroop() || head_inst->isLastMicroop()) {
-        cpu->probeArchitecturalRetire(head_inst->pcState().instAddr(),
-                                      head_inst->fetchedFromUser,
-                                      head_inst->fetchedAddressSpaceId);
-    }
 
     DPRINTF(Commit,
             "[tid:%i] [sn:%llu] Committing instruction with PC %s\n",

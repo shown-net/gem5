@@ -70,13 +70,6 @@ class CheckerCPU;
 class ThreadContext;
 class System;
 
-struct ArchitecturalRetireRecord
-{
-    Addr pc;
-    bool originUser;
-    uint64_t addressSpaceId;
-};
-
 struct AddressMonitor
 {
     AddressMonitor();
@@ -532,17 +525,6 @@ class BaseCPU : public ClockedObject
      */
     virtual void probeInstCommit(const StaticInstPtr &inst, Addr pc);
 
-    /** Notify one architectural macro-instruction retirement. */
-    void probeArchitecturalRetire(Addr pc, bool origin_user,
-                                  uint64_t address_space_id);
-
-    /** Stop the current O3 commit bundle after the retiring instruction. */
-    void requestRetireCommitStop() { retireCommitStopRequested = true; }
-    bool consumeRetireCommitStopRequest()
-    {
-        return std::exchange(retireCommitStopRequested, false);
-    }
-
    protected:
     /**
      * Helper method to instantiate probe points belonging to this
@@ -563,9 +545,6 @@ class BaseCPU : public ClockedObject
      */
     probing::PMUUPtr ppRetiredInsts;
 
-    /** Cross-model architectural instruction retirement probe. */
-    ProbePointArg<ArchitecturalRetireRecord> *ppArchitecturalRetire;
-    bool retireCommitStopRequested = false;
     probing::PMUUPtr ppRetiredInstsPC;
 
     /** Retired load instructions */

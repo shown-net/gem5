@@ -524,6 +524,13 @@ BaseKvmCPU::activateContext(ThreadID thread_num)
     assert(_status == Idle);
     assert(!tickEvent.scheduled());
 
+    // A context may be reactivated by a fork handler while the machine
+    // remains drained. drainResume() owns scheduling in that case, as
+    // with O3; scheduling here would insert the tick event twice.
+    if (drainState() == DrainState::Drained) {
+        return;
+    }
+
     baseStats.numCycles +=
         ticksToCycles(thread->lastActivate - thread->lastSuspend);
 

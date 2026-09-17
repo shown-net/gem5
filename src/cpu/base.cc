@@ -409,8 +409,6 @@ BaseCPU::regProbePoints()
 
     ppRetiredInsts = pmuProbePoint("RetiredInsts");
     ppRetiredInstsPC = pmuProbePoint("RetiredInstsPC");
-    ppArchitecturalRetire = new ProbePointArg<ArchitecturalRetireRecord>(
-        getProbeManager(), "ArchitecturalRetire");
     ppRetiredLoads = pmuProbePoint("RetiredLoads");
     ppRetiredStores = pmuProbePoint("RetiredStores");
     ppRetiredBranches = pmuProbePoint("RetiredBranches");
@@ -435,13 +433,6 @@ BaseCPU::probeInstCommit(const StaticInstPtr &inst, Addr pc)
 
     if (inst->isControl())
         ppRetiredBranches->notify(1);
-}
-
-void
-BaseCPU::probeArchitecturalRetire(Addr pc, bool origin_user,
-                                  uint64_t address_space_id)
-{
-    ppArchitecturalRetire->notify({pc, origin_user, address_space_id});
 }
 
 BaseCPU::

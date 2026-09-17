@@ -504,9 +504,6 @@ void
 workbegin(ThreadContext *tc, uint64_t workid, uint64_t threadid)
 {
     DPRINTF(PseudoInst, "pseudo_inst::workbegin(%i, %i)\n", workid, threadid);
-    // TAOGEN_ROI_HOOK_EARLY
-    gem5::o3::TaoTrace::traceWorkBegin(
-        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
     System *sys = tc->getSystemPtr();
     const System::Params &params = sys->params();
 
@@ -570,9 +567,6 @@ void
 workend(ThreadContext *tc, uint64_t workid, uint64_t threadid)
 {
     DPRINTF(PseudoInst, "pseudo_inst::workend(%i, %i)\n", workid, threadid);
-    // TAOGEN_ROI_HOOK_EARLY
-    gem5::o3::TaoTrace::traceWorkEnd(
-        uint32_t(tc->getCpuPtr()->cpuId()), workid, threadid);
     System *sys = tc->getSystemPtr();
     const System::Params &params = sys->params();
 
@@ -625,6 +619,9 @@ void
 m5Hypercall(ThreadContext *tc, uint64_t hypercall_id)
 {
     DPRINTF(PseudoInst, "pseudo_inst::m5Hypercall(%i)\n", hypercall_id);
+    if (hypercall_id == 4) {
+        gem5::o3::TaoTrace::traceMarkerWarmup(tc);
+    }
     exitSimLoopWithHypercall("m5_hypercall instruction encountered", 0,
     curTick(),0, std::map<std::string, std::string>(), hypercall_id, true);
 }

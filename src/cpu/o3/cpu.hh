@@ -175,7 +175,23 @@ class CPU : public BaseCPU
   public:
     /** Constructs a CPU with the given parameters. */
     CPU(const BaseO3CPUParams &params);
+    void
+    requestTraceCommitStop()
+    {
+        traceCommitStopRequested = true;
+    }
+    bool
+    consumeTraceCommitStopRequest()
+    {
+        const bool requested = traceCommitStopRequested;
+        traceCommitStopRequested = false;
+        return requested;
+    }
 
+  private:
+    bool traceCommitStopRequested = false;
+
+  public:
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
 
