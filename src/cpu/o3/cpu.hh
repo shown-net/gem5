@@ -215,6 +215,21 @@ class CPU : public BaseCPU
         traceMarkerFenceInstalled = true;
         traceMarkerFenceSeqNum = seq_num;
     }
+    void confirmTraceMarkerFenceCommit()
+    {
+        traceMarkerFenceReady_ = true;
+        traceMarkerFenceHeld_ = true;
+    }
+    void noteTraceMarkerFenceSquash(InstSeqNum seq_num)
+    {
+        if (traceMarkerFenceInstalled && seq_num == traceMarkerFenceSeqNum) {
+            traceMarkerFenceRequested = false;
+            traceMarkerFenceInstalled = false;
+            traceMarkerFenceHeld_ = false;
+            traceMarkerFenceReady_ = false;
+            traceMarkerFenceSeqNum = 0;
+        }
+    }
     void releaseTraceMarkerFence()
     {
         traceMarkerFenceRequested = false;

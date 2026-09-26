@@ -983,6 +983,7 @@ Commit::commitInsts()
 
             DPRINTF(Commit, "Retiring squashed instruction from "
                     "ROB.\n");
+            cpu->noteTraceMarkerFenceSquash(head_inst->seqNum);
 
             rob->retireHead(commit_thread);
 

@@ -1076,6 +1076,11 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     }
     fatal_if(owner->marker_pending_,
              "TaoTrace Marker boundary was not acknowledged");
+    // This callback is the authoritative commit observation for the selected
+    // Marker macro-op.  Its fetched instruction sequence may differ from the
+    // final committed micro-op sequence on x86, so close the owner's private
+    // fence from the observed architectural boundary itself.
+    owner->marker_cpu_->confirmTraceMarkerFenceCommit();
     owner->marker_pending_ = true;
     owner->marker_state_ = begin ? 1 : 2;
     if (owner->functionalTraceEnabled()) {
