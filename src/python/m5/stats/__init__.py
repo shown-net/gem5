@@ -359,29 +359,24 @@ def prepare():
 
 def _dump_to_visitor(visitor, roots=None, stat_names=None):
     wanted = (
-        None if stat_names is None else tuple(str(name) for name in stat_names)
+        None
+        if stat_names is None
+        else frozenset(str(name).rsplit("::", 1)[0] for name in stat_names)
     )
+    prefixes = None
+    if wanted is not None:
+        prefixes = {""}
+        for name in wanted:
+            parts = name.split(".")
+            prefixes.update(
+                ".".join(parts[:end]) for end in range(1, len(parts))
+            )
 
     def group_has_wanted(path):
-        if not path:
-            return True
-        if not wanted:
-            return True
-        prefix = ".".join(path)
-        return any(
-            item == prefix
-            or item.startswith(f"{prefix}.")
-            or item.startswith(f"{prefix}::")
-            for item in wanted
-        )
+        return wanted is None or ".".join(path) in prefixes
 
     def stat_is_wanted(path, stat):
-        if not wanted:
-            return True
-        full = ".".join(path + [stat.name])
-        return full in wanted or any(
-            item.startswith(f"{full}::") for item in wanted
-        )
+        return wanted is None or ".".join(path + [stat.name]) in wanted
 
     # New stats
     def dump_group(group, path):
@@ -410,7 +405,8 @@ def _dump_to_visitor(visitor, roots=None, stat_names=None):
 
         # Legacy stats
         for stat in stats_list:
-            stat.visit(visitor)
+            if wanted is None or stat.name in wanted:
+                stat.visit(visitor)
 
 
 lastDump = 0
@@ -424,6 +420,7 @@ def dump(roots=None, message="", stat_names=None):
     Args:
         roots: Optional list of roots to dump
         message: Optional message to include in text output headers
+        stat_names: Optional exact names to dump from new and legacy stats
     """
 
     all_roots = []

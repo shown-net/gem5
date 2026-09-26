@@ -24,7 +24,7 @@ class TaoTrace(ProbeListenerObject):
         PyBindMethod("startMarkerCapture"),
         PyBindMethod("selectMarkerWindow"),
         PyBindMethod("acknowledgeMarker"),
-        PyBindMethod("resumeMarkerWarmup"),
+        PyBindMethod("resumeMarkerHandoff"),
     ]
     marker_controlled = Param.Bool(
         False, "Defer output until a Marker fork child starts capture"

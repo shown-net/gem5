@@ -58,6 +58,8 @@ namespace gem5
 namespace o3
 {
 
+bool TaoTrace::marker_exit_scheduled_ = false;
+
 // Fix B: 跨实例共享的 line 状态机（每核一个 TaoTrace 实例 → 必须共享）
 std::unordered_map<uint64_t, TaoTrace::LineState> TaoTrace::line_states_;
 std::unordered_map<uint64_t, uint32_t>            TaoTrace::recent_line_count_;
@@ -136,7 +138,7 @@ std::vector<FunctionalPteRange> TaoTrace::initial_pte_ranges_;
 bool TaoTrace::measurement_pte_state_captured_ = false;
 TaoTrace *TaoTrace::marker_owner_ = nullptr;
 uint64_t TaoTrace::marker_address_root_ = 0;
-gem5::ThreadContext *TaoTrace::marker_warmup_context_ = nullptr;
+gem5::ThreadContext *TaoTrace::marker_handoff_context_ = nullptr;
 std::unordered_set<TaoTrace *> TaoTrace::marker_instances_;
 uint64_t TaoTrace::measurement_pte_root_ = 0;
 std::unordered_map<uint64_t, bool> TaoTrace::measurement_pte_present_;
@@ -938,22 +940,22 @@ TaoTrace::startMarkerCapture(const std::string &directory)
 }
 
 void
-TaoTrace::traceMarkerWarmup(gem5::ThreadContext *tc)
+TaoTrace::traceMarkerHandoff(gem5::ThreadContext *tc)
 {
     if (marker_instances_.empty()) {
         return;
     }
     // This also establishes the source address-space identity used by the
     // Marker owner. Control-only mode suppresses writers and commit observers,
-    // but still needs this one warmup snapshot for correct process matching.
+    // but still needs this handoff snapshot for correct process matching.
     traceSourceRoiCheckpoint(tc);
     marker_address_root_ = tc->getSystemPtr()->getSourceRoiAddressSpaceId();
     if (simQuantum && !marker_owner_) {
         // Parallel KVM hypercalls exit at the next safe global boundary.
         // Hold the triggering context so adjacent START/END instructions
-        // cannot execute in KVM before the machine is forked.
-        fatal_if(marker_warmup_context_, "overlapping Marker warmup hooks");
-        marker_warmup_context_ = tc;
+        // cannot execute in KVM before handoff or fork.
+        fatal_if(marker_handoff_context_, "overlapping Marker handoff hooks");
+        marker_handoff_context_ = tc;
         // Halt is explicitly resumed by the handler; unlike suspend it
         // cannot be undone by an interrupt during the KVM quantum.
         tc->halt();
@@ -961,13 +963,13 @@ TaoTrace::traceMarkerWarmup(gem5::ThreadContext *tc)
 }
 
 void
-TaoTrace::resumeMarkerWarmup()
+TaoTrace::resumeMarkerHandoff()
 {
-    if (!marker_warmup_context_) {
+    if (!marker_handoff_context_) {
         return;
     }
-    auto *tc = marker_warmup_context_;
-    marker_warmup_context_ = nullptr;
+    auto *tc = marker_handoff_context_;
+    marker_handoff_context_ = nullptr;
     // CPU takeover replaces the System's context for the same context ID.
     tc->getSystemPtr()->threads[tc->contextId()]->activate();
 }
@@ -994,12 +996,61 @@ TaoTrace::acknowledgeMarker()
         marker_pc_trace_->initializeTrace();
     }
     marker_pending_ = false;
+    marker_boundary_committed_ = false;
+    marker_exit_scheduled_ = false;
+    releaseMarkerFence();
+}
+
+bool
+TaoTrace::markerFenceReady()
+{
+    return std::all_of(marker_instances_.begin(), marker_instances_.end(),
+        [] (const TaoTrace *trace) {
+            return trace->marker_cpu_ &&
+                trace->marker_cpu_->traceMarkerFenceReady();
+        });
+}
+
+void
+TaoTrace::releaseMarkerFence()
+{
+    for (auto *trace : marker_instances_) {
+        if (trace->marker_cpu_)
+            trace->marker_cpu_->releaseTraceMarkerFence();
+    }
+}
+
+void
+TaoTrace::observeMarkerFetch(const DynInstPtr &inst)
+{
+    auto *owner = marker_owner_;
+    if (!owner || !owner->marker_capture_started_ ||
+        owner->marker_state_ == 2 || !inst->fetchedFromUser ||
+        inst->pcState().instAddr() != marker_pc_ ||
+        owner->marker_address_space_ != inst->fetchedAddressSpaceId) {
+        return;
+    }
+    const uint64_t next = owner->marker_ordinal_ + 1;
+    if (next != owner->marker_begin_ && next != owner->marker_end_)
+        return;
+    for (auto *trace : marker_instances_)
+        trace->marker_cpu_->requestTraceMarkerFence();
+    // The triggering core fences this exact marker.  Other participating
+    // cores claim the same one-shot request at their next rename boundary.
+    inst->setSerializeBefore();
+    owner->marker_cpu_->setTraceMarkerFenceInst(inst->seqNum);
 }
 
 void
 TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
 {
     auto *owner = marker_owner_;
+    if (owner && owner->marker_boundary_committed_ &&
+        markerFenceReady() && !marker_exit_scheduled_) {
+        marker_exit_scheduled_ = true;
+        exitSimulationLoopNow(8, {{"kind",
+            owner->marker_boundary_begin_ ? "begin" : "end"}});
+    }
     if (!owner || !marker_capture_started_ || owner->marker_state_ == 2 ||
         (inst->isMicroop() && !inst->isLastMicroop()) ||
         !inst->fetchedFromUser || !inst->fetchedAddressSpaceId) {
@@ -1037,12 +1088,17 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     if (end && owner->marker_pc_trace_) {
         owner->marker_pc_trace_->finalizeTrace();
     }
+    owner->marker_boundary_committed_ = true;
+    owner->marker_boundary_begin_ = begin;
     for (auto *trace : marker_instances_) {
         auto *cpu = trace->marker_cpu_;
         fatal_if(!cpu, "TaoTrace Marker participant is not an O3 CPU");
         cpu->requestTraceCommitStop();
     }
-    exitSimulationLoopNow(8, {{"kind", begin ? "begin" : "end"}});
+    if (markerFenceReady() && !marker_exit_scheduled_) {
+        marker_exit_scheduled_ = true;
+        exitSimulationLoopNow(8, {{"kind", begin ? "begin" : "end"}});
+    }
 }
 
 void
@@ -1621,6 +1677,9 @@ TaoTrace::regProbeListeners()
 {
     using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
     if (marker_controlled_ && !functionalTraceEnabled()) {
+        // Control-only still needs Fetch to arm the private O3 fence before
+        // the selected marker can let younger uops reach IEW.
+        connectListener<DynInstListener>(this, "Fetch", &TaoTrace::onFetch);
         connectListener<DynInstListener>(this, "Commit", &TaoTrace::onCommit);
         return;
     }
@@ -2571,7 +2630,7 @@ TaoTrace::writeFunctionalBoundary()
         (unsigned long)functional_instruction_count_,
         (unsigned long)functional_user_target_,
         functional_target_reached_.count(this) ? "true" : "false",
-        marker_controlled_ ? "marker-window"
+        marker_controlled_ ? "sampling-window"
                            : "first-core-target-common-end-v1",
         functional_target_exit_scheduled_ ? "true" : "false",
         (unsigned long)cpl_measurement_begin_tick_,
@@ -6480,6 +6539,7 @@ TaoTrace::traceSquashEpisode(const CPU *cpu,
 void
 TaoTrace::onFetch(const DynInstPtr &inst)
 {
+    observeMarkerFetch(inst);
     maybeCaptureInitialPteState(inst);
     noteWrongPathStage(inst, "fetch");
 }

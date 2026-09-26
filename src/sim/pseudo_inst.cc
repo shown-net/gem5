@@ -620,7 +620,7 @@ m5Hypercall(ThreadContext *tc, uint64_t hypercall_id)
 {
     DPRINTF(PseudoInst, "pseudo_inst::m5Hypercall(%i)\n", hypercall_id);
     if (hypercall_id == 4) {
-        gem5::o3::TaoTrace::traceMarkerWarmup(tc);
+        gem5::o3::TaoTrace::traceMarkerHandoff(tc);
     }
     exitSimLoopWithHypercall("m5_hypercall instruction encountered", 0,
     curTick(),0, std::map<std::string, std::string>(), hypercall_id, true);

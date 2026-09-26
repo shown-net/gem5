@@ -565,6 +565,7 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
                                       "transaction"),
       ADD_STAT(m_demand_hits, "Number of cache demand hits"),
       ADD_STAT(m_demand_misses, "Number of cache demand misses"),
+      ADD_STAT(m_demand_upgrades, "Permission upgrades included in demand misses"),
       ADD_STAT(m_demand_accesses, "Number of cache demand accesses",
                m_demand_hits + m_demand_misses),
       ADD_STAT(m_demand_hits_by_type, "Demand hits by Ruby request type"),
@@ -828,6 +829,13 @@ CacheMemory::profileDemandMiss(RubyRequestType type)
 {
     profileDemandMiss();
     cacheMemoryStats.m_demand_misses_by_type[type]++;
+}
+
+void
+CacheMemory::profileDemandUpgrade(RubyRequestType type)
+{
+    profileDemandMiss(type);
+    cacheMemoryStats.m_demand_upgrades++;
 }
 
 void

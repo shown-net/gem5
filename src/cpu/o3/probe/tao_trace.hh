@@ -80,9 +80,9 @@ class TaoTrace : public ProbeListenerObject
     void startMarkerCapture(const std::string &directory);
     void selectMarkerWindow(uint64_t begin, uint64_t end);
     void acknowledgeMarker();
-    void resumeMarkerWarmup();
+    void resumeMarkerHandoff();
     static void closeMarkerMeasurement();
-    static void traceMarkerWarmup(gem5::ThreadContext *tc);
+    static void traceMarkerHandoff(gem5::ThreadContext *tc);
 
     std::string name() const override
     {
@@ -229,6 +229,9 @@ class TaoTrace : public ProbeListenerObject
     void onCommit(const DynInstPtr &dynInst);
     void recordCommit(const DynInstPtr &dynInst);
     void observeMarkerCommit(const DynInstPtr &dynInst);
+    void observeMarkerFetch(const DynInstPtr &dynInst);
+    static bool markerFenceReady();
+    static void releaseMarkerFence();
     void onPreCommit(const DynInstPtr &dynInst);
     void onCommitStall(const DynInstPtr &dynInst);
     void onSquash(const DynInstPtr &dynInst);
@@ -648,10 +651,13 @@ private:
     uint64_t marker_address_space_ = 0;
     unsigned marker_state_ = 0;
     bool marker_pending_ = false;
+    bool marker_boundary_committed_ = false;
+    bool marker_boundary_begin_ = false;
+    static bool marker_exit_scheduled_;
     std::unique_ptr<MarkerPcTrace> marker_pc_trace_;
     static TaoTrace *marker_owner_;
     static uint64_t marker_address_root_;
-    static gem5::ThreadContext *marker_warmup_context_;
+    static gem5::ThreadContext *marker_handoff_context_;
     static std::unordered_set<TaoTrace *> marker_instances_;
     bool initial_pte_root_checked_ = false;
     bool initial_pte_root_mismatch_warned_ = false;

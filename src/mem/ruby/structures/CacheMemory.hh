@@ -244,6 +244,7 @@ class CacheMemory : public SimObject
 
           statistics::Scalar m_demand_hits;
           statistics::Scalar m_demand_misses;
+          statistics::Scalar m_demand_upgrades;
           statistics::Formula m_demand_accesses;
           statistics::Vector m_demand_hits_by_type;
           statistics::Vector m_demand_misses_by_type;
@@ -262,6 +263,7 @@ class CacheMemory : public SimObject
       void profileDemandMiss();
       void profileDemandHit(RubyRequestType type);
       void profileDemandMiss(RubyRequestType type);
+      void profileDemandUpgrade(RubyRequestType type);
       void profilePrefetchHit();
       void profilePrefetchMiss();
 };

@@ -1020,6 +1020,7 @@ Commit::commitInsts()
                 cpu->commitStats[tid]
                     ->committedInstType[head_inst->opClass()]++;
                 stats.committedInstType[tid][head_inst->opClass()]++;
+                cpu->noteTraceMarkerFenceCommit(head_inst->seqNum);
                 ppCommit->notify(head_inst);
 
                 // hardware transactional memory

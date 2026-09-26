@@ -263,6 +263,8 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Number of memory ordering violations"),
       ADD_STAT(squashedStores, statistics::units::Count::get(),
                "Number of stores squashed"),
+      ADD_STAT(partialForwardRetries, statistics::units::Count::get(),
+               "Load execution attempts rescheduled for partial store coverage"),
       ADD_STAT(rescheduledLoads, statistics::units::Count::get(),
                "Number of loads that were rescheduled"),
       ADD_STAT(blockedByCache, statistics::units::Count::get(),
@@ -1591,6 +1593,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 load_inst->clearIssued();
                 load_inst->effAddrValid(false);
                 ++stats.rescheduledLoads;
+                ++stats.partialForwardRetries;
 
                 // Do not generate a writeback event as this instruction is not
                 // complete.

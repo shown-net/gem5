@@ -65,7 +65,8 @@ namespace ruby
 
 Sequencer::Sequencer(const Params &p)
     : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
-      deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
+      deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check"),
+      readStats(this)
 {
     m_outstanding_count = 0;
 
@@ -143,6 +144,46 @@ Sequencer::Sequencer(const Params &p)
         }
     }
 
+}
+
+Sequencer::ReadStats::ReadStats(statistics::Group *parent)
+    : statistics::Group(parent, "readLifecycle"),
+      ADD_STAT(admitted, statistics::units::Count::get(), "Ordinary LD requests admitted"),
+      ADD_STAT(aliased, statistics::units::Count::get(), "LD admissions behind an existing line request"),
+      ADD_STAT(issued, statistics::units::Count::get(), "LD hierarchy issue calls, including reissues"),
+      ADD_STAT(completed, statistics::units::Count::get(), "LD callbacks, including later-squashed loads"),
+      ADD_STAT(coalesced, statistics::units::Count::get(), "LD callbacks marked coalesced"),
+      ADD_STAT(latencyCycles, statistics::units::Cycle::get(), "Sum of full admission-to-callback latency for completions"),
+      ADD_STAT(outstandingCycleSum, statistics::units::Cycle::get(), "ROI-clipped integral of outstanding ordinary LD requests"),
+      ADD_STAT(activeCycles, statistics::units::Cycle::get(), "ROI cycles with at least one observed LD"),
+      ADD_STAT(beginOutstanding, statistics::units::Count::get(), "Observed LD outstanding at stats reset"),
+      ADD_STAT(endOutstanding, statistics::units::Count::get(), "Observed LD outstanding at stats dump")
+{}
+
+bool
+Sequencer::observedRead(PacketPtr pkt)
+{
+    return pkt->isRead() && !pkt->isWrite() && !pkt->isAtomicOp() &&
+        !pkt->req->isInstFetch() && !pkt->req->isPrefetch() &&
+        !pkt->req->isPTWalk() && !pkt->req->isUncacheable() &&
+        !pkt->req->isLLSC() && !pkt->req->isReadModifyWrite();
+}
+
+void
+Sequencer::updateReadArea()
+{
+    const uint64_t elapsed = curCycle() - observedAt;
+    readStats.outstandingCycleSum += elapsed * observedReads;
+    if (observedReads) readStats.activeCycles += elapsed;
+    observedAt = curCycle();
+}
+
+void
+Sequencer::preDumpStats()
+{
+    RubyPort::preDumpStats();
+    updateReadArea();
+    readStats.endOutstanding = observedReads;
 }
 
 Sequencer::~Sequencer()
@@ -276,6 +317,10 @@ Sequencer::functionalWrite(Packet *func_pkt)
 
 void Sequencer::resetStats()
 {
+    RubyPort::resetStats();
+    observedAt = curCycle();
+    readStats.beginOutstanding = observedReads;
+    readStats.endOutstanding = observedReads;
     m_outstandReqHist.reset();
     m_latencyHist.reset();
     m_hitLatencyHist.reset();
@@ -375,6 +420,12 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     seq_req_list.emplace_back(pkt, primary_type,
         secondary_type, curCycle());
     m_outstanding_count++;
+    if (primary_type == RubyRequestType_LD && observedRead(pkt)) {
+        updateReadArea();
+        ++observedReads;
+        ++readStats.admitted;
+        if (seq_req_list.size() > 1) ++readStats.aliased;
+    }
 
     if (seq_req_list.size() > 1) {
         return RequestStatus_Aliased;
@@ -710,6 +761,14 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
               "in .sm files!");
 
     PacketPtr pkt = srequest->pkt;
+    if (srequest->m_type == RubyRequestType_LD && observedRead(pkt)) {
+        updateReadArea();
+        assert(observedReads > 0);
+        --observedReads;
+        ++readStats.completed;
+        if (was_coalesced) ++readStats.coalesced;
+        readStats.latencyCycles += curCycle() - srequest->issue_time;
+    }
     if (pkt->req) {
         // In this Sequencer API externalHit=true denotes a controller miss;
         // preserve the protocol-native spelling in the sideband so the event
@@ -1106,6 +1165,8 @@ Sequencer::makeRequest(PacketPtr pkt)
 void
 Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
 {
+    if (secondary_type == RubyRequestType_LD && observedRead(pkt))
+        ++readStats.issued;
     assert(pkt != NULL);
     ContextID proc_id = pkt->req->hasContextId() ?
         pkt->req->contextId() : InvalidContextID;
