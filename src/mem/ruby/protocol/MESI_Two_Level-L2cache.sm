@@ -160,6 +160,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
     MachineID L1_GetX_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
     int pendingAcks,            desc="number of pending acks for invalidates during writeback";
+    bool TraceValid, default="false", desc="Oracle trace identity is valid";
+    int TraceContextId, default="-1", desc="Oracle CPU context identity";
+    Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
   }
 
   structure(TBETable, external="yes") {
@@ -448,6 +451,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
     peek(L1RequestL2Network_in, RequestMsg) {
+      taotraceRubyMemoryFetchByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum);
       enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:GETS;
@@ -456,6 +461,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TraceValid := in_msg.TraceValid;
+        out_msg.TraceContextId := in_msg.TraceContextId;
+        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -656,6 +664,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     tbe.pendingAcks := cache_entry.Sharers.count();
   }
 
+  action(ti_recordTraceRequest, "ti", desc="Record oracle request identity") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      tbe.TraceValid := in_msg.TraceValid;
+      tbe.TraceContextId := in_msg.TraceContextId;
+      tbe.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+    }
+  }
+
+  action(tu_observeUniqueFill, "tu", desc="Record completed unique LLC fill") {
+    taotraceUniqueFillByIdentity(tbe.TraceValid, tbe.TraceContextId,
+        tbe.TraceInstSeqNum);
+  }
+
   action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
     TBEs.deallocate(address);
     unset_tbe();
@@ -849,10 +870,42 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
     L2cache.profileDemandMiss();
+    peek(L1RequestL2Network_in, RequestMsg) {
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 1);
+    }
   }
 
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
     L2cache.profileDemandHit();
+    peek(L1RequestL2Network_in, RequestMsg) {
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 0);
+    }
+  }
+
+  action(uu_profileUpgrade, "\uuu", desc="Profile permission upgrade") {
+    L2cache.profileDemandHit();
+    peek(L1RequestL2Network_in, RequestMsg) {
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 2);
+    }
+  }
+
+  action(uu_profileMergedMiss, "\umm", desc="Profile TBE-merged miss") {
+    L2cache.profileDemandMiss();
+    peek(L1RequestL2Network_in, RequestMsg) {
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 3);
+    }
+  }
+
+  action(uu_profileRemoteSupply, "\urs", desc="Profile remote-owner supply") {
+    L2cache.profileDemandMiss();
+    peek(L1RequestL2Network_in, RequestMsg) {
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 4);
+    }
   }
 
   action(nn_addSharer, "\n", desc="Add L1 sharer to list") {
@@ -959,6 +1012,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     ll_clearSharers;
     nn_addSharer;
     i_allocateTBE;
+    ti_recordTraceRequest;
     ss_recordGetSL1ID;
     a_issueFetchToMemory;
     uu_profileMiss;
@@ -970,6 +1024,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     ll_clearSharers;
     nn_addSharer;
     i_allocateTBE;
+    ti_recordTraceRequest;
     ss_recordGetSL1ID;
     a_issueFetchToMemory;
     uu_profileMiss;
@@ -981,6 +1036,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     ll_clearSharers;
     // nn_addSharer;
     i_allocateTBE;
+    ti_recordTraceRequest;
     xx_recordGetXL1ID;
     a_issueFetchToMemory;
     uu_profileMiss;
@@ -992,6 +1048,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   transition(ISS, Mem_Data, MT_MB) {
     m_writeDataToCache;
+    tu_observeUniqueFill;
     ex_sendExclusiveDataToGetSRequestors;
     s_deallocateTBE;
     o_popIncomingResponseQueue;
@@ -999,6 +1056,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   transition(IS, Mem_Data, SS) {
     m_writeDataToCache;
+    tu_observeUniqueFill;
     e_sendDataToGetSRequestors;
     s_deallocateTBE;
     o_popIncomingResponseQueue;
@@ -1007,6 +1065,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   transition(IM, Mem_Data, MT_MB) {
     m_writeDataToCache;
+    tu_observeUniqueFill;
     ee_sendDataToGetXRequestor;
     s_deallocateTBE;
     o_popIncomingResponseQueue;
@@ -1015,7 +1074,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   transition({IS, ISS}, {L1_GETS, L1_GET_INSTR}, IS) {
     nn_addSharer;
     ss_recordGetSL1ID;
-    uu_profileMiss;
+    uu_profileMergedMiss;
     jj_popL1RequestQueue;
   }
 
@@ -1050,7 +1109,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     fwm_sendFwdInvToSharersMinusRequestor;
     ts_sendInvAckToUpgrader;
     set_setMRU;
-    uu_profileHit;
+    uu_profileUpgrade;
     jj_popL1RequestQueue;
   }
 
@@ -1106,7 +1165,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   transition(MT, L1_GETX, MT_MB) {
     b_forwardRequestToExclusive;
-    uu_profileMiss;
+    uu_profileRemoteSupply;
     set_setMRU;
     jj_popL1RequestQueue;
   }
@@ -1114,7 +1173,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   transition(MT, {L1_GETS, L1_GET_INSTR}, MT_IIB) {
     b_forwardRequestToExclusive;
-    uu_profileMiss;
+    uu_profileRemoteSupply;
     set_setMRU;
     jj_popL1RequestQueue;
   }

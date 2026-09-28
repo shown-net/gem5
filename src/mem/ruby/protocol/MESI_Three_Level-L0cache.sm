@@ -611,6 +611,10 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 address, out_msg.Dest);
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.ObserverType := in_msg.Type;
+        out_msg.TraceValid := in_msg.traceIdentityValid();
+        out_msg.TraceContextId := in_msg.traceContextId();
+        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
       }
     }
   }
@@ -628,6 +632,10 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 address, out_msg.Dest);
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.ObserverType := in_msg.Type;
+        out_msg.TraceValid := in_msg.traceIdentityValid();
+        out_msg.TraceContextId := in_msg.traceContextId();
+        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
       }
     }
   }
@@ -644,6 +652,10 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 address, out_msg.Dest);
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.ObserverType := in_msg.Type;
+        out_msg.TraceValid := in_msg.traceIdentityValid();
+        out_msg.TraceContextId := in_msg.traceContextId();
+        out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
       }
     }
   }
@@ -884,19 +896,35 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   action(uu_profileInstMiss, "\ui", desc="Profile the demand miss") {
-    Icache.profileDemandMiss();
+    Icache.profileDemandMiss(RubyRequestType:IFETCH);
   }
 
   action(uu_profileInstHit, "\uih", desc="Profile the demand hit") {
-    Icache.profileDemandHit();
+    Icache.profileDemandHit(RubyRequestType:IFETCH);
   }
 
   action(uu_profileDataMiss, "\ud", desc="Profile the demand miss") {
-    Dcache.profileDemandMiss();
+    peek(mandatoryQueue_in, RubyRequest) {
+      Dcache.profileDemandMiss(in_msg.Type);
+      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
+          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 1);
+    }
   }
 
   action(uu_profileDataHit, "\udh", desc="Profile the demand hit") {
-    Dcache.profileDemandHit();
+    peek(mandatoryQueue_in, RubyRequest) {
+      Dcache.profileDemandHit(in_msg.Type);
+      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
+          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 0);
+    }
+  }
+
+  action(uu_profileDataUpgrade, "\udu", desc="Profile permission upgrade") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      Dcache.profileDemandUpgrade(in_msg.Type);
+      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
+          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 2);
+    }
   }
 
   // store conditionals
@@ -1079,7 +1107,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(S, Store, SM) {
     i_allocateTBE;
     c_issueUPGRADE;
-    uu_profileDataMiss;
+    uu_profileDataUpgrade;
     k_popMandatoryQueue;
   }
 
@@ -1087,7 +1115,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     i_allocateTBE;
     ll_markLoadLinked;
     c_issueUPGRADE;
-    uu_profileDataMiss;
+    uu_profileDataUpgrade;
     k_popMandatoryQueue;
   }
 

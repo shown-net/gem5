@@ -318,6 +318,9 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         out_msg.Sender := in_msg.Requestor;
         out_msg.MessageSize := MessageSizeType:Request_Control;
         out_msg.Len := 0;
+        out_msg.TraceValid := in_msg.TraceValid;
+        out_msg.TraceContextId := in_msg.TraceContextId;
+        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }

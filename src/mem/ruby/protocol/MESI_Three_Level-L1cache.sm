@@ -450,6 +450,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TraceValid := in_msg.TraceValid;
+        out_msg.TraceContextId := in_msg.TraceContextId;
+        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -468,6 +471,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TraceValid := in_msg.TraceValid;
+        out_msg.TraceContextId := in_msg.TraceContextId;
+        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -485,6 +491,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TraceValid := in_msg.TraceValid;
+        out_msg.TraceContextId := in_msg.TraceContextId;
+        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -895,11 +904,27 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
-    cache.profileDemandMiss();
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.profileDemandMiss(in_msg.ObserverType);
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
+    }
   }
 
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
-    cache.profileDemandHit();
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.profileDemandHit(in_msg.ObserverType);
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 0);
+    }
+  }
+
+  action(uu_profileUpgrade, "\uu", desc="Profile permission upgrade") {
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.profileDemandUpgrade(in_msg.ObserverType);
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 2);
+    }
   }
 
 
@@ -944,7 +969,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   transition({S,SS}, Store, SM) {
     i_allocateTBE;
     c_issueUPGRADE;
-    uu_profileMiss;
+    uu_profileUpgrade;
     k_popL0RequestQueue;
   }
 

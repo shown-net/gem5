@@ -45,6 +45,7 @@
 #include "mem/ruby/protocol/MemoryMsg.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "mem/ruby/system/Sequencer.hh"
+#include "mem/taotrace_response.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -306,6 +307,12 @@ AbstractController::serviceMemoryQueue()
         scheduleEvent(Cycles(1));
         recvTimingResp(pkt);
     } else if (memoryPort.sendTimingReq(pkt)) {
+        if (mem_msg->getType() == MemoryRequestType_MEMORY_READ &&
+            mem_msg->m_TraceValid && mem_msg->m_TraceContextId >= 0) {
+            TaoTraceNativeAccessRegistry::noteMemoryReadTransaction(
+                uint32_t(mem_msg->m_TraceContextId),
+                uint64_t(mem_msg->m_TraceInstSeqNum));
+        }
         mem_queue->dequeue(clockEdge());
         // Since the queue was popped the controller may be able
         // to make more progress. Make sure it wakes up

@@ -78,6 +78,7 @@ enumeration(CoherenceClass, desc="...") {
 structure(CoherenceMsg, desc="...", interface="Message") {
   Addr addr,              desc="Physical address of the cache block";
   CoherenceClass Class,         desc="Type of message (GetS, GetX, PutX, etc)";
+  RubyRequestType ObserverType, default="RubyRequestType_NULL", desc="Statistics only: originating demand type; NULL for prefetch/other";
   RubyAccessMode AccessMode,    desc="user/supervisor access type";
   MachineID Sender,             desc="What component sent this message";
   MachineID Dest,        desc="What machine receives this message";
@@ -85,6 +86,9 @@ structure(CoherenceMsg, desc="...", interface="Message") {
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
   bool Dirty, default="false",  desc="Dirty bit";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
+  bool TraceValid, default="false", desc="Oracle trace identity is valid";
+  int TraceContextId, default="-1", desc="Oracle CPU context identity";
+  Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
 
   bool functionalRead(Packet *pkt) {
     // Valid data block is only present in message with following types

@@ -57,6 +57,7 @@
 #include "mem/ruby/system/Sequencer.hh"
 #include "mem/simple_mem.hh"
 #include "sim/eventq.hh"
+#include "sim/sim_events.hh"
 #include "sim/simulate.hh"
 #include "sim/system.hh"
 
@@ -472,6 +473,13 @@ RubySystem::startup()
         m_cache_recorder = NULL;
         m_warmup_enabled = false;
 
+        // simulate() may create a temporary global tick-limit event while
+        // replaying the cache. Restoring only queue 0's head leaves its
+        // auxiliary-queue barriers behind in a multi-KVM restore.
+        if (simulate_limit_event != original_simulate_limit_event) {
+            simulate_limit_event->deschedule();
+            delete simulate_limit_event;
+        }
         // Restore eventq head
         eventq->replaceHead(eventq_head);
         // Restore exit event pointer
