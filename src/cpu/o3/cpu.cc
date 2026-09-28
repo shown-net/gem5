@@ -338,6 +338,7 @@ CPU::regProbePoints()
     fetch.regProbePoints();
     rename.regProbePoints();
     iew.regProbePoints();
+    iew.instQueue.regProbePoints();
     commit.regProbePoints();
 }
 

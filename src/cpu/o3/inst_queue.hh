@@ -60,6 +60,7 @@
 #include "cpu/timebuf.hh"
 #include "enums/SMTQueuePolicy.hh"
 #include "sim/eventq.hh"
+#include "sim/probe/probe.hh"
 
 namespace gem5
 {
@@ -78,6 +79,16 @@ namespace o3
 class FUPool;
 class CPU;
 class IEW;
+
+struct ExecutionFUEvent
+{
+    OpClass opClass;
+    int fuIndex;
+    Cycles opLatency;
+    bool pipelined;
+    Addr macroPC;
+    MicroPC microPC;
+};
 
 class IQUnit : public SimObject
 {
@@ -266,6 +277,9 @@ class InstructionQueue
 
     /** Returns a vector of FU pools */
     std::vector<FUPool *> allFUPools();
+
+    /** Register scheduler-to-FU events for optional calibration listeners. */
+    void regProbePoints();
 
     /** Returns if there are any ready instructions in the IQ. */
     bool hasReadyInsts();
@@ -633,6 +647,10 @@ class InstructionQueue
         statistics::Scalar fpAluAccesses;
         statistics::Scalar vecAluAccesses;
     } iqIOStats;
+
+  private:
+    ProbePointArg<ExecutionFUEvent> *ppExecutionIssue;
+    ProbePointArg<ExecutionFUEvent> *ppExecutionFUBlocked;
 };
 
 } // namespace o3

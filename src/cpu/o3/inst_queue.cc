@@ -229,7 +229,9 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       totalWidth(params.issueWidth),
       commitToIEWDelay(params.commitToIEWDelay),
       iqStats(cpu, totalWidth),
-      iqIOStats(cpu)
+      iqIOStats(cpu),
+      ppExecutionIssue(nullptr),
+      ppExecutionFUBlocked(nullptr)
 {
     const auto &reg_classes = params.isa[0]->regClasses();
     // Set the number of total physical registers
@@ -256,6 +258,15 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     }
 
     resetState();
+}
+
+void
+InstructionQueue::regProbePoints()
+{
+    ppExecutionIssue = new ProbePointArg<ExecutionFUEvent>(
+        cpu->getProbeManager(), "ExecutionIssue");
+    ppExecutionFUBlocked = new ProbePointArg<ExecutionFUEvent>(
+        cpu->getProbeManager(), "ExecutionFUBlocked");
 }
 
 InstructionQueue::~InstructionQueue()
@@ -987,6 +998,12 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
+            if (idx >= 0 && ppExecutionIssue) {
+                ppExecutionIssue->notify({op_class, idx, op_latency,
+                    fu_pool->isPipelined(op_class),
+                    issuing_inst->pcState().instAddr(),
+                    issuing_inst->pcState().microPC()});
+            }
             ++total_issued;
 
 #if TRACING_ON
@@ -1009,6 +1026,11 @@ InstructionQueue::scheduleReadyInsts()
         } else {
             assert(idx == FUPool::NoFreeFU);
             iqStats.statFuBusy[op_class]++;
+            if (ppExecutionFUBlocked) {
+                ppExecutionFUBlocked->notify({op_class, -1, Cycles(0), false,
+                    issuing_inst->pcState().instAddr(),
+                    issuing_inst->pcState().microPC()});
+            }
             iqStats.fuBusy[tid]++;
             ++order_it;
         }

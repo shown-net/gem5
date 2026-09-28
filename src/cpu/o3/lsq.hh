@@ -59,6 +59,7 @@
 #include "cpu/utils.hh"
 #include "enums/SMTQueuePolicy.hh"
 #include "mem/port.hh"
+#include "mem/taotrace_response.hh"
 #include "sim/sim_object.hh"
 
 namespace gem5
@@ -269,7 +270,7 @@ class LSQ
         uint32_t numInTranslationFragments;
 
 
-        void markDelayed() override { flags.set(Flag::Delayed); }
+        void markDelayed() override;
         bool isDelayed() { return flags.isSet(Flag::Delayed); }
 
       public:
@@ -409,6 +410,22 @@ class LSQ
         {
             assert (_reqs.size() == 1);
             return req();
+        }
+
+        void
+        noteNativeIssuanceClosed()
+        {
+            if (!_reqs.empty()) {
+                TaoTraceNativeAccessRegistry::noteIssuanceClosed(mainReq());
+            }
+        }
+
+        void
+        noteNativeTerminal(TaoTraceNativeTerminalReason reason)
+        {
+            if (!_reqs.empty()) {
+                TaoTraceNativeAccessRegistry::noteTerminal(mainReq(), reason);
+            }
         }
 
         /**

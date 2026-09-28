@@ -49,6 +49,7 @@
 #include <queue>
 
 #include "arch/generic/tlb.hh"
+#include "arch/x86/regs/misc.hh"
 #include "base/types.hh"
 #include "cpu/base.hh"
 #include "cpu/exetrace.hh"
@@ -61,6 +62,7 @@
 #include "debug/Fetch.hh"
 #include "debug/O3CPU.hh"
 #include "mem/packet.hh"
+#include "mem/taotrace_response.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/byteswap.hh"
 #include "sim/core.hh"
@@ -284,7 +286,6 @@ Fetch::startupStage()
 {
     assert(bac != nullptr);
     assert(ftq != nullptr);
-    assert(priorityList.empty());
     resetStage();
 
     // Fetch needs to start fetching instructions at the very beginning,
@@ -364,6 +365,10 @@ Fetch::processCacheCompletion(PacketPtr pkt)
     // to return.
     if (fetchStatus[tid] != IcacheWaitResponse ||
         pkt->req != memReq[tid]) {
+        TaoTraceFrontendRegistry::noteTerminal(
+            pkt->req,
+            TaoTraceFrontendRegistry::Terminal::SquashedResponse,
+            uint64_t(curTick()));
         ++fetchStats.icacheSquashes;
         delete pkt;
         return;
@@ -390,6 +395,9 @@ Fetch::processCacheCompletion(PacketPtr pkt)
 
     pkt->req->setAccessLatency();
     cpu->ppInstAccessComplete->notify(pkt);
+    TaoTraceFrontendRegistry::noteTerminal(
+        pkt->req, TaoTraceFrontendRegistry::Terminal::Response,
+        uint64_t(curTick()));
     // Reset the mem req to NULL.
     delete pkt;
     memReq[tid] = NULL;
@@ -562,6 +570,11 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
         Request::INST_FETCH, cpu->instRequestorId(), pc,
         cpu->thread[tid]->contextId());
 
+    TaoTraceFrontendRegistry::noteRequestStart(
+        mem_req, cpu->inUserMode(tid),
+        fetchBufferValid[tid], fetchBufferBlockPC == fetchBufferPC[tid],
+        uint64_t(curTick()));
+
     mem_req->taskId(cpu->taskId());
 
     memReq[tid] = mem_req;
@@ -585,10 +598,16 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
     // Wake up CPU if it was idle
     cpu->wakeCPU();
 
+    TaoTraceFrontendRegistry::noteTranslationComplete(mem_req);
+
     if (fetchStatus[tid] != ItlbWait || mem_req != memReq[tid] ||
         mem_req->getVaddr() != memReq[tid]->getVaddr()) {
         DPRINTF(Fetch, "[tid:%i] Ignoring itlb completed after squash\n",
                 tid);
+        TaoTraceFrontendRegistry::noteTerminal(
+            mem_req,
+            TaoTraceFrontendRegistry::Terminal::TranslationSquash,
+            uint64_t(curTick()));
         ++fetchStats.tlbSquashes;
         return;
     }
@@ -602,6 +621,9 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         if (!cpu->system->isMemAddr(mem_req->getPaddr())) {
             warn("Address %#x is outside of physical memory, stopping fetch\n",
                     mem_req->getPaddr());
+            TaoTraceFrontendRegistry::noteTerminal(
+                mem_req, TaoTraceFrontendRegistry::Terminal::NoGoodAddress,
+                uint64_t(curTick()));
             fetchStatus[tid] = NoGoodAddr;
             memReq[tid] = NULL;
             return;
@@ -618,7 +640,9 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         fetchStats.cacheLines++;
 
         // Access the cache.
-        if (!icachePort.sendTimingReq(data_pkt)) {
+        const bool accepted = icachePort.sendTimingReq(data_pkt);
+        TaoTraceFrontendRegistry::noteSendAttempt(mem_req, accepted);
+        if (!accepted) {
             assert(retryPkt == NULL);
             assert(retryTid == InvalidThreadID);
             DPRINTF(Fetch, "[tid:%i] Out of MSHRs!\n", tid);
@@ -652,6 +676,9 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
                 "[tid:%i] Got back req with addr %#x but expected %#x\n",
                 tid, mem_req->getVaddr(), memReq[tid]->getVaddr());
         // Translation faulted, icache request won't be sent.
+        TaoTraceFrontendRegistry::noteTerminal(
+            mem_req, TaoTraceFrontendRegistry::Terminal::TranslationFault,
+            uint64_t(curTick()));
         memReq[tid] = NULL;
 
         // Send the fault to commit.  This thread will not do anything
@@ -713,13 +740,18 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     DPRINTF(Fetch, "[tid:%i] Squashing, setting PC to: %s.\n",
             tid, new_pc);
 
+    TaoTraceFrontendRegistry::noteSquash(
+        uint32_t(cpu->thread[tid]->contextId()), memReq[tid] != nullptr);
+
     set(pc[tid], new_pc);
     fetchOffset[tid] = 0;
     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
-        !squashInst->isLastMicroop())
+        !squashInst->isLastMicroop()) {
         macroop[tid] = squashInst->macroop;
-    else
+        macroopFromUser[tid] = squashInst->fetchedFromUser;
+    } else {
         macroop[tid] = NULL;
+    }
     decoder[tid]->reset();
 
     // Clear the icache miss if it's outstanding.
@@ -737,6 +769,10 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     if (retryTid == tid) {
         assert(cacheBlocked);
         if (retryPkt) {
+            TaoTraceFrontendRegistry::noteTerminal(
+                retryPkt->req,
+                TaoTraceFrontendRegistry::Terminal::RetryDiscard,
+                uint64_t(curTick()));
             delete retryPkt;
         }
         retryPkt = NULL;
@@ -913,6 +949,14 @@ Fetch::tick()
 
     // Reset the number of the instruction we've fetched.
     numInst = 0;
+
+    // One sample per O3 clock and thread, gated by TaoTrace's exact per-core
+    // measurement window rather than the process-wide stats reset/dump.
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        TaoTraceFrontendRegistry::noteStatusCycle(
+            uint32_t(cpu->thread[tid]->contextId()),
+            static_cast<unsigned>(fetchStatus[tid]));
+    }
 }
 
 bool
@@ -1017,6 +1061,10 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
     instruction->setTid(tid);
+    instruction->fetchedFromUser = cpu->inUserMode(tid);
+    instruction->fetchedAddressSpaceId =
+        cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
+        ~uint64_t(0xfff);
 
     instruction->setThreadState(cpu->thread[tid]);
 
@@ -1166,6 +1214,8 @@ Fetch::fetch(bool &status_change)
 
     StaticInstPtr staticInst = NULL;
     StaticInstPtr curMacroop = macroop[tid];
+    bool curMacroopFromUser = curMacroop ? macroopFromUser[tid] :
+        cpu->inUserMode(tid);
 
     // If the read of the first instruction was successful, then grab the
     // instructions from the rest of the cache line and put them into the
@@ -1250,6 +1300,7 @@ Fetch::fetch(bool &status_change)
 
                     if (staticInst->isMacroop()) {
                         curMacroop = staticInst;
+                        curMacroopFromUser = cpu->inUserMode(tid);
                     } else {
                         pcOffset = 0;
                     }
@@ -1275,6 +1326,8 @@ Fetch::fetch(bool &status_change)
 
             DynInstPtr instruction = buildInst(
                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
+            if (curMacroop)
+                instruction->fetchedFromUser = curMacroopFromUser;
 
             ppFetch->notify(instruction);
             numInst++;
@@ -1381,6 +1434,7 @@ Fetch::fetch(bool &status_change)
     }
 
     macroop[tid] = curMacroop;
+    macroopFromUser[tid] = curMacroopFromUser;
     fetchOffset[tid] = pcOffset;
 
     if (numInst > 0) {
@@ -1404,6 +1458,9 @@ Fetch::recvReqRetry()
 {
     // If a trap is pending to execute, discard the retry
     if (retryPkt != NULL && fetchStatus[retryTid] == TrapPending) {
+        TaoTraceFrontendRegistry::noteTerminal(
+            retryPkt->req, TaoTraceFrontendRegistry::Terminal::RetryDiscard,
+            uint64_t(curTick()));
         delete retryPkt;
         retryPkt = NULL;
         retryTid = InvalidThreadID;
@@ -1414,7 +1471,9 @@ Fetch::recvReqRetry()
         assert(retryTid != InvalidThreadID);
         assert(fetchStatus[retryTid] == IcacheWaitRetry);
 
-        if (icachePort.sendTimingReq(retryPkt)) {
+        const bool accepted = icachePort.sendTimingReq(retryPkt);
+        TaoTraceFrontendRegistry::noteSendAttempt(retryPkt->req, accepted);
+        if (accepted) {
             fetchStatus[retryTid] = IcacheWaitResponse;
             // Notify Fetch Request probe when a retryPkt is successfully sent.
             // Note that notify must be called before retryPkt is set to NULL.

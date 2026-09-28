@@ -175,7 +175,93 @@ class CPU : public BaseCPU
   public:
     /** Constructs a CPU with the given parameters. */
     CPU(const BaseO3CPUParams &params);
+    void
+    requestTraceCommitStop()
+    {
+        traceCommitStopRequested = true;
+    }
+    bool
+    consumeTraceCommitStopRequest()
+    {
+        const bool requested = traceCommitStopRequested;
+        traceCommitStopRequested = false;
+        return requested;
+    }
 
+    // Marker-window statistics need an O3 boundary, not merely a commit
+    // notification: an instruction younger than the marker may otherwise
+    // issue before the Python reset/dump handler runs.  TaoTrace arms this
+    // private fence only for an already-selected marker window.
+    void requestTraceMarkerFence() { traceMarkerFenceRequested = true; }
+    bool claimTraceMarkerFence()
+    {
+        if (!traceMarkerFenceRequested || traceMarkerFenceInstalled)
+            return false;
+        traceMarkerFenceInstalled = true;
+        return true;
+    }
+    bool traceMarkerFenceHeld() const { return traceMarkerFenceHeld_; }
+    bool traceMarkerFenceReady() const { return traceMarkerFenceReady_; }
+    void noteTraceMarkerFenceCommit(InstSeqNum seq_num)
+    {
+        if (traceMarkerFenceInstalled &&
+            seq_num == traceMarkerFenceSeqNum) {
+            traceMarkerFenceReady_ = true;
+            traceMarkerFenceHeld_ = true;
+        }
+    }
+    void setTraceMarkerFenceInst(InstSeqNum seq_num)
+    {
+        traceMarkerFenceInstalled = true;
+        traceMarkerFenceSeqNum = seq_num;
+    }
+    void confirmTraceMarkerFenceCommit()
+    {
+        traceMarkerFenceReady_ = true;
+        traceMarkerFenceHeld_ = true;
+    }
+    void noteTraceMarkerFenceSquash(InstSeqNum seq_num)
+    {
+        if (traceMarkerFenceInstalled && seq_num == traceMarkerFenceSeqNum) {
+            traceMarkerFenceRequested = false;
+            traceMarkerFenceInstalled = false;
+            traceMarkerFenceHeld_ = false;
+            traceMarkerFenceReady_ = false;
+            traceMarkerFenceSeqNum = 0;
+        }
+    }
+    void releaseTraceMarkerFence()
+    {
+        traceMarkerFenceRequested = false;
+        traceMarkerFenceInstalled = false;
+        traceMarkerFenceHeld_ = false;
+        traceMarkerFenceReady_ = false;
+        traceMarkerFenceSeqNum = 0;
+        if (traceMarkerFenceSuspended_) {
+            traceMarkerFenceSuspended_ = false;
+            activateContext(0);
+        } else {
+            wakeCPU();
+        }
+    }
+    void holdTraceMarkerFence()
+    {
+        if (!traceMarkerFenceSuspended_) {
+            traceMarkerFenceSuspended_ = true;
+            suspendContext(0);
+        }
+    }
+
+  private:
+    bool traceCommitStopRequested = false;
+    bool traceMarkerFenceRequested = false;
+    bool traceMarkerFenceInstalled = false;
+    bool traceMarkerFenceHeld_ = false;
+    bool traceMarkerFenceReady_ = false;
+    bool traceMarkerFenceSuspended_ = false;
+    InstSeqNum traceMarkerFenceSeqNum = 0;
+
+  public:
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
 

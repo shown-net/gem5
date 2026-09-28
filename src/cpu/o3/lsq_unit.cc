@@ -265,6 +265,9 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Number of stores squashed"),
       ADD_STAT(rescheduledLoads, statistics::units::Count::get(),
                "Number of loads that were rescheduled"),
+      ADD_STAT(partialForwardRetries, statistics::units::Count::get(),
+               "Load execution attempts rescheduled for partial store "
+               "coverage"),
       ADD_STAT(blockedByCache, statistics::units::Count::get(),
                "Number of times an access to memory failed due to the cache "
                "being blocked"),
@@ -832,6 +835,10 @@ LSQUnit::writebackStores()
         // Store didn't write any data so no need to write it back to
         // memory.
         if (storeWBIt->size() == 0) {
+            if (storeWBIt->hasRequest()) {
+                storeWBIt->request()->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::ZeroSize);
+            }
             /* It is important that the preincrement happens at (or before)
              * the call, as the the code of completeStore checks
              * storeWBIt. */
@@ -840,6 +847,10 @@ LSQUnit::writebackStores()
         }
 
         if (storeWBIt->instruction()->isDataPrefetch()) {
+            if (storeWBIt->hasRequest()) {
+                storeWBIt->request()->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::PrefetchSkipped);
+            }
             storeWBIt++;
             continue;
         }
@@ -894,6 +905,8 @@ LSQUnit::writebackStores()
             request->packetSent();
 
             if (!success) {
+                request->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::FailedStoreConditional);
                 request->complete();
                 // Instantly complete this store.
                 DPRINTF(LSQUnit, "Store conditional [sn:%lli] failed.  "
@@ -913,6 +926,8 @@ LSQUnit::writebackStores()
         }
 
         if (request->mainReq()->isLocalAccess()) {
+            request->noteNativeTerminal(
+                TaoTraceNativeTerminalReason::LocalAccess);
             assert(!inst->isStoreConditional());
             assert(!inst->inHtmTransactionalState());
             gem5::ThreadContext *thread = cpu->tcBase(lsqID);
@@ -1390,6 +1405,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
     }
 
     if (request->mainReq()->isLocalAccess()) {
+        request->noteNativeTerminal(
+            TaoTraceNativeTerminalReason::LocalAccess);
         assert(!load_inst->memData);
         load_inst->memData = new uint8_t[MaxDataBytes];
 
@@ -1472,6 +1489,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
             }
 
             if (coverage == AddrRangeCoverage::FullAddrRangeCoverage) {
+                request->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::StoreForward);
                 // Get shift amount for offset into the store's data.
                 int shift_amt = request->mainReq()->getVaddr() -
                     store_it->instruction()->effAddr;
@@ -1575,6 +1594,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 load_inst->clearIssued();
                 load_inst->effAddrValid(false);
                 ++stats.rescheduledLoads;
+                ++stats.partialForwardRetries;
 
                 // Do not generate a writeback event as this instruction is not
                 // complete.

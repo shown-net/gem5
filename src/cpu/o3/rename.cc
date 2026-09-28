@@ -534,6 +534,15 @@ Rename::rename(bool &status_change, ThreadID tid)
 void
 Rename::renameInsts(ThreadID tid)
 {
+    // A selected TaoTrace marker uses this one-shot private fence to keep
+    // younger uops out of IEW until the marker's commit-side stat operation
+    // has completed.  It is not an ISA serialization and is never armed for
+    // ordinary O3 execution.
+    if (cpu->traceMarkerFenceHeld()) {
+        block(tid);
+        toDecode->renameUnblock[tid] = false;
+        return;
+    }
     // Instructions can be either in the skid buffer or the queue of
     // instructions coming from decode, depending on the status.
     int insts_available = renameStatus[tid] == Unblocking ?
@@ -711,6 +720,11 @@ Rename::renameInsts(ThreadID tid)
         // instructions.  This is mainly due to lack of support for
         // out-of-order operations of either of those classes of
         // instructions.
+        if (cpu->claimTraceMarkerFence()) {
+            inst->setSerializeBefore();
+            cpu->setTraceMarkerFenceInst(inst->seqNum);
+        }
+
         if (inst->isSerializeBefore() && !inst->isSerializeHandled()) {
             DPRINTF(Rename, "Serialize before instruction encountered.\n");
 
