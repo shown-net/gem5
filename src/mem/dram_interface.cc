@@ -204,8 +204,10 @@ DRAMInterface::activateBank(Rank& rank_ref, Bank& bank_ref,
             "%d active\n", bank_ref.bank, rank_ref.rank, act_at,
             ranks[rank_ref.rank]->numBanksActive);
 
-    rank_ref.cmdList.push_back(Command(MemCommand::ACT, bank_ref.bank,
-                               act_at));
+    if (enableDRAMPowerStats) {
+        rank_ref.cmdList.push_back(Command(MemCommand::ACT, bank_ref.bank,
+                                   act_at));
+    }
 
     DPRINTF(DRAMPower, "%llu,ACT,%d,%d\n", divCeil(act_at, tCK) -
             timeStampOffset, bank_ref.bank, rank_ref.rank);
@@ -321,9 +323,10 @@ DRAMInterface::prechargeBank(Rank& rank_ref, Bank& bank, Tick pre_tick,
             rank_ref.numBanksActive);
 
     if (trace) {
-
-        rank_ref.cmdList.push_back(Command(MemCommand::PRE, bank.bank,
-                                   pre_at));
+        if (enableDRAMPowerStats) {
+            rank_ref.cmdList.push_back(Command(MemCommand::PRE, bank.bank,
+                                       pre_at));
+        }
         DPRINTF(DRAMPower, "%llu,PRE,%d,%d\n", divCeil(pre_at, tCK) -
                 timeStampOffset, bank.bank, rank_ref.rank);
     }
@@ -552,10 +555,11 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick next_burst_at,
     std::string mem_cmd = mem_pkt->isRead() ? "RD" : "WR";
 
     // MemCommand required for DRAMPower library
-    MemCommand::cmds command = (mem_cmd == "RD") ? MemCommand::RD :
-                                                   MemCommand::WR;
-
-    rank_ref.cmdList.push_back(Command(command, mem_pkt->bank, cmd_at));
+    if (enableDRAMPowerStats) {
+        MemCommand::cmds command = (mem_cmd == "RD") ? MemCommand::RD :
+                                                       MemCommand::WR;
+        rank_ref.cmdList.push_back(Command(command, mem_pkt->bank, cmd_at));
+    }
 
     DPRINTF(DRAMPower, "%llu,%s,%d,%d\n", divCeil(cmd_at, tCK) -
             timeStampOffset, mem_cmd, mem_pkt->bank, mem_pkt->rank);
@@ -657,6 +661,7 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
       maxAccessesPerRow(_p.max_accesses_per_row),
       timeStampOffset(0), activeRank(0),
       enableDRAMPowerdown(_p.enable_dram_powerdown),
+      enableDRAMPowerStats(_p.enable_dram_power_stats),
       lastStatsResetTick(0),
       stats(*this)
 {
@@ -1364,7 +1369,9 @@ DRAMInterface::Rank::processRefreshEvent()
             }
 
             // precharge all banks in rank
-            cmdList.push_back(Command(MemCommand::PREA, 0, pre_at));
+            if (dram.enableDRAMPowerStats) {
+                cmdList.push_back(Command(MemCommand::PREA, 0, pre_at));
+            }
 
             DPRINTF(DRAMPower, "%llu,PREA,0,%d\n",
                     divCeil(pre_at, dram.tCK) -
@@ -1411,7 +1418,9 @@ DRAMInterface::Rank::processRefreshEvent()
         }
 
         // at the moment this affects all ranks
-        cmdList.push_back(Command(MemCommand::REF, 0, curTick()));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::REF, 0, curTick()));
+        }
 
         // Update the stats
         updatePowerStats();
@@ -1518,7 +1527,9 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
     if (pwr_state == PWR_ACT_PDN) {
         schedulePowerEvent(pwr_state, tick);
         // push command to DRAMPower
-        cmdList.push_back(Command(MemCommand::PDN_F_ACT, 0, tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::PDN_F_ACT, 0, tick));
+        }
         DPRINTF(DRAMPower, "%llu,PDN_F_ACT,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwr_state == PWR_PRE_PDN) {
@@ -1527,7 +1538,9 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
         // This is neglected here.
         schedulePowerEvent(pwr_state, tick);
         //push Command to DRAMPower
-        cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
+        }
         DPRINTF(DRAMPower, "%llu,PDN_F_PRE,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwr_state == PWR_REF) {
@@ -1537,7 +1550,9 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
         // this is not considered.
         schedulePowerEvent(PWR_PRE_PDN, tick);
         //push Command to DRAMPower
-        cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
+        }
         DPRINTF(DRAMPower, "%llu,PDN_F_PRE,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwr_state == PWR_SREF) {
@@ -1547,7 +1562,9 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
         // this is not considered.
         schedulePowerEvent(PWR_SREF, tick);
         // push Command to DRAMPower
-        cmdList.push_back(Command(MemCommand::SREN, 0, tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::SREN, 0, tick));
+        }
         DPRINTF(DRAMPower, "%llu,SREN,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     }
@@ -1597,16 +1614,22 @@ DRAMInterface::Rank::scheduleWakeUpEvent(Tick exit_delay)
     // use pwrStateTrans for cases where we have a power event scheduled
     // to enter low power that has not yet been processed
     if (pwrStateTrans == PWR_ACT_PDN) {
-        cmdList.push_back(Command(MemCommand::PUP_ACT, 0, wake_up_tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::PUP_ACT, 0, wake_up_tick));
+        }
         DPRINTF(DRAMPower, "%llu,PUP_ACT,0,%d\n", divCeil(wake_up_tick,
                 dram.tCK) - dram.timeStampOffset, rank);
 
     } else if (pwrStateTrans == PWR_PRE_PDN) {
-        cmdList.push_back(Command(MemCommand::PUP_PRE, 0, wake_up_tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::PUP_PRE, 0, wake_up_tick));
+        }
         DPRINTF(DRAMPower, "%llu,PUP_PRE,0,%d\n", divCeil(wake_up_tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwrStateTrans == PWR_SREF) {
-        cmdList.push_back(Command(MemCommand::SREX, 0, wake_up_tick));
+        if (dram.enableDRAMPowerStats) {
+            cmdList.push_back(Command(MemCommand::SREX, 0, wake_up_tick));
+        }
         DPRINTF(DRAMPower, "%llu,SREX,0,%d\n", divCeil(wake_up_tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     }
@@ -1766,6 +1789,11 @@ DRAMInterface::Rank::processPowerEvent()
 void
 DRAMInterface::Rank::updatePowerStats()
 {
+    if (!dram.enableDRAMPowerStats) {
+        cmdList.clear();
+        return;
+    }
+
     // All commands up to refresh have completed
     // flush cmdList to DRAMPower
     flushCmdList();
@@ -1821,6 +1849,11 @@ DRAMInterface::Rank::computeStats()
 
 void
 DRAMInterface::Rank::resetStats() {
+    if (!dram.enableDRAMPowerStats) {
+        cmdList.clear();
+        return;
+    }
+
     // The only way to clear the counters in DRAMPower is to call
     // calcWindowEnergy function as that then calls clearCounters. The
     // clearCounters method itself is private.

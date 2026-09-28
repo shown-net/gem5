@@ -548,6 +548,9 @@ class DRAMInterface : public MemInterface
     /** Enable or disable DRAM powerdown states. */
     bool enableDRAMPowerdown;
 
+    /** Enable or disable DRAMPower command replay and power stats. */
+    bool enableDRAMPowerStats;
+
     /** The time when stats were last reset used to calculate average power */
     Tick lastStatsResetTick;
 

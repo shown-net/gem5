@@ -143,6 +143,7 @@ action(AllocateTBE_SeqRequest, desc="") {
       out_msg.fwdRequestor := machineID;
       out_msg.seqReq := in_msg.getRequestPtr();
       out_msg.isSeqReqValid := true;
+      out_msg.seqReqType := in_msg.Type;
       assert(in_msg.Prefetch == PrefetchBit:No);
       out_msg.is_local_pf := false;
       out_msg.is_remote_pf := false;
@@ -200,6 +201,7 @@ action(AllocateTBE_SeqDvmRequest, desc="") {
       out_msg.fwdRequestor := machineID;
       out_msg.seqReq := in_msg.getRequestPtr();
       out_msg.isSeqReqValid := true;
+      out_msg.seqReqType := in_msg.Type;
 
 
       if (in_msg.Type == RubyRequestType:TLBI) {
@@ -234,6 +236,7 @@ action(AllocateTBE_PfRequest, desc="Allocate TBE for prefetch request") {
       out_msg.fwdRequestor := machineID;
       out_msg.seqReq := in_msg.getRequestPtr();
       out_msg.isSeqReqValid := true;
+      out_msg.seqReqType := in_msg.Type;
       assert(in_msg.Prefetch != PrefetchBit:No);
       out_msg.is_local_pf := true;
       out_msg.is_remote_pf := false;
@@ -3781,7 +3784,11 @@ action(Profile_Miss, desc="") {
   bool is_demand := (tbe.is_local_pf || tbe.is_remote_pf) == false;
   bool is_remote_can_notify := tbe.is_remote_pf && upstream_prefetch_trains_prefetcher;
   if (is_demand) {
-    cache.profileDemandMiss();
+    if (tbe.isSeqReqValid) {
+      cache.profileDemandMiss(tbe.seqReqType);
+    } else {
+      cache.profileDemandMiss();
+    }
   } else {
     assert(use_prefetcher || tbe.is_remote_pf);
     cache.profilePrefetchMiss();
@@ -3808,7 +3815,11 @@ action(Profile_Hit, desc="") {
   bool is_demand := (tbe.is_local_pf || tbe.is_remote_pf) == false;
   bool is_remote_can_notify := tbe.is_remote_pf && upstream_prefetch_trains_prefetcher;
   if (is_demand) {
-    cache.profileDemandHit();
+    if (tbe.isSeqReqValid) {
+      cache.profileDemandHit(tbe.seqReqType);
+    } else {
+      cache.profileDemandHit();
+    }
   } else {
     assert(use_prefetcher || tbe.is_remote_pf);
     cache.profilePrefetchHit();

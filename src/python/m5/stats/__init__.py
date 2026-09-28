@@ -357,31 +357,56 @@ def prepare():
     _visit_stats(lambda g, s: s.prepare())
 
 
-def _dump_to_visitor(visitor, roots=None):
+def _dump_to_visitor(visitor, roots=None, stat_names=None):
+    wanted = (
+        None
+        if stat_names is None
+        else frozenset(str(name).rsplit("::", 1)[0] for name in stat_names)
+    )
+    prefixes = None
+    if wanted is not None:
+        prefixes = {""}
+        for name in wanted:
+            parts = name.split(".")
+            prefixes.update(
+                ".".join(parts[:end]) for end in range(1, len(parts))
+            )
+
+    def group_has_wanted(path):
+        return wanted is None or ".".join(path) in prefixes
+
+    def stat_is_wanted(path, stat):
+        return wanted is None or ".".join(path + [stat.name]) in wanted
+
     # New stats
-    def dump_group(group):
+    def dump_group(group, path):
         for stat in group.getStats():
-            stat.visit(visitor)
+            if stat_is_wanted(path, stat):
+                stat.visit(visitor)
         for n, g in group.getStatGroups().items():
-            visitor.beginGroup(n)
-            dump_group(g)
-            visitor.endGroup()
+            child_path = path + [n]
+            if group_has_wanted(child_path):
+                visitor.beginGroup(n)
+                dump_group(g, child_path)
+                visitor.endGroup()
 
     if roots:
         # New stats from selected subroots.
         for root in roots:
             for p in root.path_list():
                 visitor.beginGroup(p)
-            dump_group(root)
+            if group_has_wanted(root.path_list()):
+                dump_group(root, root.path_list())
             for p in reversed(root.path_list()):
                 visitor.endGroup()
     else:
         # New stats starting from root.
-        dump_group(Root.getInstance())
+        dump_group(Root.getInstance(), [])
 
         # Legacy stats
         for stat in stats_list:
-            stat.visit(visitor)
+            if wanted is None or stat.name in wanted:
+                stat.visit(visitor)
 
 
 lastDump = 0
@@ -389,12 +414,13 @@ lastDump = 0
 global_dump_roots = []
 
 
-def dump(roots=None, message=""):
+def dump(roots=None, message="", stat_names=None):
     """Dump all statistics data to the registered outputs
 
     Args:
         roots: Optional list of roots to dump
         message: Optional message to include in text output headers
+        stat_names: Optional exact names to dump from new and legacy stats
     """
 
     all_roots = []
@@ -432,7 +458,9 @@ def dump(roots=None, message=""):
         else:
             if output.valid():
                 output.begin(message)
-                _dump_to_visitor(output, roots=all_roots)
+                _dump_to_visitor(
+                    output, roots=all_roots, stat_names=stat_names
+                )
                 output.end()
 
 

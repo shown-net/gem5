@@ -677,8 +677,9 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // information (e.g., PC of requesting instruction, virtual address of this
     // request, etc.). Not all transactions have this field set if they are not
     // triggered directly by a demand request from CPU.
-    RequestPtr seqReq,      default="nullptr", desc="Pointer to original request from CPU/sequencer";
-    bool isSeqReqValid,     default="false",   desc="Set if seqReq is valid (not nullptr)";
+    RequestPtr seqReq,           default="nullptr", desc="Pointer to original request from CPU/sequencer";
+    bool isSeqReqValid,          default="false",   desc="Set if seqReq is valid (not nullptr)";
+    RubyRequestType seqReqType,  default="RubyRequestType_NULL", desc="Type of original request from CPU/sequencer";
 
     // Transaction state information
     State state,    desc="SLICC line state";

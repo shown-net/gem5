@@ -351,9 +351,9 @@ void notifyCoalesced(Addr addr, RubyRequestType type, RequestPtr req,
   DPRINTF(RubySlicc, "notifyCoalesced(addr=%#x, type=%s, was_miss=%d)\n",
                       addr, type, was_miss);
   if (was_miss) {
-    cache.profileDemandMiss();
+    cache.profileDemandMiss(type);
   } else {
-    cache.profileDemandHit();
+    cache.profileDemandHit(type);
   }
   if (use_prefetcher) {
     bool is_read := (type == RubyRequestType:LD) ||
@@ -447,6 +447,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
+  tbe.seqReqType := in_msg.seqReqType;
   tbe.is_local_pf := in_msg.is_local_pf;
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
@@ -488,6 +489,7 @@ TBE allocateDvmRequestTBE(Addr txnId, CHIRequestMsg in_msg), return_by_pointer="
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
+  tbe.seqReqType := in_msg.seqReqType;
   tbe.is_local_pf := in_msg.is_local_pf;
   tbe.is_remote_pf := in_msg.is_remote_pf;
 
@@ -665,6 +667,7 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   tbe.pendReqType := type;
   out_msg.isSeqReqValid := tbe.isSeqReqValid;
   out_msg.seqReq := tbe.seqReq;
+  out_msg.seqReqType := tbe.seqReqType;
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
   out_msg.txnId := tbe.txnId;
@@ -709,6 +712,7 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.retToSrc := tbe.pendReqRetToSrc;
   out_msg.isSeqReqValid := tbe.isSeqReqValid;
   out_msg.seqReq := tbe.seqReq;
+  out_msg.seqReqType := tbe.seqReqType;
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
   out_msg.atomic_op.clear();
@@ -733,6 +737,7 @@ void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.retToSrc := tbe.pendReqRetToSrc;
   out_msg.isSeqReqValid := tbe.isSeqReqValid;
   out_msg.seqReq := tbe.seqReq;
+  out_msg.seqReqType := tbe.seqReqType;
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
 }
