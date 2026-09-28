@@ -649,11 +649,24 @@ private:
     CPU *marker_cpu_ = nullptr;
     uint64_t marker_ordinal_ = 0, marker_begin_ = 1, marker_end_ = 2;
     uint64_t marker_address_space_ = 0;
-    unsigned marker_state_ = 0;
-    bool marker_pending_ = false;
-    bool marker_boundary_committed_ = false;
-    bool marker_boundary_begin_ = false;
-    static bool marker_exit_scheduled_;
+    enum class MarkerMeasurementPhase : uint8_t {
+        Warming,
+        Measuring,
+        Complete,
+    };
+    enum class MarkerBoundaryPhase : uint8_t {
+        Idle,
+        WaitingForFence,
+        ExitScheduled,
+    };
+    enum class MarkerBoundaryKind : uint8_t {
+        Begin,
+        End,
+    };
+    MarkerMeasurementPhase marker_measurement_phase_ =
+        MarkerMeasurementPhase::Warming;
+    MarkerBoundaryPhase marker_boundary_phase_ = MarkerBoundaryPhase::Idle;
+    MarkerBoundaryKind marker_boundary_kind_ = MarkerBoundaryKind::Begin;
     std::unique_ptr<MarkerPcTrace> marker_pc_trace_;
     static TaoTrace *marker_owner_;
     static uint64_t marker_address_root_;

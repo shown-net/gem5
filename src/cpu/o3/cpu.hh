@@ -237,7 +237,19 @@ class CPU : public BaseCPU
         traceMarkerFenceHeld_ = false;
         traceMarkerFenceReady_ = false;
         traceMarkerFenceSeqNum = 0;
-        wakeCPU();
+        if (traceMarkerFenceSuspended_) {
+            traceMarkerFenceSuspended_ = false;
+            activateContext(0);
+        } else {
+            wakeCPU();
+        }
+    }
+    void holdTraceMarkerFence()
+    {
+        if (!traceMarkerFenceSuspended_) {
+            traceMarkerFenceSuspended_ = true;
+            suspendContext(0);
+        }
     }
 
   private:
@@ -246,6 +258,7 @@ class CPU : public BaseCPU
     bool traceMarkerFenceInstalled = false;
     bool traceMarkerFenceHeld_ = false;
     bool traceMarkerFenceReady_ = false;
+    bool traceMarkerFenceSuspended_ = false;
     InstSeqNum traceMarkerFenceSeqNum = 0;
 
   public:

@@ -58,7 +58,6 @@ namespace gem5
 namespace o3
 {
 
-bool TaoTrace::marker_exit_scheduled_ = false;
 
 // Fix B: 跨实例共享的 line 状态机（每核一个 TaoTrace 实例 → 必须共享）
 std::unordered_map<uint64_t, TaoTrace::LineState> TaoTrace::line_states_;
@@ -990,14 +989,14 @@ TaoTrace::selectMarkerWindow(uint64_t begin, uint64_t end)
 void
 TaoTrace::acknowledgeMarker()
 {
-    fatal_if(marker_owner_ != this || !marker_pending_,
+    fatal_if(marker_owner_ != this ||
+                 marker_boundary_phase_ != MarkerBoundaryPhase::ExitScheduled,
              "no pending TaoTrace Marker boundary");
-    if (marker_state_ == 1 && marker_pc_trace_) {
+    if (marker_measurement_phase_ == MarkerMeasurementPhase::Measuring &&
+        marker_pc_trace_) {
         marker_pc_trace_->initializeTrace();
     }
-    marker_pending_ = false;
-    marker_boundary_committed_ = false;
-    marker_exit_scheduled_ = false;
+    marker_boundary_phase_ = MarkerBoundaryPhase::Idle;
     releaseMarkerFence();
 }
 
@@ -1025,7 +1024,8 @@ TaoTrace::observeMarkerFetch(const DynInstPtr &inst)
 {
     auto *owner = marker_owner_;
     if (!owner || !owner->marker_capture_started_ ||
-        owner->marker_state_ == 2 || !inst->fetchedFromUser ||
+        owner->marker_measurement_phase_ == MarkerMeasurementPhase::Complete ||
+        !inst->fetchedFromUser ||
         inst->pcState().instAddr() != marker_pc_ ||
         owner->marker_address_space_ != inst->fetchedAddressSpaceId) {
         return;
@@ -1045,13 +1045,20 @@ void
 TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
 {
     auto *owner = marker_owner_;
-    if (owner && owner->marker_boundary_committed_ &&
-        markerFenceReady() && !marker_exit_scheduled_) {
-        marker_exit_scheduled_ = true;
+    if (owner &&
+        owner->marker_boundary_phase_ == MarkerBoundaryPhase::WaitingForFence &&
+        markerFenceReady()) {
+        owner->marker_boundary_phase_ = MarkerBoundaryPhase::ExitScheduled;
+        if (owner->marker_boundary_kind_ == MarkerBoundaryKind::End) {
+            for (auto *trace : marker_instances_)
+                trace->marker_cpu_->holdTraceMarkerFence();
+        }
         exitSimulationLoopNow(8, {{"kind",
-            owner->marker_boundary_begin_ ? "begin" : "end"}});
+            owner->marker_boundary_kind_ == MarkerBoundaryKind::Begin ?
+                "begin" : "end"}});
     }
-    if (!owner || !marker_capture_started_ || owner->marker_state_ == 2 ||
+    if (!owner || !marker_capture_started_ ||
+        owner->marker_measurement_phase_ == MarkerMeasurementPhase::Complete ||
         (inst->isMicroop() && !inst->isLastMicroop()) ||
         !inst->fetchedFromUser || !inst->fetchedAddressSpaceId) {
         return;
@@ -1061,7 +1068,8 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
         return;
     }
     const Addr pc = inst->pcState().instAddr();
-    if (owner->marker_state_ == 1 && owner->marker_pc_trace_) {
+    if (owner->marker_measurement_phase_ == MarkerMeasurementPhase::Measuring &&
+        owner->marker_pc_trace_) {
         owner->marker_pc_trace_->append(pc);
     }
     if (pc != marker_pc_) {
@@ -1074,15 +1082,15 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     if (!begin && !end) {
         return;
     }
-    fatal_if(owner->marker_pending_,
+    fatal_if(owner->marker_boundary_phase_ != MarkerBoundaryPhase::Idle,
              "TaoTrace Marker boundary was not acknowledged");
     // This callback is the authoritative commit observation for the selected
     // Marker macro-op.  Its fetched instruction sequence may differ from the
     // final committed micro-op sequence on x86, so close the owner's private
     // fence from the observed architectural boundary itself.
     owner->marker_cpu_->confirmTraceMarkerFenceCommit();
-    owner->marker_pending_ = true;
-    owner->marker_state_ = begin ? 1 : 2;
+    owner->marker_measurement_phase_ = begin ?
+        MarkerMeasurementPhase::Measuring : MarkerMeasurementPhase::Complete;
     if (owner->functionalTraceEnabled()) {
         if (begin) {
             traceMeasurementBegin();
@@ -1093,15 +1101,20 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     if (end && owner->marker_pc_trace_) {
         owner->marker_pc_trace_->finalizeTrace();
     }
-    owner->marker_boundary_committed_ = true;
-    owner->marker_boundary_begin_ = begin;
+    owner->marker_boundary_kind_ = begin ? MarkerBoundaryKind::Begin :
+                                           MarkerBoundaryKind::End;
+    owner->marker_boundary_phase_ = MarkerBoundaryPhase::WaitingForFence;
     for (auto *trace : marker_instances_) {
         auto *cpu = trace->marker_cpu_;
         fatal_if(!cpu, "TaoTrace Marker participant is not an O3 CPU");
         cpu->requestTraceCommitStop();
     }
-    if (markerFenceReady() && !marker_exit_scheduled_) {
-        marker_exit_scheduled_ = true;
+    if (markerFenceReady()) {
+        owner->marker_boundary_phase_ = MarkerBoundaryPhase::ExitScheduled;
+        if (!begin) {
+            for (auto *trace : marker_instances_)
+                trace->marker_cpu_->holdTraceMarkerFence();
+        }
         exitSimulationLoopNow(8, {{"kind", begin ? "begin" : "end"}});
     }
 }
