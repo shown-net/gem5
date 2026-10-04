@@ -836,6 +836,27 @@ parseFstCoreIdFromName(const std::string &probe_name)
 
 } // namespace
 
+TaoTrace::NativeLoadStats::NativeLoadStats(statistics::Group *parent)
+    : statistics::Group(parent, "nativeLoadStats"),
+      ADD_STAT(committedLoadUops, statistics::units::Count::get(),
+               "Committed load DynInsts in the Marker ROI, including prefetch if isLoad"),
+      ADD_STAT(resolvedLoadUops, statistics::units::Count::get(),
+               "Committed load uops with complete native lifecycle and L1 hierarchy at END"),
+      ADD_STAT(l1HitFragments, statistics::units::Count::get(),
+               "Real L1 hits from native Request fragments of resolved committed load uops"),
+      ADD_STAT(l1TagMissFragments, statistics::units::Count::get(),
+               "Real L1 tag misses from native Request fragments of resolved committed load uops"),
+      ADD_STAT(l1MergedFragments, statistics::units::Count::get(),
+               "Real L1 merged misses from native Request fragments of resolved committed load uops"),
+      ADD_STAT(noRubyLoadUops, statistics::units::Count::get(),
+               "Resolved committed load uops with an explicit no-Ruby lifecycle"),
+      ADD_STAT(unresolvedLoadUops, statistics::units::Count::get(),
+               "Committed load uops unresolved at exact Marker END; no post-ROI completion"),
+      ADD_STAT(prefetchLoadUops, statistics::units::Count::get(),
+               "Committed isLoad uops that are also data prefetch")
+{
+}
+
 TaoTrace::TaoTrace(const TaoTraceParams &params)
     : ProbeListenerObject(params),
       emit_macro_(params.emit_macro),
@@ -851,12 +872,16 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_user_target_(params.functional_user_target),
       marker_controlled_(params.marker_controlled),
       control_only_(params.control_only),
+      native_stats_(params.native_stats),
+      native_load_stats_(this),
       require_roi_param_(params.require_roi),
       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
       output_dir_(params.output_dir),
       uarch_profile_path_(params.uarch_profile_path)
 {
     live_instances_ += 1;
+    fatal_if(native_stats_ && (!marker_controlled_ || !control_only_),
+             "Lightweight native stats require Marker control-only mode");
     if (control_only_) {
         fatal_if(
             !marker_controlled_ || emit_micro_ || emit_macro_ ||
@@ -864,7 +889,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
                 emit_native_response_jsonl_ || emit_wrong_path_oracle_ ||
                 functionalTraceEnabled() || functional_warmup_ ||
                 functional_user_target_ || require_roi_param_,
-            "TaoTrace control-only mode permits Marker boundary control only");
+            "TaoTrace control-only mode forbids trace writers");
     }
     if (marker_controlled_) {
         marker_pc_ = params.marker_pc;
@@ -948,6 +973,9 @@ TaoTrace::startMarkerCapture(const std::string &directory)
     if (marker_cpu_) {
         cpl_core_id_ = parseFstCoreIdFromName(name());
         cpl_clock_period_ticks_ = marker_cpu_->clockPeriod();
+        if (native_stats_)
+            TaoTraceNativeAccessRegistry::prepareContext(
+                uint32_t(marker_cpu_->tcBase(0)->contextId()));
     }
 }
 
@@ -1010,6 +1038,11 @@ TaoTrace::acknowledgeMarker()
         marker_pc_trace_->initializeTrace();
     }
     marker_boundary_phase_ = MarkerBoundaryPhase::Idle;
+    if (native_stats_) {
+        for (auto *trace : marker_instances_)
+            trace->native_measurement_active_ =
+                marker_measurement_phase_ == MarkerMeasurementPhase::Measuring;
+    }
     releaseMarkerFence();
 }
 
@@ -1104,6 +1137,19 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     owner->marker_cpu_->confirmTraceMarkerFenceCommit();
     owner->marker_measurement_phase_ = begin ?
         MarkerMeasurementPhase::Measuring : MarkerMeasurementPhase::Complete;
+    if (owner->native_stats_) {
+        for (auto *trace : marker_instances_) {
+            if (!trace->native_stats_) continue;
+            const uint32_t context = uint32_t(trace->marker_cpu_->tcBase(0)->contextId());
+            if (begin) {
+                TaoTraceNativeAccessRegistry::enableContext(context);
+            } else {
+                trace->native_measurement_active_ = false;
+                trace->flushNativeLoads(true);
+                TaoTraceNativeAccessRegistry::disableContext(context);
+            }
+        }
+    }
     if (owner->functionalTraceEnabled()) {
         if (begin) {
             traceMeasurementBegin();
@@ -1712,6 +1758,8 @@ TaoTrace::regProbeListeners()
         // the selected marker can let younger uops reach IEW.
         connectListener<DynInstListener>(this, "Fetch", &TaoTrace::onFetch);
         connectListener<DynInstListener>(this, "Commit", &TaoTrace::onCommit);
+        if (native_stats_)
+            connectListener<DynInstListener>(this, "Squash", &TaoTrace::observeNativeSquash);
         return;
     }
     // 在第一个 callback 触发之前装载 uarch_profile.json：保证后续 LRU/TLB/walker
@@ -2831,6 +2879,80 @@ nativeHierarchyReady(
         native.hierarchy.accesses[0] == native.hierarchyRequests;
 }
 
+
+void
+TaoTrace::importNativeCommitted(const DynInstPtr &inst)
+{
+    const uint32_t tid = getTraceThreadId(inst);
+    // Import the complete Request-carried ledger before marking retirement.
+    // This is necessary for a load that completed before the process-wide
+    // warmup marker but retired after it on another core.  Such a request is
+    // no longer visible to a measurement-only registry, while its extension
+    // still contains the exact Ruby or explicit no-Ruby lifecycle.
+    if (inst->savedRequest && inst->isCompleted()) {
+        const auto request = inst->savedRequest->mainReq();
+        if (request) {
+            const auto extension =
+                request->getExtension<TaoTraceRubyResponseExtension>();
+            if (extension) {
+                TaoTraceNativeAccessRegistry::noteObservedLifecycle(
+                    tid, inst->seqNum, *extension);
+            }
+        }
+    }
+    TaoTraceNativeAccessRegistry::noteCommitted(tid, inst->seqNum);
+}
+
+void
+TaoTrace::observeNativeSquash(const DynInstPtr &inst)
+{
+    TaoTraceNativeAccessRegistry::noteSquashed(getTraceThreadId(inst), inst->seqNum);
+}
+
+void
+TaoTrace::flushNativeLoads(bool final)
+{
+    for (auto it = pending_native_loads_.begin(); it != pending_native_loads_.end();) {
+        const auto [context, seq] = it->first;
+        const bool measured_load = it->second;
+        const auto native = TaoTraceNativeAccessRegistry::snapshot(context, seq);
+        const bool ready = native.resolved() && nativeHierarchyReady(native);
+        if (!ready && !final) { ++it; continue; }
+        if (measured_load) {
+            if (!ready) {
+                ++native_load_stats_.unresolvedLoadUops;
+            } else {
+                ++native_load_stats_.resolvedLoadUops;
+                native_load_stats_.noRubyLoadUops += native.responses == 0;
+                native_load_stats_.l1HitFragments += native.hierarchy.hits[0];
+                native_load_stats_.l1TagMissFragments += native.hierarchy.tagMisses[0];
+                native_load_stats_.l1MergedFragments += native.hierarchy.mergedMisses[0];
+            }
+        }
+        TaoTraceNativeAccessRegistry::erase(context, seq);
+        it = pending_native_loads_.erase(it);
+    }
+}
+
+void
+TaoTrace::recordNativeLoad(const DynInstPtr &inst)
+{
+    if (!marker_capture_started_ || !marker_owner_ ||
+        marker_owner_->marker_measurement_phase_ == MarkerMeasurementPhase::Complete)
+        return;
+    if (inst->isMemRef()) {
+        importNativeCommitted(inst);
+        const bool measured_load = inst->isLoad() && native_measurement_active_;
+        if (measured_load) {
+            ++native_load_stats_.committedLoadUops;
+            native_load_stats_.prefetchLoadUops += inst->isDataPrefetch();
+        }
+        pending_native_loads_.emplace(
+            std::make_pair(getTraceThreadId(inst), uint64_t(inst->seqNum)), measured_load);
+    }
+    flushNativeLoads(false);
+}
+
 static void
 writeNativeHierarchyJson(std::FILE *file,
                          const TaoTraceNativeHierarchyFacts &facts)
@@ -2882,23 +3004,7 @@ TaoTrace::writeNativeResponseCommit(
         ? uint32_t(cpl_core_id_) : getCoreId(inst);
     const uint64_t key =
         (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
-    // Import the complete Request-carried ledger before marking retirement.
-    // This is necessary for a load that completed before the process-wide
-    // warmup marker but retired after it on another core.  Such a request is
-    // no longer visible to a measurement-only registry, while its extension
-    // still contains the exact Ruby or explicit no-Ruby lifecycle.
-    if (inst->savedRequest && inst->isCompleted()) {
-        const auto request = inst->savedRequest->mainReq();
-        if (request) {
-            const auto extension =
-                request->getExtension<TaoTraceRubyResponseExtension>();
-            if (extension) {
-                TaoTraceNativeAccessRegistry::noteObservedLifecycle(
-                    tid, inst->seqNum, *extension);
-            }
-        }
-    }
-    TaoTraceNativeAccessRegistry::noteCommitted(tid, inst->seqNum);
+    importNativeCommitted(inst);
     // SharedAttr is also the functional/proxy cache descriptor.  The
     // fallback path may reuse a macro's first completed memory micro-op for
     // later micro-ops, so its native fields are not identity-safe.  Import
@@ -6959,6 +7065,7 @@ TaoTrace::onPreCommit(const DynInstPtr &inst)
 void
 TaoTrace::onCommit(const DynInstPtr &inst)
 {
+    if (native_stats_) recordNativeLoad(inst);
     if (!marker_controlled_ || functionalTraceEnabled()) {
         recordCommit(inst);
     }

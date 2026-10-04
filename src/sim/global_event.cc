@@ -47,8 +47,8 @@ BaseGlobalEvent::~BaseGlobalEvent()
 {
     // see GlobalEvent::BarrierEvent::~BarrierEvent() comments
     if (barrierEvent[0] != NULL) {
-        for (int i = 0; i < numMainEventQueues; ++i)
-            delete barrierEvent[i];
+        for (auto *event : barrierEvent)
+            delete event;
     }
 }
 

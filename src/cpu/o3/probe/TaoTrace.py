@@ -31,8 +31,11 @@ class TaoTrace(ProbeListenerObject):
     )
     control_only = Param.Bool(
         False,
-        "Use Marker Commit only for boundary control without trace writers "
-        "or observers",
+        "Keep Marker boundary control without trace writers; "
+        "native_stats optionally enables request statistics",
+    )
+    native_stats = Param.Bool(
+        False, "Publish lightweight native committed-load request facts without trace writers"
     )
     marker_pc = Param.Addr(0, "Common Marker PC consumed by TaoTrace Commit")
     marker_pc_trace_file = Param.String("", "Optional normalized PC trace")

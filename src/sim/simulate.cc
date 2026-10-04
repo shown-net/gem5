@@ -283,6 +283,34 @@ terminateEventQueueThreads()
     simulatorThreads->terminateThreads();
 }
 
+void
+enterSingleEventQueueMode()
+{
+    fatal_if(inParallelMode || curEventQueue() != mainEventQueue[0],
+             "single event queue transition requires a stopped main queue");
+    fatal_if(!simulatorThreads || global_exit_event == nullptr,
+             "single event queue transition requires a completed simulation exit");
+    if (numMainEventQueues == 1) {
+        simQuantum = 0;
+        return;
+    }
+    simulatorThreads.reset();
+    const Tick maximum_tick = get_max_tick();
+    simulate_limit_event->deschedule();
+    delete simulate_limit_event;
+    simulate_limit_event = nullptr;
+    for (uint32_t index = 1; index < numMainEventQueues; ++index) {
+        auto *queue = mainEventQueue[index];
+        queue->handleAsyncInsertions();
+        fatal_if(!queue->empty(),
+                 "cannot retire event queue %u with pending events", index);
+    }
+    numMainEventQueues = 1;
+    mainEventQueue.resize(1);
+    simQuantum = 0;
+    set_max_tick(maximum_tick);
+}
+
 
 /**
  * The main per-thread simulation loop. This loop is executed by all

@@ -29,6 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "base/statistics.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/probe/taogen_shared/lru_banked.hh"
@@ -664,6 +665,20 @@ private:
     bool functional_measurement_started_ = false;
     const bool marker_controlled_;
     const bool control_only_;
+    const bool native_stats_;
+    bool native_measurement_active_ = false;
+    struct NativeLoadStats : public statistics::Group
+    {
+        NativeLoadStats(statistics::Group *parent);
+        statistics::Scalar committedLoadUops, resolvedLoadUops;
+        statistics::Scalar l1HitFragments, l1TagMissFragments, l1MergedFragments;
+        statistics::Scalar noRubyLoadUops, unresolvedLoadUops, prefetchLoadUops;
+    } native_load_stats_;
+    std::map<std::pair<uint32_t, uint64_t>, bool> pending_native_loads_;
+    void importNativeCommitted(const DynInstPtr &inst);
+    void recordNativeLoad(const DynInstPtr &inst);
+    void flushNativeLoads(bool final);
+    void observeNativeSquash(const DynInstPtr &inst);
     bool marker_capture_started_ = false;
     Addr marker_pc_ = 0;
     CPU *marker_cpu_ = nullptr;
