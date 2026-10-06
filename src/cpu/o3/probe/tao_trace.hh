@@ -37,6 +37,7 @@
 #include "cpu/probes/marker_pc_trace.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
+#include "mem/taotrace_observation.hh"
 #include "params/TaoTrace.hh"
 #include "sim/probe/probe_listener_object.hh"
 
@@ -77,6 +78,7 @@ class TaoTrace : public ProbeListenerObject
     TaoTrace(const TaoTraceParams &params);
     ~TaoTrace() override;
 
+    void regProbePoints() override;
     void regProbeListeners() override;
     void startMarkerCapture(const std::string &directory);
     void selectMarkerWindow(uint64_t begin, uint64_t end);
@@ -674,6 +676,8 @@ private:
         statistics::Scalar l1HitFragments, l1TagMissFragments, l1MergedFragments;
         statistics::Scalar noRubyLoadUops, unresolvedLoadUops, prefetchLoadUops;
     } native_load_stats_;
+    std::unique_ptr<ProbePointArg<TaoTraceMemoryObservation>>
+        ppNativeMemoryObservation;
     std::map<std::pair<uint32_t, uint64_t>, bool> pending_native_loads_;
     void importNativeCommitted(const DynInstPtr &inst);
     void recordNativeLoad(const DynInstPtr &inst);

@@ -1039,9 +1039,13 @@ TaoTrace::acknowledgeMarker()
     }
     marker_boundary_phase_ = MarkerBoundaryPhase::Idle;
     if (native_stats_) {
-        for (auto *trace : marker_instances_)
+        for (auto *trace : marker_instances_) {
             trace->native_measurement_active_ =
                 marker_measurement_phase_ == MarkerMeasurementPhase::Measuring;
+            if (trace->native_stats_ && trace->native_measurement_active_)
+                trace->ppNativeMemoryObservation->notify(
+                    TaoTraceMemoryBoundary{true});
+        }
     }
     releaseMarkerFence();
 }
@@ -1146,6 +1150,8 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
             } else {
                 trace->native_measurement_active_ = false;
                 trace->flushNativeLoads(true);
+                trace->ppNativeMemoryObservation->notify(
+                    TaoTraceMemoryBoundary{false});
                 TaoTraceNativeAccessRegistry::disableContext(context);
             }
         }
@@ -1747,6 +1753,14 @@ TaoTrace::getL1iMshr(uint32_t cid)
         configured.insert(cid);
     }
     return s;
+}
+
+void
+TaoTrace::regProbePoints()
+{
+    ppNativeMemoryObservation =
+        std::make_unique<ProbePointArg<TaoTraceMemoryObservation>>(
+            getProbeManager(), "NativeMemoryObservation");
 }
 
 void
@@ -2928,6 +2942,10 @@ TaoTrace::flushNativeLoads(bool final)
                 native_load_stats_.l1TagMissFragments += native.hierarchy.tagMisses[0];
                 native_load_stats_.l1MergedFragments += native.hierarchy.mergedMisses[0];
             }
+            // Publish final read-only facts before the owning ledger erases
+            // them. Listeners neither own identities nor schedule completion.
+            ppNativeMemoryObservation->notify(
+                TaoTraceMemoryLoadOutcome{context, seq, ready, native});
         }
         TaoTraceNativeAccessRegistry::erase(context, seq);
         it = pending_native_loads_.erase(it);
@@ -7065,6 +7083,14 @@ TaoTrace::onPreCommit(const DynInstPtr &inst)
 void
 TaoTrace::onCommit(const DynInstPtr &inst)
 {
+    if (native_stats_ && native_measurement_active_) {
+        ppNativeMemoryObservation->notify(TaoTraceMemoryCommit{
+            getTraceThreadId(inst), uint64_t(inst->seqNum),
+            !inst->isMicroop() || inst->isFirstMicroop(),
+            !inst->isMicroop() || inst->isLastMicroop(), inst->isLoad(),
+            inst->isDataPrefetch() || inst->isAtomic() ||
+                isMacroopLocked(inst) || isLockedAtomicMicro(inst)});
+    }
     if (native_stats_) recordNativeLoad(inst);
     if (!marker_controlled_ || functionalTraceEnabled()) {
         recordCommit(inst);
