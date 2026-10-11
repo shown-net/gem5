@@ -78,6 +78,9 @@ class LSQ
 {
   public:
     class LSQRequest;
+    struct StorePrepareSenderState : public Packet::SenderState
+    {
+    };
 
     /**
      * DcachePort class for the load/store queue.

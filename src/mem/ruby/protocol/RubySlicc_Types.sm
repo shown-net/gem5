@@ -157,6 +157,7 @@ structure (Sequencer, external = "yes") {
   void llscClearLocalMonitor();
 
   void evictionCallback(Addr);
+  void storePrepareComplete();
 
   void invL1Callback();
 

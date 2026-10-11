@@ -105,6 +105,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     PF_Inst_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
     PF_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
     PF_IE, AccessPermission:Busy, desc="Issued GETX, have not seen response yet";
+    SP_IE, AccessPermission:Busy, desc="Buffered store is preparing write permission";
 
     // LL/SC states
     LLSC_E, AccessPermission:Read_Only, desc="a L1 cache entry Exclusive (LL/SC locked)";
@@ -151,6 +152,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     PF_Ifetch,       desc="Instruction fetch request from prefetcher";
     PF_Store,        desc="Exclusive load request from prefetcher";
     PF_Bad_Addr,     desc="Throw away prefetch request due to bad address generation";
+    Store_Prepare,   desc="Permission-only request for a buffered store";
+    Store_Prepare_Bad_Addr, desc="Discard buffered store preparation to a bad address";
 
     // LL/SC lock transitions
     Load_Linked,         desc="Load-Linked request from the home processor";
@@ -327,6 +330,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     } else if ((type == RubyRequestType:ST)
                || (type == RubyRequestType:Load_Linked)) {
       return Event:PF_Store;
+    } else if (type == RubyRequestType:Store_Prepare) {
+      return Event:Store_Prepare;
     } else {
       error("Invalid RubyRequestType");
     }
@@ -377,7 +382,13 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
         if (nidint >= numDirs) {
           Entry cache_entry := static_cast(Entry, "pointer", Dcache.getNullEntry());
           TBE tbe := TBEs.getNullEntry();
-          trigger(Event:PF_Bad_Addr, in_msg.LineAddress, cache_entry, tbe);
+          if (in_msg.Type == RubyRequestType:Store_Prepare) {
+            trigger(Event:Store_Prepare_Bad_Addr,
+                    in_msg.LineAddress, cache_entry, tbe);
+          } else {
+            trigger(Event:PF_Bad_Addr,
+                    in_msg.LineAddress, cache_entry, tbe);
+          }
         } else if (in_msg.Type == RubyRequestType:IFETCH) {
           // Instruction Prefetch
           Entry icache_entry := getICacheEntry(in_msg.LineAddress);
@@ -970,8 +981,26 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     }
   }
 
+  action(pc_issuePfUPGRADE, "pc", desc="Issue prefetch UPGRADE") {
+    peek(optionalQueue_in, RubyRequest) {
+      enqueue(requestNetwork_out, CoherenceMsg, request_latency) {
+        out_msg.addr := address;
+        out_msg.Class := CoherenceClass:UPGRADE;
+        out_msg.Sender := machineID;
+        out_msg.Dest := createMachineID(MachineType:L1Cache, version);
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.AccessMode := in_msg.AccessMode;
+      }
+    }
+  }
+
   action(pq_popPrefetchQueue, "\pq", desc="Pop the prefetch request queue") {
     optionalQueue_in.dequeue(clockEdge());
+  }
+
+  action(sp_completeStorePrepare, "sp", desc="Complete buffered store permission preparation") {
+    sequencer.storePrepareComplete();
   }
 
   action(mp_markPrefetched, "mp", desc="Write data from response queue to cache") {
@@ -1280,7 +1309,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   // prefetcher
 
-  transition({Inst_IS, IS, IM, SM, PF_Inst_IS, PF_IS, PF_IE, LLSC_E, LLSC_M}, PF_L0_Replacement) {
+  transition({Inst_IS, IS, IM, SM, PF_Inst_IS, PF_IS, PF_IE, SP_IE, LLSC_E, LLSC_M}, PF_L0_Replacement) {
      z_stallAndWaitOptionalQueue;
   }
 
@@ -1288,13 +1317,32 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     z_stallAndWaitMandatoryQueue;
   }
 
-  transition({PF_IE}, {Load, Ifetch, L0_Replacement}) {
+  transition({PF_IE, SP_IE}, {Load, Ifetch, L0_Replacement}) {
     z_stallAndWaitMandatoryQueue;
   }
 
-  transition({S,E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,LLSC_E,LLSC_M},
+  transition({S,E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,SP_IE,LLSC_E,LLSC_M},
              {PF_Load, PF_Store, PF_Ifetch}) {
       pq_popPrefetchQueue;
+  }
+
+  transition({E,M,Inst_IS,IS,IM,SM,PF_Inst_IS,PF_IS,PF_IE,SP_IE,LLSC_E,LLSC_M},
+             Store_Prepare) {
+    sp_completeStorePrepare;
+    pq_popPrefetchQueue;
+  }
+
+  transition(S, Store_Prepare, SP_IE) {
+    i_allocateTBE;
+    pc_issuePfUPGRADE;
+    pq_popPrefetchQueue;
+  }
+
+  transition(I, Store_Prepare, SP_IE) {
+    oo_allocateDCacheBlock;
+    i_allocateTBE;
+    pb_issuePfGETX;
+    pq_popPrefetchQueue;
   }
 
   transition(I, PF_Load, PF_IS) {
@@ -1336,7 +1384,13 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     k_popMandatoryQueue;
   }
 
-  transition({PF_Inst_IS, PF_IS, PF_IE}, {InvOwn, InvElse}) {
+  transition(SP_IE, Store, IM) {
+    sp_completeStorePrepare;
+    uu_profileDataMiss;
+    k_popMandatoryQueue;
+  }
+
+  transition({PF_Inst_IS, PF_IS, PF_IE, SP_IE}, {InvOwn, InvElse}) {
     fi_sendInvAck;
     l_popRequestQueue;
   }
@@ -1390,7 +1444,20 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     kd_wakeUpDependents;
   }
 
+  transition(SP_IE, Data_Exclusive, E) {
+    u_writeDataToCache;
+    s_deallocateTBE;
+    sp_completeStorePrepare;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
   transition(I, PF_Bad_Addr) {
+    pq_popPrefetchQueue;
+  }
+
+  transition(I, Store_Prepare_Bad_Addr) {
+    sp_completeStorePrepare;
     pq_popPrefetchQueue;
   }
 

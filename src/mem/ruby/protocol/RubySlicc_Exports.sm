@@ -169,6 +169,7 @@ enumeration(TransitionResult, desc="...") {
 enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
   LD,                desc="Load";
   ST,                desc="Store";
+  Store_Prepare,     desc="Permission-only preparation for a buffered store";
   ATOMIC,            desc="Atomic Load/Store -- depricated. use ATOMIC_RETURN or ATOMIC_NO_RETURN";
   ATOMIC_RETURN,     desc="Atomic Load/Store, return data";
   ATOMIC_NO_RETURN,  desc="Atomic Load/Store, do not return data";

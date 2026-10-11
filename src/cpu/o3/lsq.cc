@@ -450,6 +450,12 @@ LSQ::recvTimingResp(PacketPtr pkt)
         DPRINTF(LSQ, "Got error packet back for address: %#X\n",
                 pkt->getAddr());
 
+    if (dynamic_cast<StorePrepareSenderState*>(pkt->senderState)) {
+        delete pkt->popSenderState();
+        delete pkt;
+        return true;
+    }
+
     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
     panic_if(!request, "Got packet back with unknown sender state\n");
 

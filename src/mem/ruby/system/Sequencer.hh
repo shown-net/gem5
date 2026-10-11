@@ -147,7 +147,10 @@ class Sequencer : public RubyPort
 
     RequestStatus makeRequest(PacketPtr pkt) override;
     virtual bool empty() const;
-    int outstandingCount() const override { return m_outstanding_count; }
+    int outstandingCount() const override
+    {
+        return m_outstanding_count + m_store_prepare_outstanding;
+    }
 
     bool isDeadlockEventScheduled() const override
     { return deadlockCheckEvent.scheduled(); }
@@ -158,6 +161,7 @@ class Sequencer : public RubyPort
     virtual void print(std::ostream& out) const;
 
     void markRemoved();
+    void storePrepareComplete();
     void evictionCallback(Addr address);
     int coreId() const { return m_coreId; }
 
@@ -273,6 +277,7 @@ class Sequencer : public RubyPort
 
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
+    int m_store_prepare_outstanding;
 
     // Bounded observer state, ordinary cacheable LD requests only. No events
     // are scheduled by this observer and no request identities are retained.

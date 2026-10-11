@@ -68,6 +68,7 @@ Sequencer::Sequencer(const Params &p)
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
+    m_store_prepare_outstanding = 0;
 
     m_ruby_system = p.ruby_system;
 
@@ -449,6 +450,14 @@ void
 Sequencer::markRemoved()
 {
     m_outstanding_count--;
+}
+
+void
+Sequencer::storePrepareComplete()
+{
+    assert(m_store_prepare_outstanding > 0);
+    --m_store_prepare_outstanding;
+    testDrainComplete();
 }
 
 void
@@ -1021,12 +1030,20 @@ bool
 Sequencer::empty() const
 {
     return m_RequestTable.empty() &&
-           m_UnaddressedRequestTable.empty();
+           m_UnaddressedRequestTable.empty() &&
+           m_store_prepare_outstanding == 0;
 }
 
 RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
+    if (pkt->req->isStorePrepare()) {
+        ++m_store_prepare_outstanding;
+        m_controller->enqueuePrefetch(
+            makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
+        return RequestStatus_Issued;
+    }
+
     // HTM abort signals must be allowed to reach the Sequencer
     // the same cycle they are issued. They cannot be retried.
     if ((m_outstanding_count >= m_max_outstanding_requests) &&
@@ -1289,6 +1306,7 @@ Sequencer::print(std::ostream& out) const
 {
     out << "[Sequencer: " << m_version
         << ", outstanding requests: " << m_outstanding_count
+        << ", outstanding store prepares: " << m_store_prepare_outstanding
         << ", request table: " << m_RequestTable
         << "]";
 }

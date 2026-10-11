@@ -60,6 +60,7 @@
 #include "cpu/timebuf.hh"
 #include "debug/HtmCpu.hh"
 #include "debug/LSQUnit.hh"
+#include "enums/TSOStore.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
 
@@ -157,6 +158,8 @@ class LSQUnit
         bool _committed = false;
         /** Whether or not the store is completed. */
         bool _completed = false;
+        /** Whether a buffer-mode exclusive permission prefetch was sent. */
+        bool _storePrepareIssued = false;
         /** Does this request write all zeros and thus doesn't
          * have any data attached to it. Used for cache block zero
          * style instructs (ARM DC ZVA; ALPHA WH64)
@@ -177,7 +180,8 @@ class LSQUnit
         clear()
         {
             LSQEntry::clear();
-            _canWB = _completed = _committed = _isAllZeros = false;
+            _canWB = _completed = _committed = _storePrepareIssued =
+                _isAllZeros = false;
         }
 
         /** Member accessors. */
@@ -188,6 +192,11 @@ class LSQUnit
         const bool& completed() const { return _completed; }
         bool& committed() { return _committed; }
         const bool& committed() const { return _committed; }
+        bool& storePrepareIssued() { return _storePrepareIssued; }
+        const bool& storePrepareIssued() const
+        {
+            return _storePrepareIssued;
+        }
         bool& isAllZeros() { return _isAllZeros; }
         const bool& isAllZeros() const { return _isAllZeros; }
         char* data() { return _data; }
@@ -386,6 +395,9 @@ class LSQUnit
     /** Try to finish a previously blocked write back attempt */
     void writebackBlockedStore();
 
+    /** Issue buffer-mode exclusive permission prefetches. */
+    void issueStorePrepareRequests();
+
     /** Completes the store at the specified index. */
     void completeStore(typename StoreQueue::iterator store_idx);
 
@@ -513,6 +525,12 @@ class LSQUnit
     /** Whether or not a store is in flight. */
     bool storeInFlight;
 
+    /** Selected TSO committed-store implementation. */
+    enums::TSOStore tsoStore;
+
+    /** Configured buffer-mode store capacity. */
+    unsigned tsoStoreBufferSize;
+
     /** The oldest load that caused a memory ordering violation. */
     DynInstPtr memDepViolator;
 
@@ -549,6 +567,12 @@ class LSQUnit
 
         /** Number of times the LSQ is blocked due to the cache. */
         statistics::Scalar blockedByCache;
+
+        /** Buffer-mode exclusive permission prefetches issued. */
+        statistics::Scalar storePrepareIssued;
+
+        /** Buffer-mode permission prefetches rejected for retry. */
+        statistics::Scalar storePrepareBlocked;
 
         /** Distribution of cycle latency between the first time a load
          * is issued and its completion */
