@@ -1064,6 +1064,9 @@ class DynInst : public ExecContext, public RefCounted
 
     /* Values used by LoadToUse stat */
     Tick firstIssue = -1;
+    bool ordinaryLoadTiming = false;
+    Tick loadDataReady = -1;
+    Tick loadWriteback = -1;
     Tick lastWakeDependents = -1;
 
     /** Reads a misc. register, including any side-effects the read

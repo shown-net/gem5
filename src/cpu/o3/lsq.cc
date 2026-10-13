@@ -194,6 +194,8 @@ bool
 LSQ::isDrained() const
 {
     bool drained(true);
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        drained = drained && thread[tid].timingDrained();
 
     if (!lqEmpty()) {
         DPRINTF(Drain, "Not drained, LQ not empty.\n");

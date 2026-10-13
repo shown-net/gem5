@@ -24,9 +24,13 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from m5.objects.InstDecoder import InstDecoder
+from m5.params import Param
 
 
 class X86Decoder(InstDecoder):
     type = "X86Decoder"
     cxx_class = "gem5::X86ISA::Decoder"
     cxx_header = "arch/x86/decoder.hh"
+    singleResultImul = Param.Bool(False, "Use one result-producing uop for register IMUL")
+    singleUopSetz = Param.Bool(False, "Use one result uop for register SETZ")
+    zfOnlySetz = Param.Bool(False, "Read only Zaps for register SETZ")

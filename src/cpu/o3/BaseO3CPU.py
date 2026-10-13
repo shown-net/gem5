@@ -74,12 +74,21 @@ class BaseO3CPU(BaseCPU):
     def support_take_over(cls):
         return True
 
+    # Research model: SPR admission scale, xs reference address arbitration.
+    ordinaryLoadService = Param.Bool(False, "Enable ordinary load service stages")
+    loadServiceAdmission = Param.Bool(True, "Limit service admission to three per cycle")
+    loadServiceArbitration = Param.Bool(True, "Use xs reference bank arbitration")
+    loadServicePropagation = Param.Bool(True, "Use a clocked result-completion stage")
+    loadServiceCacheSets = Param.Unsigned(64, "L1D sets for xs reference arbitration")
+
     activity = Param.Unsigned(0, "Initial count")
 
     cacheStorePorts = Param.Unsigned(
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
+    ordinaryLoadMinLatency = Param.Cycles(
+        0, "Minimum issue-to-result latency for ordinary non-split 8-byte loads; zero disables")
 
     # Backward pipeline delays
     fetchToBacDelay = Param.Cycles(1, "Fetch to Branch address calc. delay")
@@ -215,6 +224,11 @@ class BaseO3CPU(BaseCPU):
     )
     tsoStoreBufferSize = Param.Unsigned(
         114, "Store-buffer entries used only by the buffer TSO implementation"
+    )
+    tsoStoreMaxInFlight = Param.Unsigned(
+        1,
+        "Maximum committed stores awaiting cache responses; experimental "
+        "buffer-mode drain overlap",
     )
 
     recvRespThrottling = Param.Bool(

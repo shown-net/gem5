@@ -238,6 +238,9 @@ class Decoder : public InstDecoder
     State processExtendedOpcode(ByteTable &immTable);
 
   protected:
+    const bool singleResultImul;
+    const bool singleUopSetz;
+    const bool zfOnlySetz;
     /// Caching for decoded instruction objects.
 
     typedef RegVal CacheKey;
@@ -258,6 +261,8 @@ class Decoder : public InstDecoder
 
   public:
     Decoder(const X86DecoderParams &p) : InstDecoder(p, &fetchChunk)
+        , singleResultImul(p.singleResultImul),
+          singleUopSetz(p.singleUopSetz), zfOnlySetz(p.zfOnlySetz)
     {
         emi.reset();
         emi.mode.cpl = cpl;

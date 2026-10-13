@@ -354,5 +354,21 @@ let {{
             blocks.decoder_output = macroop.getDefinition(env)
             macroop.declared = True
         blocks.decode_block = "return %s;\n" % macroop.getAllocator(env)
+        if Name == "IMUL_R_R":
+            candidate = genMacroop("IMUL_R_R_SINGLE", env)
+            candidate.decode_block = "if (singleResultImul) {\n" + candidate.decode_block + "}\n"
+            candidate.append(blocks)
+            return candidate
+        if Name == "SETZ_R":
+            single_zf = genMacroop("SETZ_R_SINGLE", env)
+            single_wide = genMacroop("SETZ_R_SINGLE_WIDE", env)
+            two_zf = genMacroop("SETZ_R_TWO_ZF", env)
+            single_zf.decode_block = "if (singleUopSetz && zfOnlySetz) {\n" + single_zf.decode_block + "}\n"
+            single_wide.decode_block = "if (singleUopSetz) {\n" + single_wide.decode_block + "}\n"
+            two_zf.decode_block = "if (zfOnlySetz) {\n" + two_zf.decode_block + "}\n"
+            single_zf.append(single_wide)
+            single_zf.append(two_zf)
+            single_zf.append(blocks)
+            return single_zf
         return blocks
 }};

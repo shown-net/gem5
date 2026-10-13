@@ -254,7 +254,8 @@ class LSQ
             WritebackScheduled  = 0x00001000,
             WritebackDone       = 0x00002000,
             /** True if this is an atomic request */
-            IsAtomic            = 0x00004000
+            IsAtomic            = 0x00004000,
+            ServiceScheduled    = 0x00008000
         };
         FlagsType flags;
 
@@ -439,6 +440,7 @@ class LSQ
         {
             return numInTranslationFragments > 0 ||
                 _numOutstandingPackets > 0 ||
+                flags.isSet(Flag::ServiceScheduled) ||
                 (flags.isSet(Flag::WritebackScheduled) &&
                  !flags.isSet(Flag::WritebackDone));
         }
@@ -453,6 +455,15 @@ class LSQ
         {
             return flags.isSet(Flag::LSQEntryFreed) ||
                 flags.isSet(Flag::Discarded);
+        }
+
+        bool serviceScheduled() const { return flags.isSet(Flag::ServiceScheduled); }
+        void scheduleService() { flags.set(Flag::ServiceScheduled); }
+        void finishService()
+        {
+            flags.clear(Flag::ServiceScheduled);
+            if (isReleased() && !isAnyOutstandingRequest())
+                delete this;
         }
 
         bool
@@ -575,7 +586,7 @@ class LSQ
         {
             assert(_numOutstandingPackets > 0);
             _numOutstandingPackets--;
-            if (_numOutstandingPackets == 0 && isReleased())
+            if (!isAnyOutstandingRequest() && isReleased())
                 delete this;
         }
 
@@ -591,7 +602,7 @@ class LSQ
         {
             flags.set(Flag::WritebackDone);
             /* If the lsq resources are already free */
-            if (_numOutstandingPackets == 0 && isReleased()) {
+            if (!isAnyOutstandingRequest() && isReleased()) {
                 delete this;
             }
         }
@@ -602,7 +613,7 @@ class LSQ
             assert(numInTranslationFragments == 0);
             flags.set(Flag::TranslationSquashed);
             /* If we are on our own, self-destruct. */
-            if (isReleased()) {
+            if (isReleased() && !isAnyOutstandingRequest()) {
                 delete this;
             }
         }

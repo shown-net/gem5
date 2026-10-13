@@ -57,6 +57,7 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/lsq.hh"
+#include "cpu/o3/ordinary_load_service.hh"
 #include "cpu/timebuf.hh"
 #include "debug/HtmCpu.hh"
 #include "debug/LSQUnit.hh"
@@ -160,6 +161,8 @@ class LSQUnit
         bool _completed = false;
         /** Whether a buffer-mode exclusive permission prefetch was sent. */
         bool _storePrepareIssued = false;
+        /** Whether this store has an outstanding cache request. */
+        bool _storeRequestInFlight = false;
         /** Does this request write all zeros and thus doesn't
          * have any data attached to it. Used for cache block zero
          * style instructs (ARM DC ZVA; ALPHA WH64)
@@ -181,7 +184,7 @@ class LSQUnit
         {
             LSQEntry::clear();
             _canWB = _completed = _committed = _storePrepareIssued =
-                _isAllZeros = false;
+                _storeRequestInFlight = _isAllZeros = false;
         }
 
         /** Member accessors. */
@@ -196,6 +199,11 @@ class LSQUnit
         const bool& storePrepareIssued() const
         {
             return _storePrepareIssued;
+        }
+        bool& storeRequestInFlight() { return _storeRequestInFlight; }
+        const bool& storeRequestInFlight() const
+        {
+            return _storeRequestInFlight;
         }
         bool& isAllZeros() { return _isAllZeros; }
         const bool& isAllZeros() const { return _isAllZeros; }
@@ -242,6 +250,8 @@ class LSQUnit
 
     /** Perform sanity checks after a drain. */
     void drainSanityCheck() const;
+    bool timingDrained() const
+    { return pendingLoadResults == 0 && pendingLoadServiceRequests == 0; }
 
     /** Takes over from another CPU's thread. */
     void takeOverFrom();
@@ -430,6 +440,36 @@ class LSQUnit
     /** Pointer to the LSQ. */
     LSQ *lsq;
 
+    OrdinaryLoadService loadService;
+    unsigned pendingLoadServiceRequests = 0;
+    bool ordinaryLoad(LSQRequest *request) const;
+    class LoadServiceRequestEvent : public Event
+    {
+      public:
+        LoadServiceRequestEvent(LSQRequest *request, LSQUnit *owner);
+        void process() override;
+        const char *description() const override { return "Ordinary load request stage"; }
+      private:
+        LSQRequest *request;
+        LSQUnit *owner;
+    };
+
+    Cycles ordinaryLoadMinLatency = Cycles(0);
+    unsigned pendingLoadResults = 0;
+    class LoadResultEvent : public Event
+    {
+      public:
+        LoadResultEvent(const DynInstPtr &inst, LSQRequest *request,
+                        LSQUnit *owner);
+        void process() override;
+        const char *description() const override
+        { return "Ordinary load result availability"; }
+      private:
+        DynInstPtr inst;
+        LSQRequest *request;
+        LSQUnit *owner;
+    };
+
     /** Pointer to the dcache port.  Used only for sending. */
     RequestPort *dcachePort;
 
@@ -522,14 +562,17 @@ class LSQUnit
     /** Whehter or not a store is blocked due to the memory system. */
     bool isStoreBlocked;
 
-    /** Whether or not a store is in flight. */
-    bool storeInFlight;
+    /** Number of committed stores awaiting cache responses. */
+    unsigned storesInFlight;
 
     /** Selected TSO committed-store implementation. */
     enums::TSOStore tsoStore;
 
     /** Configured buffer-mode store capacity. */
     unsigned tsoStoreBufferSize;
+
+    /** Maximum number of committed stores awaiting cache responses. */
+    unsigned tsoStoreMaxInFlight;
 
     /** The oldest load that caused a memory ordering violation. */
     DynInstPtr memDepViolator;
@@ -573,6 +616,12 @@ class LSQUnit
 
         /** Buffer-mode permission prefetches rejected for retry. */
         statistics::Scalar storePrepareBlocked;
+
+        statistics::Scalar serviceAccepted;
+        statistics::Scalar serviceAdmissionRetries;
+        statistics::Scalar serviceArbitrationRetries;
+        statistics::Scalar serviceCacheRetries;
+        statistics::Scalar serviceSquashed;
 
         /** Distribution of cycle latency between the first time a load
          * is issued and its completion */

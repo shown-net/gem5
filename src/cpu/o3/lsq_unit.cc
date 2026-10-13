@@ -176,7 +176,22 @@ LSQUnit::completeDataAccess(PacketPtr pkt)
                     pkt->getHtmTransactionFailedInCacheRC() );
             }
 
-            writeback(inst, request->mainPacket());
+            const bool ordinary = ordinaryLoad(request);
+            Tick available = curTick();
+            if (ordinary) {
+                inst->ordinaryLoadTiming = true;
+                inst->loadDataReady = curTick();
+                assert(inst->firstIssue != Tick(-1));
+                available = std::max(available, inst->firstIssue +
+                    cpu->cyclesToTicks(ordinaryLoadMinLatency));
+                if (loadService.enabled && loadService.propagation)
+                    available = cpu->clockEdge(Cycles(1));
+            }
+            if (available > curTick()) {
+                schedule(*new LoadResultEvent(inst, request, this), available);
+            } else {
+                writeback(inst, request->mainPacket());
+            }
             if (inst->isStore() || inst->isAtomic()) {
                 request->writebackDone();
                 completeStore(request->instruction()->sqIt);
@@ -195,7 +210,7 @@ LSQUnit::LSQUnit(uint32_t lqEntries, uint32_t sqEntries)
       htmStarts(0), htmStops(0),
       lastRetiredHtmUid(0),
       cacheBlockMask(0), stalled(false),
-      isStoreBlocked(false), storeInFlight(false), stats(nullptr)
+      isStoreBlocked(false), storesInFlight(0), stats(nullptr)
 {
 }
 
@@ -216,9 +231,24 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
 
     depCheckShift = params.LSQDepCheckShift;
     checkLoads = params.LSQCheckLoads;
+    ordinaryLoadMinLatency = params.ordinaryLoadMinLatency;
     needsTSO = params.needsTSO;
     tsoStore = params.tsoStore;
     tsoStoreBufferSize = params.tsoStoreBufferSize;
+    tsoStoreMaxInFlight = params.tsoStoreMaxInFlight;
+    fatal_if(tsoStoreMaxInFlight == 0,
+             "tsoStoreMaxInFlight must be greater than zero");
+    fatal_if(tsoStore == enums::TSOStore::serial &&
+                 tsoStoreMaxInFlight != 1,
+             "serial TSO store mode requires tsoStoreMaxInFlight=1");
+    loadService.enabled = params.ordinaryLoadService;
+    loadService.admission = params.loadServiceAdmission;
+    loadService.arbitration = params.loadServiceArbitration;
+    loadService.propagation = params.loadServicePropagation;
+    fatal_if(loadService.enabled && ordinaryLoadMinLatency != Cycles(0),
+             "service stages and historical minimum latency are exclusive");
+    loadService.geometry(cpu->cacheLineSize(),
+        params.loadServiceCacheSets);
     fatal_if(tsoStore == enums::TSOStore::buffer && !needsTSO,
              "buffer TSO store mode requires needsTSO=true");
     fatal_if(tsoStore == enums::TSOStore::buffer &&
@@ -234,6 +264,7 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
 void
 LSQUnit::resetState()
 {
+    storesInFlight = 0;
     storesToWB = 0;
 
     // hardware transactional memory
@@ -285,6 +316,16 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Buffer-mode exclusive permission prefetches issued"),
       ADD_STAT(storePrepareBlocked, statistics::units::Count::get(),
                "Buffer-mode permission prefetches rejected for retry"),
+      ADD_STAT(serviceAccepted, statistics::units::Count::get(),
+               "Ordinary-load service admissions, including cache retries"),
+      ADD_STAT(serviceAdmissionRetries, statistics::units::Count::get(),
+               "Ordinary-load admission-width rejections"),
+      ADD_STAT(serviceArbitrationRetries, statistics::units::Count::get(),
+               "xs reference address-bank arbitration rejections"),
+      ADD_STAT(serviceCacheRetries, statistics::units::Count::get(),
+               "Admitted service attempts rejected by native cache ports"),
+      ADD_STAT(serviceSquashed, statistics::units::Count::get(),
+               "Pending service requests cancelled by squash/release"),
       ADD_STAT(loadToUse, statistics::units::Cycle::get(),
                "Distribution of cycle latency between the "
                "first time a load is issued and its completion"),
@@ -313,6 +354,7 @@ LSQUnit::setDcachePort(RequestPort *dcache_port)
 void
 LSQUnit::drainSanityCheck() const
 {
+    assert(timingDrained());
     for (int i = 0; i < loadQueue.capacity(); ++i)
         assert(!loadQueue[i].valid());
 
@@ -837,7 +879,7 @@ LSQUnit::writebackStores()
            storeWBIt.dereferenceable() &&
            storeWBIt->valid() &&
            storeWBIt->canWB() &&
-           ((!needsTSO) || (!storeInFlight)) &&
+           ((!needsTSO) || (storesInFlight < tsoStoreMaxInFlight)) &&
            lsq->cachePortAvailable(false)) {
 
         if (isStoreBlocked) {
@@ -1189,7 +1231,8 @@ LSQUnit::storePostSend()
     }
 
     if (needsTSO) {
-        storeInFlight = true;
+        storeWBIt->storeRequestInFlight() = true;
+        ++storesInFlight;
     }
 
     storeWBIt++;
@@ -1208,6 +1251,8 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
     }
 
     if (!inst->isExecuted()) {
+        if (inst->ordinaryLoadTiming)
+            inst->loadWriteback = curTick();
         inst->setExecuted();
 
         if (inst->fault == NoFault) {
@@ -1261,6 +1306,7 @@ void
 LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
 {
     assert(store_idx->valid());
+    const bool store_request_in_flight = store_idx->storeRequestInFlight();
     store_idx->completed() = true;
     --storesToWB;
     // A bit conservative because a store completion may not free up entries,
@@ -1302,8 +1348,9 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
 
     store_inst->setCompleted();
 
-    if (needsTSO) {
-        storeInFlight = false;
+    if (needsTSO && store_request_in_flight) {
+        assert(storesInFlight > 0);
+        --storesInFlight;
     }
 
     // Tell the checker we've completed this instruction.  Some stores
@@ -1723,6 +1770,12 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
     // then put the instruction into retry queue so we do not need
     // an exta cycle to re-issue and execute
     request->buildPackets();
+    if (loadService.enabled && ordinaryLoad(request)) {
+        if (!request->serviceScheduled())
+            schedule(*new LoadServiceRequestEvent(request, this),
+                     cpu->clockEdge(Cycles(1)));
+        return NoFault;
+    }
     request->sendPacketToCache();
     if (!request->isSent()) {
         if (!lsq->cacheBlocked()) {
