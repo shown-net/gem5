@@ -54,7 +54,7 @@ from m5.SimObject import *
 
 
 class TSOStore(Enum):
-    vals = ["serial", "buffer"]
+    vals = ["serial", "buffer", "sbuffer"]
 
 
 class BaseO3CPU(BaseCPU):
@@ -229,6 +229,24 @@ class BaseO3CPU(BaseCPU):
         1,
         "Maximum committed stores awaiting cache responses; experimental "
         "buffer-mode drain overlap",
+    )
+    divsdLatency = Param.Unsigned(14, "Dedicated register DIVSD result latency")
+    divsdIssueInterval = Param.Unsigned(4, "Dedicated register DIVSD initiation interval")
+
+    sbufferOffloadWidth = Param.Unsigned(
+        1, "Maximum committed SQ stores transferred to SBuffer per cycle"
+    )
+    sbufferDrainWidth = Param.Unsigned(
+        1, "Maximum SBuffer writes issued to the cache per cycle"
+    )
+    sbufferMerge = Param.Bool(
+        True, "Merge an ordinary store into the unsent same-line FIFO tail"
+    )
+    sbufferForwarding = Param.Bool(
+        True, "Forward younger ordinary loads from committed SBuffer entries"
+    )
+    sbufferPrepare = Param.Bool(
+        False, "Issue the inherited store-permission preparation in SBuffer mode"
     )
 
     recvRespThrottling = Param.Bool(

@@ -983,7 +983,6 @@ Commit::commitInsts()
 
             DPRINTF(Commit, "Retiring squashed instruction from "
                     "ROB.\n");
-            cpu->noteTraceMarkerFenceSquash(head_inst->seqNum);
 
             rob->retireHead(commit_thread);
 
@@ -1021,7 +1020,6 @@ Commit::commitInsts()
                 cpu->commitStats[tid]
                     ->committedInstType[head_inst->opClass()]++;
                 stats.committedInstType[tid][head_inst->opClass()]++;
-                cpu->noteTraceMarkerFenceCommit(head_inst->seqNum);
                 ppCommit->notify(head_inst);
 
                 // hardware transactional memory
@@ -1125,11 +1123,6 @@ Commit::commitInsts()
                     onInstBoundary && cpu->checkInterrupts(0))
                     squashAfter(tid, head_inst);
 
-                // ROI window exits must cut the commit bundle at the exact
-                // architectural instruction that raised the event.
-                if (cpu->consumeTraceCommitStopRequest()) {
-                    break;
-                }
             } else {
                 DPRINTF(Commit, "Unable to commit head instruction PC:%s "
                         "[tid:%i] [sn:%llu].\n",

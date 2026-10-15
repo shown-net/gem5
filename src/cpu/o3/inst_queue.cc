@@ -230,6 +230,8 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       commitToIEWDelay(params.commitToIEWDelay),
       iqStats(cpu, totalWidth),
       iqIOStats(cpu),
+      divsdIssueInterval(params.divsdIssueInterval),
+      divsdStats(cpu, *this),
       ppExecutionIssue(nullptr),
       ppExecutionFUBlocked(nullptr)
 {
@@ -258,6 +260,48 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     }
 
     resetState();
+}
+
+InstructionQueue::DivsdStats::DivsdStats(CPU *cpu, InstructionQueue &owner)
+    : statistics::Group(cpu, "divsd"), iq(owner),
+      ADD_STAT(issued, statistics::units::Count::get(), "Dedicated DIVSD issues"),
+      ADD_STAT(completed, statistics::units::Count::get(), "Dedicated DIVSD FU completions including squashed work"),
+      ADD_STAT(squashedAtCompletion, statistics::units::Count::get(), "Dedicated DIVSD squashed at FU completion"),
+      ADD_STAT(admissionRejected, statistics::units::Count::get(), "Dedicated DIVSD admission rejection attempts"),
+      ADD_STAT(admissionCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD admission reservation intervals"),
+      ADD_STAT(inFlightCycles, statistics::units::Cycle::get(), "Union of DIVSD issue to scheduled FU completion intervals"),
+      ADD_STAT(issueToCompletionCycles, statistics::units::Cycle::get(), "Sum of issue to FU completion cycles for completed DIVSD"),
+      ADD_STAT(boundaryInFlight, statistics::units::Count::get(), "Outstanding dedicated DIVSD at stats reset"),
+      ADD_STAT(endInFlight, statistics::units::Count::get(), "Outstanding dedicated DIVSD at stats dump")
+{
+}
+
+void
+InstructionQueue::DivsdStats::account()
+{
+    const uint64_t now = iq.cpu->curCycle();
+    const auto covered = [this, now](uint64_t end) {
+        return end > lastCycle ? std::min(end, now) - lastCycle : 0;
+    };
+    admissionCycles += covered(iq.divsdNextIssue);
+    inFlightCycles += covered(iq.divsdActiveUntil);
+    lastCycle = now;
+}
+
+void
+InstructionQueue::DivsdStats::preDumpStats()
+{
+    account();
+    endInFlight = iq.divsdIssuedAt.size();
+    statistics::Group::preDumpStats();
+}
+
+void
+InstructionQueue::DivsdStats::resetStats()
+{
+    statistics::Group::resetStats();
+    lastCycle = iq.cpu->curCycle();
+    boundaryInFlight = iq.divsdIssuedAt.size();
 }
 
 void
@@ -834,6 +878,16 @@ void
 InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                                       int fu_idx)
 {
+    if (inst->opClass() == X86DivsdOp) {
+        divsdStats.account();
+        const auto it = divsdIssuedAt.find(inst->seqNum);
+        assert(it != divsdIssuedAt.end());
+        ++divsdStats.completed;
+        divsdStats.issueToCompletionCycles += uint64_t(cpu->curCycle()) - it->second;
+        if (inst->isSquashed())
+            ++divsdStats.squashedAtCompletion;
+        divsdIssuedAt.erase(it);
+    }
     DPRINTF(IQ, "Processing FU completion [sn:%llu]\n", inst->seqNum);
     assert(!cpu->switchedOut());
     // The CPU could have been sleeping until this op completed (*extremely*
@@ -928,6 +982,12 @@ InstructionQueue::scheduleReadyInsts()
         assert(iq);
         auto fu_pool = iq->fuPool();
         if (op_class != No_OpClass) {
+            if (op_class == X86DivsdOp &&
+                uint64_t(cpu->curCycle()) < divsdNextIssue) {
+                ++divsdStats.admissionRejected;
+                ++order_it;
+                continue;
+            }
             idx = fu_pool->getUnit(op_class);
             if (issuing_inst->isFloating()) {
                 iqIOStats.fpAluAccesses++;
@@ -945,6 +1005,20 @@ InstructionQueue::scheduleReadyInsts()
         // valid FU, then schedule for execution.
         if (idx > FUPool::NoFreeFU || idx == FUPool::NoNeedFU ||
             idx == FUPool::NoCapableFU) {
+            if (op_class == X86DivsdOp) {
+                panic_if(idx < 0 || op_latency < Cycles(2) ||
+                         divsdIssueInterval == 0,
+                         "Dedicated DIVSD requires a FU, latency >= 2 and interval >= 1");
+                divsdStats.account();
+                const uint64_t now = cpu->curCycle();
+                divsdNextIssue = now + divsdIssueInterval;
+                // Upstream IQ completes the FU at opLat-1; execution/writeback
+                // follows via its normal queue. Do not rename this PMU activity.
+                divsdActiveUntil = std::max(divsdActiveUntil,
+                                           now + uint64_t(op_latency) - 1);
+                divsdIssuedAt.emplace(issuing_inst->seqNum, now);
+                ++divsdStats.issued;
+            }
             if (op_latency == Cycles(1)) {
                 i2e_info->size++;
                 instsToExecute.push_back(issuing_inst);

@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "cpu/op_class.hh"
+#include "base/statistics.hh"
 #include "params/FUPool.hh"
 #include "sim/sim_object.hh"
 
@@ -130,6 +131,14 @@ class FUPool : public SimObject
 
     /** Functional units. */
     std::vector<FuncUnit *> funcUnits;
+
+    // Model allocation events, including speculative/replayed operations.
+    // Rows are pool-local FU instances, not hardware execution ports.
+    struct AllocationStats : public statistics::Group
+    {
+        AllocationStats(statistics::Group *parent);
+        statistics::Vector2d allocatedByUnit;
+    } allocationStats;
 
   public:
     typedef FUPoolParams Params;

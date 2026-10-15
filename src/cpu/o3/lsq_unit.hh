@@ -44,9 +44,11 @@
 
 #include <algorithm>
 #include <cstring>
+#include <list>
 #include <map>
 #include <memory>
 #include <queue>
+#include <vector>
 
 #include "arch/generic/debugfaults.hh"
 #include "arch/generic/vec_reg.hh"
@@ -138,6 +140,13 @@ class LSQUnit
 
         LSQRequest* request() { return _request; }
         void setRequest(LSQRequest* r) { _request = r; }
+        LSQRequest*
+        takeRequest()
+        {
+            LSQRequest *request = _request;
+            _request = nullptr;
+            return request;
+        }
         bool hasRequest() { return _request != nullptr; }
         /** Member accessors. */
         /** @{ */
@@ -212,6 +221,35 @@ class LSQUnit
         /** @} */
     };
     using LQEntry = LSQEntry;
+
+    struct CommittedStoreEntry
+    {
+        CommittedStoreEntry(uint64_t id, Addr block_paddr,
+                            unsigned line_size, Request::Flags flags,
+                            RequestorID requestor_id, ContextID context_id,
+                            Addr pc, InstSeqNum seq_num,
+                            LSQRequest *request)
+            : id(id), blockPaddr(block_paddr), data(line_size, 0),
+              byteEnable(line_size, false), flags(flags),
+              requestorId(requestor_id), contextId(context_id), pc(pc),
+              firstSeqNum(seq_num), lastSeqNum(seq_num), requests{request}
+        {}
+
+        uint64_t id;
+        Addr blockPaddr;
+        std::vector<uint8_t> data;
+        std::vector<bool> byteEnable;
+        Request::Flags flags;
+        RequestorID requestorId;
+        ContextID contextId;
+        Addr pc;
+        InstSeqNum firstSeqNum;
+        InstSeqNum lastSeqNum;
+        std::vector<LSQRequest *> requests;
+        size_t nextToSend = 0;
+        size_t completedRequests = 0;
+        bool completed = false;
+    };
 
     /** Coverage of one address range with another */
     enum class AddrRangeCoverage
@@ -324,8 +362,9 @@ class LSQUnit
     /** Returns the number of loads in the LQ. */
     int numLoads() { return loadQueue.size(); }
 
-    /** Returns the number of stores in the SQ. */
-    int numStores() { return storeQueue.size(); }
+    /** Returns the number of stores using speculative or committed state. */
+    int numStores()
+    { return storeQueue.size() + committedStoreBuffer.size(); }
 
     /** Returns the current occupancy of the passed
      * queue (store queue or load queue) */
@@ -356,43 +395,53 @@ class LSQUnit
     /** Returns if either the LQ or SQ is full. */
     bool isFull() { return lqFull() || sqFull(); }
 
-    /** Returns if both the LQ and SQ are empty. */
+    /** Returns if both the LQ and all store state are empty. */
     bool isEmpty() const { return lqEmpty() && sqEmpty(); }
 
     /** Returns if the LQ is full. */
     bool lqFull() { return loadQueue.full(); }
 
-    /** Returns if the SQ is full. */
-    bool sqFull() { return storeQueue.full(); }
+    /** Returns if the physical SQ or shared store-state budget is full. */
+    bool sqFull();
 
     /** Returns if the LQ is empty. */
     bool lqEmpty() const { return loadQueue.size() == 0; }
 
-    /** Returns if the SQ is empty. */
-    bool sqEmpty() const { return storeQueue.size() == 0; }
+    /** Returns if the SQ and committed SBuffer are empty. */
+    bool sqEmpty() const
+    { return storeQueue.size() == 0 && committedStoreBuffer.empty(); }
 
     /** Returns the number of instructions in the LSQ. */
-    unsigned getCount() { return loadQueue.size() + storeQueue.size(); }
+    unsigned getCount()
+    { return loadQueue.size() + storeQueue.size() + committedStoreBuffer.size(); }
 
     /** Returns if there are any stores to writeback. */
-    bool hasStoresToWB() { return storesToWB; }
+    bool hasStoresToWB()
+    { return storesToWB || !committedStoreBuffer.empty(); }
 
     /** Returns the number of stores to writeback. */
-    int numStoresToWB() { return storesToWB; }
+    int numStoresToWB()
+    { return storesToWB + committedStoreBuffer.size(); }
 
     /** Returns if the LSQ unit will writeback on this cycle. */
     bool
     willWB()
     {
-        return storeWBIt.dereferenceable() &&
-                        storeWBIt->valid() &&
-                        storeWBIt->canWB() &&
-                        !storeWBIt->completed() &&
-                        !isStoreBlocked;
+        const bool sq_ready = storeWBIt.dereferenceable() &&
+                              storeWBIt->valid() &&
+                              storeWBIt->canWB() &&
+                              !storeWBIt->completed();
+        const bool sbuffer_ready = !committedStoreBuffer.empty() &&
+            committedStoreBuffer.front().nextToSend <
+                committedStoreBuffer.front().requests.size();
+        return (sq_ready || sbuffer_ready) && !isStoreBlocked;
     }
 
     /** Handles doing the retry. */
     void recvRetry();
+
+    /** Complete a committed SBuffer write response. */
+    void completeStoreBufferWrite(uint64_t entry_id, LSQRequest *request);
 
     unsigned int cacheLineSize();
   private:
@@ -407,6 +456,14 @@ class LSQUnit
 
     /** Issue buffer-mode exclusive permission prefetches. */
     void issueStorePrepareRequests();
+
+    bool sbufferMode() const
+    { return tsoStore == enums::TSOStore::sbuffer; }
+    bool bufferableStore(SQEntry &entry) const;
+    bool forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx);
+    void offloadCommittedStores();
+    void drainCommittedStoreBuffer();
+    void updateStoreBufferOccupancy();
 
     /** Completes the store at the specified index. */
     void completeStore(typename StoreQueue::iterator store_idx);
@@ -574,6 +631,14 @@ class LSQUnit
     /** Maximum number of committed stores awaiting cache responses. */
     unsigned tsoStoreMaxInFlight;
 
+    unsigned sbufferOffloadWidth;
+    unsigned sbufferDrainWidth;
+    bool sbufferMerge;
+    bool sbufferForwarding;
+    bool sbufferPrepare;
+    uint64_t nextStoreBufferEntryId = 1;
+    std::list<CommittedStoreEntry> committedStoreBuffer;
+
     /** The oldest load that caused a memory ordering violation. */
     DynInstPtr memDepViolator;
 
@@ -616,6 +681,17 @@ class LSQUnit
 
         /** Buffer-mode permission prefetches rejected for retry. */
         statistics::Scalar storePrepareBlocked;
+
+        statistics::Scalar sbufferOffloaded;
+        statistics::Scalar sbufferOffloadBlocked;
+        statistics::Scalar sbufferMergedStores;
+        statistics::Scalar sbufferMergedBytes;
+        statistics::Scalar sbufferForwardedLoads;
+        statistics::Scalar sbufferPartialForwardRetries;
+        statistics::Scalar sbufferDrainIssued;
+        statistics::Scalar sbufferDrainBlocked;
+        statistics::Scalar sbufferDrainCompleted;
+        statistics::Average sbufferAvgOccupancy;
 
         statistics::Scalar serviceAccepted;
         statistics::Scalar serviceAdmissionRetries;

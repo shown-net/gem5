@@ -23,7 +23,6 @@ class TaoTrace(ProbeListenerObject):
     cxx_exports = [
         PyBindMethod("startMarkerCapture"),
         PyBindMethod("selectMarkerWindow"),
-        PyBindMethod("acknowledgeMarker"),
         PyBindMethod("resumeMarkerHandoff"),
     ]
     marker_controlled = Param.Bool(

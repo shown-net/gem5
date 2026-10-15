@@ -52,6 +52,7 @@ class OpClass(Enum):
         "FloatMult",
         "FloatMultAcc",
         "FloatDiv",
+        "X86Divsd",
         "FloatMisc",
         "FloatSqrt",
         "SimdAdd",

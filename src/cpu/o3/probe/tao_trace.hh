@@ -82,7 +82,6 @@ class TaoTrace : public ProbeListenerObject
     void regProbeListeners() override;
     void startMarkerCapture(const std::string &directory);
     void selectMarkerWindow(uint64_t begin, uint64_t end);
-    void acknowledgeMarker();
     void resumeMarkerHandoff();
     static void closeMarkerMeasurement();
     static void traceMarkerHandoff(gem5::ThreadContext *tc);
@@ -241,9 +240,6 @@ class TaoTrace : public ProbeListenerObject
     void onCommit(const DynInstPtr &dynInst);
     void recordCommit(const DynInstPtr &dynInst);
     void observeMarkerCommit(const DynInstPtr &dynInst);
-    void observeMarkerFetch(const DynInstPtr &dynInst);
-    static bool markerFenceReady();
-    static void releaseMarkerFence();
     void onPreCommit(const DynInstPtr &dynInst);
     void onCommitStall(const DynInstPtr &dynInst);
     void onSquash(const DynInstPtr &dynInst);
@@ -694,21 +690,8 @@ private:
         Measuring,
         Complete,
     };
-    enum class MarkerBoundaryPhase : uint8_t
-    {
-        Idle,
-        WaitingForFence,
-        ExitScheduled,
-    };
-    enum class MarkerBoundaryKind : uint8_t
-    {
-        Begin,
-        End,
-    };
     MarkerMeasurementPhase marker_measurement_phase_ =
         MarkerMeasurementPhase::Warming;
-    MarkerBoundaryPhase marker_boundary_phase_ = MarkerBoundaryPhase::Idle;
-    MarkerBoundaryKind marker_boundary_kind_ = MarkerBoundaryKind::Begin;
     std::unique_ptr<MarkerPcTrace> marker_pc_trace_;
     static TaoTrace *marker_owner_;
     static uint64_t marker_address_root_;

@@ -899,8 +899,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
         marker_instances_.insert(this);
         if (!params.marker_pc_trace_file.empty()) {
             marker_pc_trace_ = std::make_unique<MarkerPcTrace>(
-                params.marker_image_base, params.marker_exec_segments,
-                params.marker_pc_trace_file, params.marker_elf_sha256);
+                params.marker_pc_trace_file);
         }
     }
     wrong_path_core_id_ = parseFstCoreIdFromName(name());
@@ -1028,85 +1027,9 @@ TaoTrace::selectMarkerWindow(uint64_t begin, uint64_t end)
 }
 
 void
-TaoTrace::acknowledgeMarker()
-{
-    fatal_if(marker_owner_ != this ||
-                 marker_boundary_phase_ != MarkerBoundaryPhase::ExitScheduled,
-             "no pending TaoTrace Marker boundary");
-    if (marker_measurement_phase_ == MarkerMeasurementPhase::Measuring &&
-        marker_pc_trace_) {
-        marker_pc_trace_->initializeTrace();
-    }
-    marker_boundary_phase_ = MarkerBoundaryPhase::Idle;
-    if (native_stats_) {
-        for (auto *trace : marker_instances_) {
-            trace->native_measurement_active_ =
-                marker_measurement_phase_ == MarkerMeasurementPhase::Measuring;
-            if (trace->native_stats_ && trace->native_measurement_active_)
-                trace->ppNativeMemoryObservation->notify(
-                    TaoTraceMemoryBoundary{true});
-        }
-    }
-    releaseMarkerFence();
-}
-
-bool
-TaoTrace::markerFenceReady()
-{
-    return std::all_of(marker_instances_.begin(), marker_instances_.end(),
-        [] (const TaoTrace *trace) {
-            return trace->marker_cpu_ &&
-                trace->marker_cpu_->traceMarkerFenceReady();
-        });
-}
-
-void
-TaoTrace::releaseMarkerFence()
-{
-    for (auto *trace : marker_instances_) {
-        if (trace->marker_cpu_)
-            trace->marker_cpu_->releaseTraceMarkerFence();
-    }
-}
-
-void
-TaoTrace::observeMarkerFetch(const DynInstPtr &inst)
-{
-    auto *owner = marker_owner_;
-    if (!owner || !owner->marker_capture_started_ ||
-        owner->marker_measurement_phase_ == MarkerMeasurementPhase::Complete ||
-        !inst->fetchedFromUser ||
-        inst->pcState().instAddr() != marker_pc_ ||
-        owner->marker_address_space_ != inst->fetchedAddressSpaceId) {
-        return;
-    }
-    const uint64_t next = owner->marker_ordinal_ + 1;
-    if (next != owner->marker_begin_ && next != owner->marker_end_)
-        return;
-    for (auto *trace : marker_instances_)
-        trace->marker_cpu_->requestTraceMarkerFence();
-    // The triggering core fences this exact marker.  Other participating
-    // cores claim the same one-shot request at their next rename boundary.
-    inst->setSerializeBefore();
-    owner->marker_cpu_->setTraceMarkerFenceInst(inst->seqNum);
-}
-
-void
 TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
 {
     auto *owner = marker_owner_;
-    if (owner &&
-        owner->marker_boundary_phase_ == MarkerBoundaryPhase::WaitingForFence &&
-        markerFenceReady()) {
-        owner->marker_boundary_phase_ = MarkerBoundaryPhase::ExitScheduled;
-        if (owner->marker_boundary_kind_ == MarkerBoundaryKind::End) {
-            for (auto *trace : marker_instances_)
-                trace->marker_cpu_->holdTraceMarkerFence();
-        }
-        exitSimulationLoopNow(8, {{"kind",
-            owner->marker_boundary_kind_ == MarkerBoundaryKind::Begin ?
-                "begin" : "end"}});
-    }
     if (!owner || !marker_capture_started_ ||
         owner->marker_measurement_phase_ == MarkerMeasurementPhase::Complete ||
         (inst->isMicroop() && !inst->isLastMicroop()) ||
@@ -1132,13 +1055,6 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     if (!begin && !end) {
         return;
     }
-    fatal_if(owner->marker_boundary_phase_ != MarkerBoundaryPhase::Idle,
-             "TaoTrace Marker boundary was not acknowledged");
-    // This callback is the authoritative commit observation for the selected
-    // Marker macro-op.  Its fetched instruction sequence may differ from the
-    // final committed micro-op sequence on x86, so close the owner's private
-    // fence from the observed architectural boundary itself.
-    owner->marker_cpu_->confirmTraceMarkerFenceCommit();
     owner->marker_measurement_phase_ = begin ?
         MarkerMeasurementPhase::Measuring : MarkerMeasurementPhase::Complete;
     if (owner->native_stats_) {
@@ -1166,22 +1082,18 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     if (end && owner->marker_pc_trace_) {
         owner->marker_pc_trace_->finalizeTrace();
     }
-    owner->marker_boundary_kind_ = begin ? MarkerBoundaryKind::Begin :
-                                           MarkerBoundaryKind::End;
-    owner->marker_boundary_phase_ = MarkerBoundaryPhase::WaitingForFence;
+    // Snapshot synchronously at commit; leave the pipeline running normally.
+    statistics::dump();
+    if (begin && owner->marker_pc_trace_)
+        owner->marker_pc_trace_->initializeTrace();
     for (auto *trace : marker_instances_) {
-        auto *cpu = trace->marker_cpu_;
-        fatal_if(!cpu, "TaoTrace Marker participant is not an O3 CPU");
-        cpu->requestTraceCommitStop();
+        trace->native_measurement_active_ = begin;
+        if (begin && trace->native_stats_)
+            trace->ppNativeMemoryObservation->notify(
+                TaoTraceMemoryBoundary{true});
     }
-    if (markerFenceReady()) {
-        owner->marker_boundary_phase_ = MarkerBoundaryPhase::ExitScheduled;
-        if (!begin) {
-            for (auto *trace : marker_instances_)
-                trace->marker_cpu_->holdTraceMarkerFence();
-        }
-        exitSimulationLoopNow(8, {{"kind", begin ? "begin" : "end"}});
-    }
+    if (end)
+        exitSimulationLoopNow(8, {{"kind", "end"}});
 }
 
 void
@@ -1768,9 +1680,6 @@ TaoTrace::regProbeListeners()
 {
     using DynInstListener = ProbeListenerArg<TaoTrace, DynInstPtr>;
     if (marker_controlled_ && !functionalTraceEnabled()) {
-        // Control-only still needs Fetch to arm the private O3 fence before
-        // the selected marker can let younger uops reach IEW.
-        connectListener<DynInstListener>(this, "Fetch", &TaoTrace::onFetch);
         connectListener<DynInstListener>(this, "Commit", &TaoTrace::onCommit);
         if (native_stats_)
             connectListener<DynInstListener>(this, "Squash", &TaoTrace::observeNativeSquash);
@@ -6695,7 +6604,6 @@ TaoTrace::traceSquashEpisode(const CPU *cpu,
 void
 TaoTrace::onFetch(const DynInstPtr &inst)
 {
-    observeMarkerFetch(inst);
     maybeCaptureInitialPteState(inst);
     noteWrongPathStage(inst, "fetch");
 }

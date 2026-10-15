@@ -45,6 +45,7 @@
 #include <list>
 #include <map>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 #include "base/statistics.hh"
@@ -649,6 +650,26 @@ class InstructionQueue
     } iqIOStats;
 
   private:
+    // One logical divider admission resource, independent of result latency.
+    const unsigned divsdIssueInterval;
+    uint64_t divsdNextIssue = 0;
+    uint64_t divsdActiveUntil = 0;
+    std::unordered_map<InstSeqNum, uint64_t> divsdIssuedAt;
+
+    struct DivsdStats : public statistics::Group
+    {
+        InstructionQueue &iq;
+        uint64_t lastCycle = 0;
+        DivsdStats(CPU *cpu, InstructionQueue &owner);
+        void account();
+        void preDumpStats() override;
+        void resetStats() override;
+        statistics::Scalar issued, completed, squashedAtCompletion;
+        statistics::Scalar admissionRejected, admissionCycles, inFlightCycles;
+        statistics::Scalar issueToCompletionCycles;
+        statistics::Scalar boundaryInFlight, endInFlight;
+    } divsdStats;
+
     ProbePointArg<ExecutionFUEvent> *ppExecutionIssue;
     ProbePointArg<ExecutionFUEvent> *ppExecutionFUBlocked;
 };

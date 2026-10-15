@@ -359,6 +359,11 @@ let {{
             candidate.decode_block = "if (singleResultImul) {\n" + candidate.decode_block + "}\n"
             candidate.append(blocks)
             return candidate
+        if Name == "DIVSD_XMM_XMM":
+            candidate = genMacroop("DIVSD_XMM_XMM_INDEPENDENT", env)
+            candidate.decode_block = "if (independentDivsd && !machInst.vex.present) {\n" + candidate.decode_block + "}\n"
+            candidate.append(blocks)
+            return candidate
         if Name == "SETZ_R":
             single_zf = genMacroop("SETZ_R_SINGLE", env)
             single_wide = genMacroop("SETZ_R_SINGLE_WIDE", env)

@@ -32,5 +32,6 @@ class X86Decoder(InstDecoder):
     cxx_class = "gem5::X86ISA::Decoder"
     cxx_header = "arch/x86/decoder.hh"
     singleResultImul = Param.Bool(False, "Use one result-producing uop for register IMUL")
+    independentDivsd = Param.Bool(False, "Route register DIVSD to its dedicated execution resource")
     singleUopSetz = Param.Bool(False, "Use one result uop for register SETZ")
     zfOnlySetz = Param.Bool(False, "Read only Zaps for register SETZ")

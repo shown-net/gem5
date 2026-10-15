@@ -239,6 +239,7 @@ class Decoder : public InstDecoder
 
   protected:
     const bool singleResultImul;
+    const bool independentDivsd;
     const bool singleUopSetz;
     const bool zfOnlySetz;
     /// Caching for decoded instruction objects.
@@ -262,6 +263,7 @@ class Decoder : public InstDecoder
   public:
     Decoder(const X86DecoderParams &p) : InstDecoder(p, &fetchChunk)
         , singleResultImul(p.singleResultImul),
+          independentDivsd(p.independentDivsd),
           singleUopSetz(p.singleUopSetz), zfOnlySetz(p.zfOnlySetz)
     {
         emi.reset();

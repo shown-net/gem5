@@ -293,6 +293,8 @@ class LSQ
         uint32_t _numOutstandingPackets;
         AtomicOpFunctorPtr _amo_op;
         bool _hasStaleTranslation;
+        bool _sbufferOwned = false;
+        uint64_t _sbufferEntryId = 0;
 
       protected:
         LSQUnit* lsqUnit() { return &_port; }
@@ -465,6 +467,14 @@ class LSQ
             if (isReleased() && !isAnyOutstandingRequest())
                 delete this;
         }
+
+        void moveToSbuffer(uint64_t entry_id)
+        {
+            _sbufferOwned = true;
+            _sbufferEntryId = entry_id;
+        }
+        bool sbufferOwned() const { return _sbufferOwned; }
+        uint64_t sbufferEntryId() const { return _sbufferEntryId; }
 
         bool
         isSplit() const

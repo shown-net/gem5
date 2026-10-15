@@ -461,6 +461,15 @@ LSQ::recvTimingResp(PacketPtr pkt)
     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
     panic_if(!request, "Got packet back with unknown sender state\n");
 
+    if (request->sbufferOwned()) {
+        ThreadID tid = cpu->contextToThread(request->contextId());
+        thread.at(tid).completeStoreBufferWrite(
+            request->sbufferEntryId(), request);
+        request->packetReplied();
+        request->freeLSQEntry();
+        return true;
+    }
+
     thread[cpu->contextToThread(request->contextId())].recvTimingResp(pkt);
 
     if (pkt->isInvalidate()) {
