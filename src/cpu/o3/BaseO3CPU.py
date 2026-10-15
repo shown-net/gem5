@@ -82,6 +82,9 @@ class BaseO3CPU(BaseCPU):
     loadServiceCacheSets = Param.Unsigned(64, "L1D sets for xs reference arbitration")
 
     activity = Param.Unsigned(0, "Initial count")
+    taskStatsSwitchPc = Param.Addr(0, "x86 Linux __switch_to; zero disables TASK observer")
+    taskStatsCurrentOffset = Param.Addr(0, "GS-relative pcpu_hot.current_task offset")
+    taskStatsPidOffset = Param.Unsigned(0, "BTF task_struct.pid offset")
 
     cacheStorePorts = Param.Unsigned(
         200, "Cache Ports. Constrains stores only."

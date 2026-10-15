@@ -52,6 +52,7 @@
 
 #include "arch/generic/pcstate.hh"
 #include "base/statistics.hh"
+#include "cpu/o3/task_uop_stats.hh"
 #include "cpu/activity.hh"
 #include "cpu/base.hh"
 #include "cpu/o3/bac.hh"
@@ -599,6 +600,8 @@ class CPU : public BaseCPU
     {
         return iew.ldstQueue.getDataPort();
     }
+
+    std::vector<std::unique_ptr<TaskUopStats>> uopTaskStats;
 
     struct CPUStats : public statistics::Group
     {

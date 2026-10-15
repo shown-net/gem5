@@ -1072,6 +1072,8 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
+            cpu->uopTaskStats[tid]->scheduled(
+                idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU);
             if (idx >= 0 && ppExecutionIssue) {
                 ppExecutionIssue->notify({op_class, idx, op_latency,
                     fu_pool->isPipelined(op_class),

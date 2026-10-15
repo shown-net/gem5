@@ -970,6 +970,10 @@ TaoTrace::startMarkerCapture(const std::string &directory)
     }
     marker_capture_started_ = true;
     if (marker_cpu_) {
+        const auto &task_params = static_cast<const BaseO3CPUParams &>(marker_cpu_->params());
+        marker_cpu_->uopTaskStats.at(0)->observe(
+            marker_cpu_->tcBase(0), task_params.taskStatsSwitchPc,
+            task_params.taskStatsCurrentOffset, task_params.taskStatsPidOffset);
         cpl_core_id_ = parseFstCoreIdFromName(name());
         cpl_clock_period_ticks_ = marker_cpu_->clockPeriod();
         if (native_stats_)

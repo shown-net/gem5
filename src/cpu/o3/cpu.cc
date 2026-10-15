@@ -115,6 +115,10 @@ CPU::CPU(const BaseO3CPUParams &params)
       lastRunningCycle(curCycle()),
       cpuStats(this)
 {
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        uopTaskStats.emplace_back(std::make_unique<TaskUopStats>(
+            this, csprintf("uopTaskStats%d", tid).c_str()));
+    }
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
 
@@ -373,6 +377,8 @@ CPU::tick()
     assert(drainState() != DrainState::Drained);
 
     ++baseStats.numCycles;
+    for (auto &stats : uopTaskStats)
+        stats->beginCycle();
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
 
 //    activity = false;
@@ -389,6 +395,8 @@ CPU::tick()
     iew.tick();
 
     commit.tick();
+    for (auto &stats : uopTaskStats)
+        stats->endCycle();
 
     // Now advance the time buffers
     timeBuffer.advance();
@@ -1349,6 +1357,10 @@ CPU::wakeCPU()
         --cycles;
         cpuStats.idleCycles += cycles;
         baseStats.numCycles += cycles;
+        for (ThreadID tid = 0; tid < numThreads; ++tid) {
+            if (threadContexts[tid]->status() == gem5::ThreadContext::Active)
+                uopTaskStats[tid]->accountGap(cycles);
+        }
     }
 
     schedule(tickEvent, clockEdge());
