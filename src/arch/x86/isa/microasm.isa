@@ -54,6 +54,7 @@ let {{
 }};
 
 ##include "calibration/imul.isa"
+##include "calibration/integer_decomposition.isa"
 ##include "calibration/setz.isa"
 
 let {{

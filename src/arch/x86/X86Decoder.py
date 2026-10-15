@@ -32,6 +32,9 @@ class X86Decoder(InstDecoder):
     cxx_class = "gem5::X86ISA::Decoder"
     cxx_header = "arch/x86/decoder.hh"
     singleResultImul = Param.Bool(False, "Use one result-producing uop for register IMUL")
+    singleUopAluImmediate = Param.Bool(False, "Embed full immediates in 32/64-bit register ALU uops")
+    singleResultImulForms = Param.Bool(False, "Use direct-result IMUL for memory and 32/64-bit immediate forms")
+    imul16ImmediateMode = Param.Unsigned(0, "16-bit immediate IMUL: 0 original, 1 direct, 2 multiply then merge")
     independentDivsd = Param.Bool(False, "Route register DIVSD to its dedicated execution resource")
     singleUopSetz = Param.Bool(False, "Use one result uop for register SETZ")
     zfOnlySetz = Param.Bool(False, "Read only Zaps for register SETZ")

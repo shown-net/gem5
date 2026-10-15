@@ -354,6 +354,27 @@ let {{
             blocks.decoder_output = macroop.getDefinition(env)
             macroop.declared = True
         blocks.decode_block = "return %s;\n" % macroop.getAllocator(env)
+        if Name in ("ADD_R_I", "SUB_R_I", "AND_R_I", "OR_R_I",
+                    "XOR_R_I", "CMP_R_I", "TEST_R_I"):
+            candidate = genMacroop(Name + "_DIRECT", env)
+            # Byte operands keep their own width even when the default
+            # architectural operand size is 32 bits (for example TEST AL, Ib).
+            candidate.decode_block = "if (singleUopAluImmediate && (%s) >= 4) {\n" % env.dataSize + candidate.decode_block + "}\n"
+            candidate.append(blocks)
+            return candidate
+        if Name in ("IMUL_R_R_I", "IMUL_R_M_I"):
+            direct = genMacroop(Name + "_DIRECT", env)
+            split = genMacroop(Name + "_SPLIT16", env)
+            direct.decode_block = "if ((machInst.opSize == 2 && imul16ImmediateMode == 1) || (machInst.opSize >= 4 && singleResultImulForms)) {\n" + direct.decode_block + "}\n"
+            split.decode_block = "if (machInst.opSize == 2 && imul16ImmediateMode == 2) {\n" + split.decode_block + "}\n"
+            direct.append(split)
+            direct.append(blocks)
+            return direct
+        if Name == "IMUL_R_M":
+            candidate = genMacroop(Name + "_DIRECT", env)
+            candidate.decode_block = "if (singleResultImulForms) {\n" + candidate.decode_block + "}\n"
+            candidate.append(blocks)
+            return candidate
         if Name == "IMUL_R_R":
             candidate = genMacroop("IMUL_R_R_SINGLE", env)
             candidate.decode_block = "if (singleResultImul) {\n" + candidate.decode_block + "}\n"

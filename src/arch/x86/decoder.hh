@@ -239,6 +239,9 @@ class Decoder : public InstDecoder
 
   protected:
     const bool singleResultImul;
+    const bool singleUopAluImmediate;
+    const bool singleResultImulForms;
+    const unsigned imul16ImmediateMode;
     const bool independentDivsd;
     const bool singleUopSetz;
     const bool zfOnlySetz;
@@ -263,6 +266,9 @@ class Decoder : public InstDecoder
   public:
     Decoder(const X86DecoderParams &p) : InstDecoder(p, &fetchChunk)
         , singleResultImul(p.singleResultImul),
+          singleUopAluImmediate(p.singleUopAluImmediate),
+          singleResultImulForms(p.singleResultImulForms),
+          imul16ImmediateMode(p.imul16ImmediateMode),
           independentDivsd(p.independentDivsd),
           singleUopSetz(p.singleUopSetz), zfOnlySetz(p.zfOnlySetz)
     {
