@@ -70,6 +70,15 @@ class X86IntMultDiv(IntMultDiv):
     count = 2
 
 
+class X86IntDivResult(FUDesc):
+    opList = [
+        OpDesc(opClass="X86IntDivQuot", opLat=1),
+        OpDesc(opClass="X86IntDivRem32", opLat=2),
+        OpDesc(opClass="X86IntDivRem64", opLat=3),
+    ]
+    count = 1
+
+
 class DefaultX86FUPool(FUPool):
     FUList = [
         IntALU(),

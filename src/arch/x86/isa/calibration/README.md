@@ -13,6 +13,13 @@ macroop. The original path remains selected when all parameters are false.
   Byte merge retains the old destination dependency. Both false select the
   original register SETZ. The earlier single-result candidate corresponds
   to both parameters true.
+* `idiv.isa`: `compactIntDiv` selects a fixed-footprint behavior proxy for
+  32/64-bit register DIV/IDIV. It computes quotient, remainder and #DE
+  semantics atomically, then exposes separate quotient/remainder result stages;
+  O3 owns the shared width-sensitive admission timing. False selects the
+  original macro-op. 8/16-bit and memory forms remain unchanged. The proxy is
+  constrained by published SPR behavior and is not a claim about Intel's
+  internal microcode algorithm.
 
 Parameters do not change during simulation. ISA definitions and their includes
 are tracked by the normal SCons ISA scanner. Functional and performance

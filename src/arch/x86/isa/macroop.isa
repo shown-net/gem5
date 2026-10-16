@@ -380,6 +380,22 @@ let {{
             candidate.decode_block = "if (singleResultImul) {\n" + candidate.decode_block + "}\n"
             candidate.append(blocks)
             return candidate
+        if Name == "IDIV_R":
+            compact64 = genMacroop("IDIV_R_COMPACT64", env)
+            compact32 = genMacroop("IDIV_R_COMPACT32", env)
+            compact64.decode_block = "if (compactIntDiv && machInst.opSize == 8) {\n" + compact64.decode_block + "}\n"
+            compact32.decode_block = "if (compactIntDiv && machInst.opSize == 4) {\n" + compact32.decode_block + "}\n"
+            compact64.append(compact32)
+            compact64.append(blocks)
+            return compact64
+        if Name == "DIV_R":
+            compact64 = genMacroop("DIV_R_COMPACT64", env)
+            compact32 = genMacroop("DIV_R_COMPACT32", env)
+            compact64.decode_block = "if (compactIntDiv && machInst.opSize == 8) {\n" + compact64.decode_block + "}\n"
+            compact32.decode_block = "if (compactIntDiv && machInst.opSize == 4) {\n" + compact32.decode_block + "}\n"
+            compact64.append(compact32)
+            compact64.append(blocks)
+            return compact64
         if Name == "DIVSD_XMM_XMM":
             candidate = genMacroop("DIVSD_XMM_XMM_INDEPENDENT", env)
             candidate.decode_block = "if (independentDivsd && !machInst.vex.present) {\n" + candidate.decode_block + "}\n"

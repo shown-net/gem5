@@ -35,6 +35,7 @@ class X86Decoder(InstDecoder):
     singleUopAluImmediate = Param.Bool(False, "Embed full immediates in 32/64-bit register ALU uops")
     singleResultImulForms = Param.Bool(False, "Use direct-result IMUL for memory and 32/64-bit immediate forms")
     imul16ImmediateMode = Param.Unsigned(0, "16-bit immediate IMUL: 0 original, 1 direct, 2 multiply then merge")
+    compactIntDiv = Param.Bool(False, "Use fixed-footprint register DIV/IDIV behavior proxy for 32/64-bit forms")
     independentDivsd = Param.Bool(False, "Route register DIVSD to its dedicated execution resource")
     singleUopSetz = Param.Bool(False, "Use one result uop for register SETZ")
     zfOnlySetz = Param.Bool(False, "Read only Zaps for register SETZ")

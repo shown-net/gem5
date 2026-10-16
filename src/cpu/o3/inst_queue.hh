@@ -670,6 +670,27 @@ class InstructionQueue
         statistics::Scalar divsdInFlightAtDump;
     } divsdStats;
 
+    const unsigned intDiv32IssueInterval;
+    const unsigned intDiv64IssueInterval;
+    uint64_t intDivNextIssue = 0;
+    uint64_t intDivActiveUntil = 0;
+    std::unordered_map<InstSeqNum, uint64_t> intDivIssuedAt;
+
+    struct IntDivStats : public statistics::Group
+    {
+        InstructionQueue &iq;
+        uint64_t lastCycle = 0;
+        IntDivStats(CPU *cpu, InstructionQueue &owner);
+        void account();
+        void preDumpStats() override;
+        void resetStats() override;
+        statistics::Scalar issued32, issued64, fuCompleted;
+        statistics::Scalar squashedAtCompletion;
+        statistics::Scalar admissionRejected32, admissionRejected64;
+        statistics::Scalar admissionCycles, inFlightCycles;
+        statistics::Scalar issueToCompletionCycles, inFlightAtDump;
+    } intDivStats;
+
     ProbePointArg<ExecutionFUEvent> *ppExecutionIssue;
     ProbePointArg<ExecutionFUEvent> *ppExecutionFUBlocked;
 };

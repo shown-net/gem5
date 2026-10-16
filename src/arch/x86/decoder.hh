@@ -242,6 +242,7 @@ class Decoder : public InstDecoder
     const bool singleUopAluImmediate;
     const bool singleResultImulForms;
     const unsigned imul16ImmediateMode;
+    const bool compactIntDiv;
     const bool independentDivsd;
     const bool singleUopSetz;
     const bool zfOnlySetz;
@@ -269,6 +270,7 @@ class Decoder : public InstDecoder
           singleUopAluImmediate(p.singleUopAluImmediate),
           singleResultImulForms(p.singleResultImulForms),
           imul16ImmediateMode(p.imul16ImmediateMode),
+          compactIntDiv(p.compactIntDiv),
           independentDivsd(p.independentDivsd),
           singleUopSetz(p.singleUopSetz), zfOnlySetz(p.zfOnlySetz)
     {

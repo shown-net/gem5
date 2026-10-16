@@ -235,6 +235,12 @@ class BaseO3CPU(BaseCPU):
     )
     divsdLatency = Param.Unsigned(14, "Dedicated register DIVSD result latency")
     divsdIssueInterval = Param.Unsigned(4, "Dedicated register DIVSD initiation interval")
+    intDiv32QuotientLatency = Param.Unsigned(13, "Compact 32-bit DIV/IDIV quotient latency")
+    intDiv32RemainderLatency = Param.Unsigned(15, "Compact 32-bit DIV/IDIV remainder latency")
+    intDiv64QuotientLatency = Param.Unsigned(15, "Compact 64-bit DIV/IDIV quotient latency")
+    intDiv64RemainderLatency = Param.Unsigned(18, "Compact 64-bit DIV/IDIV remainder latency")
+    intDiv32IssueInterval = Param.Unsigned(6, "Compact 32-bit DIV/IDIV initiation interval")
+    intDiv64IssueInterval = Param.Unsigned(10, "Compact 64-bit DIV/IDIV initiation interval")
 
     sbufferOffloadWidth = Param.Unsigned(
         1, "Maximum committed SQ stores transferred to SBuffer per cycle"
