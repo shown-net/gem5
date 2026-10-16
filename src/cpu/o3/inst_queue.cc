@@ -263,16 +263,15 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
 }
 
 InstructionQueue::DivsdStats::DivsdStats(CPU *cpu, InstructionQueue &owner)
-    : statistics::Group(cpu, "divsd"), iq(owner),
-      ADD_STAT(issued, statistics::units::Count::get(), "Dedicated DIVSD issues"),
-      ADD_STAT(completed, statistics::units::Count::get(), "Dedicated DIVSD FU completions including squashed work"),
-      ADD_STAT(squashedAtCompletion, statistics::units::Count::get(), "Dedicated DIVSD squashed at FU completion"),
-      ADD_STAT(admissionRejected, statistics::units::Count::get(), "Dedicated DIVSD admission rejection attempts"),
-      ADD_STAT(admissionCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD admission reservation intervals"),
-      ADD_STAT(inFlightCycles, statistics::units::Cycle::get(), "Union of DIVSD issue to scheduled FU completion intervals"),
-      ADD_STAT(issueToCompletionCycles, statistics::units::Cycle::get(), "Sum of issue to FU completion cycles for completed DIVSD"),
-      ADD_STAT(boundaryInFlight, statistics::units::Count::get(), "Outstanding dedicated DIVSD at stats reset"),
-      ADD_STAT(endInFlight, statistics::units::Count::get(), "Outstanding dedicated DIVSD at stats dump")
+    : statistics::Group(&cpu->customStats), iq(owner),
+      ADD_STAT(divsdIssued, statistics::units::Count::get(), "Dedicated DIVSD issues"),
+      ADD_STAT(divsdFuCompleted, statistics::units::Count::get(), "Dedicated DIVSD FU completions including squashed work"),
+      ADD_STAT(divsdSquashedAtCompletion, statistics::units::Count::get(), "Dedicated DIVSD squashed at FU completion"),
+      ADD_STAT(divsdAdmissionRejected, statistics::units::Count::get(), "Dedicated DIVSD admission rejection attempts"),
+      ADD_STAT(divsdAdmissionCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD admission reservation intervals"),
+      ADD_STAT(divsdInFlightCycles, statistics::units::Cycle::get(), "Union of DIVSD issue to scheduled FU completion intervals"),
+      ADD_STAT(divsdIssueToCompletionCycles, statistics::units::Cycle::get(), "Sum of issue to FU completion cycles for divsdFuCompleted DIVSD"),
+      ADD_STAT(divsdInFlightAtDump, statistics::units::Count::get(), "Outstanding dedicated DIVSD at each stats dump")
 {
 }
 
@@ -283,8 +282,8 @@ InstructionQueue::DivsdStats::account()
     const auto covered = [this, now](uint64_t end) {
         return end > lastCycle ? std::min(end, now) - lastCycle : 0;
     };
-    admissionCycles += covered(iq.divsdNextIssue);
-    inFlightCycles += covered(iq.divsdActiveUntil);
+    divsdAdmissionCycles += covered(iq.divsdNextIssue);
+    divsdInFlightCycles += covered(iq.divsdActiveUntil);
     lastCycle = now;
 }
 
@@ -292,7 +291,7 @@ void
 InstructionQueue::DivsdStats::preDumpStats()
 {
     account();
-    endInFlight = iq.divsdIssuedAt.size();
+    divsdInFlightAtDump = iq.divsdIssuedAt.size();
     statistics::Group::preDumpStats();
 }
 
@@ -301,7 +300,6 @@ InstructionQueue::DivsdStats::resetStats()
 {
     statistics::Group::resetStats();
     lastCycle = iq.cpu->curCycle();
-    boundaryInFlight = iq.divsdIssuedAt.size();
 }
 
 void
@@ -882,10 +880,10 @@ InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
         divsdStats.account();
         const auto it = divsdIssuedAt.find(inst->seqNum);
         assert(it != divsdIssuedAt.end());
-        ++divsdStats.completed;
-        divsdStats.issueToCompletionCycles += uint64_t(cpu->curCycle()) - it->second;
+        ++divsdStats.divsdFuCompleted;
+        divsdStats.divsdIssueToCompletionCycles += uint64_t(cpu->curCycle()) - it->second;
         if (inst->isSquashed())
-            ++divsdStats.squashedAtCompletion;
+            ++divsdStats.divsdSquashedAtCompletion;
         divsdIssuedAt.erase(it);
     }
     DPRINTF(IQ, "Processing FU completion [sn:%llu]\n", inst->seqNum);
@@ -984,7 +982,7 @@ InstructionQueue::scheduleReadyInsts()
         if (op_class != No_OpClass) {
             if (op_class == X86DivsdOp &&
                 uint64_t(cpu->curCycle()) < divsdNextIssue) {
-                ++divsdStats.admissionRejected;
+                ++divsdStats.divsdAdmissionRejected;
                 ++order_it;
                 continue;
             }
@@ -1017,7 +1015,7 @@ InstructionQueue::scheduleReadyInsts()
                 divsdActiveUntil = std::max(divsdActiveUntil,
                                            now + uint64_t(op_latency) - 1);
                 divsdIssuedAt.emplace(issuing_inst->seqNum, now);
-                ++divsdStats.issued;
+                ++divsdStats.divsdIssued;
             }
             if (op_latency == Cycles(1)) {
                 i2e_info->size++;
@@ -1072,7 +1070,7 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
-            cpu->uopTaskStats[tid]->scheduled(
+            cpu->customStats.scheduled(
                 idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU);
             if (idx >= 0 && ppExecutionIssue) {
                 ppExecutionIssue->notify({op_class, idx, op_latency,

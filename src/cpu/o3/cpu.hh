@@ -53,6 +53,7 @@
 #include "arch/generic/pcstate.hh"
 #include "base/statistics.hh"
 #include "cpu/o3/task_uop_stats.hh"
+#include "cpu/o3/task_stats.hh"
 #include "cpu/activity.hh"
 #include "cpu/base.hh"
 #include "cpu/o3/bac.hh"
@@ -97,6 +98,8 @@ class ThreadContext;
 class CPU : public BaseCPU
 {
   public:
+    CustomUopStats customStats;
+    TaskStatsObserver taskStats;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -601,7 +604,7 @@ class CPU : public BaseCPU
         return iew.ldstQueue.getDataPort();
     }
 
-    std::vector<std::unique_ptr<TaskUopStats>> uopTaskStats;
+    void preDumpStats() override;
 
     struct CPUStats : public statistics::Group
     {

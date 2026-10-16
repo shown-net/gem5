@@ -175,7 +175,10 @@ class Info
 class ScalarInfo : public Info
 {
   public:
+    // Optional boundary-accounted TASK value; raw storage keeps accumulating.
+    const Counter *taskValue = nullptr;
     virtual Counter value() const = 0;
+    virtual Counter rawValue() const { return value(); }
     virtual Result result() const = 0;
     virtual Result total() const = 0;
 };
@@ -183,6 +186,7 @@ class ScalarInfo : public Info
 class VectorInfo : public Info
 {
   public:
+    const VCounter *taskValues = nullptr;
     /** Names and descriptions of subfields. */
     std::vector<std::string> subnames;
     std::vector<std::string> subdescs;
@@ -193,6 +197,7 @@ class VectorInfo : public Info
   public:
     virtual size_type size() const = 0;
     virtual const VCounter &value() const = 0;
+    virtual const VCounter &rawValue() const { return value(); }
     virtual const VResult &result() const = 0;
     virtual Result total() const = 0;
 };
@@ -225,6 +230,8 @@ class VectorDistInfo : public Info
 class Vector2dInfo : public Info
 {
   public:
+    const VCounter *taskValues = nullptr;
+    virtual const VCounter &rawValue() const { return cvec; }
     /** Names and descriptions of subfields. */
     std::vector<std::string> subnames;
     std::vector<std::string> subdescs;

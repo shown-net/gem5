@@ -72,6 +72,7 @@ namespace o3
 
 CPU::CPU(const BaseO3CPUParams &params)
     : BaseCPU(params),
+      customStats(this), taskStats(*this),
       mmu(params.mmu),
       tickEvent([this] { tick(); }, "O3CPU tick", false, Event::CPU_Tick_Pri),
       threadExitEvent([this] { exitThreads(); }, "O3CPU exit threads", false,
@@ -115,10 +116,6 @@ CPU::CPU(const BaseO3CPUParams &params)
       lastRunningCycle(curCycle()),
       cpuStats(this)
 {
-    for (ThreadID tid = 0; tid < numThreads; ++tid) {
-        uopTaskStats.emplace_back(std::make_unique<TaskUopStats>(
-            this, csprintf("uopTaskStats%d", tid).c_str()));
-    }
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
 
@@ -370,6 +367,13 @@ CPU::CPUStats::CPUStats(CPU *cpu)
 }
 
 void
+CPU::preDumpStats()
+{
+    taskStats.settle();
+    BaseCPU::preDumpStats();
+}
+
+void
 CPU::tick()
 {
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
@@ -377,8 +381,7 @@ CPU::tick()
     assert(drainState() != DrainState::Drained);
 
     ++baseStats.numCycles;
-    for (auto &stats : uopTaskStats)
-        stats->beginCycle();
+    customStats.beginCycle();
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
 
 //    activity = false;
@@ -395,8 +398,7 @@ CPU::tick()
     iew.tick();
 
     commit.tick();
-    for (auto &stats : uopTaskStats)
-        stats->endCycle();
+    taskStats.endCycle();
 
     // Now advance the time buffers
     timeBuffer.advance();
@@ -1357,10 +1359,8 @@ CPU::wakeCPU()
         --cycles;
         cpuStats.idleCycles += cycles;
         baseStats.numCycles += cycles;
-        for (ThreadID tid = 0; tid < numThreads; ++tid) {
-            if (threadContexts[tid]->status() == gem5::ThreadContext::Active)
-                uopTaskStats[tid]->accountGap(cycles);
-        }
+        if (threadContexts[0]->status() == gem5::ThreadContext::Active)
+            customStats.accountGap(cycles);
     }
 
     schedule(tickEvent, clockEdge());

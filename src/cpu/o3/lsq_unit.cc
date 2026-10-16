@@ -210,7 +210,7 @@ LSQUnit::LSQUnit(uint32_t lqEntries, uint32_t sqEntries)
       htmStarts(0), htmStops(0),
       lastRetiredHtmUid(0),
       cacheBlockMask(0), stalled(false),
-      isStoreBlocked(false), storesInFlight(0), stats(nullptr)
+      isStoreBlocked(false), storesInFlight(0), stats(nullptr), customStats(&stats)
 {
 }
 
@@ -257,6 +257,8 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
     fatal_if(sbufferOffloadWidth == 0 || sbufferDrainWidth == 0,
              "sbuffer widths must be greater than zero");
     loadService.enabled = params.ordinaryLoadService;
+    if (loadService.enabled)
+        serviceStats = std::make_unique<LoadServiceStats>(&customStats);
     loadService.admission = params.loadServiceAdmission;
     loadService.arbitration = params.loadServiceArbitration;
     loadService.propagation = params.loadServicePropagation;
@@ -323,12 +325,33 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Number of stores squashed"),
       ADD_STAT(rescheduledLoads, statistics::units::Count::get(),
                "Number of loads that were rescheduled"),
-      ADD_STAT(partialForwardRetries, statistics::units::Count::get(),
-               "Load execution attempts rescheduled for partial store "
-               "coverage"),
       ADD_STAT(blockedByCache, statistics::units::Count::get(),
                "Number of times an access to memory failed due to the cache "
                "being blocked"),
+      ADD_STAT(loadToUse, statistics::units::Cycle::get(),
+               "Distribution of cycle latency between the "
+               "first time a load is issued and its completion"),
+      ADD_STAT(addedLoadsAndStores, statistics::units::Count::get(),
+               "Number of loads and stores written to the Load Store Queue"),
+      ADD_STAT(lqAvgOccupancy, statistics::units::Ratio::get(),
+               "Average LQ Occupancy (UsedSlots/TotalSlots)"),
+      ADD_STAT(sqAvgOccupancy, statistics::units::Ratio::get(),
+               "Average SQ Occupancy (UsedSlots/TotalSlots)")
+{
+    loadToUse
+        .init(0, 299, 10)
+        .flags(statistics::nozero);
+
+    lqAvgOccupancy.precision(2);
+
+    sqAvgOccupancy.precision(2);
+}
+
+LSQUnit::CustomLSQStats::CustomLSQStats(statistics::Group *parent)
+    : statistics::Group(parent, "custom"),
+      ADD_STAT(partialForwardRetries, statistics::units::Count::get(),
+               "Load execution attempts rescheduled for partial store "
+               "coverage"),
       ADD_STAT(storePrepareIssued, statistics::units::Count::get(),
                "Buffer-mode exclusive permission prefetches issued"),
       ADD_STAT(storePrepareBlocked, statistics::units::Count::get(),
@@ -352,7 +375,13 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(sbufferDrainCompleted, statistics::units::Count::get(),
                "SBuffer write responses completed"),
       ADD_STAT(sbufferAvgOccupancy, statistics::units::Count::get(),
-               "Average committed SBuffer entries"),
+               "Cumulative time-average committed SBuffer entry count; not an interval difference")
+{
+    sbufferAvgOccupancy.precision(2);
+}
+
+LSQUnit::LoadServiceStats::LoadServiceStats(statistics::Group *parent)
+    : statistics::Group(parent),
       ADD_STAT(serviceAccepted, statistics::units::Count::get(),
                "Ordinary-load service admissions, including cache retries"),
       ADD_STAT(serviceAdmissionRetries, statistics::units::Count::get(),
@@ -362,25 +391,8 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(serviceCacheRetries, statistics::units::Count::get(),
                "Admitted service attempts rejected by native cache ports"),
       ADD_STAT(serviceSquashed, statistics::units::Count::get(),
-               "Pending service requests cancelled by squash/release"),
-      ADD_STAT(loadToUse, statistics::units::Cycle::get(),
-               "Distribution of cycle latency between the "
-               "first time a load is issued and its completion"),
-      ADD_STAT(addedLoadsAndStores, statistics::units::Count::get(),
-               "Number of loads and stores written to the Load Store Queue"),
-      ADD_STAT(lqAvgOccupancy, statistics::units::Ratio::get(),
-               "Average LQ Occupancy (UsedSlots/TotalSlots)"),
-      ADD_STAT(sqAvgOccupancy, statistics::units::Ratio::get(),
-               "Average SQ Occupancy (UsedSlots/TotalSlots)")
+               "Pending service requests cancelled by squash/release")
 {
-    loadToUse
-        .init(0, 299, 10)
-        .flags(statistics::nozero);
-
-    lqAvgOccupancy.precision(2);
-
-    sqAvgOccupancy.precision(2);
-    sbufferAvgOccupancy.precision(2);
 }
 
 void
@@ -946,7 +958,7 @@ LSQUnit::bufferableStore(SQEntry &entry) const
 void
 LSQUnit::updateStoreBufferOccupancy()
 {
-    stats.sbufferAvgOccupancy = committedStoreBuffer.size();
+    customStats.sbufferAvgOccupancy = committedStoreBuffer.size();
 }
 
 void
@@ -958,7 +970,7 @@ LSQUnit::offloadCommittedStores()
            storeWBIt->canWB() && !storeWBIt->completed()) {
         if (!bufferableStore(*storeWBIt)) {
             if (!committedStoreBuffer.empty()) {
-                ++stats.sbufferOffloadBlocked;
+                ++customStats.sbufferOffloadBlocked;
             }
             break;
         }
@@ -994,12 +1006,12 @@ LSQUnit::offloadCommittedStores()
                 tail.flags.isSet(Request::SECURE) == main_req->isSecure()) {
                 target = &tail;
                 merged = true;
-                ++stats.sbufferMergedStores;
+                ++customStats.sbufferMergedStores;
             }
         }
         if (!target) {
             if (committedStoreBuffer.size() >= tsoStoreBufferSize) {
-                ++stats.sbufferOffloadBlocked;
+                ++customStats.sbufferOffloadBlocked;
                 break;
             }
             const uint64_t entry_id = nextStoreBufferEntryId++;
@@ -1027,14 +1039,14 @@ LSQUnit::offloadCommittedStores()
                 0 : static_cast<uint8_t>(storeWBIt->data()[i]);
             target->byteEnable[offset + i] = true;
             if (merged) {
-                ++stats.sbufferMergedBytes;
+                ++customStats.sbufferMergedBytes;
             }
         }
         panic_if(storeWBIt->takeRequest() != request,
                  "failed to transfer LSQ request to SBuffer");
 
         completeStore(storeWBIt++);
-        ++stats.sbufferOffloaded;
+        ++customStats.sbufferOffloaded;
         ++offloaded;
         updateStoreBufferOccupancy();
     }
@@ -1063,7 +1075,7 @@ LSQUnit::drainCommittedStoreBuffer()
                 return;
             }
             ++entry.nextToSend;
-            ++stats.sbufferDrainIssued;
+            ++customStats.sbufferDrainIssued;
             ++issued;
         }
 
@@ -1090,7 +1102,7 @@ LSQUnit::completeStoreBufferWrite(uint64_t entry_id, LSQRequest *request)
     *request_it = nullptr;
     ++entry->completedRequests;
     entry->completed = entry->completedRequests == entry->requests.size();
-    ++stats.sbufferDrainCompleted;
+    ++customStats.sbufferDrainCompleted;
 
     if (entry->completed && isStalled() &&
         stallingStoreIsn >= entry->firstSeqNum &&
@@ -1327,12 +1339,12 @@ LSQUnit::issueStorePrepareRequests()
             delete prepare_pkt;
             lsq->cacheBlocked(true);
             ++stats.blockedByCache;
-            ++stats.storePrepareBlocked;
+            ++customStats.storePrepareBlocked;
             break;
         }
 
         store_it->storePrepareIssued() = true;
-        ++stats.storePrepareIssued;
+        ++customStats.storePrepareIssued;
         lsq->cachePortBusy(false);
     }
 }
@@ -1653,7 +1665,7 @@ LSQUnit::trySendPacket(bool isLoad, PacketPtr data_pkt)
             assert(request == storeWBIt->request());
             isStoreBlocked = true;
         } else if (request->sbufferOwned()) {
-            ++stats.sbufferDrainBlocked;
+            ++customStats.sbufferDrainBlocked;
         }
         request->packetNotSent();
     }
@@ -1763,7 +1775,7 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
         load_inst->clearIssued();
         load_inst->effAddrValid(false);
         ++stats.rescheduledLoads;
-        ++stats.sbufferPartialForwardRetries;
+        ++customStats.sbufferPartialForwardRetries;
         request->discard();
         load_entry.setRequest(nullptr);
         return true;
@@ -1813,7 +1825,7 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
         WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
         cpu->schedule(wb, curTick());
         ++stats.forwLoads;
-        ++stats.sbufferForwardedLoads;
+        ++customStats.sbufferForwardedLoads;
         return true;
     }
 
@@ -1827,7 +1839,7 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
     load_inst->clearIssued();
     load_inst->effAddrValid(false);
     ++stats.rescheduledLoads;
-    ++stats.sbufferPartialForwardRetries;
+    ++customStats.sbufferPartialForwardRetries;
     request->discard();
     load_entry.setRequest(nullptr);
     return true;
@@ -2076,7 +2088,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 load_inst->clearIssued();
                 load_inst->effAddrValid(false);
                 ++stats.rescheduledLoads;
-                ++stats.partialForwardRetries;
+                ++customStats.partialForwardRetries;
 
                 // Do not generate a writeback event as this instruction is not
                 // complete.

@@ -271,7 +271,7 @@ class LSQUnit
      * contructor is deleted explicitly. However, STL vector requires
      * a valid copy constructor for the base type at compile time.
      */
-    LSQUnit(const LSQUnit &l): stats(nullptr)
+    LSQUnit(const LSQUnit &l): stats(nullptr), customStats(&stats)
     {
         panic("LSQUnit is not copy-able");
     }
@@ -671,33 +671,15 @@ class LSQUnit
 
         /** Number of loads that were rescheduled. */
         statistics::Scalar rescheduledLoads;
-        statistics::Scalar partialForwardRetries;
 
         /** Number of times the LSQ is blocked due to the cache. */
         statistics::Scalar blockedByCache;
 
         /** Buffer-mode exclusive permission prefetches issued. */
-        statistics::Scalar storePrepareIssued;
 
         /** Buffer-mode permission prefetches rejected for retry. */
-        statistics::Scalar storePrepareBlocked;
 
-        statistics::Scalar sbufferOffloaded;
-        statistics::Scalar sbufferOffloadBlocked;
-        statistics::Scalar sbufferMergedStores;
-        statistics::Scalar sbufferMergedBytes;
-        statistics::Scalar sbufferForwardedLoads;
-        statistics::Scalar sbufferPartialForwardRetries;
-        statistics::Scalar sbufferDrainIssued;
-        statistics::Scalar sbufferDrainBlocked;
-        statistics::Scalar sbufferDrainCompleted;
-        statistics::Average sbufferAvgOccupancy;
 
-        statistics::Scalar serviceAccepted;
-        statistics::Scalar serviceAdmissionRetries;
-        statistics::Scalar serviceArbitrationRetries;
-        statistics::Scalar serviceCacheRetries;
-        statistics::Scalar serviceSquashed;
 
         /** Distribution of cycle latency between the first time a load
          * is issued and its completion */
@@ -711,6 +693,35 @@ class LSQUnit
         /** SQ Occupancy */
         statistics::Average sqAvgOccupancy;
     } stats;
+
+    struct LoadServiceStats : public statistics::Group
+    {
+        explicit LoadServiceStats(statistics::Group *parent);
+        statistics::Scalar serviceAccepted;
+        statistics::Scalar serviceAdmissionRetries;
+        statistics::Scalar serviceArbitrationRetries;
+        statistics::Scalar serviceCacheRetries;
+        statistics::Scalar serviceSquashed;
+    };
+    struct CustomLSQStats : public statistics::Group
+    {
+        explicit CustomLSQStats(statistics::Group *parent);
+        statistics::Scalar partialForwardRetries;
+        statistics::Scalar storePrepareIssued;
+        statistics::Scalar storePrepareBlocked;
+        statistics::Scalar sbufferOffloaded;
+        statistics::Scalar sbufferOffloadBlocked;
+        statistics::Scalar sbufferMergedStores;
+        statistics::Scalar sbufferMergedBytes;
+        statistics::Scalar sbufferForwardedLoads;
+        statistics::Scalar sbufferPartialForwardRetries;
+        statistics::Scalar sbufferDrainIssued;
+        statistics::Scalar sbufferDrainBlocked;
+        statistics::Scalar sbufferDrainCompleted;
+        statistics::Average sbufferAvgOccupancy;
+    } customStats;
+    std::unique_ptr<LoadServiceStats> serviceStats;
+
 
   public:
     /** Executes the load at the given index. */

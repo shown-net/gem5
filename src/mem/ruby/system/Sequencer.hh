@@ -284,9 +284,9 @@ class Sequencer : public RubyPort
     struct ReadStats : public statistics::Group
     {
         ReadStats(statistics::Group *parent);
-        statistics::Scalar admitted, aliased, issued, completed, coalesced;
-        statistics::Scalar latencyCycles, outstandingCycleSum, activeCycles;
-        statistics::Scalar beginOutstanding, endOutstanding;
+        statistics::Scalar readAdmitted, readAliased, readIssued, readCompleted, readCoalesced;
+        statistics::Scalar readLatencyCycles, readOutstandingCycleSum, readActiveCycles;
+        statistics::Scalar readOutstandingAtDump;
     } readStats;
     uint64_t observedReads = 0;
     Cycles observedAt = Cycles(0);

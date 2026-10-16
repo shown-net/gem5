@@ -668,10 +668,11 @@ private:
     struct NativeLoadStats : public statistics::Group
     {
         NativeLoadStats(statistics::Group *parent);
-        statistics::Scalar committedLoadUops, resolvedLoadUops;
-        statistics::Scalar l1HitFragments, l1TagMissFragments, l1MergedFragments;
-        statistics::Scalar noRubyLoadUops, unresolvedLoadUops, prefetchLoadUops;
-    } native_load_stats_;
+        statistics::Scalar loadObsCommittedUops, loadObsResolvedUops;
+        statistics::Scalar loadObsL1HitFragments, loadObsL1TagMissFragments, loadObsL1MergedFragments;
+        statistics::Scalar loadObsNoRubyUops, loadObsUnresolvedUops, loadObsPrefetchUops;
+    };
+    std::unique_ptr<NativeLoadStats> native_load_stats_;
     std::unique_ptr<ProbePointArg<TaoTraceMemoryObservation>>
         ppNativeMemoryObservation;
     std::map<std::pair<uint32_t, uint64_t>, bool> pending_native_loads_;

@@ -83,7 +83,7 @@ FUPool::~FUPool()
 
 // Constructor
 FUPool::AllocationStats::AllocationStats(statistics::Group *parent)
-    : statistics::Group(parent),
+    : statistics::Group(parent, "custom"),
       ADD_STAT(allocatedByUnit, statistics::units::Count::get(),
                "Successful FU allocations by pool-local instance and op class")
 {

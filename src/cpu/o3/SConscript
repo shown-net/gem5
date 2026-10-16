@@ -55,6 +55,7 @@ if env['CONF']['BUILD_ISA']:
     Source('commit.cc')
     Source('cpu.cc')
     Source('task_uop_stats.cc')
+    Source('task_stats.cc')
     Source('decode.cc')
     Source('dyn_inst.cc')
     Source('fetch.cc')

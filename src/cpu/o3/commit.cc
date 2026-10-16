@@ -1398,7 +1398,7 @@ Commit::updateComInstStats(const DynInstPtr &inst)
     }
 
     cpu->commitStats[tid]->numOps++;
-    cpu->uopTaskStats[tid]->retired(
+    cpu->customStats.retired(
         !inst->isMicroop() || inst->isLastMicroop());
     if (in_user_mode) {
         cpu->commitStats[tid]->numUserOps++;

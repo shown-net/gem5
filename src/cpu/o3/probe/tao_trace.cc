@@ -837,22 +837,22 @@ parseFstCoreIdFromName(const std::string &probe_name)
 } // namespace
 
 TaoTrace::NativeLoadStats::NativeLoadStats(statistics::Group *parent)
-    : statistics::Group(parent, "nativeLoadStats"),
-      ADD_STAT(committedLoadUops, statistics::units::Count::get(),
+    : statistics::Group(parent, "custom"),
+      ADD_STAT(loadObsCommittedUops, statistics::units::Count::get(),
                "Committed load DynInsts in the Marker ROI, including prefetch if isLoad"),
-      ADD_STAT(resolvedLoadUops, statistics::units::Count::get(),
+      ADD_STAT(loadObsResolvedUops, statistics::units::Count::get(),
                "Committed load uops with complete native lifecycle and L1 hierarchy at END"),
-      ADD_STAT(l1HitFragments, statistics::units::Count::get(),
+      ADD_STAT(loadObsL1HitFragments, statistics::units::Count::get(),
                "Real L1 hits from native Request fragments of resolved committed load uops"),
-      ADD_STAT(l1TagMissFragments, statistics::units::Count::get(),
+      ADD_STAT(loadObsL1TagMissFragments, statistics::units::Count::get(),
                "Real L1 tag misses from native Request fragments of resolved committed load uops"),
-      ADD_STAT(l1MergedFragments, statistics::units::Count::get(),
+      ADD_STAT(loadObsL1MergedFragments, statistics::units::Count::get(),
                "Real L1 merged misses from native Request fragments of resolved committed load uops"),
-      ADD_STAT(noRubyLoadUops, statistics::units::Count::get(),
+      ADD_STAT(loadObsNoRubyUops, statistics::units::Count::get(),
                "Resolved committed load uops with an explicit no-Ruby lifecycle"),
-      ADD_STAT(unresolvedLoadUops, statistics::units::Count::get(),
+      ADD_STAT(loadObsUnresolvedUops, statistics::units::Count::get(),
                "Committed load uops unresolved at exact Marker END; no post-ROI completion"),
-      ADD_STAT(prefetchLoadUops, statistics::units::Count::get(),
+      ADD_STAT(loadObsPrefetchUops, statistics::units::Count::get(),
                "Committed isLoad uops that are also data prefetch")
 {
 }
@@ -873,7 +873,8 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       marker_controlled_(params.marker_controlled),
       control_only_(params.control_only),
       native_stats_(params.native_stats),
-      native_load_stats_(this),
+      native_load_stats_(params.native_stats ?
+          std::make_unique<NativeLoadStats>(this) : nullptr),
       require_roi_param_(params.require_roi),
       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
       output_dir_(params.output_dir),
@@ -971,7 +972,7 @@ TaoTrace::startMarkerCapture(const std::string &directory)
     marker_capture_started_ = true;
     if (marker_cpu_) {
         const auto &task_params = static_cast<const BaseO3CPUParams &>(marker_cpu_->params());
-        marker_cpu_->uopTaskStats.at(0)->observe(
+        marker_cpu_->taskStats.observe(
             marker_cpu_->tcBase(0), task_params.taskStatsSwitchPc,
             task_params.taskStatsCurrentOffset, task_params.taskStatsPidOffset);
         cpl_core_id_ = parseFstCoreIdFromName(name());
@@ -1047,7 +1048,11 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     const Addr pc = inst->pcState().instAddr();
     if (owner->marker_measurement_phase_ == MarkerMeasurementPhase::Measuring &&
         owner->marker_pc_trace_) {
-        owner->marker_pc_trace_->append(pc);
+        const int64_t fetch_tick = inst->fetchTick == Tick(-1) ?
+            -1 : int64_t(inst->fetchTick);
+        owner->marker_pc_trace_->append(
+            pc, curTick(), fetch_tick, inst->dispatchTick, inst->issueTick,
+            inst->completeTick);
     }
     if (pc != marker_pc_) {
         return;
@@ -2847,13 +2852,13 @@ TaoTrace::flushNativeLoads(bool final)
         if (!ready && !final) { ++it; continue; }
         if (measured_load) {
             if (!ready) {
-                ++native_load_stats_.unresolvedLoadUops;
+                ++native_load_stats_->loadObsUnresolvedUops;
             } else {
-                ++native_load_stats_.resolvedLoadUops;
-                native_load_stats_.noRubyLoadUops += native.responses == 0;
-                native_load_stats_.l1HitFragments += native.hierarchy.hits[0];
-                native_load_stats_.l1TagMissFragments += native.hierarchy.tagMisses[0];
-                native_load_stats_.l1MergedFragments += native.hierarchy.mergedMisses[0];
+                ++native_load_stats_->loadObsResolvedUops;
+                native_load_stats_->loadObsNoRubyUops += native.responses == 0;
+                native_load_stats_->loadObsL1HitFragments += native.hierarchy.hits[0];
+                native_load_stats_->loadObsL1TagMissFragments += native.hierarchy.tagMisses[0];
+                native_load_stats_->loadObsL1MergedFragments += native.hierarchy.mergedMisses[0];
             }
             // Publish final read-only facts before the owning ledger erases
             // them. Listeners neither own identities nor schedule completion.
@@ -2875,8 +2880,8 @@ TaoTrace::recordNativeLoad(const DynInstPtr &inst)
         importNativeCommitted(inst);
         const bool measured_load = inst->isLoad() && native_measurement_active_;
         if (measured_load) {
-            ++native_load_stats_.committedLoadUops;
-            native_load_stats_.prefetchLoadUops += inst->isDataPrefetch();
+            ++native_load_stats_->loadObsCommittedUops;
+            native_load_stats_->loadObsPrefetchUops += inst->isDataPrefetch();
         }
         pending_native_loads_.emplace(
             std::make_pair(getTraceThreadId(inst), uint64_t(inst->seqNum)), measured_load);

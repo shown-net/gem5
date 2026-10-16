@@ -147,26 +147,24 @@ Sequencer::Sequencer(const Params &p)
 }
 
 Sequencer::ReadStats::ReadStats(statistics::Group *parent)
-    : statistics::Group(parent, "readLifecycle"),
-      ADD_STAT(admitted, statistics::units::Count::get(),
-               "Ordinary LD requests admitted"),
-      ADD_STAT(aliased, statistics::units::Count::get(),
+    : statistics::Group(parent, "custom"),
+      ADD_STAT(readAdmitted, statistics::units::Count::get(),
+               "Ordinary LD requests readAdmitted"),
+      ADD_STAT(readAliased, statistics::units::Count::get(),
                "LD admissions behind an existing line request"),
-      ADD_STAT(issued, statistics::units::Count::get(),
+      ADD_STAT(readIssued, statistics::units::Count::get(),
                "LD hierarchy issue calls, including reissues"),
-      ADD_STAT(completed, statistics::units::Count::get(),
+      ADD_STAT(readCompleted, statistics::units::Count::get(),
                "LD callbacks, including later-squashed loads"),
-      ADD_STAT(coalesced, statistics::units::Count::get(),
-               "LD callbacks marked coalesced"),
-      ADD_STAT(latencyCycles, statistics::units::Cycle::get(),
+      ADD_STAT(readCoalesced, statistics::units::Count::get(),
+               "LD callbacks marked readCoalesced"),
+      ADD_STAT(readLatencyCycles, statistics::units::Cycle::get(),
                "Sum of full admission-to-callback latency for completions"),
-      ADD_STAT(outstandingCycleSum, statistics::units::Cycle::get(),
+      ADD_STAT(readOutstandingCycleSum, statistics::units::Cycle::get(),
                "ROI-clipped integral of outstanding ordinary LD requests"),
-      ADD_STAT(activeCycles, statistics::units::Cycle::get(),
+      ADD_STAT(readActiveCycles, statistics::units::Cycle::get(),
                "ROI cycles with at least one observed LD"),
-      ADD_STAT(beginOutstanding, statistics::units::Count::get(),
-               "Observed LD outstanding at stats reset"),
-      ADD_STAT(endOutstanding, statistics::units::Count::get(),
+      ADD_STAT(readOutstandingAtDump, statistics::units::Count::get(),
                "Observed LD outstanding at stats dump")
 {}
 
@@ -183,8 +181,8 @@ void
 Sequencer::updateReadArea()
 {
     const uint64_t elapsed = curCycle() - observedAt;
-    readStats.outstandingCycleSum += elapsed * observedReads;
-    if (observedReads) readStats.activeCycles += elapsed;
+    readStats.readOutstandingCycleSum += elapsed * observedReads;
+    if (observedReads) readStats.readActiveCycles += elapsed;
     observedAt = curCycle();
 }
 
@@ -193,7 +191,7 @@ Sequencer::preDumpStats()
 {
     RubyPort::preDumpStats();
     updateReadArea();
-    readStats.endOutstanding = observedReads;
+    readStats.readOutstandingAtDump = observedReads;
 }
 
 Sequencer::~Sequencer()
@@ -329,8 +327,7 @@ void Sequencer::resetStats()
 {
     RubyPort::resetStats();
     observedAt = curCycle();
-    readStats.beginOutstanding = observedReads;
-    readStats.endOutstanding = observedReads;
+    readStats.readOutstandingAtDump = observedReads;
     m_outstandReqHist.reset();
     m_latencyHist.reset();
     m_hitLatencyHist.reset();
@@ -433,8 +430,8 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     if (primary_type == RubyRequestType_LD && observedRead(pkt)) {
         updateReadArea();
         ++observedReads;
-        ++readStats.admitted;
-        if (seq_req_list.size() > 1) ++readStats.aliased;
+        ++readStats.readAdmitted;
+        if (seq_req_list.size() > 1) ++readStats.readAliased;
     }
 
     if (seq_req_list.size() > 1) {
@@ -783,9 +780,9 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
         updateReadArea();
         assert(observedReads > 0);
         --observedReads;
-        ++readStats.completed;
-        if (was_coalesced) ++readStats.coalesced;
-        readStats.latencyCycles += curCycle() - srequest->issue_time;
+        ++readStats.readCompleted;
+        if (was_coalesced) ++readStats.readCoalesced;
+        readStats.readLatencyCycles += curCycle() - srequest->issue_time;
     }
     if (pkt->req) {
         // In this Sequencer API externalHit=true denotes a controller miss;
@@ -1192,7 +1189,7 @@ void
 Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
 {
     if (secondary_type == RubyRequestType_LD && observedRead(pkt))
-        ++readStats.issued;
+        ++readStats.readIssued;
     assert(pkt != NULL);
     ContextID proc_id = pkt->req->hasContextId() ?
         pkt->req->contextId() : InvalidContextID;

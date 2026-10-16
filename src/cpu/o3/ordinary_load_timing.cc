@@ -77,7 +77,7 @@ LSQUnit::LoadServiceRequestEvent::process()
     assert(!owner->cpu->switchedOut());
     owner->cpu->wakeCPU();
     if (request->isReleased() || request->instruction()->isSquashed()) {
-        ++owner->stats.serviceSquashed;
+        ++owner->serviceStats->serviceSquashed;
         --owner->pendingLoadServiceRequests;
         request->finishService();
         return;
@@ -86,18 +86,18 @@ LSQUnit::LoadServiceRequestEvent::process()
         auto decision = owner->loadService.accept(request->getVaddr(),
             request->mainReq()->getSize(), owner->cpu->clockEdge());
         if (decision == OrdinaryLoadService::Decision::AdmissionRetry) {
-            ++owner->stats.serviceAdmissionRetries;
+            ++owner->serviceStats->serviceAdmissionRetries;
         } else if (decision == OrdinaryLoadService::Decision::ArbitrationRetry) {
-            ++owner->stats.serviceArbitrationRetries;
+            ++owner->serviceStats->serviceArbitrationRetries;
         } else {
-            ++owner->stats.serviceAccepted;
+            ++owner->serviceStats->serviceAccepted;
             request->sendPacketToCache();
             if (request->isSent()) {
                 --owner->pendingLoadServiceRequests;
                 request->finishService();
                 return;
             }
-            ++owner->stats.serviceCacheRetries;
+            ++owner->serviceStats->serviceCacheRetries;
         }
     }
     // Capacity rejection and native Ruby backpressure retain the SAME request.

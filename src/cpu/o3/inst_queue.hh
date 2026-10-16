@@ -664,10 +664,10 @@ class InstructionQueue
         void account();
         void preDumpStats() override;
         void resetStats() override;
-        statistics::Scalar issued, completed, squashedAtCompletion;
-        statistics::Scalar admissionRejected, admissionCycles, inFlightCycles;
-        statistics::Scalar issueToCompletionCycles;
-        statistics::Scalar boundaryInFlight, endInFlight;
+        statistics::Scalar divsdIssued, divsdFuCompleted, divsdSquashedAtCompletion;
+        statistics::Scalar divsdAdmissionRejected, divsdAdmissionCycles, divsdInFlightCycles;
+        statistics::Scalar divsdIssueToCompletionCycles;
+        statistics::Scalar divsdInFlightAtDump;
     } divsdStats;
 
     ProbePointArg<ExecutionFUEvent> *ppExecutionIssue;

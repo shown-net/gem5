@@ -14,9 +14,13 @@ MarkerPcTrace::initializeTrace()
 }
 
 void
-MarkerPcTrace::append(Addr pc)
+MarkerPcTrace::append(Addr pc, Tick commitTick, int64_t fetchTick,
+                      int32_t dispatchTick, int32_t issueTick,
+                      int32_t completeTick)
 {
-    output << std::hex << pc << '\n';
+    output << std::hex << pc << '\t' << std::dec << commitTick << '\t'
+           << fetchTick << '\t' << dispatchTick << '\t' << issueTick << '\t'
+           << completeTick << '\n';
     fatal_if(!output, "cannot append committed PC trace");
 }
 

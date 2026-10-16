@@ -762,7 +762,7 @@ Rename::renameInsts(ThreadID tid)
         // Put instruction in rename queue.
         toIEW->insts[toIEWIndex] = inst;
         ++(toIEW->size);
-        cpu->uopTaskStats[tid]->allocated();
+        cpu->customStats.allocated();
 
         // Increment which instruction we're on.
         ++toIEWIndex;
