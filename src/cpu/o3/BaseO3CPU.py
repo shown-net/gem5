@@ -235,6 +235,9 @@ class BaseO3CPU(BaseCPU):
     )
     divsdLatency = Param.Unsigned(14, "Dedicated register DIVSD result latency")
     divsdIssueInterval = Param.Unsigned(4, "Dedicated register DIVSD initiation interval")
+    divsdActivityDuration = Param.Unsigned(
+        8, "Dedicated register DIVSD observable activity duration"
+    )
     intDiv32QuotientLatency = Param.Unsigned(13, "Compact 32-bit DIV/IDIV quotient latency")
     intDiv32RemainderLatency = Param.Unsigned(15, "Compact 32-bit DIV/IDIV remainder latency")
     intDiv64QuotientLatency = Param.Unsigned(15, "Compact 64-bit DIV/IDIV quotient latency")

@@ -231,6 +231,7 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       iqStats(cpu, totalWidth),
       iqIOStats(cpu),
       divsdIssueInterval(params.divsdIssueInterval),
+      divsdActivityDuration(params.divsdActivityDuration),
       divsdStats(cpu, *this),
       intDiv32IssueInterval(params.intDiv32IssueInterval),
       intDiv64IssueInterval(params.intDiv64IssueInterval),
@@ -273,6 +274,7 @@ InstructionQueue::DivsdStats::DivsdStats(CPU *cpu, InstructionQueue &owner)
       ADD_STAT(divsdAdmissionRejected, statistics::units::Count::get(), "Dedicated DIVSD admission rejection attempts"),
       ADD_STAT(divsdAdmissionCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD admission reservation intervals"),
       ADD_STAT(divsdInFlightCycles, statistics::units::Cycle::get(), "Union of DIVSD issue to scheduled FU completion intervals"),
+      ADD_STAT(divsdActivityCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD observable activity intervals"),
       ADD_STAT(divsdIssueToCompletionCycles, statistics::units::Cycle::get(), "Sum of issue to FU completion cycles for divsdFuCompleted DIVSD"),
       ADD_STAT(divsdInFlightAtDump, statistics::units::Count::get(), "Outstanding dedicated DIVSD at each stats dump")
 {
@@ -286,7 +288,8 @@ InstructionQueue::DivsdStats::account()
         return end > lastCycle ? std::min(end, now) - lastCycle : 0;
     };
     divsdAdmissionCycles += covered(iq.divsdNextIssue);
-    divsdInFlightCycles += covered(iq.divsdActiveUntil);
+    divsdInFlightCycles += covered(iq.divsdInFlightUntil);
+    divsdActivityCycles += covered(iq.divsdActivityUntil);
     lastCycle = now;
 }
 
@@ -1079,9 +1082,12 @@ InstructionQueue::scheduleReadyInsts()
                 const uint64_t now = cpu->curCycle();
                 divsdNextIssue = now + divsdIssueInterval;
                 // Upstream IQ completes the FU at opLat-1; execution/writeback
-                // follows via its normal queue. Do not rename this PMU activity.
-                divsdActiveUntil = std::max(divsdActiveUntil,
-                                           now + uint64_t(op_latency) - 1);
+                // follows via its normal queue. Observable activity is a
+                // separate behavior proxy and is not a physical PMU alias.
+                divsdInFlightUntil = std::max(divsdInFlightUntil,
+                                             now + uint64_t(op_latency) - 1);
+                divsdActivityUntil = std::max(divsdActivityUntil,
+                                             now + divsdActivityDuration);
                 divsdIssuedAt.emplace(issuing_inst->seqNum, now);
                 ++divsdStats.divsdIssued;
             }
@@ -1156,7 +1162,8 @@ InstructionQueue::scheduleReadyInsts()
 
             issuing_inst->setIssued();
             cpu->customStats.scheduled(
-                idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU);
+                idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU,
+                issuing_inst->isZeroIdiom());
             if (idx >= 0 && ppExecutionIssue) {
                 ppExecutionIssue->notify({op_class, idx, op_latency,
                     fu_pool->isPipelined(op_class),

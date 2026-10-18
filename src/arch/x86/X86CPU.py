@@ -79,6 +79,13 @@ class X86IntDivResult(FUDesc):
     count = 1
 
 
+class X86ZeroIdiom(FUDesc):
+    # Abstract completion capacity for operations eliminated from ordinary
+    # execution ports. This is a behavior proxy, not an Intel physical FU.
+    opList = [OpDesc(opClass="X86ZeroIdiom", opLat=1, pipelined=True)]
+    count = 6
+
+
 class DefaultX86FUPool(FUPool):
     FUList = [
         IntALU(),

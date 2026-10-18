@@ -652,8 +652,10 @@ class InstructionQueue
   private:
     // One logical divider admission resource, independent of result latency.
     const unsigned divsdIssueInterval;
+    const unsigned divsdActivityDuration;
     uint64_t divsdNextIssue = 0;
-    uint64_t divsdActiveUntil = 0;
+    uint64_t divsdInFlightUntil = 0;
+    uint64_t divsdActivityUntil = 0;
     std::unordered_map<InstSeqNum, uint64_t> divsdIssuedAt;
 
     struct DivsdStats : public statistics::Group
@@ -665,7 +667,8 @@ class InstructionQueue
         void preDumpStats() override;
         void resetStats() override;
         statistics::Scalar divsdIssued, divsdFuCompleted, divsdSquashedAtCompletion;
-        statistics::Scalar divsdAdmissionRejected, divsdAdmissionCycles, divsdInFlightCycles;
+        statistics::Scalar divsdAdmissionRejected, divsdAdmissionCycles;
+        statistics::Scalar divsdInFlightCycles, divsdActivityCycles;
         statistics::Scalar divsdIssueToCompletionCycles;
         statistics::Scalar divsdInFlightAtDump;
     } divsdStats;

@@ -61,6 +61,7 @@ static const OpClass X86IntDiv64Op = enums::X86IntDiv64;
 static const OpClass X86IntDivQuotOp = enums::X86IntDivQuot;
 static const OpClass X86IntDivRem32Op = enums::X86IntDivRem32;
 static const OpClass X86IntDivRem64Op = enums::X86IntDivRem64;
+static const OpClass X86ZeroIdiomOp = enums::X86ZeroIdiom;
 static const OpClass FloatAddOp = enums::FloatAdd;
 static const OpClass FloatCmpOp = enums::FloatCmp;
 static const OpClass FloatCvtOp = enums::FloatCvt;

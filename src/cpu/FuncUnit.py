@@ -51,6 +51,7 @@ class OpClass(Enum):
         "X86IntDivQuot",
         "X86IntDivRem32",
         "X86IntDivRem64",
+        "X86ZeroIdiom",
         "FloatAdd",
         "FloatCmp",
         "FloatCvt",

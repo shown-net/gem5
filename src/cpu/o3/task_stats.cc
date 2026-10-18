@@ -116,7 +116,8 @@ TaskStatsObserver::observe(gem5::ThreadContext *tc, Addr switchPc, Addr currentO
             "scheduledOps", "scheduleCyclesGe1", "scheduleCyclesGe2",
             "scheduleCyclesGe3", "scheduleCyclesGe4", "scheduleZeroCycles",
             "retireActiveCycles", "retireZeroCycles", "retiredNonLastMicroops",
-            "scheduledNoNeedFU", "scheduledNoCapableFU"})
+            "scheduledNoNeedFU", "scheduledNoCapableFU",
+            "gprZeroIdiomRouted"})
         bind(cpu.customStats, name);
     const auto bindPools = [this](auto &&self, statistics::Group &group) -> void {
         for (const auto &[name, child] : group.getStatGroups()) {

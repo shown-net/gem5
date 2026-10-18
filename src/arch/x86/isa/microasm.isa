@@ -57,6 +57,7 @@ let {{
 ##include "calibration/integer_decomposition.isa"
 ##include "calibration/idiv.isa"
 ##include "calibration/setz.isa"
+##include "calibration/zero_idiom.isa"
 
 let {{
     # print microcode

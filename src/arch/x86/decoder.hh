@@ -244,6 +244,7 @@ class Decoder : public InstDecoder
     const unsigned imul16ImmediateMode;
     const bool compactIntDiv;
     const bool independentDivsd;
+    const unsigned gprZeroIdiomMode;
     const bool singleUopSetz;
     const bool zfOnlySetz;
     /// Caching for decoded instruction objects.
@@ -272,6 +273,7 @@ class Decoder : public InstDecoder
           imul16ImmediateMode(p.imul16ImmediateMode),
           compactIntDiv(p.compactIntDiv),
           independentDivsd(p.independentDivsd),
+          gprZeroIdiomMode(p.gprZeroIdiomMode),
           singleUopSetz(p.singleUopSetz), zfOnlySetz(p.zfOnlySetz)
     {
         emi.reset();

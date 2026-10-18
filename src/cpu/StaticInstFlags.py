@@ -58,6 +58,7 @@ class StaticInstFlags(Enum):
 
     vals = [
         "IsNop",  # Is a no-op (no effect at all).
+        "IsZeroIdiom",  # x86 calibration zero-result dependency-breaking op.
         "IsInteger",  # References integer regs.
         "IsFloating",  # References FP regs.
         "IsVector",  # References Vector regs.

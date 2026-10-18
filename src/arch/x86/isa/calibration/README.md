@@ -20,6 +20,13 @@ macroop. The original path remains selected when all parameters are false.
   original macro-op. 8/16-bit and memory forms remain unchanged. The proxy is
   constrained by published SPR behavior and is not a claim about Intel's
   internal microcode algorithm.
+* `zero_idiom.isa`: `gprZeroIdiomMode=1` routes 32/64-bit same-register
+  XOR/SUB to a zero-result operation without the old GPR dependency while
+  retaining IntAlu use. Mode 2 uses the same semantics with an abstract
+  six-wide completion resource rather than an ordinary execution port. Both
+  preserve result, flags and retirement; neither claims to implement Intel's
+  undisclosed rename-map representation. Other widths and forms remain on the
+  original path.
 
 Parameters do not change during simulation. ISA definitions and their includes
 are tracked by the normal SCons ISA scanner. Functional and performance

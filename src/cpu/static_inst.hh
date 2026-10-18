@@ -138,6 +138,7 @@ class StaticInst : public RefCounted, public StaticInstFlags
     //@{
 
     bool isNop()          const { return flags[IsNop]; }
+    bool isZeroIdiom()    const { return flags[IsZeroIdiom]; }
 
     bool
     isMemRef() const

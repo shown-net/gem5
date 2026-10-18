@@ -15,6 +15,8 @@ CustomUopStats::CustomUopStats(statistics::Group *parent)
       ADD_STAT(retiredNonLastMicroops, statistics::units::Count::get(), "Retired non-last microops of each macro instruction"),
       ADD_STAT(scheduledNoNeedFU, statistics::units::Count::get(), "Dispatches needing no FU"),
       ADD_STAT(scheduledNoCapableFU, statistics::units::Count::get(), "Dispatches with no capable FU"),
+      ADD_STAT(gprZeroIdiomRouted, statistics::units::Count::get(),
+               "Scheduled GPR zero-idiom candidate operations"),
       ADD_STAT(targetTid, statistics::units::Count::get(), "Guest Linux TID; endpoint gauge"),
       ADD_STAT(scopeValid, statistics::units::Count::get(), "Task identity established; endpoint gauge"),
       ADD_STAT(targetSwitches, statistics::units::Count::get(), "Observed switches into or out of target")
@@ -36,7 +38,8 @@ void CustomUopStats::allocated()
     if (++allocatedThisCycle == 1) ++allocationActiveCycles;
 }
 
-void CustomUopStats::scheduled(bool no_need_fu, bool no_capable_fu)
+void CustomUopStats::scheduled(
+    bool no_need_fu, bool no_capable_fu, bool zero_idiom)
 {
     ++scheduledOps;
     switch (++scheduledThisCycle) {
@@ -47,6 +50,7 @@ void CustomUopStats::scheduled(bool no_need_fu, bool no_capable_fu)
     }
     if (no_need_fu) ++scheduledNoNeedFU;
     if (no_capable_fu) ++scheduledNoCapableFU;
+    if (zero_idiom) ++gprZeroIdiomRouted;
 }
 
 void CustomUopStats::retired(bool last)

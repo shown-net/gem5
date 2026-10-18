@@ -14,11 +14,12 @@ struct CustomUopStats : public statistics::Group
     statistics::Scalar retireActiveCycles, retireZeroCycles;
     statistics::Scalar retiredNonLastMicroops;
     statistics::Scalar scheduledNoNeedFU, scheduledNoCapableFU;
+    statistics::Scalar gprZeroIdiomRouted;
     statistics::Scalar targetTid, scopeValid, targetSwitches;
     explicit CustomUopStats(statistics::Group *parent);
     void beginCycle();
     void allocated();
-    void scheduled(bool no_need_fu, bool no_capable_fu);
+    void scheduled(bool no_need_fu, bool no_capable_fu, bool zero_idiom);
     void retired(bool last);
     void accountGap(uint64_t count);
 };
