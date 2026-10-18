@@ -20,4 +20,31 @@ class MarkerPcTrace
     const std::string outputFile;
     std::ofstream output;
 };
+
+// Separate from the six-column committed-PC stream so its existing readers
+// retain their format. Records describe retired architectural conditional
+// branches; missing direction lookups remain unknown, rather than false.
+struct MarkerBranchObservation
+{
+    uint64_t branchIndex, macroIndex, seqNum;
+    uint32_t threadId;
+    Addr pc;
+    Tick commitTick;
+    bool actualTaken, directionValid, originalDirection, predTaken;
+    Addr predNextPc, actualNextPc;
+    bool directionMispred, nextPcMispred, redirect, commitSquash, btbHit;
+};
+
+class MarkerBranchTrace
+{
+  public:
+    explicit MarkerBranchTrace(const std::string &path);
+    void initializeTrace();
+    void append(const MarkerBranchObservation &observation);
+    void finalizeTrace();
+
+  private:
+    const std::string outputFile;
+    std::ofstream output;
+};
 } // namespace gem5

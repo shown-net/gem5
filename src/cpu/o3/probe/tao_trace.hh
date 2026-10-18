@@ -694,6 +694,18 @@ private:
     MarkerMeasurementPhase marker_measurement_phase_ =
         MarkerMeasurementPhase::Warming;
     std::unique_ptr<MarkerPcTrace> marker_pc_trace_;
+    const bool branch_observation_;
+    struct BranchObservationStats : public statistics::Group
+    {
+        BranchObservationStats(statistics::Group *parent);
+        statistics::Scalar retiredCondBranches, directionPredictions;
+        statistics::Scalar directionMispredicts, nextPcMispredicts;
+        statistics::Scalar redirects, commitSquashes, btbMisses;
+    };
+    std::unique_ptr<BranchObservationStats> branch_observation_stats_;
+    std::unique_ptr<MarkerBranchTrace> marker_branch_trace_;
+    uint64_t marker_macro_index_ = 0, marker_branch_index_ = 0;
+    void observeMarkerBranch(const DynInstPtr &inst);
     static TaoTrace *marker_owner_;
     static uint64_t marker_address_root_;
     static gem5::ThreadContext *marker_handoff_context_;

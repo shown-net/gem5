@@ -38,6 +38,12 @@ class TaoTrace(ProbeListenerObject):
     )
     marker_pc = Param.Addr(0, "Common Marker PC consumed by TaoTrace Commit")
     marker_pc_trace_file = Param.String("", "Optional normalized PC trace")
+    branch_observation = Param.Bool(
+        False, "Count retired user conditional macro branches in the Marker ROI"
+    )
+    marker_branch_trace_file = Param.String(
+        "", "Optional retired conditional branch JSONL; requires branch_observation"
+    )
     marker_image_base = Param.Addr(0, "PC trace ELF image base")
     marker_exec_segments = VectorParam.Addr(
         [], "PC trace executable segment pairs"

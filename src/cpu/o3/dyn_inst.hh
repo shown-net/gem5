@@ -332,6 +332,14 @@ class DynInst : public ExecContext, public RefCounted
     /** Predicted PC state after this instruction. */
     std::unique_ptr<PCStateBase> predPC;
 
+    // Immutable observations of the original fetch prediction. Decode may
+    // subsequently repair predPC. None of these fields drive the pipeline.
+    std::unique_ptr<PCStateBase> originalBranchPredPC;
+    bool branchDirectionPredictionValid = false;
+    bool originalBranchDirectionPrediction = false;
+    bool branchBtbHit = false;
+    bool branchCommitSquash = false;
+
     /** The Macroop if one exists */
     const StaticInstPtr macroop;
 

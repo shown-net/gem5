@@ -281,6 +281,7 @@ class BPredUnit : public SimObject
               inst(inst), type(getBranchType(inst)),
               call(inst->isCall()), uncond(!inst->isCondCtrl()),
               predTaken(false), actuallyTaken(false), condPred(false),
+              condPredValid(false),
               btbHit(false), targetProvider(TargetProvider::NoTarget),
               resteered(false), mispredict(false), target(nullptr),
               bpHistory(nullptr),
@@ -332,6 +333,9 @@ class BPredUnit : public SimObject
 
         /** The prediction of the conditional predictor */
         bool condPred;
+
+        /** A direction lookup occurred (false for decoupled placeholders). */
+        bool condPredValid;
 
         /** Was BTB hit at prediction time */
         bool btbHit;

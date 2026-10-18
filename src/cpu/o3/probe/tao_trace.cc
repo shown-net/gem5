@@ -857,6 +857,25 @@ TaoTrace::NativeLoadStats::NativeLoadStats(statistics::Group *parent)
 {
 }
 
+TaoTrace::BranchObservationStats::BranchObservationStats(
+    statistics::Group *parent)
+    : statistics::Group(parent, "branch"),
+      ADD_STAT(retiredCondBranches, statistics::units::Count::get(),
+               "Retired architectural conditional branches in the user Marker ROI"),
+      ADD_STAT(directionPredictions, statistics::units::Count::get(),
+               "Retired conditional branches with an original direction lookup"),
+      ADD_STAT(directionMispredicts, statistics::units::Count::get(),
+               "Wrong original direction lookups among retired conditional branches"),
+      ADD_STAT(nextPcMispredicts, statistics::units::Count::get(),
+               "Retired conditional branches with a wrong original architectural next PC"),
+      ADD_STAT(redirects, statistics::units::Count::get(),
+               "Retired conditional branches marked for a Decode or IEW redirect"),
+      ADD_STAT(commitSquashes, statistics::units::Count::get(),
+               "Retired conditional branches whose IEW recovery was accepted by Commit"),
+      ADD_STAT(btbMisses, statistics::units::Count::get(),
+               "Retired conditional branches without a BTB hit at prediction time")
+{}
+
 TaoTrace::TaoTrace(const TaoTraceParams &params)
     : ProbeListenerObject(params),
       emit_macro_(params.emit_macro),
@@ -875,6 +894,9 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       native_stats_(params.native_stats),
       native_load_stats_(params.native_stats ?
           std::make_unique<NativeLoadStats>(this) : nullptr),
+      branch_observation_(params.branch_observation),
+      branch_observation_stats_(params.branch_observation ?
+          std::make_unique<BranchObservationStats>(this) : nullptr),
       require_roi_param_(params.require_roi),
       syscall_arg_counts_(parseSyscallArgCounts(params.syscall_arg_counts)),
       output_dir_(params.output_dir),
@@ -883,6 +905,10 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     live_instances_ += 1;
     fatal_if(native_stats_ && (!marker_controlled_ || !control_only_),
              "Lightweight native stats require Marker control-only mode");
+    fatal_if(branch_observation_ && !marker_controlled_,
+             "Retired branch observations require Marker control");
+    fatal_if(!params.marker_branch_trace_file.empty() && !branch_observation_,
+             "Marker branch trace requires branch_observation");
     if (control_only_) {
         fatal_if(
             !marker_controlled_ || emit_micro_ || emit_macro_ ||
@@ -901,6 +927,10 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
         if (!params.marker_pc_trace_file.empty()) {
             marker_pc_trace_ = std::make_unique<MarkerPcTrace>(
                 params.marker_pc_trace_file);
+        }
+        if (!params.marker_branch_trace_file.empty()) {
+            marker_branch_trace_ = std::make_unique<MarkerBranchTrace>(
+                params.marker_branch_trace_file);
         }
     }
     wrong_path_core_id_ = parseFstCoreIdFromName(name());
@@ -1032,6 +1062,47 @@ TaoTrace::selectMarkerWindow(uint64_t begin, uint64_t end)
 }
 
 void
+TaoTrace::observeMarkerBranch(const DynInstPtr &inst)
+{
+    const uint64_t macro_index = marker_macro_index_++;
+    if (!branch_observation_ || !inst->isCondCtrl()) return;
+    // x86 Br and Eret control the microcode sequencer, rather than the
+    // architectural instruction stream. Br also lacks IsLastMicroop, but
+    // explicitly exclude both here to preserve that boundary for Eret.
+    const auto mnemonic = inst->staticInst->getName();
+    if (inst->isMicroop() && (mnemonic == "br" || mnemonic == "eret")) return;
+
+    fatal_if(!inst->originalBranchPredPC,
+             "retired conditional branch lacks its original prediction");
+    const bool taken = inst->pcState().branching();
+    std::unique_ptr<PCStateBase> next_pc(inst->pcState().clone());
+    inst->staticInst->advancePC(*next_pc);
+    const bool direction_miss = inst->branchDirectionPredictionValid &&
+        inst->originalBranchDirectionPrediction != taken;
+    const bool next_pc_miss = inst->originalBranchPredPC->instAddr() !=
+        next_pc->instAddr();
+    auto &stats = *branch_observation_stats_;
+    ++stats.retiredCondBranches;
+    if (inst->branchDirectionPredictionValid) ++stats.directionPredictions;
+    if (direction_miss) ++stats.directionMispredicts;
+    if (next_pc_miss) ++stats.nextPcMispredicts;
+    if (inst->branchPredMispredicted()) ++stats.redirects;
+    if (inst->branchCommitSquash) ++stats.commitSquashes;
+    if (!inst->branchBtbHit) ++stats.btbMisses;
+    const uint64_t branch_index = marker_branch_index_++;
+    if (marker_branch_trace_) {
+        marker_branch_trace_->append(MarkerBranchObservation{
+            branch_index, macro_index, uint64_t(inst->seqNum),
+            uint32_t(inst->threadNumber), inst->pcState().instAddr(),
+            curTick(), taken, inst->branchDirectionPredictionValid,
+            inst->originalBranchDirectionPrediction, inst->readPredTaken(),
+            inst->originalBranchPredPC->instAddr(), next_pc->instAddr(),
+            direction_miss, next_pc_miss, inst->branchPredMispredicted(),
+            inst->branchCommitSquash, inst->branchBtbHit});
+    }
+}
+
+void
 TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
 {
     auto *owner = marker_owner_;
@@ -1046,6 +1117,9 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
         return;
     }
     const Addr pc = inst->pcState().instAddr();
+    if (owner->marker_measurement_phase_ == MarkerMeasurementPhase::Measuring) {
+        owner->observeMarkerBranch(inst);
+    }
     if (owner->marker_measurement_phase_ == MarkerMeasurementPhase::Measuring &&
         owner->marker_pc_trace_) {
         const int64_t fetch_tick = inst->fetchTick == Tick(-1) ?
@@ -1091,10 +1165,18 @@ TaoTrace::observeMarkerCommit(const DynInstPtr &inst)
     if (end && owner->marker_pc_trace_) {
         owner->marker_pc_trace_->finalizeTrace();
     }
+    if (end && owner->marker_branch_trace_) {
+        owner->marker_branch_trace_->finalizeTrace();
+    }
     // Snapshot synchronously at commit; leave the pipeline running normally.
     statistics::dump();
     if (begin && owner->marker_pc_trace_)
         owner->marker_pc_trace_->initializeTrace();
+    if (begin) {
+        owner->marker_macro_index_ = owner->marker_branch_index_ = 0;
+        if (owner->marker_branch_trace_)
+            owner->marker_branch_trace_->initializeTrace();
+    }
     for (auto *trace : marker_instances_) {
         trace->native_measurement_active_ = begin;
         if (begin && trace->native_stats_)
