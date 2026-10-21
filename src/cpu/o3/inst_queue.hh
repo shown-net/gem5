@@ -51,6 +51,7 @@
 #include "base/statistics.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
+#include "cpu/instruction_form.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dep_graph.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
@@ -465,7 +466,10 @@ class InstructionQueue
     /** List of ready instructions, per op class.  They are separated by op
      *  class to allow for easy mapping to FUs.
      */
-    ReadyInstQueue readyInsts[Num_OpClasses];
+    static constexpr unsigned NumReadyQueues = Num_OpClasses +
+        unsigned(InstructionForm::Count) - 1;
+    unsigned readyQueue(const DynInstPtr &inst) const;
+    ReadyInstQueue readyInsts[NumReadyQueues];
 
     /** List of non-speculative instructions that will be scheduled
      *  once the IQ gets a signal from commit.  While it's redundant to
@@ -481,7 +485,7 @@ class InstructionQueue
     /** Entry for the list age ordering by op class. */
     struct ListOrderEntry
     {
-        OpClass queueType;
+        unsigned queueType;
         InstSeqNum oldestInst;
     };
 
@@ -497,15 +501,15 @@ class InstructionQueue
     typedef typename std::list<ListOrderEntry>::iterator ListOrderIt;
 
     /** Tracks if each ready queue is on the age order list. */
-    bool queueOnList[Num_OpClasses];
+    bool queueOnList[NumReadyQueues];
 
     /** Iterators of each ready queue.  Points to their spot in the age order
      *  list.
      */
-    ListOrderIt readyIt[Num_OpClasses];
+    ListOrderIt readyIt[NumReadyQueues];
 
     /** Add an op class to the age order list. */
-    void addToOrderList(OpClass op_class);
+    void addToOrderList(unsigned queue_idx);
 
     /**
      * Called when the oldest instruction has been removed from a ready queue;

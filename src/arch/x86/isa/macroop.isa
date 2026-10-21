@@ -243,6 +243,17 @@ let {{
                     "microops[%d] = %s;\n" % \
                     (micropc, op.getAllocator(flags))
                 micropc += 1
+            timing_forms = {
+                "ADD_R_R": ("Add64Reg", "env.dataSize == 8"),
+                "IMUL_R_R_SINGLE": ("Imul64Reg", "env.dataSize == 8"),
+                "DIVSD_XMM_XMM": ("DivsdReg", "!machInst.vex.present"),
+                "DIVSD_XMM_XMM_INDEPENDENT": ("DivsdReg", "!machInst.vex.present"),
+            }
+            if self.name in timing_forms:
+                form, condition = timing_forms[self.name]
+                assert numMicroops == 1
+                allocMicroops += ("if (" + condition + ") microops[0]->"
+                                  "instructionForm(InstructionForm::" + form + ");\n")
             if env.useStackSize:
                 useStackSize = "true"
             else:

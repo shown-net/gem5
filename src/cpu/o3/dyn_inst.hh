@@ -72,8 +72,11 @@ class Packet;
 namespace o3
 {
 
+class InstructionTiming;
+
 class DynInst : public ExecContext, public RefCounted
 {
+    const InstructionTiming *instructionTiming = nullptr;
   private:
     DynInst(const StaticInstPtr &staticInst, const StaticInstPtr &macroop,
             InstSeqNum seq_num, CPU *cpu);
@@ -716,6 +719,7 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Returns the opclass of this instruction. */
     OpClass opClass() const { return staticInst->opClass(); }
+    const InstructionTiming *timingEntry() const { return instructionTiming; }
 
     /** Returns the branch target address. */
     std::unique_ptr<PCStateBase>

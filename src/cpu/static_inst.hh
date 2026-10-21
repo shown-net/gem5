@@ -53,6 +53,7 @@
 #include "base/logging.hh"
 #include "base/refcnt.hh"
 #include "cpu/op_class.hh"
+#include "cpu/instruction_form.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "enums/StaticInstFlags.hh"
@@ -105,6 +106,9 @@ class StaticInst : public RefCounted, public StaticInstFlags
     /// See opClass().
     OpClass _opClass;
 
+    // Semantic form tag only. Per-CPU timing never mutates a StaticInst.
+    InstructionForm _instructionForm = InstructionForm::None;
+
     /// See numSrcRegs().
     uint8_t _numSrcRegs = 0;
 
@@ -116,6 +120,8 @@ class StaticInst : public RefCounted, public StaticInstFlags
   public:
 
     /// @name Register information.
+    InstructionForm instructionForm() const { return _instructionForm; }
+    void instructionForm(InstructionForm form) { _instructionForm = form; }
     /// The sum of the different numDestRegs([type])-s equals numDestRegs().
     /// The per-type function is used to track physical register usage.
     //@{

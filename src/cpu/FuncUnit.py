@@ -162,3 +162,4 @@ class FUDesc(SimObject):
 
     count = Param.Int("number of these FU's available")
     opList = VectorParam.OpDesc("operation classes for this FU type")
+    timingPort = Param.String("", "Port name for a single FU instance")

@@ -82,9 +82,11 @@ class FUDesc : public SimObject
   public:
     std::vector<OpDesc *> opDescList;
     unsigned         number;
+    const std::string timingPort;
 
     FUDesc(const FUDescParams &p)
-        : SimObject(p), opDescList(p.opList), number(p.count) {};
+        : SimObject(p), opDescList(p.opList), number(p.count),
+          timingPort(p.timingPort) {};
 };
 
 

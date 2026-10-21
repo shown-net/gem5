@@ -614,7 +614,7 @@ InstructionQueue::resetState()
         squashedSeqNum[tid] = 0;
     }
 
-    for (int i = 0; i < Num_OpClasses; ++i) {
+    for (int i = 0; i < NumReadyQueues; ++i) {
         while (!readyInsts[i].empty())
             readyInsts[i].pop();
         queueOnList[i] = false;
@@ -658,6 +658,8 @@ InstructionQueue::isDrained() const
                    wbOutstanding == 0;
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         drained = drained && memDepUnit[tid].isDrained();
+    for (auto *iq : iqs)
+        drained = drained && !iq->fuPool()->admissionPending(cpu->curCycle());
 
     return drained;
 }
@@ -744,7 +746,7 @@ InstructionQueue::hasReadyInsts()
         return true;
     }
 
-    for (int i = 0; i < Num_OpClasses; ++i) {
+    for (int i = 0; i < NumReadyQueues; ++i) {
         if (!readyInsts[i].empty()) {
             return true;
         }
@@ -869,8 +871,16 @@ InstructionQueue::getInstToExecute()
     return inst;
 }
 
+unsigned
+InstructionQueue::readyQueue(const DynInstPtr &inst) const
+{
+    if (const auto *entry = inst->timingEntry())
+        return Num_OpClasses + unsigned(entry->form) - 1;
+    return inst->opClass();
+}
+
 void
-InstructionQueue::addToOrderList(OpClass op_class)
+InstructionQueue::addToOrderList(unsigned op_class)
 {
     assert(!readyInsts[op_class].empty());
 
@@ -904,7 +914,7 @@ InstructionQueue::moveToYoungerInst(ListOrderIt list_order_it)
     // than the new instruction.  If so, then add in a new iterator right here.
     // If not, then move along.
     ListOrderEntry queue_entry;
-    OpClass op_class = (*list_order_it).queueType;
+    unsigned op_class = (*list_order_it).queueType;
     ListOrderIt next_it = list_order_it;
 
     ++next_it;
@@ -924,7 +934,7 @@ void
 InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                                       int fu_idx)
 {
-    if (inst->opClass() == X86DivsdOp) {
+    if (inst->opClass() == X86DivsdOp && !inst->timingEntry()) {
         divsdStats.account();
         const auto it = divsdIssuedAt.find(inst->seqNum);
         assert(it != divsdIssuedAt.end());
@@ -999,11 +1009,12 @@ InstructionQueue::scheduleReadyInsts()
     ListOrderIt order_end_it = listOrder.end();
 
     while (total_issued < totalWidth && order_it != order_end_it) {
-        OpClass op_class = (*order_it).queueType;
+        unsigned queue_idx = (*order_it).queueType;
+        OpClass op_class = readyInsts[queue_idx].top()->opClass();
 
-        assert(!readyInsts[op_class].empty());
+        assert(!readyInsts[queue_idx].empty());
 
-        DynInstPtr issuing_inst = readyInsts[op_class].top();
+        DynInstPtr issuing_inst = readyInsts[queue_idx].top();
 
         if (issuing_inst->isFloating()) {
             iqIOStats.fpInstQueueReads++;
@@ -1016,13 +1027,13 @@ InstructionQueue::scheduleReadyInsts()
         assert(issuing_inst->seqNum == (*order_it).oldestInst);
 
         if (issuing_inst->isSquashed()) {
-            readyInsts[op_class].pop();
+            readyInsts[queue_idx].pop();
 
-            if (!readyInsts[op_class].empty()) {
+            if (!readyInsts[queue_idx].empty()) {
                 moveToYoungerInst(order_it);
             } else {
-                readyIt[op_class] = listOrder.end();
-                queueOnList[op_class] = false;
+                readyIt[queue_idx] = listOrder.end();
+                queueOnList[queue_idx] = false;
             }
 
             listOrder.erase(order_it++);
@@ -1039,7 +1050,11 @@ InstructionQueue::scheduleReadyInsts()
         IQUnit *iq = issuing_inst->iq;
         assert(iq);
         auto fu_pool = iq->fuPool();
-        if (op_class != No_OpClass) {
+        const auto *timing = issuing_inst->timingEntry();
+        if (timing) {
+            idx = fu_pool->getUnit(*timing, op_class, cpu->curCycle());
+            op_latency = timing->latency;
+        } else if (op_class != No_OpClass) {
             if (op_class == X86DivsdOp &&
                 uint64_t(cpu->curCycle()) < divsdNextIssue) {
                 ++divsdStats.divsdAdmissionRejected;
@@ -1074,7 +1089,7 @@ InstructionQueue::scheduleReadyInsts()
         // valid FU, then schedule for execution.
         if (idx > FUPool::NoFreeFU || idx == FUPool::NoNeedFU ||
             idx == FUPool::NoCapableFU) {
-            if (op_class == X86DivsdOp) {
+            if (op_class == X86DivsdOp && !timing) {
                 panic_if(idx < 0 || op_latency < Cycles(2) ||
                          divsdIssueInterval == 0,
                          "Dedicated DIVSD requires a FU, latency >= 2 and interval >= 1");
@@ -1127,7 +1142,7 @@ InstructionQueue::scheduleReadyInsts()
                   issuing_inst->setNoCapableFU();
             } else {
                 assert(idx != FUPool::NoCapableFU);
-                bool pipelined = fu_pool->isPipelined(op_class);
+                bool pipelined = timing || fu_pool->isPipelined(op_class);
                 // Generate completion event for the FU
                 ++wbOutstanding;
                 auto execution =
@@ -1151,22 +1166,26 @@ InstructionQueue::scheduleReadyInsts()
                     tid, issuing_inst->pcState(),
                     issuing_inst->seqNum);
 
-            readyInsts[op_class].pop();
+            readyInsts[queue_idx].pop();
 
-            if (!readyInsts[op_class].empty()) {
+            if (!readyInsts[queue_idx].empty()) {
                 moveToYoungerInst(order_it);
             } else {
-                readyIt[op_class] = listOrder.end();
-                queueOnList[op_class] = false;
+                readyIt[queue_idx] = listOrder.end();
+                queueOnList[queue_idx] = false;
             }
 
             issuing_inst->setIssued();
+            // Fast builds disable the legacy tracing assignment below.
+            // Covered forms still expose their actual admission timestamp.
+            if (timing)
+                issuing_inst->issueTick = curTick() - issuing_inst->fetchTick;
             cpu->customStats.scheduled(
                 idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU,
                 issuing_inst->isZeroIdiom());
             if (idx >= 0 && ppExecutionIssue) {
                 ppExecutionIssue->notify({op_class, idx, op_latency,
-                    fu_pool->isPipelined(op_class),
+                    timing || fu_pool->isPipelined(op_class),
                     issuing_inst->pcState().instAddr(),
                     issuing_inst->pcState().microPC()});
             }
@@ -1361,9 +1380,9 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
 void
 InstructionQueue::addReadyMemInst(const DynInstPtr &ready_inst)
 {
-    OpClass op_class = ready_inst->opClass();
+    unsigned op_class = readyQueue(ready_inst);
 
-    assert(op_class < Num_OpClasses);
+    assert(op_class < NumReadyQueues);
 
     readyInsts[op_class].push(ready_inst);
 
@@ -1739,9 +1758,9 @@ InstructionQueue::addIfReady(const DynInstPtr &inst)
             return;
         }
 
-        OpClass op_class = inst->opClass();
+        unsigned op_class = readyQueue(inst);
 
-        assert(op_class < Num_OpClasses);
+        assert(op_class < NumReadyQueues);
 
         DPRINTF(IQ, "Instruction is ready to issue, putting it onto "
                 "the ready list, PC %s opclass:%i [sn:%llu].\n",
@@ -1764,7 +1783,7 @@ InstructionQueue::addIfReady(const DynInstPtr &inst)
 void
 InstructionQueue::dumpLists()
 {
-    for (int i = 0; i < Num_OpClasses; ++i) {
+    for (int i = 0; i < NumReadyQueues; ++i) {
         cprintf("Ready list %i size: %i\n", i, readyInsts[i].size());
 
         cprintf("\n");
