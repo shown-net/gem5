@@ -1,16 +1,26 @@
 #include "cpu/probes/marker_pc_trace.hh"
 #include "base/logging.hh"
 #include "base/output.hh"
+#include "proto/marker_trace.pb.h"
+#include "proto/protoio.hh"
+#include "sim/core.hh"
 
 namespace gem5
 {
 MarkerPcTrace::MarkerPcTrace(const std::string &path) : outputFile(path) {}
+MarkerPcTrace::~MarkerPcTrace() = default;
 
 void
 MarkerPcTrace::initializeTrace()
 {
-    output.open(simout.resolve(outputFile), std::ios::trunc);
-    fatal_if(!output, "cannot initialize committed PC trace");
+    output = std::make_unique<ProtoOutputStream>(simout.resolve(outputFile));
+    ProtoMessage::MarkerTraceHeader header;
+    header.set_version(1);
+    header.set_trace_kind("committed-pc");
+    header.set_tick_freq(sim_clock::Frequency);
+    header.set_batch_size(BatchSize);
+    output->write(header);
+    batch = std::make_unique<ProtoMessage::MarkerPcBatch>();
 }
 
 void
@@ -18,60 +28,91 @@ MarkerPcTrace::append(Addr pc, Tick commitTick, int64_t fetchTick,
                       int32_t dispatchTick, int32_t issueTick,
                       int32_t completeTick)
 {
-    output << std::hex << pc << '\t' << std::dec << commitTick << '\t'
-           << fetchTick << '\t' << dispatchTick << '\t' << issueTick << '\t'
-           << completeTick << '\n';
-    fatal_if(!output, "cannot append committed PC trace");
+    batch->add_pc(pc);
+    batch->add_commit_tick(commitTick);
+    batch->add_fetch_tick(fetchTick);
+    batch->add_dispatch_from_fetch(dispatchTick);
+    batch->add_issue_from_fetch(issueTick);
+    batch->add_complete_from_fetch(completeTick);
+    if (batch->pc_size() >= BatchSize)
+        flush();
+}
+
+void
+MarkerPcTrace::flush()
+{
+    if (!batch || batch->pc_size() == 0)
+        return;
+    batch->set_row_count(batch->pc_size());
+    output->write(*batch);
+    batch->Clear();
 }
 
 void
 MarkerPcTrace::finalizeTrace()
 {
-    output.close();
-    fatal_if(output.fail(), "cannot close committed PC trace");
+    flush();
+    batch.reset();
+    output.reset();
 }
 
 MarkerBranchTrace::MarkerBranchTrace(const std::string &path)
     : outputFile(path)
 {}
+MarkerBranchTrace::~MarkerBranchTrace() = default;
 
 void
 MarkerBranchTrace::initializeTrace()
 {
-    output.open(simout.resolve(outputFile), std::ios::trunc);
-    fatal_if(!output, "cannot initialize committed branch trace");
+    output = std::make_unique<ProtoOutputStream>(simout.resolve(outputFile));
+    ProtoMessage::MarkerTraceHeader header;
+    header.set_version(1);
+    header.set_trace_kind("committed-branch");
+    header.set_tick_freq(sim_clock::Frequency);
+    header.set_batch_size(BatchSize);
+    output->write(header);
+    batch = std::make_unique<ProtoMessage::MarkerBranchBatch>();
 }
 
 void
 MarkerBranchTrace::append(const MarkerBranchObservation &b)
 {
-    output << std::boolalpha << "{\"schema\":1,\"branch_index\":"
-           << b.branchIndex << ",\"macro_index\":" << b.macroIndex
-           << ",\"seq_num\":" << b.seqNum
-           << ",\"thread_id\":" << b.threadId << ",\"pc\":\"0x"
-           << std::hex << b.pc << std::dec << "\",\"commit_tick\":"
-           << b.commitTick << ",\"actual_taken\":" << b.actualTaken
-           << ",\"direction_valid\":" << b.directionValid
-           << ",\"original_direction\":";
-    if (b.directionValid) output << b.originalDirection;
-    else output << "null";
-    output << ",\"pred_taken\":" << b.predTaken
-           << ",\"pred_next_pc\":\"0x" << std::hex << b.predNextPc
-           << "\",\"actual_next_pc\":\"0x" << b.actualNextPc << std::dec
-           << "\",\"direction_mispred\":";
-    if (b.directionValid) output << b.directionMispred;
-    else output << "null";
-    output << ",\"next_pc_mispred\":" << b.nextPcMispred
-           << ",\"redirect\":" << b.redirect
-           << ",\"commit_squash\":" << b.commitSquash
-           << ",\"btb_hit\":" << b.btbHit << "}\n";
-    fatal_if(!output, "cannot append committed branch trace");
+    batch->add_branch_index(b.branchIndex);
+    batch->add_macro_index(b.macroIndex);
+    batch->add_seq_num(b.seqNum);
+    batch->add_thread_id(b.threadId);
+    batch->add_pc(b.pc);
+    batch->add_commit_tick(b.commitTick);
+    batch->add_actual_taken(b.actualTaken);
+    batch->add_direction_valid(b.directionValid);
+    batch->add_original_direction(b.originalDirection);
+    batch->add_pred_taken(b.predTaken);
+    batch->add_pred_next_pc(b.predNextPc);
+    batch->add_actual_next_pc(b.actualNextPc);
+    batch->add_direction_mispred(b.directionMispred);
+    batch->add_next_pc_mispred(b.nextPcMispred);
+    batch->add_redirect(b.redirect);
+    batch->add_commit_squash(b.commitSquash);
+    batch->add_btb_hit(b.btbHit);
+    if (batch->pc_size() >= BatchSize)
+        flush();
+}
+
+void
+MarkerBranchTrace::flush()
+{
+    if (!batch || batch->pc_size() == 0)
+        return;
+    batch->set_row_count(batch->pc_size());
+    output->write(*batch);
+    batch->Clear();
 }
 
 void
 MarkerBranchTrace::finalizeTrace()
 {
-    output.close();
-    fatal_if(output.fail(), "cannot close committed branch trace");
+    flush();
+    batch.reset();
+    output.reset();
 }
 } // namespace gem5

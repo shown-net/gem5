@@ -412,6 +412,7 @@ def _dump_to_visitor(visitor, roots=None, stat_names=None):
 lastDump = 0
 # List[SimObject].
 global_dump_roots = []
+global_dump_stat_names = None
 
 
 def dump(roots=None, message="", stat_names=None):
@@ -428,6 +429,9 @@ def dump(roots=None, message="", stat_names=None):
         all_roots.extend(roots)
     global global_dump_roots
     all_roots.extend(global_dump_roots)
+    global global_dump_stat_names
+    if stat_names is None:
+        stat_names = global_dump_stat_names
 
     now = m5.curTick()
     global lastDump
