@@ -274,6 +274,7 @@ class BPredUnit : public SimObject
               predTaken(false),
               actuallyTaken(false),
               condPred(false),
+              condPredValid(false),
               overridden(false),
               btbHit(false),
               targetProvider(TargetProvider::NoTarget),
@@ -330,6 +331,9 @@ class BPredUnit : public SimObject
 
         /** The prediction of the conditional predictor */
         bool condPred;
+
+        /** A direction lookup occurred (false for decoupled placeholders). */
+        bool condPredValid;
 
         /** Whether the overriding predictor was the provider */
         bool overridden;

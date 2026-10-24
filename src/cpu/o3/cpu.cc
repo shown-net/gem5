@@ -72,6 +72,7 @@ namespace o3
 
 CPU::CPU(const BaseO3CPUParams &params)
     : BaseCPU(params),
+      customStats(this), taskStats(*this),
       mmu(params.mmu),
       tickEvent([this] { tick(); }, "O3CPU tick", false, Event::CPU_Tick_Pri),
       threadExitEvent([this] { exitThreads(); }, "O3CPU exit threads", false,
@@ -365,6 +366,13 @@ CPU::CPUStats::CPUStats(CPU *cpu)
 }
 
 void
+CPU::preDumpStats()
+{
+    taskStats.settle();
+    BaseCPU::preDumpStats();
+}
+
+void
 CPU::tick()
 {
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
@@ -372,6 +380,7 @@ CPU::tick()
     assert(drainState() != DrainState::Drained);
 
     ++baseStats.numCycles;
+    customStats.beginCycle();
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
 
 //    activity = false;
@@ -388,6 +397,7 @@ CPU::tick()
     iew.tick();
 
     commit.tick();
+    taskStats.endCycle();
 
     // Now advance the time buffers
     timeBuffer.advance();
@@ -1348,6 +1358,8 @@ CPU::wakeCPU()
         --cycles;
         cpuStats.idleCycles += cycles;
         baseStats.numCycles += cycles;
+        if (threadContexts[0]->status() == gem5::ThreadContext::Active)
+            customStats.accountGap(cycles);
     }
 
     schedule(tickEvent, clockEdge());

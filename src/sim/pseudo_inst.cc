@@ -54,6 +54,7 @@
 #include "base/debug.hh"
 #include "base/output.hh"
 #include "cpu/base.hh"
+#include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Loader.hh"
 #include "debug/Quiesce.hh"
@@ -384,6 +385,10 @@ m5checkpoint(ThreadContext *tc, Tick delay, Tick period)
         return;
 
     if (DistIface::readyToCkpt(delay, period)) {
+        // Bind source-level ROI checkpoints to the exact address space that
+        // executed the marker. System serializes this identity before the
+        // KVM checkpoint is restored under a detailed CPU.
+        gem5::o3::TaoTrace::traceSourceRoiCheckpoint(tc);
         Tick when = curTick() + delay * sim_clock::as_int::ns;
         Tick repeat = period * sim_clock::as_int::ns;
         exitSimulationLoopClassic("checkpoint", 0, when, repeat);
@@ -641,6 +646,9 @@ void
 m5Hypercall(ThreadContext *tc, uint64_t hypercall_id)
 {
     DPRINTF(PseudoInst, "pseudo_inst::m5Hypercall(%i)\n", hypercall_id);
+    if (hypercall_id == 4) {
+        gem5::o3::TaoTrace::traceMarkerHandoff(tc);
+    }
     exitSimulationLoop(hypercall_id, ExitPayload(), curTick() + simQuantum);
 }
 

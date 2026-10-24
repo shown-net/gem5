@@ -1067,6 +1067,8 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
+            cpu->customStats.scheduled(
+                idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU, false);
             ++total_issued;
 
 #if TRACING_ON

@@ -82,8 +82,14 @@ FUPool::~FUPool()
 
 
 // Constructor
+FUPool::AllocationStats::AllocationStats(statistics::Group *parent)
+    : statistics::Group(parent, "custom"),
+      ADD_STAT(allocatedByUnit, statistics::units::Count::get(),
+               "Successful allocations by FU instance and operation class")
+{}
+
 FUPool::FUPool(const Params &p)
-    : SimObject(p)
+    : SimObject(p), allocationStats(this)
 {
     numFU = 0;
 
@@ -147,6 +153,10 @@ FUPool::FUPool(const Params &p)
     }
 
     unitBusy.resize(numFU);
+    allocationStats.allocatedByUnit.init(numFU, Num_OpClasses).flags(statistics::total);
+    allocationStats.allocatedByUnit.ysubnames(enums::OpClassStrings);
+    for (int i = 0; i < numFU; ++i)
+        allocationStats.allocatedByUnit.subname(i, "fu" + std::to_string(i));
 
     for (int i = 0; i < numFU; i++) {
         unitBusy[i] = false;
@@ -185,6 +195,7 @@ FUPool::getUnit(OpClass capability)
     assert(fu_idx < numFU);
 
     unitBusy[fu_idx] = true;
+    allocationStats.allocatedByUnit[fu_idx][capability]++;
 
     return fu_idx;
 }

@@ -54,6 +54,10 @@ from m5.SimObject import *
 
 
 class BaseO3CPU(BaseCPU):
+    taskStatsSwitchPc = Param.Addr(0, "x86 Linux __switch_to; zero disables TASK observer")
+    taskStatsCurrentOffset = Param.Addr(0, "GS-relative pcpu_hot.current_task offset")
+    taskStatsPidOffset = Param.Unsigned(0, "BTF task_struct.pid offset")
+
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/cpu.hh"

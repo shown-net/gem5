@@ -192,6 +192,7 @@ class DynInst : public ExecContext, public RefCounted
         Predicate,
         MemAccPredicate,
         PredTaken,
+        BranchPredMispredicted,
         IsStrictlyOrdered,
         ReqMade,
         MemOpDone,
@@ -327,12 +328,25 @@ class DynInst : public ExecContext, public RefCounted
     /** The thread this instruction is from. */
     ThreadID threadNumber = 0;
 
+    /** User-mode state at fetch, before the instruction can change it. */
+    bool fetchedFromUser = false;
+    /** Page-table root at fetch, excluding x86 CR3 control/PCID bits. */
+    uint64_t fetchedAddressSpaceId = 0;
+
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
 
     ////////////////////// Branch Data ///////////////
     /** Predicted PC state after this instruction. */
     std::unique_ptr<PCStateBase> predPC;
+
+    // Immutable observations of the original fetch prediction. Decode may
+    // subsequently repair predPC. None of these fields drive the pipeline.
+    std::unique_ptr<PCStateBase> originalBranchPredPC;
+    bool branchDirectionPredictionValid = false;
+    bool originalBranchDirectionPrediction = false;
+    bool branchBtbHit = false;
+    bool branchCommitSquash = false;
 
     /** The Macroop if one exists */
     const StaticInstPtr macroop;
@@ -532,6 +546,25 @@ class DynInst : public ExecContext, public RefCounted
     setPredTaken(bool predicted_taken)
     {
         instFlags[PredTaken] = predicted_taken;
+    }
+
+    /** Remember that the original fetch prediction caused a redirect.
+     *
+     * Decode may repair a direct target in predPC before this instruction
+     * retires. DynInst::mispredicted() is therefore a current-PC comparison,
+     * not persistent branch-predictor history. This sticky bit preserves the
+     * original BPred miss until retirement.
+     */
+    bool
+    branchPredMispredicted() const
+    {
+        return instFlags[BranchPredMispredicted];
+    }
+
+    void
+    setBranchPredMispredicted()
+    {
+        instFlags[BranchPredMispredicted] = true;
     }
 
     /** Returns whether the instruction mispredicted. */

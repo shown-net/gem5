@@ -719,6 +719,7 @@ Rename::renameInsts(ThreadID tid)
         // instructions.  This is mainly due to lack of support for
         // out-of-order operations of either of those classes of
         // instructions.
+
         if (inst->isSerializeBefore() && !inst->isSerializeHandled()) {
             DPRINTF(Rename, "Serialize before instruction encountered.\n");
 
@@ -769,6 +770,7 @@ Rename::renameInsts(ThreadID tid)
         // Put instruction in rename queue.
         toIEW->insts[toIEWIndex] = inst;
         ++(toIEW->size);
+        cpu->customStats.allocated();
 
         // Increment which instruction we're on.
         ++toIEWIndex;

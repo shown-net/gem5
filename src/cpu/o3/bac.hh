@@ -322,7 +322,8 @@ class BAC
      */
     bool updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
                          const StaticInstPtr &inst, PCStateBase &pc,
-                         const FetchTargetPtr &ft);
+                         const FetchTargetPtr &ft,
+                         const DynInstPtr &dyn_inst);
 
   private:
     /** Squashes BAC for a specific thread and resets the PC. */

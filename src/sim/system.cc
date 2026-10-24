@@ -348,6 +348,8 @@ System::serialize(CheckpointOut &cp) const
         paramOut(cp, csprintf("quiesceEndTick_%d", id), when);
     }
 
+    paramOut(cp, "sourceRoiAddressSpaceId", sourceRoiAddressSpaceId);
+
     // also serialize the memories in the system
     physmem.serializeSection(cp, "physmem");
 }
@@ -356,6 +358,8 @@ System::serialize(CheckpointOut &cp) const
 void
 System::unserialize(CheckpointIn &cp)
 {
+    optParamIn(cp, "sourceRoiAddressSpaceId", sourceRoiAddressSpaceId);
+
     for (auto &t: threads.threads) {
         Tick when = 0;
         ContextID id = t.context->contextId();

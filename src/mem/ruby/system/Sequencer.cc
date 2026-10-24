@@ -64,7 +64,7 @@ namespace ruby
 {
 
 Sequencer::Sequencer(const Params &p)
-    : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
+    : RubyPort(p), readStats(this), m_IncompleteTimes(MachineType_NUM),
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
@@ -141,6 +141,54 @@ Sequencer::Sequencer(const Params &p)
         }
     }
 
+}
+
+Sequencer::ReadStats::ReadStats(statistics::Group *parent)
+    : statistics::Group(parent, "custom"),
+      ADD_STAT(readAdmitted, statistics::units::Count::get(),
+               "Ordinary LD requests readAdmitted"),
+      ADD_STAT(readAliased, statistics::units::Count::get(),
+               "LD admissions behind an existing line request"),
+      ADD_STAT(readIssued, statistics::units::Count::get(),
+               "LD hierarchy issue calls, including reissues"),
+      ADD_STAT(readCompleted, statistics::units::Count::get(),
+               "LD callbacks, including later-squashed loads"),
+      ADD_STAT(readCoalesced, statistics::units::Count::get(),
+               "LD callbacks marked readCoalesced"),
+      ADD_STAT(readLatencyCycles, statistics::units::Cycle::get(),
+               "Sum of full admission-to-callback latency for completions"),
+      ADD_STAT(readOutstandingCycleSum, statistics::units::Cycle::get(),
+               "ROI-clipped integral of outstanding ordinary LD requests"),
+      ADD_STAT(readActiveCycles, statistics::units::Cycle::get(),
+               "ROI cycles with at least one observed LD"),
+      ADD_STAT(readOutstandingAtDump, statistics::units::Count::get(),
+               "Observed LD outstanding at stats dump")
+{}
+
+bool
+Sequencer::observedRead(PacketPtr pkt)
+{
+    return pkt->isRead() && !pkt->isWrite() && !pkt->isAtomicOp() &&
+        !pkt->req->isInstFetch() && !pkt->req->isPrefetch() &&
+        !pkt->req->isPTWalk() && !pkt->req->isUncacheable() &&
+        !pkt->req->isLLSC() && !pkt->req->isReadModifyWrite();
+}
+
+void
+Sequencer::updateReadArea()
+{
+    const uint64_t elapsed = curCycle() - observedAt;
+    readStats.readOutstandingCycleSum += elapsed * observedReads;
+    if (observedReads) readStats.readActiveCycles += elapsed;
+    observedAt = curCycle();
+}
+
+void
+Sequencer::preDumpStats()
+{
+    RubyPort::preDumpStats();
+    updateReadArea();
+    readStats.readOutstandingAtDump = observedReads;
 }
 
 Sequencer::~Sequencer()
@@ -274,6 +322,9 @@ Sequencer::functionalWrite(Packet *func_pkt)
 
 void Sequencer::resetStats()
 {
+    RubyPort::resetStats();
+    observedAt = curCycle();
+    readStats.readOutstandingAtDump = observedReads;
     m_outstandReqHist.reset();
     m_latencyHist.reset();
     m_hitLatencyHist.reset();
@@ -373,6 +424,13 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     seq_req_list.emplace_back(pkt, primary_type,
         secondary_type, curCycle());
     m_outstanding_count++;
+    if (primary_type == RubyRequestType_LD && observedRead(pkt)) {
+        updateReadArea();
+        ++observedReads;
+        ++readStats.readAdmitted;
+        if (seq_req_list.size() > 1) ++readStats.readAliased;
+    }
+
 
     if (seq_req_list.size() > 1) {
         return RequestStatus_Aliased;
@@ -752,6 +810,15 @@ Sequencer::hitCallback(SequencerRequest *srequest, DataBlock &data,
               "in .sm files!");
 
     PacketPtr pkt = srequest->pkt;
+    if (srequest->m_type == RubyRequestType_LD && observedRead(pkt)) {
+        updateReadArea();
+        assert(observedReads > 0);
+        --observedReads;
+        ++readStats.readCompleted;
+        if (was_coalesced) ++readStats.readCoalesced;
+        readStats.readLatencyCycles += curCycle() - srequest->issue_time;
+    }
+
     Addr request_address(pkt->getAddr());
     RubyRequestType type = srequest->m_type;
 
@@ -1140,6 +1207,8 @@ Sequencer::makeRequest(PacketPtr pkt)
 void
 Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
 {
+    if (secondary_type == RubyRequestType_LD && observedRead(pkt))
+        ++readStats.readIssued;
     assert(pkt != NULL);
     ContextID proc_id = pkt->req->hasContextId() ?
         pkt->req->contextId() : InvalidContextID;

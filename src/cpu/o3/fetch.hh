@@ -429,6 +429,7 @@ class Fetch
     Addr fetchOffset[MaxThreads];
 
     StaticInstPtr macroop[MaxThreads];
+    bool macroopFromUser[MaxThreads] = {};
 
     /** Can the fetch stage redirect from an interrupt on this instruction? */
     bool delayedCommit[MaxThreads];

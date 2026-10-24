@@ -47,6 +47,7 @@
 #include <string>
 #include <vector>
 
+#include "base/statistics.hh"
 #include "cpu/op_class.hh"
 #include "params/FUPool.hh"
 #include "sim/sim_object.hh"
@@ -127,6 +128,12 @@ class FUPool : public SimObject
 
     /** Number of FUs. */
     int numFU;
+
+    struct AllocationStats : public statistics::Group
+    {
+        explicit AllocationStats(statistics::Group *parent);
+        statistics::Vector2d allocatedByUnit;
+    } allocationStats;
 
     /** Functional units. */
     std::vector<FuncUnit *> funcUnits;

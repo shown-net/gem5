@@ -112,6 +112,7 @@ pybind_init_event(py::module_ &m_native)
     m.def("setMaxTick", &set_max_tick, py::arg("tick"));
     m.def("getMaxTick", &get_max_tick, py::return_value_policy::copy);
     m.def("terminateEventQueueThreads", &terminateEventQueueThreads);
+    m.def("enterSingleEventQueueMode", &enterSingleEventQueueMode);
     /* Python-level deprecation wrapper for the legacy exitSimLoop API.
      * Preserve the original behavior and ABI but emit a DeprecationWarning
      * so Python callers start migrating to the replacement matching their

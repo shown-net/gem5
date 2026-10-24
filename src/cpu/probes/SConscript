@@ -35,6 +35,9 @@ Source("pc_count_tracker_manager.cc")
 
 DebugFlag("PcCountTracker")
 
+if env["CONF"].get("HAVE_ZSTD", False):
+    Source("marker_pc_trace.cc")
+
 SimObject(
     "InstTracker.py",
     sim_objects=["GlobalInstTracker", "LocalInstTracker"],

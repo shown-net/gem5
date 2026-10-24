@@ -99,6 +99,7 @@ class Sequencer : public RubyPort
     // Public Methods
     virtual void wakeup(); // Used only for deadlock detection
     void resetStats() override;
+    void preDumpStats() override;
     void collateStats();
 
     void writeCallbackCBusy(Addr address, DataBlock &data,
@@ -320,6 +321,22 @@ class Sequencer : public RubyPort
 
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
+
+    // Bounded observer state, ordinary cacheable LD requests only. No events
+    // are scheduled by this observer and no request identities are retained.
+    struct ReadStats : public statistics::Group
+    {
+        ReadStats(statistics::Group *parent);
+        statistics::Scalar readAdmitted, readAliased, readIssued, readCompleted, readCoalesced;
+        statistics::Scalar readLatencyCycles, readOutstandingCycleSum, readActiveCycles;
+        statistics::Scalar readOutstandingAtDump;
+    } readStats;
+    uint64_t observedReads = 0;
+    Cycles observedAt = Cycles(0);
+    static bool observedRead(PacketPtr pkt);
+    void updateReadArea();
+
+
     bool m_deadlock_check_scheduled;
 
     int m_coreId;

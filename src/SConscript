@@ -145,6 +145,8 @@ class PySource(SourceFile):
             **overrides)
         Source(cpp, tags=self.tags, add_tags=['python', 'm5_module'])
 
+sim_object_param_headers = []
+
 class SimObject(PySource):
     '''Add a SimObject python file as a python source object and add
     it to a list of sim object modules'''
@@ -177,12 +179,12 @@ class SimObject(PySource):
 
             # Params header.
             params_hh = build_dir.File(f'params/{simobj}.hh').get_abspath()
-            gem5py_env.Command([ "${PARAMS_HH}" ], srcs,
+            sim_object_param_headers.extend(gem5py_env.Command([ "${PARAMS_HH}" ], srcs,
                     MakeAction(cmdline('PARAMS_HH'), Transform("SO Param", 2)),
                     MODULE=module,
                     SIMOBJ=simobj,
                     PYSCRIPT=build_tools.File('sim_object_param_struct_hh.py'),
-                    PARAMS_HH=params_hh)
+                    PARAMS_HH=params_hh))
 
             # Params cc.
             cc_file = build_dir.File(f'python/_m5/param_{simobj}.cc')
@@ -443,6 +445,15 @@ class Executable(TopLevelBase):
 
 class Gem5(Executable):
     '''Base class for the main gem5 executable.'''
+
+    def srcs_to_objs(self, env, sources):
+        objs = super().srcs_to_objs(env, sources)
+        # Generated headers may gain inherited includes after common header
+        # changes. Finish them before compilation, including a cold scan.
+        headers_ready = env.Alias(env['BUILDDIR'] + '/params-ready',
+                                  sim_object_param_headers)
+        env.Requires(objs, headers_ready)
+        return objs
 
     def declare(self, env):
         objs = self.srcs_to_objs(env, self.sources(env))

@@ -179,6 +179,7 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
         } else {
             totalLatency += condPred.latency;
         }
+        hist->condPredValid = true;
 
         if (hist->condPred) {
             ++stats.condPredictedTaken;

@@ -49,6 +49,7 @@
 #include <queue>
 
 #include "arch/generic/tlb.hh"
+#include "arch/x86/regs/misc.hh"
 #include "base/types.hh"
 #include "cpu/base.hh"
 #include "cpu/exetrace.hh"
@@ -284,7 +285,6 @@ Fetch::startupStage()
 {
     assert(bac != nullptr);
     assert(ftq != nullptr);
-    assert(priorityList.empty());
     resetStage();
 
     // Fetch needs to start fetching instructions at the very beginning,
@@ -1017,6 +1017,10 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
     instruction->setTid(tid);
+    instruction->fetchedFromUser = cpu->inUserMode(tid);
+    instruction->fetchedAddressSpaceId =
+        cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
+        ~uint64_t(0xfff);
 
     instruction->setThreadState(cpu->thread[tid]);
 
@@ -1166,6 +1170,8 @@ Fetch::fetch(bool &status_change)
 
     StaticInstPtr staticInst = NULL;
     StaticInstPtr curMacroop = macroop[tid];
+    bool curMacroopFromUser = curMacroop ? macroopFromUser[tid] :
+        cpu->inUserMode(tid);
 
     // If the read of the first instruction was successful, then grab the
     // instructions from the rest of the cache line and put them into the
@@ -1250,6 +1256,7 @@ Fetch::fetch(bool &status_change)
 
                     if (staticInst->isMacroop()) {
                         curMacroop = staticInst;
+                        curMacroopFromUser = cpu->inUserMode(tid);
                     } else {
                         pcOffset = 0;
                     }
@@ -1275,6 +1282,8 @@ Fetch::fetch(bool &status_change)
 
             DynInstPtr instruction = buildInst(
                     tid, staticInst, curMacroop, this_pc, *next_pc, true);
+            if (curMacroop)
+                instruction->fetchedFromUser = curMacroopFromUser;
 
             ppFetch->notify(instruction);
             numInst++;
@@ -1381,6 +1390,7 @@ Fetch::fetch(bool &status_change)
     }
 
     macroop[tid] = curMacroop;
+    macroopFromUser[tid] = curMacroopFromUser;
     fetchOffset[tid] = pcOffset;
 
     if (numInst > 0) {

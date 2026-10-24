@@ -42,6 +42,10 @@ if env['CONF']['BUILD_ISA']:
     Source('simple_trace.cc')
     DebugFlag('SimpleTrace')
 
+    SimObject('TaoTrace.py', sim_objects=['TaoTrace'])
+    Source('tao_trace.cc')
+    DebugFlag('TaoTrace')
+
     if env['CONF']['HAVE_PROTOBUF']:
         SimObject(
             'ElasticTrace.py',
