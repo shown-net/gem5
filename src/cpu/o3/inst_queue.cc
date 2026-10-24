@@ -254,13 +254,19 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       commitToIEWDelay(params.commitToIEWDelay),
       iqStats(cpu, totalWidth),
       iqIOStats(cpu),
-      divsdIssueInterval(params.divsdIssueInterval),
-      divsdActivityDuration(params.divsdActivityDuration),
-      divsdStats(cpu, *this),
+      intDiv32QuotientLatency(params.intDiv32QuotientLatency),
+      intDiv64QuotientLatency(params.intDiv64QuotientLatency),
+      intDiv32RemainderLatency(params.intDiv32RemainderLatency),
+      intDiv64RemainderLatency(params.intDiv64RemainderLatency),
       intDiv32IssueInterval(params.intDiv32IssueInterval),
       intDiv64IssueInterval(params.intDiv64IssueInterval),
       intDivStats(cpu, *this)
 {
+    panic_if(intDiv32QuotientLatency < 3 || intDiv64QuotientLatency < 3 ||
+             intDiv32RemainderLatency <= intDiv32QuotientLatency ||
+             intDiv64RemainderLatency <= intDiv64QuotientLatency ||
+             intDiv32IssueInterval == 0 || intDiv64IssueInterval == 0,
+             "Integer divide needs positive service intervals and ordered results");
     const auto &reg_classes = params.isa[0]->regClasses();
     // Set the number of total physical registers
     // As the vector registers have two addressing modes, they are added twice
@@ -288,60 +294,18 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     resetState();
 }
 
-InstructionQueue::DivsdStats::DivsdStats(CPU *cpu, InstructionQueue &owner)
-    : statistics::Group(&cpu->customStats), iq(owner),
-      ADD_STAT(divsdIssued, statistics::units::Count::get(), "Dedicated DIVSD issues"),
-      ADD_STAT(divsdFuCompleted, statistics::units::Count::get(), "Dedicated DIVSD FU completions including squashed work"),
-      ADD_STAT(divsdSquashedAtCompletion, statistics::units::Count::get(), "Dedicated DIVSD squashed at FU completion"),
-      ADD_STAT(divsdAdmissionRejected, statistics::units::Count::get(), "Dedicated DIVSD admission rejection attempts"),
-      ADD_STAT(divsdAdmissionCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD admission reservation intervals"),
-      ADD_STAT(divsdInFlightCycles, statistics::units::Cycle::get(), "Union of DIVSD issue to scheduled FU completion intervals"),
-      ADD_STAT(divsdActivityCycles, statistics::units::Cycle::get(), "Union of dedicated DIVSD observable activity intervals"),
-      ADD_STAT(divsdIssueToCompletionCycles, statistics::units::Cycle::get(), "Sum of issue to FU completion cycles for divsdFuCompleted DIVSD"),
-      ADD_STAT(divsdInFlightAtDump, statistics::units::Count::get(), "Outstanding dedicated DIVSD at each stats dump")
-{
-}
-
-void
-InstructionQueue::DivsdStats::account()
-{
-    const uint64_t now = iq.cpu->curCycle();
-    const auto covered = [this, now](uint64_t end) {
-        return end > lastCycle ? std::min(end, now) - lastCycle : 0;
-    };
-    divsdAdmissionCycles += covered(iq.divsdNextIssue);
-    divsdInFlightCycles += covered(iq.divsdInFlightUntil);
-    divsdActivityCycles += covered(iq.divsdActivityUntil);
-    lastCycle = now;
-}
-
-void
-InstructionQueue::DivsdStats::preDumpStats()
-{
-    account();
-    divsdInFlightAtDump = iq.divsdIssuedAt.size();
-    statistics::Group::preDumpStats();
-}
-
-void
-InstructionQueue::DivsdStats::resetStats()
-{
-    statistics::Group::resetStats();
-    lastCycle = iq.cpu->curCycle();
-}
-
 InstructionQueue::IntDivStats::IntDivStats(CPU *cpu, InstructionQueue &owner)
     : statistics::Group(&cpu->customStats), iq(owner),
-      ADD_STAT(issued32, statistics::units::Count::get(), "Compact 32-bit DIV/IDIV core issues"),
-      ADD_STAT(issued64, statistics::units::Count::get(), "Compact 64-bit DIV/IDIV core issues"),
-      ADD_STAT(fuCompleted, statistics::units::Count::get(), "Compact DIV/IDIV core completions including squashed work"),
-      ADD_STAT(squashedAtCompletion, statistics::units::Count::get(), "Compact DIV/IDIV cores squashed at completion"),
-      ADD_STAT(admissionRejected32, statistics::units::Count::get(), "Compact 32-bit divider admission rejection attempts"),
-      ADD_STAT(admissionRejected64, statistics::units::Count::get(), "Compact 64-bit divider admission rejection attempts"),
-      ADD_STAT(admissionCycles, statistics::units::Cycle::get(), "Union of compact integer-divider admission intervals"),
-      ADD_STAT(inFlightCycles, statistics::units::Cycle::get(), "Union of compact integer-divider core execution intervals"),
-      ADD_STAT(issueToCompletionCycles, statistics::units::Cycle::get(), "Sum of compact core issue-to-completion cycles"),
-      ADD_STAT(inFlightAtDump, statistics::units::Count::get(), "Outstanding compact divider cores at each stats dump")
+      ADD_STAT(issued32, statistics::units::Count::get(), "Integer 32-bit DIV/IDIV core issues"),
+      ADD_STAT(issued64, statistics::units::Count::get(), "Integer 64-bit DIV/IDIV core issues"),
+      ADD_STAT(fuCompleted, statistics::units::Count::get(), "Integer DIV/IDIV core completions including squashed work"),
+      ADD_STAT(squashedAtCompletion, statistics::units::Count::get(), "Integer DIV/IDIV cores squashed at completion"),
+      ADD_STAT(admissionRejected32, statistics::units::Count::get(), "Integer 32-bit divider admission rejection attempts"),
+      ADD_STAT(admissionRejected64, statistics::units::Count::get(), "Integer 64-bit divider admission rejection attempts"),
+      ADD_STAT(admissionCycles, statistics::units::Cycle::get(), "Union of integer integer-divider admission intervals"),
+      ADD_STAT(inFlightCycles, statistics::units::Cycle::get(), "Union of integer integer-divider core execution intervals"),
+      ADD_STAT(issueToCompletionCycles, statistics::units::Cycle::get(), "Sum of integer core issue-to-completion cycles"),
+      ADD_STAT(inFlightAtDump, statistics::units::Count::get(), "Outstanding integer divider cores at each stats dump")
 {
 }
 
@@ -1003,16 +967,6 @@ void
 InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                                       int fu_idx)
 {
-    if (inst->opClass() == X86DivsdOp && !inst->timingEntry()) {
-        divsdStats.account();
-        const auto it = divsdIssuedAt.find(inst->seqNum);
-        assert(it != divsdIssuedAt.end());
-        ++divsdStats.divsdFuCompleted;
-        divsdStats.divsdIssueToCompletionCycles += uint64_t(cpu->curCycle()) - it->second;
-        if (inst->isSquashed())
-            ++divsdStats.divsdSquashedAtCompletion;
-        divsdIssuedAt.erase(it);
-    }
     if (inst->opClass() == X86IntDiv32Op ||
         inst->opClass() == X86IntDiv64Op) {
         intDivStats.account();
@@ -1124,15 +1078,9 @@ InstructionQueue::scheduleReadyInsts()
             idx = fu_pool->getUnit(*timing, op_class, cpu->curCycle());
             op_latency = timing->latency;
         } else if (op_class != No_OpClass) {
-            if (op_class == X86DivsdOp &&
-                uint64_t(cpu->curCycle()) < divsdNextIssue) {
-                ++divsdStats.divsdAdmissionRejected;
-                ++order_it;
-                continue;
-            }
-            const bool compact_int_div =
+            const bool integer_divide =
                 op_class == X86IntDiv32Op || op_class == X86IntDiv64Op;
-            if (compact_int_div &&
+            if (integer_divide &&
                 uint64_t(cpu->curCycle()) < intDivNextIssue) {
                 if (op_class == X86IntDiv32Op)
                     ++intDivStats.admissionRejected32;
@@ -1151,6 +1099,16 @@ InstructionQueue::scheduleReadyInsts()
             }
             if (idx > FUPool::NoFreeFU) {
                 op_latency = fu_pool->getOpLatency(op_class);
+                if (op_class == X86IntDiv32Op)
+                    op_latency = Cycles(intDiv32QuotientLatency - 1);
+                else if (op_class == X86IntDiv64Op)
+                    op_latency = Cycles(intDiv64QuotientLatency - 1);
+                else if (op_class == X86IntDivRem32Op)
+                    op_latency = Cycles(intDiv32RemainderLatency -
+                                        intDiv32QuotientLatency);
+                else if (op_class == X86IntDivRem64Op)
+                    op_latency = Cycles(intDiv64RemainderLatency -
+                                        intDiv64QuotientLatency);
             }
         }
 
@@ -1158,29 +1116,12 @@ InstructionQueue::scheduleReadyInsts()
         // valid FU, then schedule for execution.
         if (idx > FUPool::NoFreeFU || idx == FUPool::NoNeedFU ||
             idx == FUPool::NoCapableFU) {
-            if (op_class == X86DivsdOp && !timing) {
-                panic_if(idx < 0 || op_latency < Cycles(2) ||
-                         divsdIssueInterval == 0,
-                         "Dedicated DIVSD requires a FU, latency >= 2 and interval >= 1");
-                divsdStats.account();
-                const uint64_t now = cpu->curCycle();
-                divsdNextIssue = now + divsdIssueInterval;
-                // Upstream IQ completes the FU at opLat-1; execution/writeback
-                // follows via its normal queue. Observable activity is a
-                // separate behavior proxy and is not a physical PMU alias.
-                divsdInFlightUntil = std::max(divsdInFlightUntil,
-                                             now + uint64_t(op_latency) - 1);
-                divsdActivityUntil = std::max(divsdActivityUntil,
-                                             now + divsdActivityDuration);
-                divsdIssuedAt.emplace(issuing_inst->seqNum, now);
-                ++divsdStats.divsdIssued;
-            }
             if (op_class == X86IntDiv32Op ||
                 op_class == X86IntDiv64Op) {
                 const unsigned interval = op_class == X86IntDiv32Op ?
                     intDiv32IssueInterval : intDiv64IssueInterval;
                 panic_if(idx < 0 || op_latency < Cycles(2) || interval == 0,
-                         "Compact integer divide requires a FU, latency >= 2 and interval >= 1");
+                         "Integer integer divide requires a FU, latency >= 2 and interval >= 1");
                 intDivStats.account();
                 const uint64_t now = cpu->curCycle();
                 intDivNextIssue = now + interval;

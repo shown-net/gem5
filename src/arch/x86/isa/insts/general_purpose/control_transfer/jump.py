@@ -70,8 +70,7 @@ def macroop JMP_P
     .adjust_env oszIn64Override
     .control_indirect
 
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     wripi t1, 0
 };
 

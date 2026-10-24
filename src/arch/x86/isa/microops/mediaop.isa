@@ -923,9 +923,6 @@ let {{
             FpDestReg_uqw = result;
         '''
 
-    class Mdivsd(Mdivf):
-        op_class = 'X86DivsdOp'
-
     class Maddi(Media3Op):
         op_class = 'SimdAddOp'
         code = '''

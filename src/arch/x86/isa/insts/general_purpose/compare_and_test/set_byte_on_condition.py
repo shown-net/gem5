@@ -41,8 +41,7 @@ def macroop SALC_R
 
 def macroop SETZ_R
 {
-    movi reg, reg, 1, flags=(CZF,)
-    movi reg, reg, 0, flags=(nCZF,)
+    setzvalue reg, reg, dataSize=1
 };
 
 def macroop SETZ_M
@@ -62,8 +61,7 @@ def macroop SETZ_P
 
 def macroop SETNZ_R
 {
-    movi reg, reg, 1, flags=(nCZF,)
-    movi reg, reg, 0, flags=(CZF,)
+    setnzvalue reg, reg, dataSize=1
 };
 
 def macroop SETNZ_M
@@ -83,8 +81,7 @@ def macroop SETNZ_P
 
 def macroop SETB_R
 {
-    movi reg, reg, 1, flags=(CCF,)
-    movi reg, reg, 0, flags=(nCCF,)
+    setbvalue reg, reg, dataSize=1
 };
 
 def macroop SETB_M
@@ -104,8 +101,7 @@ def macroop SETB_P
 
 def macroop SETNB_R
 {
-    movi reg, reg, 1, flags=(nCCF,)
-    movi reg, reg, 0, flags=(CCF,)
+    setnbvalue reg, reg, dataSize=1
 };
 
 def macroop SETNB_M
@@ -123,10 +119,9 @@ def macroop SETNB_P
     st t1, seg, riprel, disp
 };
 
-def macroop SETBE_R
-{
-    movi reg, reg, 1, flags=(CCvZF,)
-    movi reg, reg, 0, flags=(nCCvZF,)
+def macroop SETBE_R {
+    conditionbe
+    setcondition reg, reg, dataSize=1
 };
 
 def macroop SETBE_M
@@ -144,10 +139,9 @@ def macroop SETBE_P
     st t1, seg, riprel, disp
 };
 
-def macroop SETNBE_R
-{
-    movi reg, reg, 1, flags=(nCCvZF,)
-    movi reg, reg, 0, flags=(CCvZF,)
+def macroop SETNBE_R {
+    conditionnbe
+    setcondition reg, reg, dataSize=1
 };
 
 def macroop SETNBE_M
@@ -167,8 +161,7 @@ def macroop SETNBE_P
 
 def macroop SETS_R
 {
-    movi reg, reg, 1, flags=(CSF,)
-    movi reg, reg, 0, flags=(nCSF,)
+    setsvalue reg, reg, dataSize=1
 };
 
 def macroop SETS_M
@@ -188,8 +181,7 @@ def macroop SETS_P
 
 def macroop SETNS_R
 {
-    movi reg, reg, 1, flags=(nCSF,)
-    movi reg, reg, 0, flags=(CSF,)
+    setnsvalue reg, reg, dataSize=1
 };
 
 def macroop SETNS_M
@@ -209,8 +201,7 @@ def macroop SETNS_P
 
 def macroop SETP_R
 {
-    movi reg, reg, 1, flags=(CPF,)
-    movi reg, reg, 0, flags=(nCPF,)
+    setpvalue reg, reg, dataSize=1
 };
 
 def macroop SETP_M
@@ -230,8 +221,7 @@ def macroop SETP_P
 
 def macroop SETNP_R
 {
-    movi reg, reg, 1, flags=(nCPF,)
-    movi reg, reg, 0, flags=(CPF,)
+    setnpvalue reg, reg, dataSize=1
 };
 
 def macroop SETNP_M
@@ -251,8 +241,7 @@ def macroop SETNP_P
 
 def macroop SETL_R
 {
-    movi reg, reg, 1, flags=(CSxOF,)
-    movi reg, reg, 0, flags=(nCSxOF,)
+    setlvalue reg, reg, dataSize=1
 };
 
 def macroop SETL_M
@@ -272,8 +261,7 @@ def macroop SETL_P
 
 def macroop SETNL_R
 {
-    movi reg, reg, 1, flags=(nCSxOF,)
-    movi reg, reg, 0, flags=(CSxOF,)
+    setnlvalue reg, reg, dataSize=1
 };
 
 def macroop SETNL_M
@@ -293,8 +281,7 @@ def macroop SETNL_P
 
 def macroop SETLE_R
 {
-    movi reg, reg, 1, flags=(CSxOvZF,)
-    movi reg, reg, 0, flags=(nCSxOvZF,)
+    setlevalue reg, reg, dataSize=1
 };
 
 def macroop SETLE_M
@@ -314,8 +301,7 @@ def macroop SETLE_P
 
 def macroop SETNLE_R
 {
-    movi reg, reg, 1, flags=(nCSxOvZF,)
-    movi reg, reg, 0, flags=(CSxOvZF,)
+    setnlevalue reg, reg, dataSize=1
 };
 
 def macroop SETNLE_M
@@ -335,8 +321,7 @@ def macroop SETNLE_P
 
 def macroop SETO_R
 {
-    movi reg, reg, 1, flags=(COF,)
-    movi reg, reg, 0, flags=(nCOF,)
+    setovalue reg, reg, dataSize=1
 };
 
 def macroop SETO_M
@@ -356,8 +341,7 @@ def macroop SETO_P
 
 def macroop SETNO_R
 {
-    movi reg, reg, 1, flags=(nCOF,)
-    movi reg, reg, 0, flags=(COF,)
+    setnovalue reg, reg, dataSize=1
 };
 
 def macroop SETNO_M

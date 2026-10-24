@@ -70,7 +70,6 @@ def macroop ADD_LOCKED_M_I
 
 def macroop ADD_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     addi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
@@ -104,7 +103,6 @@ def macroop ADD_LOCKED_M_R
 
 def macroop ADD_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     add t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -120,8 +118,7 @@ def macroop ADD_R_M
 
 def macroop ADD_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     add reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -143,8 +140,7 @@ def macroop SUB_R_M
 
 def macroop SUB_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     sub reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -174,7 +170,6 @@ def macroop SUB_LOCKED_M_I
 
 def macroop SUB_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     subi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
@@ -208,7 +203,6 @@ def macroop SUB_LOCKED_M_R
 
 def macroop SUB_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sub t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -252,7 +246,6 @@ def macroop ADC_LOCKED_M_I
 
 def macroop ADC_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     adci t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
@@ -286,7 +279,6 @@ def macroop ADC_LOCKED_M_R
 
 def macroop ADC_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     adc t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -302,8 +294,7 @@ def macroop ADC_R_M
 
 def macroop ADC_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     adc reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -325,8 +316,7 @@ def macroop SBB_R_M
 
 def macroop SBB_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     sbb reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -356,7 +346,6 @@ def macroop SBB_LOCKED_M_I
 
 def macroop SBB_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sbbi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
@@ -390,7 +379,6 @@ def macroop SBB_LOCKED_M_R
 
 def macroop SBB_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sbb t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -429,11 +417,16 @@ def macroop NEG_LOCKED_M
 
 def macroop NEG_LOCKED_P
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sub t1, t0, t1, flags=(CF,OF,SF,ZF,AF,PF)
     stul t1, seg, riprel, disp
     mfence
+};
+"""
+
+microcode += """
+def macroop SUB_R_R_ZERO {
+    subzeroalu reg, flags=(OF,SF,ZF,PF,CF,AF)
 };
 """

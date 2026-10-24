@@ -53,11 +53,9 @@ let {{
     from insts import microcode
 }};
 
-##include "calibration/imul.isa"
-##include "calibration/integer_decomposition.isa"
-##include "calibration/idiv.isa"
-##include "calibration/setz.isa"
-##include "calibration/zero_idiom.isa"
+##include "microops/imul.isa"
+##include "microops/division.isa"
+##include "microops/zero_idiom.isa"
 
 let {{
     # print microcode
@@ -84,6 +82,8 @@ let {{
     assembler.symbols["crRegIdx"] = crRegIdx
     assembler.symbols["drRegIdx"] = drRegIdx
     assembler.symbols["segRegIdx"] = segRegIdx
+
+    assembler.symbols["divisor"] = gpRegIdx("int_reg::Divisor")
 
     # Add in symbols for the microcode registers
     for num in range(16):

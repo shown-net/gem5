@@ -153,6 +153,7 @@ def operands {{
         'Remainder':     IntReg('X86ISA::int_reg::Remainder', 10),
         'Divisor':       IntReg('X86ISA::int_reg::Divisor', 11),
         'DoubleBits':    IntReg('X86ISA::int_reg::Doublebits', 11),
+        'ConditionValue': IntReg('X86ISA::intRegMicro(14)', 11),
         'Rax':           IntReg('X86ISA::int_reg::Rax', 12),
         'Rbx':           IntReg('X86ISA::int_reg::Rbx', 13),
         'Rcx':           IntReg('X86ISA::int_reg::Rcx', 14),

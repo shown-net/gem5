@@ -38,27 +38,21 @@
 
 microcode = """
 def macroop BT_R_I {
-    sexti t0, reg, imm, flags=(CF,)
+    btvaluei t0, reg, imm
 };
 
 def macroop BT_M_I {
-    limm t1, imm, dataSize=asz
-    # This fudges just a tiny bit, but it's reasonable to expect the
-    # microcode generation logic to have the log of the various sizes
-    # floating around as well.
     ld t1, seg, sib, disp
-    sexti t0, t1, imm, flags=(CF,)
+    btvaluei t0, t1, imm
 };
 
 def macroop BT_P_I {
-    rdip t7
-    limm t1, imm, dataSize=asz
-    ld t1, seg, riprel, disp, dataSize=asz
-    sexti t0, t1, imm, flags=(CF,)
+    ldrip t1, seg, riprel, disp
+    btvaluei t0, t1, imm
 };
 
 def macroop BT_R_R {
-    sext t0, reg, regm, flags=(CF,)
+    btvalue t0, reg, regm
 };
 
 def macroop BT_M_R {
@@ -78,10 +72,7 @@ def macroop BT_P_R {
 };
 
 def macroop BTC_R_I {
-    sexti t0, reg, imm, flags=(CF,)
-    limm t1, 1
-    roli t1, t1, imm
-    xor reg, reg, t1
+    btcvaluei reg, reg, imm
 };
 
 def macroop BTC_M_I {
@@ -134,10 +125,7 @@ def macroop BTC_LOCKED_P_I {
 };
 
 def macroop BTC_R_R {
-    sext t0, reg, regm, flags=(CF,)
-    limm t1, 1
-    rol t1, t1, regm
-    xor reg, reg, t1
+    btcvalue reg, reg, regm
 };
 
 def macroop BTC_M_R {
@@ -193,10 +181,7 @@ def macroop BTC_LOCKED_P_R {
 };
 
 def macroop BTR_R_I {
-    sexti t0, reg, imm, flags=(CF,)
-    limm t1, "(uint64_t(-(2ULL)))"
-    roli t1, t1, imm
-    and reg, reg, t1
+    btrvaluei reg, reg, imm
 };
 
 def macroop BTR_M_I {
@@ -246,10 +231,7 @@ def macroop BTR_LOCKED_P_I {
 };
 
 def macroop BTR_R_R {
-    sext t0, reg, regm, flags=(CF,)
-    limm t1, "(uint64_t(-(2ULL)))"
-    rol t1, t1, regm
-    and reg, reg, t1
+    btrvalue reg, reg, regm
 };
 
 def macroop BTR_M_R {
@@ -305,10 +287,7 @@ def macroop BTR_LOCKED_P_R {
 };
 
 def macroop BTS_R_I {
-    sexti t0, reg, imm, flags=(CF,)
-    limm t1, 1
-    roli t1, t1, imm
-    or reg, reg, t1
+    btsvaluei reg, reg, imm
 };
 
 def macroop BTS_M_I {
@@ -358,10 +337,7 @@ def macroop BTS_LOCKED_P_I {
 };
 
 def macroop BTS_R_R {
-    sext t0, reg, regm, flags=(CF,)
-    limm t1, 1
-    rol t1, t1, regm
-    or reg, reg, t1
+    btsvalue reg, reg, regm
 };
 
 def macroop BTS_M_R {

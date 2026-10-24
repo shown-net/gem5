@@ -65,7 +65,6 @@ def macroop OR_LOCKED_M_I
 
 def macroop OR_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     ori t1, t1, imm, flags=(OF,SF,ZF,PF,CF,AF)
@@ -99,7 +98,6 @@ def macroop OR_LOCKED_M_R
 
 def macroop OR_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     or t1, t1, reg, flags=(OF,SF,ZF,PF,CF,AF)
@@ -115,8 +113,7 @@ def macroop OR_R_M
 
 def macroop OR_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     or reg, reg, t1, flags=(OF,SF,ZF,PF,CF,AF)
 };
 
@@ -161,7 +158,6 @@ def macroop XOR_LOCKED_M_I
 
 def macroop XOR_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     xori t1, t1, imm, flags=(OF,SF,ZF,PF,CF,AF)
@@ -195,7 +191,6 @@ def macroop XOR_LOCKED_M_R
 
 def macroop XOR_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     xor t1, t1, reg, flags=(OF,SF,ZF,PF,CF,AF)
@@ -211,8 +206,7 @@ def macroop XOR_R_M
 
 def macroop XOR_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     xor reg, reg, t1, flags=(OF,SF,ZF,PF,CF,AF)
 };
 
@@ -229,8 +223,7 @@ def macroop AND_R_M
 
 def macroop AND_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     and reg, reg, t1, flags=(OF,SF,ZF,PF,CF,AF)
 };
 
@@ -265,7 +258,6 @@ def macroop AND_LOCKED_M_I
 
 def macroop AND_LOCKED_P_I
 {
-    rdip t7
     mfence
     ldstl t2, seg, riprel, disp
     andi t2, t2, imm, flags=(OF,SF,ZF,PF,CF,AF)
@@ -299,7 +291,6 @@ def macroop AND_LOCKED_M_R
 
 def macroop AND_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     and t1, t1, reg, flags=(OF,SF,ZF,PF,CF,AF)
@@ -307,10 +298,8 @@ def macroop AND_LOCKED_P_R
     mfence
 };
 
-def macroop NOT_R
-{
-    limm t1, -1
-    xor reg, reg, t1
+def macroop NOT_R {
+    notvalue reg, reg, reg
 };
 
 def macroop NOT_M
@@ -343,11 +332,16 @@ def macroop NOT_LOCKED_M
 def macroop NOT_LOCKED_P
 {
     limm t1, -1
-    rdip t7
     mfence
     ldstl t2, seg, riprel, disp
     xor t2, t2, t1
     stul t2, seg, riprel, disp
     mfence
+};
+"""
+
+microcode += """
+def macroop XOR_R_R_ZERO {
+    xorzeroalu reg, flags=(OF,SF,ZF,PF,CF,AF)
 };
 """

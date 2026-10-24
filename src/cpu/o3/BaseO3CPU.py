@@ -236,17 +236,12 @@ class BaseO3CPU(BaseCPU):
         "Maximum committed stores awaiting cache responses; experimental "
         "buffer-mode drain overlap",
     )
-    divsdLatency = Param.Unsigned(14, "Dedicated register DIVSD result latency")
-    divsdIssueInterval = Param.Unsigned(4, "Dedicated register DIVSD initiation interval")
-    divsdActivityDuration = Param.Unsigned(
-        8, "Dedicated register DIVSD observable activity duration"
-    )
-    intDiv32QuotientLatency = Param.Unsigned(13, "Compact 32-bit DIV/IDIV quotient latency")
-    intDiv32RemainderLatency = Param.Unsigned(15, "Compact 32-bit DIV/IDIV remainder latency")
-    intDiv64QuotientLatency = Param.Unsigned(15, "Compact 64-bit DIV/IDIV quotient latency")
-    intDiv64RemainderLatency = Param.Unsigned(18, "Compact 64-bit DIV/IDIV remainder latency")
-    intDiv32IssueInterval = Param.Unsigned(6, "Compact 32-bit DIV/IDIV initiation interval")
-    intDiv64IssueInterval = Param.Unsigned(10, "Compact 64-bit DIV/IDIV initiation interval")
+    intDiv32QuotientLatency = Param.Unsigned(13, "Integer 32-bit DIV/IDIV quotient latency")
+    intDiv32RemainderLatency = Param.Unsigned(15, "Integer 32-bit DIV/IDIV remainder latency")
+    intDiv64QuotientLatency = Param.Unsigned(15, "Integer 64-bit DIV/IDIV quotient latency")
+    intDiv64RemainderLatency = Param.Unsigned(18, "Integer 64-bit DIV/IDIV remainder latency")
+    intDiv32IssueInterval = Param.Unsigned(6, "Integer 32-bit DIV/IDIV initiation interval")
+    intDiv64IssueInterval = Param.Unsigned(10, "Integer 64-bit DIV/IDIV initiation interval")
 
     sbufferOffloadWidth = Param.Unsigned(
         1, "Maximum committed SQ stores transferred to SBuffer per cycle"

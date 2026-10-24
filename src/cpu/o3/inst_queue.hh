@@ -653,29 +653,9 @@ class InstructionQueue
     } iqIOStats;
 
   private:
-    // One logical divider admission resource, independent of result latency.
-    const unsigned divsdIssueInterval;
-    const unsigned divsdActivityDuration;
-    uint64_t divsdNextIssue = 0;
-    uint64_t divsdInFlightUntil = 0;
-    uint64_t divsdActivityUntil = 0;
-    std::unordered_map<InstSeqNum, uint64_t> divsdIssuedAt;
-
-    struct DivsdStats : public statistics::Group
-    {
-        InstructionQueue &iq;
-        uint64_t lastCycle = 0;
-        DivsdStats(CPU *cpu, InstructionQueue &owner);
-        void account();
-        void preDumpStats() override;
-        void resetStats() override;
-        statistics::Scalar divsdIssued, divsdFuCompleted, divsdSquashedAtCompletion;
-        statistics::Scalar divsdAdmissionRejected, divsdAdmissionCycles;
-        statistics::Scalar divsdInFlightCycles, divsdActivityCycles;
-        statistics::Scalar divsdIssueToCompletionCycles;
-        statistics::Scalar divsdInFlightAtDump;
-    } divsdStats;
-
+    // Integer-divider service is owned by O3, independently of ISA stages.
+    const unsigned intDiv32QuotientLatency, intDiv64QuotientLatency;
+    const unsigned intDiv32RemainderLatency, intDiv64RemainderLatency;
     const unsigned intDiv32IssueInterval;
     const unsigned intDiv64IssueInterval;
     uint64_t intDivNextIssue = 0;

@@ -454,7 +454,7 @@ let {{
 
     def defineMicroLoadOp(mnemonic, code, bigCode='',
                           mem_flags="0", big=True, nonSpec=False,
-                          is_float=False):
+                          is_float=False, ea_code=None):
         global header_output
         global decoder_output
         global exec_output
@@ -467,15 +467,16 @@ let {{
         else:
             base = 'X86ISA::LdStOp'
 
+        load_ea = calculateEA if ea_code is None else ea_code
         # Build up the all register version of this micro op
         iops = [InstObjParams(name, Name, base,
                               { "code": code,
-                                "ea_code": calculateEA,
+                                "ea_code": load_ea,
                                 "memDataSize": "dataSize" })]
         if big:
             iops += [InstObjParams(name, Name + "Big", base,
                                    { "code": bigCode,
-                                     "ea_code": calculateEA,
+                                     "ea_code": load_ea,
                                      "memDataSize": "dataSize" })]
         for iop in iops:
             header_output += MicroLdStOpDeclare.subst(iop)
@@ -502,6 +503,23 @@ let {{
 
     defineMicroLoadOp('Ld', 'Data = merge(Data, data, Mem, dataSize);',
                             'Data = Mem & mask(dataSize * 8);')
+    rip_load_ea = (
+        'EA = SegBase + bits(xc->pcState().as<PCState>().npc() + disp, '
+        'addressSize * 8 - 1, 0);')
+    defineMicroLoadOp('Ldrip', 'Data = merge(Data, data, Mem, dataSize);',
+                     'Data = Mem & mask(dataSize * 8);', ea_code=rip_load_ea)
+    for suffix, size, signed in (('sxb', 1, True), ('sxw', 2, True),
+                                 ('sxd', 4, True), ('zxb', 1, False),
+                                 ('zxw', 2, False)):
+        value = ('sext<%d>(Mem)' % (size * 8) if signed else
+                 'Mem & mask(%d)' % (size * 8))
+        # These forms only decode for 32/64-bit destinations, so the
+        # load overwrites the entire GPR without reading its old value.
+        code = 'Data = (%s) & mask(machInst.opSize * 8);' % value
+        defineMicroLoadOp('Ld' + suffix, code, big=False)
+        defineMicroLoadOp('Ld' + suffix + 'rip', code, big=False,
+                         ea_code=rip_load_ea)
+
     defineMicroLoadOp('Ldst', 'Data = merge(Data, data, Mem, dataSize);',
                               'Data = Mem & mask(dataSize * 8);',
                       'Request::READ_MODIFY_WRITE')

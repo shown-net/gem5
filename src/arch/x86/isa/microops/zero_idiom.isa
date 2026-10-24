@@ -1,0 +1,20 @@
+// Same-register 32/64-bit zero idioms execute on ordinary IntAlu.
+let {{
+    class ZeroIdiomRegOp(RegOp):
+        operand_types = (IntDestOp,)
+        abstract = True
+        code = 'DestReg = result = 0;'
+        cond_control_flag_init = 'flags[IsZeroIdiom] = true;'
+
+        def __init__(self, dest, flags=None, dataSize="env.dataSize"):
+            super().__init__(dest, flags=flags, dataSize=dataSize)
+
+    class Xorzeroalu(ZeroIdiomRegOp):
+        flag_code = Xor.flag_code.replace("PSrcReg1", "uint64_t(0)") \
+                                 .replace("op2", "uint64_t(0)")
+
+    class Subzeroalu(ZeroIdiomRegOp):
+        flag_code = Sub.flag_code.replace("PSrcReg1", "uint64_t(0)") \
+                                 .replace("op2", "uint64_t(0)")
+
+}};

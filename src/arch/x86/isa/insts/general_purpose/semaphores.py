@@ -72,7 +72,6 @@ def macroop CMPXCHG_LOCKED_M_R {
 };
 
 def macroop CMPXCHG_LOCKED_P_R {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sub t0, rax, t1, flags=(OF, SF, ZF, AF, PF, CF)
@@ -108,7 +107,6 @@ def macroop XADD_LOCKED_M_R {
 };
 
 def macroop XADD_LOCKED_P_R {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     add t2, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)

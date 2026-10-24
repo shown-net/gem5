@@ -368,7 +368,7 @@ let {{
             operand_types = map(resolve_dual, self.operand_types)
             op_iter = iter(self.ops)
             ops = list([Type(op_iter).ctor_args() for Type in operand_types])
-            op_args = ', '.join(ops)
+            op_args = ', ' + ', '.join(ops) if ops else ''
             if self.big_code != "":
                 className = self.className
                 if is_imm:
@@ -376,10 +376,10 @@ let {{
                 allocString = '''
                     (%(dataSize)s >= 4) ?
                         (StaticInstPtr)(new %(class_name)sBig(machInst,
-                            macrocodeBlock, %(flags)s, %(dataSize)s, %(ext)s,
+                            macrocodeBlock, %(flags)s, %(dataSize)s, %(ext)s
                             %(op_args)s)) :
                         (StaticInstPtr)(new %(class_name)s(machInst,
-                            macrocodeBlock, %(flags)s, %(dataSize)s, %(ext)s,
+                            macrocodeBlock, %(flags)s, %(dataSize)s, %(ext)s
                             %(op_args)s))
                     '''
                 allocator = allocString % {
@@ -394,7 +394,7 @@ let {{
                 if is_imm:
                     className += "Imm"
                 allocator = '''new %(class_name)s(machInst, macrocodeBlock,
-                        %(flags)s, %(dataSize)s, %(ext)s, %(op_args)s)''' % {
+                        %(flags)s, %(dataSize)s, %(ext)s %(op_args)s)''' % {
                     "class_name" : className,
                     "flags" : self.microFlagsText(microFlags),
                     "op_args" : op_args,
@@ -1739,7 +1739,8 @@ let {{
         '''
 
     class Popcnt(BasicRegOp):
-        code = 'DestReg = merge(DestReg, dest, popCount(PSrcReg1), dataSize);'
+        code = 'DestReg = merge(DestReg, dest, popCount(PSrcReg1 & mask(dataSize * 8)), dataSize);'
+        big_code = 'DestReg = popCount(PSrcReg1 & mask(dataSize * 8));'
         flag_code = '''
             ccFlagBits = ccFlagBits & ~(X86ISA::SFBit | X86ISA::AFBit |
                     X86ISA::ZFBit | X86ISA::PFBit);
@@ -1748,4 +1749,220 @@ let {{
             }
             cfofBits = cfofBits & ~(X86ISA::OFBit | X86ISA::CFBit);
         '''
+}};
+
+let {{
+    class Setovalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ((cfofBits & OFBit) != 0), dataSize);'
+
+    class Cmovovalue(BasicRegOp):
+        code = 'DestReg = ((cfofBits & OFBit) != 0) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (((cfofBits & OFBit) != 0) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnovalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!((cfofBits & OFBit) != 0)), dataSize);'
+
+    class Cmovnovalue(BasicRegOp):
+        code = 'DestReg = (!((cfofBits & OFBit) != 0)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!((cfofBits & OFBit) != 0)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setbvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ((cfofBits & CFBit) != 0), dataSize);'
+
+    class Cmovbvalue(BasicRegOp):
+        code = 'DestReg = ((cfofBits & CFBit) != 0) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (((cfofBits & CFBit) != 0) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnbvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!((cfofBits & CFBit) != 0)), dataSize);'
+
+    class Cmovnbvalue(BasicRegOp):
+        code = 'DestReg = (!((cfofBits & CFBit) != 0)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!((cfofBits & CFBit) != 0)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setzvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ((ccFlagBits & ZFBit) != 0), dataSize);'
+
+    class Cmovzvalue(BasicRegOp):
+        code = 'DestReg = ((ccFlagBits & ZFBit) != 0) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (((ccFlagBits & ZFBit) != 0) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnzvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!((ccFlagBits & ZFBit) != 0)), dataSize);'
+
+    class Cmovnzvalue(BasicRegOp):
+        code = 'DestReg = (!((ccFlagBits & ZFBit) != 0)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!((ccFlagBits & ZFBit) != 0)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setbevalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0), dataSize);'
+
+    class Cmovbevalue(BasicRegOp):
+        code = 'DestReg = (((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnbevalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!(((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0)), dataSize);'
+
+    class Cmovnbevalue(BasicRegOp):
+        code = 'DestReg = (!(((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!(((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setsvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ((ccFlagBits & SFBit) != 0), dataSize);'
+
+    class Cmovsvalue(BasicRegOp):
+        code = 'DestReg = ((ccFlagBits & SFBit) != 0) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (((ccFlagBits & SFBit) != 0) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnsvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!((ccFlagBits & SFBit) != 0)), dataSize);'
+
+    class Cmovnsvalue(BasicRegOp):
+        code = 'DestReg = (!((ccFlagBits & SFBit) != 0)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!((ccFlagBits & SFBit) != 0)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setpvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ((ccFlagBits & PFBit) != 0), dataSize);'
+
+    class Cmovpvalue(BasicRegOp):
+        code = 'DestReg = ((ccFlagBits & PFBit) != 0) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (((ccFlagBits & PFBit) != 0) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnpvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!((ccFlagBits & PFBit) != 0)), dataSize);'
+
+    class Cmovnpvalue(BasicRegOp):
+        code = 'DestReg = (!((ccFlagBits & PFBit) != 0)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!((ccFlagBits & PFBit) != 0)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setlvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit)), dataSize);'
+
+    class Cmovlvalue(BasicRegOp):
+        code = 'DestReg = (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit)) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit)) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnlvalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!(bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit))), dataSize);'
+
+    class Cmovnlvalue(BasicRegOp):
+        code = 'DestReg = (!(bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit))) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!(bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit))) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setlevalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ((ccFlagBits & ZFBit) || (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit))), dataSize);'
+
+    class Cmovlevalue(BasicRegOp):
+        code = 'DestReg = ((ccFlagBits & ZFBit) || (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit))) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (((ccFlagBits & ZFBit) || (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit))) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Setnlevalue(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, (!((ccFlagBits & ZFBit) || (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit)))), dataSize);'
+
+    class Cmovnlevalue(BasicRegOp):
+        code = 'DestReg = (!((ccFlagBits & ZFBit) || (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit)))) ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = ((!((ccFlagBits & ZFBit) || (bool(ccFlagBits & SFBit) != bool(cfofBits & OFBit)))) ? op2 : SrcReg1) & mask(dataSize * 8);'
+
+    class Bsfvalue(BasicRegOp):
+        code = """
+            const uint64_t value = PSrcReg1 & mask(dataSize * 8);
+            DestReg = value ? merge(DestReg, dest,
+                findLsbSet(value), dataSize) : DestReg;
+            ccFlagBits = (ccFlagBits & ~ZFBit) | (value ? 0 : ZFBit);
+        """
+
+    class Bsrvalue(BasicRegOp):
+        code = Bsfvalue.code.replace('findLsbSet', 'findMsbSet')
+
+    class Clcflag(RegOp):
+        operand_types = ()
+        code = 'cfofBits = cfofBits & ~CFBit;'
+
+    class Stcflag(RegOp):
+        operand_types = ()
+        code = 'cfofBits = cfofBits | CFBit;'
+
+    class Cmcflag(RegOp):
+        operand_types = ()
+        code = 'cfofBits = cfofBits ^ CFBit;'
+
+    class Lahfvalue(RdRegOp):
+        code = """
+            DestReg = merge(SrcReg1, dest,
+                (ccFlagBits | (cfofBits & CFBit) | 2) & 0xd7, 1);
+        """
+
+    class Sahfflags(RdRegOp):
+        code = """
+            ccFlagBits = PSrcReg1 & (SFBit | ZFBit | AFBit | PFBit);
+            cfofBits = (cfofBits & ~CFBit) | (PSrcReg1 & CFBit);
+        """
+}};
+
+let {{
+    class Notvalue(BasicRegOp):
+        code = 'DestReg = merge(DestReg, dest, ~PSrcReg1, dataSize);'
+        big_code = 'DestReg = ~PSrcReg1 & mask(dataSize * 8);'
+
+    class Btvalue(BasicRegOp):
+        code = """
+            const unsigned bit = op2 & (dataSize * 8 - 1);
+            cfofBits = (cfofBits & ~CFBit) |
+                        (bits(PSrcReg1, bit) ? CFBit : 0);
+        """
+
+    class Btcvalue(BasicRegOp):
+        code = Btvalue.code + """
+            DestReg = merge(DestReg, dest,
+                PSrcReg1 ^ (uint64_t(1) << bit), dataSize);
+        """
+        big_code = Btvalue.code + """
+            DestReg = (PSrcReg1 ^ (uint64_t(1) << bit)) &
+                      mask(dataSize * 8);
+        """
+
+    class Btrvalue(Btcvalue):
+        code = Btcvalue.code.replace('^ (uint64_t(1) << bit)',
+                                     '& ~(uint64_t(1) << bit)')
+        big_code = Btcvalue.big_code.replace('^ (uint64_t(1) << bit)',
+                                             '& ~(uint64_t(1) << bit)')
+
+    class Btsvalue(Btcvalue):
+        code = Btcvalue.code.replace('^ (uint64_t(1) << bit)',
+                                     '| (uint64_t(1) << bit)')
+        big_code = Btcvalue.big_code.replace('^ (uint64_t(1) << bit)',
+                                             '| (uint64_t(1) << bit)')
+
+    class Bswapvalue(RdRegOp):
+        code = """
+            DestReg = dataSize == 4 ? uint64_t(__builtin_bswap32(SrcReg1)) :
+                                      __builtin_bswap64(SrcReg1);
+        """
+
+    class Bswaplow(RdRegOp):
+        code = 'DestReg = uint64_t(__builtin_bswap32(SrcReg1));'
+
+    class Bswapjoin(BasicRegOp):
+        code = """
+            DestReg = (op2 << 32) |
+                uint64_t(__builtin_bswap32(SrcReg1 >> 32));
+        """
+}};
+
+let {{
+    class Conditionbe(RegOp):
+        operand_types = ()
+        code = 'ConditionValue = ((cfofBits & CFBit) | (ccFlagBits & ZFBit)) != 0;'
+
+    class Conditionnbe(RegOp):
+        operand_types = ()
+        code = 'ConditionValue = ((cfofBits & CFBit) | (ccFlagBits & ZFBit)) == 0;'
+
+    class Setcondition(RdRegOp):
+        code = 'DestReg = merge(SrcReg1, dest, ConditionValue, dataSize);'
+
+    class Cmovcondition(BasicRegOp):
+        code = 'DestReg = ConditionValue ? merge(SrcReg1, dest, op2, dataSize) : SrcReg1;'
+        big_code = 'DestReg = (ConditionValue ? op2 : SrcReg1) & mask(dataSize * 8);'
 }};
