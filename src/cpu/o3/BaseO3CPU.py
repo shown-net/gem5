@@ -53,11 +53,11 @@ from m5.proxy import *
 from m5.SimObject import *
 
 
-class BaseO3CPU(BaseCPU):
-    taskStatsSwitchPc = Param.Addr(0, "x86 Linux __switch_to; zero disables TASK observer")
-    taskStatsCurrentOffset = Param.Addr(0, "GS-relative pcpu_hot.current_task offset")
-    taskStatsPidOffset = Param.Unsigned(0, "BTF task_struct.pid offset")
+class TSOStore(Enum):
+    vals = ["serial", "buffer", "sbuffer"]
 
+
+class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/cpu.hh"
@@ -74,12 +74,24 @@ class BaseO3CPU(BaseCPU):
     def support_take_over(cls):
         return True
 
+    # Research model: SPR admission scale, xs reference address arbitration.
+    ordinaryLoadService = Param.Bool(False, "Enable ordinary load service stages")
+    loadServiceAdmission = Param.Bool(True, "Limit service admission to three per cycle")
+    loadServiceArbitration = Param.Bool(True, "Use xs reference bank arbitration")
+    loadServicePropagation = Param.Bool(True, "Use a clocked result-completion stage")
+    loadServiceCacheSets = Param.Unsigned(64, "L1D sets for xs reference arbitration")
+
     activity = Param.Unsigned(0, "Initial count")
+    taskStatsSwitchPc = Param.Addr(0, "x86 Linux __switch_to; zero disables TASK observer")
+    taskStatsCurrentOffset = Param.Addr(0, "GS-relative pcpu_hot.current_task offset")
+    taskStatsPidOffset = Param.Unsigned(0, "BTF task_struct.pid offset")
 
     cacheStorePorts = Param.Unsigned(
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
+    ordinaryLoadMinLatency = Param.Cycles(
+        0, "Minimum issue-to-result latency for ordinary non-split 8-byte loads; zero disables")
 
     # Backward pipeline delays
     fetchToBacDelay = Param.Cycles(1, "Fetch to Branch address calc. delay")
@@ -213,6 +225,44 @@ class BaseO3CPU(BaseCPU):
         "Branch Predictor",
     )
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
+    tsoStore = Param.TSOStore(
+        "serial", "Committed-store implementation used by TSO CPUs"
+    )
+    tsoStoreBufferSize = Param.Unsigned(
+        114, "Store-buffer entries used only by the buffer TSO implementation"
+    )
+    tsoStoreMaxInFlight = Param.Unsigned(
+        1,
+        "Maximum committed stores awaiting cache responses; experimental "
+        "buffer-mode drain overlap",
+    )
+    divsdLatency = Param.Unsigned(14, "Dedicated register DIVSD result latency")
+    divsdIssueInterval = Param.Unsigned(4, "Dedicated register DIVSD initiation interval")
+    divsdActivityDuration = Param.Unsigned(
+        8, "Dedicated register DIVSD observable activity duration"
+    )
+    intDiv32QuotientLatency = Param.Unsigned(13, "Compact 32-bit DIV/IDIV quotient latency")
+    intDiv32RemainderLatency = Param.Unsigned(15, "Compact 32-bit DIV/IDIV remainder latency")
+    intDiv64QuotientLatency = Param.Unsigned(15, "Compact 64-bit DIV/IDIV quotient latency")
+    intDiv64RemainderLatency = Param.Unsigned(18, "Compact 64-bit DIV/IDIV remainder latency")
+    intDiv32IssueInterval = Param.Unsigned(6, "Compact 32-bit DIV/IDIV initiation interval")
+    intDiv64IssueInterval = Param.Unsigned(10, "Compact 64-bit DIV/IDIV initiation interval")
+
+    sbufferOffloadWidth = Param.Unsigned(
+        1, "Maximum committed SQ stores transferred to SBuffer per cycle"
+    )
+    sbufferDrainWidth = Param.Unsigned(
+        1, "Maximum SBuffer writes issued to the cache per cycle"
+    )
+    sbufferMerge = Param.Bool(
+        True, "Merge an ordinary store into the unsent same-line FIFO tail"
+    )
+    sbufferForwarding = Param.Bool(
+        True, "Forward younger ordinary loads from committed SBuffer entries"
+    )
+    sbufferPrepare = Param.Bool(
+        False, "Issue the inherited store-permission preparation in SBuffer mode"
+    )
 
     recvRespThrottling = Param.Bool(
         False, "Enable load receive response throttling in the LSQ"

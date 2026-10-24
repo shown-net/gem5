@@ -46,12 +46,19 @@ class OpClass(Enum):
         "IntAlu",
         "IntMult",
         "IntDiv",
+        "X86IntDiv32",
+        "X86IntDiv64",
+        "X86IntDivQuot",
+        "X86IntDivRem32",
+        "X86IntDivRem64",
+        "X86ZeroIdiom",
         "FloatAdd",
         "FloatCmp",
         "FloatCvt",
         "FloatMult",
         "FloatMultAcc",
         "FloatDiv",
+        "X86Divsd",
         "FloatMisc",
         "FloatSqrt",
         "SimdAdd",
@@ -157,3 +164,4 @@ class FUDesc(SimObject):
 
     count = Param.Int("number of these FU's available")
     opList = VectorParam.OpDesc("operation classes for this FU type")
+    timingPort = Param.String("", "Port name for a single FU instance")

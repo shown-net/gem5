@@ -24,9 +24,22 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from m5.objects.InstDecoder import InstDecoder
+from m5.params import Param
 
 
 class X86Decoder(InstDecoder):
     type = "X86Decoder"
     cxx_class = "gem5::X86ISA::Decoder"
     cxx_header = "arch/x86/decoder.hh"
+    singleResultImul = Param.Bool(False, "Use one result-producing uop for register IMUL")
+    singleResultImulForms = Param.Bool(False, "Use direct-result IMUL for memory and 32/64-bit immediate forms")
+    imul16ImmediateMode = Param.Unsigned(0, "16-bit immediate IMUL: 0 original, 1 direct, 2 multiply then merge")
+    compactIntDiv = Param.Bool(False, "Use fixed-footprint register DIV/IDIV behavior proxy for 32/64-bit forms")
+    independentDivsd = Param.Bool(False, "Route register DIVSD to its dedicated execution resource")
+    gprZeroIdiomMode = Param.Unsigned(
+        0,
+        "GPR XOR/SUB same-register behavior: 0 original, 1 dependency-only, "
+        "2 dependency plus abstract completion-resource proxy",
+    )
+    singleUopSetz = Param.Bool(False, "Use one result uop for register SETZ")
+    zfOnlySetz = Param.Bool(False, "Read only Zaps for register SETZ")

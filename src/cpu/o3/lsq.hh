@@ -173,7 +173,8 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
         WritebackScheduled = 0x00001000,
         WritebackDone = 0x00002000,
         /** True if this is an atomic request */
-        IsAtomic = 0x00004000
+        IsAtomic = 0x00004000,
+        ServiceScheduled = 0x00008000
     };
     FlagsType flags;
 
@@ -193,9 +194,7 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
     uint32_t numTranslatedFragments;
     uint32_t numInTranslationFragments;
 
-    void
-    markDelayed() override
-    { flags.set(Flag::Delayed); }
+    void markDelayed() override { flags.set(Flag::Delayed); }
     bool
     isDelayed()
     { return flags.isSet(Flag::Delayed); }
@@ -216,6 +215,8 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
     uint32_t _numOutstandingPackets;
     AtomicOpFunctorPtr _amo_op;
     bool _hasStaleTranslation;
+    bool _sbufferOwned = false;
+    uint64_t _sbufferEntryId = 0;
 
   protected:
     LSQUnit *
@@ -354,6 +355,7 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
     isAnyOutstandingRequest()
     {
         return numInTranslationFragments > 0 || _numOutstandingPackets > 0 ||
+               flags.isSet(Flag::ServiceScheduled) ||
                (flags.isSet(Flag::WritebackScheduled) &&
                 !flags.isSet(Flag::WritebackDone));
     }
@@ -369,6 +371,23 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
         return flags.isSet(Flag::LSQEntryFreed) ||
                flags.isSet(Flag::Discarded);
     }
+
+    bool serviceScheduled() const { return flags.isSet(Flag::ServiceScheduled); }
+    void scheduleService() { flags.set(Flag::ServiceScheduled); }
+    void finishService()
+    {
+        flags.clear(Flag::ServiceScheduled);
+        if (isReleased() && !isAnyOutstandingRequest())
+            delete this;
+    }
+
+    void moveToSbuffer(uint64_t entry_id)
+    {
+        _sbufferOwned = true;
+        _sbufferEntryId = entry_id;
+    }
+    bool sbufferOwned() const { return _sbufferOwned; }
+    uint64_t sbufferEntryId() const { return _sbufferEntryId; }
 
     bool
     isSplit() const
@@ -464,7 +483,7 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
     {
         assert(_numOutstandingPackets > 0);
         _numOutstandingPackets--;
-        if (_numOutstandingPackets == 0 && isReleased()) {
+        if (!isAnyOutstandingRequest() && isReleased()) {
             delete this;
         }
     }
@@ -481,7 +500,7 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
     {
         flags.set(Flag::WritebackDone);
         /* If the lsq resources are already free */
-        if (_numOutstandingPackets == 0 && isReleased()) {
+        if (!isAnyOutstandingRequest() && isReleased()) {
             delete this;
         }
     }
@@ -492,7 +511,7 @@ class LSQRequest : public BaseMMU::Translation, public Packet::SenderState
         assert(numInTranslationFragments == 0);
         flags.set(Flag::TranslationSquashed);
         /* If we are on our own, self-destruct. */
-        if (isReleased()) {
+        if (isReleased() && !isAnyOutstandingRequest()) {
             delete this;
         }
     }
@@ -605,6 +624,10 @@ class SplitDataRequest : public LSQRequest
 class LSQ
 {
   public:
+    struct StorePrepareSenderState : public Packet::SenderState
+    {
+    };
+
     /**
      * DcachePort class for the load/store queue.
      */

@@ -1342,6 +1342,7 @@ IEW::executeInsts()
             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
 
             if (inst->mispredicted() && !loadNotExecuted) {
+                inst->setBranchPredMispredicted();
                 fetchRedirect[tid] = true;
 
                 DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "
@@ -1657,6 +1658,7 @@ IEW::checkMisprediction(const DynInstPtr& inst)
         toCommit->squashedSeqNum[tid] > inst->seqNum) {
 
         if (inst->mispredicted()) {
+            inst->setBranchPredMispredicted();
             fetchRedirect[tid] = true;
 
             DPRINTF(IEW, "[tid:%i] [sn:%llu] Execute: "

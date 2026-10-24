@@ -80,9 +80,11 @@ class LSQRequest;
 class ThreadState;
 class LSQEntry;
 class SQEntry;
+class InstructionTiming;
 
 class DynInst : public ExecContext, public RefCounted
 {
+    const InstructionTiming *instructionTiming = nullptr;
   private:
     DynInst(const StaticInstPtr &staticInst, const StaticInstPtr &macroop,
             InstSeqNum seq_num, CPU *cpu);
@@ -580,6 +582,7 @@ class DynInst : public ExecContext, public RefCounted
     //  Instruction types.  Forward checks to StaticInst object.
     //
     bool isNop()          const { return staticInst->isNop(); }
+    bool isZeroIdiom()    const { return staticInst->isZeroIdiom(); }
     bool isMemRef()       const { return staticInst->isMemRef(); }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
@@ -709,6 +712,7 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Returns the opclass of this instruction. */
     OpClass opClass() const { return staticInst->opClass(); }
+    const InstructionTiming *timingEntry() const { return instructionTiming; }
 
     /** Returns the branch target address. */
     std::unique_ptr<PCStateBase>
@@ -1038,6 +1042,9 @@ class DynInst : public ExecContext, public RefCounted
 
     /* Values used by LoadToUse stat */
     Tick firstIssue = -1;
+    bool ordinaryLoadTiming = false;
+    Tick loadDataReady = -1;
+    Tick loadWriteback = -1;
     Tick lastWakeDependents = -1;
 
     /** Reads a misc. register, including any side-effects the read

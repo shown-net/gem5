@@ -266,6 +266,8 @@ class Request : public Extensible<Request>
         /** TLBI_EXT_SYNC_COMP seems to be the largest value
             of FlagsType, so HAS_NO_ADDR's value is that << 4 */
         HAS_NO_ADDR                = 0x0008000000000000,
+        /** Internal O3 TSO store-buffer permission preparation. */
+        STORE_PREPARE              = 0x0010000000000000,
         // clang-format on
     };
     static const FlagsType STORE_NO_DATA = CACHE_BLOCK_ZERO |
@@ -1059,6 +1061,7 @@ class Request : public Extensible<Request>
         return (_flags.isSet(PREFETCH | PF_EXCLUSIVE));
     }
     bool isPrefetchEx() const { return _flags.isSet(PF_EXCLUSIVE); }
+    bool isStorePrepare() const { return _flags.isSet(STORE_PREPARE); }
     bool isLLSC() const { return _flags.isSet(LLSC); }
     bool isPriv() const { return _flags.isSet(PRIVILEGED); }
     bool isLockedRMW() const { return _flags.isSet(LOCKED_RMW); }

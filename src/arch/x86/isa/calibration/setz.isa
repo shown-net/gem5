@@ -1,0 +1,46 @@
+// Runtime-selectable research mechanism; baseline remains the original macroop.
+let {{
+    class Setzvalue(RdRegOp):
+        # Byte merge keeps the required old destination dependency.
+        # Only Zaps is read; no condition-code register is written.
+        code = '''
+            DestReg = merge(SrcReg1, dest,
+                    (ccFlagBits & ZFBit) != 0, dataSize);
+        '''
+
+    class Setzwide(RdRegOp):
+        # Deliberately retain generic condition-reader dependencies.
+        code = '''
+            DestReg = merge(SrcReg1, dest,
+                ((ccFlagBits | cfofBits | dfBit | ecfBit | ezfBit)
+                    & ZFBit) != 0, dataSize);
+        '''
+
+    class Setztrue(RdRegOp):
+        code = '''
+            DestReg = (ccFlagBits & ZFBit) ?
+                merge(SrcReg1, dest, 1, dataSize) : SrcReg1;
+        '''
+
+    class Setzfalse(RdRegOp):
+        code = '''
+            DestReg = (ccFlagBits & ZFBit) ? SrcReg1 :
+                merge(SrcReg1, dest, 0, dataSize);
+        '''
+
+    microcode += '''
+def macroop SETZ_R_SINGLE
+{
+    setzvalue reg, reg, dataSize=1
+};
+def macroop SETZ_R_SINGLE_WIDE
+{
+    setzwide reg, reg, dataSize=1
+};
+def macroop SETZ_R_TWO_ZF
+{
+    setztrue reg, reg, dataSize=1
+    setzfalse reg, reg, dataSize=1
+};
+'''
+}};

@@ -212,6 +212,8 @@ bool
 LSQ::isDrained() const
 {
     bool drained(true);
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        drained = drained && thread[tid]->timingDrained();
 
     if (!lqEmpty()) {
         DPRINTF(Drain, "Not drained, LQ not empty.\n");
@@ -463,8 +465,23 @@ LSQ::recvTimingResp(PacketPtr pkt)
         DPRINTF(LSQ, "Got error packet back for address: %#X\n",
                 pkt->getAddr());
 
+    if (dynamic_cast<StorePrepareSenderState*>(pkt->senderState)) {
+        delete pkt->popSenderState();
+        delete pkt;
+        return true;
+    }
+
     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
     panic_if(!request, "Got packet back with unknown sender state\n");
+
+    if (request->sbufferOwned()) {
+        ThreadID tid = cpu->contextToThread(request->contextId());
+        thread.at(tid)->completeStoreBufferWrite(
+            request->sbufferEntryId(), request);
+        request->packetReplied();
+        request->freeLSQEntry();
+        return true;
+    }
 
     thread[cpu->contextToThread(request->contextId())]->recvTimingResp(pkt);
 
@@ -980,6 +997,7 @@ SplitDataRequest::initiateTranslation()
     _mainReq = std::make_shared<Request>(base_addr,
                 _size, _flags, _inst->requestorId(),
                 _inst->pcState().instAddr(), _inst->contextId());
+    _mainReq->setReqInstSeqNum(_inst->seqNum);
     _mainReq->setByteEnable(_byteEnable);
 
     // Paddr is not used in _mainReq. However, we will accumulate the flags

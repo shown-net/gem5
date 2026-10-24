@@ -68,6 +68,7 @@ Sequencer::Sequencer(const Params &p)
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
+    m_store_prepare_outstanding = 0;
 
     m_dataCache_ptr = p.dcache;
     m_max_outstanding_requests = p.max_outstanding_requests;
@@ -431,7 +432,6 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
         if (seq_req_list.size() > 1) ++readStats.readAliased;
     }
 
-
     if (seq_req_list.size() > 1) {
         return RequestStatus_Aliased;
     }
@@ -445,6 +445,14 @@ void
 Sequencer::markRemoved()
 {
     m_outstanding_count--;
+}
+
+void
+Sequencer::storePrepareComplete()
+{
+    assert(m_store_prepare_outstanding > 0);
+    --m_store_prepare_outstanding;
+    testDrainComplete();
 }
 
 void
@@ -818,7 +826,6 @@ Sequencer::hitCallback(SequencerRequest *srequest, DataBlock &data,
         if (was_coalesced) ++readStats.readCoalesced;
         readStats.readLatencyCycles += curCycle() - srequest->issue_time;
     }
-
     Addr request_address(pkt->getAddr());
     RubyRequestType type = srequest->m_type;
 
@@ -1059,12 +1066,20 @@ bool
 Sequencer::empty() const
 {
     return m_RequestTable.empty() &&
-           m_UnaddressedRequestTable.empty();
+           m_UnaddressedRequestTable.empty() &&
+           m_store_prepare_outstanding == 0;
 }
 
 RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
+    if (pkt->req->isStorePrepare()) {
+        ++m_store_prepare_outstanding;
+        m_controller->enqueuePrefetch(
+            makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
+        return RequestStatus_Issued;
+    }
+
     // HTM abort signals must be allowed to reach the Sequencer
     // the same cycle they are issued. They cannot be retried.
     if ((m_outstanding_count >= m_max_outstanding_requests) &&
@@ -1195,6 +1210,12 @@ Sequencer::makeRequest(PacketPtr pkt)
     // It is OK to receive RequestStatus_Aliased, it can be considered Issued
     if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
         return status;
+    // Only requests accepted into the Sequencer request table are native
+    // Ruby line admissions. Buffer-full and locked-line retries return above;
+    // MemSyncReq is an uninserted alias and is outside the retired data-UOP
+    // population.
+    if (pkt->cmd != MemCmd::MemSyncReq) {
+    }
     // non-aliased with any existing request in the request table, just issue
     // to the cache
     if (status != RequestStatus_Aliased)
@@ -1303,6 +1324,10 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
     assert(latency > 0);
 
     assert(m_mandatory_q_ptr != NULL);
+    // Count the exact request population that enters the Ruby hierarchy.
+    // RequestStatus_Aliased alone cannot identify this population: a merged
+    // read may share its parent's lookup, while an aliased write can be
+    // reissued here after the parent response.
     m_mandatory_q_ptr->enqueue(msg, clockEdge(), latency,
                                m_ruby_system->getRandomization(),
                                m_ruby_system->getWarmupEnabled());
@@ -1327,6 +1352,7 @@ Sequencer::print(std::ostream& out) const
 {
     out << "[Sequencer: " << m_version
         << ", outstanding requests: " << m_outstanding_count
+        << ", outstanding store prepares: " << m_store_prepare_outstanding
         << ", request table: " << m_RequestTable
         << "]";
 }

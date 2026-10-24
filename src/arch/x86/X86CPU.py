@@ -70,6 +70,22 @@ class X86IntMultDiv(IntMultDiv):
     count = 2
 
 
+class X86IntDivResult(FUDesc):
+    opList = [
+        OpDesc(opClass="X86IntDivQuot", opLat=1),
+        OpDesc(opClass="X86IntDivRem32", opLat=2),
+        OpDesc(opClass="X86IntDivRem64", opLat=3),
+    ]
+    count = 1
+
+
+class X86ZeroIdiom(FUDesc):
+    # Abstract completion capacity for operations eliminated from ordinary
+    # execution ports. This is a behavior proxy, not an Intel physical FU.
+    opList = [OpDesc(opClass="X86ZeroIdiom", opLat=1, pipelined=True)]
+    count = 6
+
+
 class DefaultX86FUPool(FUPool):
     FUList = [
         IntALU(),

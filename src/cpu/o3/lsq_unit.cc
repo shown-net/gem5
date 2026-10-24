@@ -50,6 +50,7 @@
 #include "base/stats/units.hh"
 #include "base/trace.hh"
 #include "base/types.hh"
+#include "base/str.hh"
 #include "cpu/checker/cpu.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/cpu.hh"
@@ -188,7 +189,22 @@ LSQUnit::completeDataAccess(PacketPtr pkt)
                     pkt->getHtmTransactionFailedInCacheRC() );
             }
 
-            writeback(inst, request->mainPacket());
+            const bool ordinary = ordinaryLoad(request);
+            Tick available = curTick();
+            if (ordinary) {
+                inst->ordinaryLoadTiming = true;
+                inst->loadDataReady = curTick();
+                assert(inst->firstIssue != Tick(-1));
+                available = std::max(available, inst->firstIssue +
+                    cpu->cyclesToTicks(ordinaryLoadMinLatency));
+                if (loadService.enabled && loadService.propagation)
+                    available = cpu->clockEdge(Cycles(1));
+            }
+            if (available > curTick()) {
+                schedule(*new LoadResultEvent(inst, request, this), available);
+            } else {
+                writeback(inst, request->mainPacket());
+            }
             if (inst->isStore() || inst->isAtomic()) {
                 request->writebackDone();
                 completeStore(request->instruction()->sqIt);
@@ -217,7 +233,7 @@ LSQUnit::LSQUnit(uint32_t lqEntries, uint32_t sqEntries)
       htmStarts(0), htmStops(0),
       lastRetiredHtmUid(0),
       cacheBlockMask(0), stalled(false),
-      isStoreBlocked(false), storeInFlight(false), stats(nullptr)
+      isStoreBlocked(false), storesInFlight(0), stats(nullptr), customStats(&stats)
 {
 }
 
@@ -238,7 +254,48 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
 
     depCheckShift = params.LSQDepCheckShift;
     checkLoads = params.LSQCheckLoads;
+    ordinaryLoadMinLatency = params.ordinaryLoadMinLatency;
     needsTSO = params.needsTSO;
+    tsoStore = params.tsoStore;
+    tsoStoreBufferSize = params.tsoStoreBufferSize;
+    tsoStoreMaxInFlight = params.tsoStoreMaxInFlight;
+    sbufferOffloadWidth = params.sbufferOffloadWidth;
+    sbufferDrainWidth = params.sbufferDrainWidth;
+    sbufferMerge = params.sbufferMerge;
+    sbufferForwarding = params.sbufferForwarding;
+    sbufferPrepare = params.sbufferPrepare;
+    fatal_if(tsoStoreMaxInFlight == 0,
+             "tsoStoreMaxInFlight must be greater than zero");
+    fatal_if(tsoStore == enums::TSOStore::serial &&
+                 tsoStoreMaxInFlight != 1,
+             "serial TSO store mode requires tsoStoreMaxInFlight=1");
+    fatal_if(sbufferMode() && !needsTSO,
+             "sbuffer TSO store mode requires needsTSO=true");
+    fatal_if(sbufferMode() && tsoStoreMaxInFlight != 1,
+             "sbuffer mode cannot be combined with tsoStoreMaxInFlight");
+    fatal_if(sbufferMode() && params.SQEntries != tsoStoreBufferSize,
+             "sbuffer TSO store mode requires SQEntries (%u) to match "
+             "the shared store-state budget tsoStoreBufferSize (%u)",
+             params.SQEntries, tsoStoreBufferSize);
+    fatal_if(sbufferOffloadWidth == 0 || sbufferDrainWidth == 0,
+             "sbuffer widths must be greater than zero");
+    loadService.enabled = params.ordinaryLoadService;
+    if (loadService.enabled)
+        serviceStats = std::make_unique<LoadServiceStats>(&customStats);
+    loadService.admission = params.loadServiceAdmission;
+    loadService.arbitration = params.loadServiceArbitration;
+    loadService.propagation = params.loadServicePropagation;
+    fatal_if(loadService.enabled && ordinaryLoadMinLatency != Cycles(0),
+             "service stages and historical minimum latency are exclusive");
+    loadService.geometry(cpu->cacheLineSize(),
+        params.loadServiceCacheSets);
+    fatal_if(tsoStore == enums::TSOStore::buffer && !needsTSO,
+             "buffer TSO store mode requires needsTSO=true");
+    fatal_if(tsoStore == enums::TSOStore::buffer &&
+                 params.SQEntries != tsoStoreBufferSize,
+             "buffer TSO store mode requires SQEntries (%u) to match "
+             "tsoStoreBufferSize (%u)",
+             params.SQEntries, tsoStoreBufferSize);
 
     resetState();
 }
@@ -247,6 +304,9 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
 void
 LSQUnit::resetState()
 {
+    committedStoreBuffer.clear();
+    nextStoreBufferEntryId = 1;
+    storesInFlight = 0;
     storesToWB = 0;
 
     // hardware transactional memory
@@ -310,6 +370,54 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
     sqAvgOccupancy.precision(2);
 }
 
+LSQUnit::CustomLSQStats::CustomLSQStats(statistics::Group *parent)
+    : statistics::Group(parent, "custom"),
+      ADD_STAT(partialForwardRetries, statistics::units::Count::get(),
+               "Load execution attempts rescheduled for partial store "
+               "coverage"),
+      ADD_STAT(storePrepareIssued, statistics::units::Count::get(),
+               "Buffer-mode exclusive permission prefetches issued"),
+      ADD_STAT(storePrepareBlocked, statistics::units::Count::get(),
+               "Buffer-mode permission prefetches rejected for retry"),
+      ADD_STAT(sbufferOffloaded, statistics::units::Count::get(),
+               "Committed SQ stores transferred to SBuffer"),
+      ADD_STAT(sbufferOffloadBlocked, statistics::units::Count::get(),
+               "Committed SQ stores blocked from entering SBuffer"),
+      ADD_STAT(sbufferMergedStores, statistics::units::Count::get(),
+               "Committed stores merged into the unsent SBuffer tail"),
+      ADD_STAT(sbufferMergedBytes, statistics::units::Count::get(),
+               "Enabled store bytes merged into SBuffer entries"),
+      ADD_STAT(sbufferForwardedLoads, statistics::units::Count::get(),
+               "Loads fully forwarded from committed SBuffer state"),
+      ADD_STAT(sbufferPartialForwardRetries, statistics::units::Count::get(),
+               "Loads rescheduled for partial SBuffer coverage"),
+      ADD_STAT(sbufferDrainIssued, statistics::units::Count::get(),
+               "SBuffer write requests accepted by the cache port"),
+      ADD_STAT(sbufferDrainBlocked, statistics::units::Count::get(),
+               "SBuffer write requests rejected by the cache port"),
+      ADD_STAT(sbufferDrainCompleted, statistics::units::Count::get(),
+               "SBuffer write responses completed"),
+      ADD_STAT(sbufferAvgOccupancy, statistics::units::Count::get(),
+               "Cumulative time-average committed SBuffer entry count; not an interval difference")
+{
+    sbufferAvgOccupancy.precision(2);
+}
+
+LSQUnit::LoadServiceStats::LoadServiceStats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(serviceAccepted, statistics::units::Count::get(),
+               "Ordinary-load service admissions, including cache retries"),
+      ADD_STAT(serviceAdmissionRetries, statistics::units::Count::get(),
+               "Ordinary-load admission-width rejections"),
+      ADD_STAT(serviceArbitrationRetries, statistics::units::Count::get(),
+               "xs reference address-bank arbitration rejections"),
+      ADD_STAT(serviceCacheRetries, statistics::units::Count::get(),
+               "Admitted service attempts rejected by native cache ports"),
+      ADD_STAT(serviceSquashed, statistics::units::Count::get(),
+               "Pending service requests cancelled by squash/release")
+{
+}
+
 void
 LSQUnit::setDcachePort(RequestPort *dcache_port)
 {
@@ -319,6 +427,7 @@ LSQUnit::setDcachePort(RequestPort *dcache_port)
 void
 LSQUnit::drainSanityCheck() const
 {
+    assert(timingDrained());
     for (int i = 0; i < loadQueue.capacity(); ++i)
         assert(!loadQueue[i].valid());
 
@@ -415,6 +524,7 @@ void
 LSQUnit::insertStore(const DynInstPtr& store_inst)
 {
     // Make sure it is not full before inserting an instruction.
+    assert(!sqFull());
     assert(!storeQueue.full());
     assert(storeQueue.size() < storeQueue.capacity());
     ++stats.addedLoadsAndStores;
@@ -456,11 +566,27 @@ LSQUnit::numFreeLoadEntries()
 unsigned
 LSQUnit::numFreeStoreEntries()
 {
-        DPRINTF(LSQUnit, "SQ size: %d, #stores occupied: %d\n",
-                storeQueue.capacity(), storeQueue.size());
-        return storeQueue.capacity() - storeQueue.size();
+    DPRINTF(LSQUnit, "SQ size: %d, #stores occupied: %d, "
+            "SBuffer entries: %d\n", storeQueue.capacity(),
+            storeQueue.size(), committedStoreBuffer.size());
+    const unsigned physical_free = storeQueue.capacity() - storeQueue.size();
+    if (!sbufferMode()) {
+        return physical_free;
+    }
+    const unsigned used = storeQueue.size() + committedStoreBuffer.size();
+    const unsigned shared_free = used < tsoStoreBufferSize ?
+        tsoStoreBufferSize - used : 0;
+    return std::min(physical_free, shared_free);
 
- }
+}
+
+bool
+LSQUnit::sqFull()
+{
+    return storeQueue.full() || (sbufferMode() &&
+        storeQueue.size() + committedStoreBuffer.size() >=
+            tsoStoreBufferSize);
+}
 
 void
 LSQUnit::checkSnoop(PacketPtr pkt)
@@ -864,9 +990,210 @@ LSQUnit::writebackBlockedStore()
     }
 }
 
+bool
+LSQUnit::bufferableStore(SQEntry &entry) const
+{
+    if (!entry.valid() || entry.size() == 0 || !entry.hasRequest()) {
+        return false;
+    }
+    const DynInstPtr &inst = entry.instruction();
+    LSQRequest *request = entry.request();
+    const RequestPtr &main_req = request->mainReq();
+    if (!inst->isStore() || inst->isStoreConditional() || inst->isAtomic() ||
+        inst->inHtmTransactionalState() || inst->isDataPrefetch() ||
+        request->isSplit() || !main_req || main_req->isLLSC() ||
+        main_req->isRelease() || main_req->isLocalAccess() ||
+        main_req->isUncacheable() || main_req->isStrictlyOrdered() ||
+        main_req->isCacheMaintenance()) {
+        return false;
+    }
+    const Addr offset = main_req->getPaddr() & (cpu->cacheLineSize() - 1);
+    return offset + main_req->getSize() <= cpu->cacheLineSize();
+}
+
+void
+LSQUnit::updateStoreBufferOccupancy()
+{
+    customStats.sbufferAvgOccupancy = committedStoreBuffer.size();
+}
+
+void
+LSQUnit::offloadCommittedStores()
+{
+    unsigned offloaded = 0;
+    while (offloaded < sbufferOffloadWidth && storesToWB > 0 &&
+           storeWBIt.dereferenceable() && storeWBIt->valid() &&
+           storeWBIt->canWB() && !storeWBIt->completed()) {
+        if (!bufferableStore(*storeWBIt)) {
+            if (!committedStoreBuffer.empty()) {
+                ++customStats.sbufferOffloadBlocked;
+            }
+            break;
+        }
+
+        LSQRequest *request = storeWBIt->request();
+        const RequestPtr &main_req = request->mainReq();
+        const DynInstPtr inst = storeWBIt->instruction();
+        const unsigned line_size = cpu->cacheLineSize();
+        const Addr block = main_req->getPaddr() & ~(Addr(line_size) - 1);
+        const unsigned offset = main_req->getPaddr() - block;
+        const unsigned size = main_req->getSize();
+        std::vector<bool> byte_enable = main_req->getByteEnable();
+        if (byte_enable.empty()) {
+            byte_enable.assign(size, true);
+        }
+        panic_if(byte_enable.size() != size,
+                 "SBuffer byte-enable size mismatch");
+        if (!inst->memData) {
+            inst->memData = new uint8_t[size];
+        }
+        if (storeWBIt->isAllZeros()) {
+            memset(inst->memData, 0, size);
+        } else {
+            memcpy(inst->memData, storeWBIt->data(), size);
+        }
+
+        CommittedStoreEntry *target = nullptr;
+        bool merged = false;
+        if (sbufferMerge && !committedStoreBuffer.empty()) {
+            auto &tail = committedStoreBuffer.back();
+            if (tail.nextToSend == 0 && tail.blockPaddr == block &&
+                tail.contextId == main_req->contextId() &&
+                tail.flags.isSet(Request::SECURE) == main_req->isSecure()) {
+                target = &tail;
+                merged = true;
+                ++customStats.sbufferMergedStores;
+            }
+        }
+        if (!target) {
+            if (committedStoreBuffer.size() >= tsoStoreBufferSize) {
+                ++customStats.sbufferOffloadBlocked;
+                break;
+            }
+            const uint64_t entry_id = nextStoreBufferEntryId++;
+            request->buildPackets();
+            request->moveToSbuffer(entry_id);
+            committedStoreBuffer.emplace_back(
+                entry_id, block, line_size,
+                main_req->getFlags(), main_req->requestorId(),
+                main_req->contextId(),
+                main_req->hasPC() ? main_req->getPC() : 0,
+                inst->seqNum, request);
+            target = &committedStoreBuffer.back();
+        } else {
+            target->lastSeqNum = inst->seqNum;
+            request->buildPackets();
+            request->moveToSbuffer(target->id);
+            target->requests.push_back(request);
+        }
+
+        for (unsigned i = 0; i < size; ++i) {
+            if (!byte_enable[i]) {
+                continue;
+            }
+            target->data[offset + i] = storeWBIt->isAllZeros() ?
+                0 : static_cast<uint8_t>(storeWBIt->data()[i]);
+            target->byteEnable[offset + i] = true;
+            if (merged) {
+                ++customStats.sbufferMergedBytes;
+            }
+        }
+        panic_if(storeWBIt->takeRequest() != request,
+                 "failed to transfer LSQ request to SBuffer");
+
+        completeStore(storeWBIt++);
+        ++customStats.sbufferOffloaded;
+        ++offloaded;
+        updateStoreBufferOccupancy();
+    }
+}
+
+void
+LSQUnit::drainCommittedStoreBuffer()
+{
+    unsigned issued = 0;
+    for (auto &entry : committedStoreBuffer) {
+        if (entry.completed) {
+            continue;
+        }
+
+        while (issued < sbufferDrainWidth &&
+               entry.nextToSend < entry.requests.size()) {
+            if (!lsq->cachePortAvailable(false) || lsq->cacheBlocked()) {
+                return;
+            }
+
+            LSQRequest *request = entry.requests[entry.nextToSend];
+            panic_if(!request, "null unsent request in SBuffer entry %llu",
+                     entry.id);
+            request->sendPacketToCache();
+            if (!request->isAnyOutstandingRequest()) {
+                return;
+            }
+            ++entry.nextToSend;
+            ++customStats.sbufferDrainIssued;
+            ++issued;
+        }
+
+        if (issued >= sbufferDrainWidth) {
+            return;
+        }
+    }
+}
+
+void
+LSQUnit::completeStoreBufferWrite(uint64_t entry_id, LSQRequest *request)
+{
+    auto entry = std::find_if(
+        committedStoreBuffer.begin(), committedStoreBuffer.end(),
+        [entry_id](const auto &candidate) { return candidate.id == entry_id; });
+    panic_if(entry == committedStoreBuffer.end(),
+             "response for unknown SBuffer entry %llu", entry_id);
+    panic_if(entry->completed || entry->completedRequests >= entry->nextToSend,
+             "invalid response state for SBuffer entry %llu", entry_id);
+    auto request_it = std::find(entry->requests.begin(), entry->requests.end(),
+                                request);
+    panic_if(request_it == entry->requests.end(),
+             "response request not owned by SBuffer entry %llu", entry_id);
+    *request_it = nullptr;
+    ++entry->completedRequests;
+    entry->completed = entry->completedRequests == entry->requests.size();
+    ++customStats.sbufferDrainCompleted;
+
+    if (entry->completed && isStalled() &&
+        stallingStoreIsn >= entry->firstSeqNum &&
+        stallingStoreIsn <= entry->lastSeqNum) {
+        stalled = false;
+        stallingStoreIsn = 0;
+        iewStage->replayMemInst(loadQueue[stallingLoadIdx].instruction());
+    }
+
+    while (!committedStoreBuffer.empty() &&
+           committedStoreBuffer.front().completed) {
+        committedStoreBuffer.pop_front();
+    }
+    updateStoreBufferOccupancy();
+    iewStage->updateLSQNextCycle = true;
+    cpu->wakeCPU();
+    cpu->activityThisCycle();
+}
+
 void
 LSQUnit::writebackStores()
 {
+    if (sbufferMode()) {
+        if (sbufferPrepare && !isStoreBlocked) {
+            issueStorePrepareRequests();
+        }
+        offloadCommittedStores();
+        drainCommittedStoreBuffer();
+        if (storesToWB == 0 || !committedStoreBuffer.empty() ||
+            (storeWBIt.dereferenceable() && storeWBIt->valid() &&
+             storeWBIt->canWB() && bufferableStore(*storeWBIt))) {
+            return;
+        }
+    }
+
     if (isStoreBlocked) {
         DPRINTF(LSQUnit, "Writing back  blocked store\n");
         writebackBlockedStore();
@@ -876,7 +1203,7 @@ LSQUnit::writebackStores()
            storeWBIt.dereferenceable() &&
            storeWBIt->valid() &&
            storeWBIt->canWB() &&
-           ((!needsTSO) || (!storeInFlight)) &&
+           ((!needsTSO) || (storesInFlight < tsoStoreMaxInFlight)) &&
            lsq->cachePortAvailable(false)) {
 
         if (isStoreBlocked) {
@@ -994,6 +1321,76 @@ LSQUnit::writebackStores()
         }
     }
     assert(storesToWB >= 0);
+
+    if (tsoStore == enums::TSOStore::buffer && !isStoreBlocked) {
+        issueStorePrepareRequests();
+    }
+}
+
+void
+LSQUnit::issueStorePrepareRequests()
+{
+    if (lsq->cacheBlocked()) {
+        return;
+    }
+
+    for (auto store_it = storeQueue.begin();
+         store_it != storeQueue.end() && lsq->cachePortAvailable(false);
+         ++store_it) {
+        if (!store_it->valid() || !store_it->canWB()) {
+            break;
+        }
+        if (store_it->size() == 0 || !store_it->hasRequest()) {
+            continue;
+        }
+
+        const DynInstPtr& inst = store_it->instruction();
+        LSQRequest* request = store_it->request();
+        RequestPtr main_req = request->mainReq();
+        if (!inst->isStore() || inst->isStoreConditional() ||
+            inst->isAtomic() || inst->inHtmTransactionalState() ||
+            inst->isDataPrefetch() || request->isSplit() ||
+            main_req->isLLSC() || main_req->isRelease() ||
+            main_req->isLocalAccess() || main_req->isUncacheable() ||
+            main_req->isStrictlyOrdered() ||
+            main_req->isCacheMaintenance()) {
+            break;
+        }
+        if (store_it->committed() || store_it->storePrepareIssued()) {
+            continue;
+        }
+
+        Request::Flags flags =
+            Request::PF_EXCLUSIVE | Request::STORE_PREPARE;
+        if (main_req->isSecure()) {
+            flags.set(Request::SECURE);
+        }
+        RequestPtr prepare_req = std::make_shared<Request>(
+            main_req->getPaddr(), 0, flags, main_req->requestorId());
+        if (main_req->hasPC()) {
+            prepare_req->setPC(main_req->getPC());
+        }
+        if (main_req->hasContextId()) {
+            prepare_req->setContext(main_req->contextId());
+        }
+
+        PacketPtr prepare_pkt = new Packet(prepare_req, MemCmd::SoftPFExReq);
+        prepare_pkt->allocate();
+        prepare_pkt->senderState = new LSQ::StorePrepareSenderState();
+
+        if (!dcachePort->sendTimingReq(prepare_pkt)) {
+            delete prepare_pkt->popSenderState();
+            delete prepare_pkt;
+            lsq->cacheBlocked(true);
+            ++stats.blockedByCache;
+            ++customStats.storePrepareBlocked;
+            break;
+        }
+
+        store_it->storePrepareIssued() = true;
+        ++customStats.storePrepareIssued;
+        lsq->cachePortBusy(false);
+    }
 }
 
 void
@@ -1146,7 +1543,8 @@ LSQUnit::storePostSend()
     }
 
     if (needsTSO) {
-        storeInFlight = true;
+        storeWBIt->storeRequestInFlight() = true;
+        ++storesInFlight;
     }
 
     storeWBIt++;
@@ -1165,6 +1563,8 @@ LSQUnit::writeback(const DynInstPtr &inst, PacketPtr pkt)
     }
 
     if (!inst->isExecuted()) {
+        if (inst->ordinaryLoadTiming)
+            inst->loadWriteback = curTick();
         inst->setExecuted();
 
         if (inst->fault == NoFault) {
@@ -1218,6 +1618,7 @@ void
 LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
 {
     assert(store_idx->valid());
+    const bool store_request_in_flight = store_idx->storeRequestInFlight();
     store_idx->completed() = true;
     --storesToWB;
     // A bit conservative because a store completion may not free up entries,
@@ -1259,8 +1660,9 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
 
     store_inst->setCompleted();
 
-    if (needsTSO) {
-        storeInFlight = false;
+    if (needsTSO && store_request_in_flight) {
+        assert(storesInFlight > 0);
+        --storesInFlight;
     }
 
     // Tell the checker we've completed this instruction.  Some stores
@@ -1303,9 +1705,11 @@ LSQUnit::trySendPacket(bool isLoad, PacketPtr data_pkt)
             lsq->cacheBlocked(true);
             ++stats.blockedByCache;
         }
-        if (!isLoad) {
+        if (!isLoad && !request->sbufferOwned()) {
             assert(request == storeWBIt->request());
             isStoreBlocked = true;
+        } else if (request->sbufferOwned()) {
+            ++customStats.sbufferDrainBlocked;
         }
         request->packetNotSent();
     }
@@ -1390,6 +1794,98 @@ unsigned int
 LSQUnit::cacheLineSize()
 {
     return cpu->cacheLineSize();
+}
+
+bool
+LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
+{
+    if (!sbufferMode() || committedStoreBuffer.empty()) {
+        return false;
+    }
+
+    LQEntry &load_entry = loadQueue[load_idx];
+    const DynInstPtr &load_inst = load_entry.instruction();
+    const RequestPtr &main_req = request->mainReq();
+    const unsigned size = main_req->getSize();
+    const Addr address = main_req->getPaddr();
+    const unsigned line_size = cpu->cacheLineSize();
+    if (request->isSplit() ||
+        (address & ~(Addr(line_size) - 1)) !=
+            ((address + size - 1) & ~(Addr(line_size) - 1))) {
+        if (committedStoreBuffer.empty()) {
+            return false;
+        }
+        iewStage->rescheduleMemInst(load_inst);
+        load_inst->clearIssued();
+        load_inst->effAddrValid(false);
+        ++stats.rescheduledLoads;
+        ++customStats.sbufferPartialForwardRetries;
+        request->discard();
+        load_entry.setRequest(nullptr);
+        return true;
+    }
+
+    std::vector<uint8_t> data(size, 0);
+    std::vector<bool> covered(size, false);
+    bool overlap = false;
+    InstSeqNum youngest_overlap = 0;
+    for (auto it = committedStoreBuffer.rbegin();
+         it != committedStoreBuffer.rend(); ++it) {
+        if (it->firstSeqNum >= load_inst->seqNum) {
+            continue;
+        }
+        for (unsigned byte = 0; byte < size; ++byte) {
+            if (covered[byte]) {
+                continue;
+            }
+            const Addr byte_address = address + byte;
+            if (byte_address < it->blockPaddr ||
+                byte_address >= it->blockPaddr + line_size) {
+                continue;
+            }
+            const unsigned offset = byte_address - it->blockPaddr;
+            if (it->byteEnable[offset]) {
+                data[byte] = it->data[offset];
+                covered[byte] = true;
+                overlap = true;
+                youngest_overlap = std::max(youngest_overlap, it->lastSeqNum);
+            }
+        }
+    }
+    if (!overlap) {
+        return false;
+    }
+
+    const bool complete = std::all_of(
+        covered.begin(), covered.end(), [](bool value) { return value; });
+    if (sbufferForwarding && complete) {
+        if (!load_inst->memData) {
+            load_inst->memData = new uint8_t[size];
+        }
+        memcpy(load_inst->memData, data.data(), size);
+        PacketPtr data_pkt = new Packet(main_req, MemCmd::ReadReq);
+        data_pkt->dataStatic(load_inst->memData);
+        WritebackEvent *wb = new WritebackEvent(load_inst, data_pkt, this);
+        cpu->schedule(wb, curTick());
+        ++stats.forwLoads;
+        ++customStats.sbufferForwardedLoads;
+        return true;
+    }
+
+    if (!stalled || load_inst->seqNum <
+            loadQueue[stallingLoadIdx].instruction()->seqNum) {
+        stalled = true;
+        stallingStoreIsn = youngest_overlap;
+        stallingLoadIdx = load_idx;
+    }
+    iewStage->rescheduleMemInst(load_inst);
+    load_inst->clearIssued();
+    load_inst->effAddrValid(false);
+    ++stats.rescheduledLoads;
+    ++customStats.sbufferPartialForwardRetries;
+    request->discard();
+    load_entry.setRequest(nullptr);
+    return true;
 }
 
 Fault
@@ -1631,6 +2127,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 load_inst->clearIssued();
                 load_inst->effAddrValid(false);
                 ++stats.rescheduledLoads;
+                ++customStats.partialForwardRetries;
 
                 // Do not generate a writeback event as this instruction is not
                 // complete.
@@ -1644,6 +2141,11 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 return NoFault;
             }
         }
+    }
+
+    if (!load_inst->isDataPrefetch() &&
+        forwardFromStoreBuffer(request, load_idx)) {
+        return NoFault;
     }
 
     // If there's no forwarding case, then go access memory
@@ -1675,6 +2177,12 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
     // then put the instruction into retry queue so we do not need
     // an extra cycle to re-issue and execute
     request->buildPackets();
+    if (loadService.enabled && ordinaryLoad(request)) {
+        if (!request->serviceScheduled())
+            schedule(*new LoadServiceRequestEvent(request, this),
+                     cpu->clockEdge(Cycles(1)));
+        return NoFault;
+    }
     request->sendPacketToCache();
     if (!request->isSent()) {
         if (!lsq->cacheBlocked()) {
@@ -1774,10 +2282,11 @@ void
 SQEntry::clear()
 {
     LSQEntry::clear();
-    _canWB = _completed = _committed = _isAllZeros = false;
+    _canWB = _completed = _committed = _storePrepareIssued =
+        _storeRequestInFlight = _isAllZeros = false;
 }
 
-LSQUnit::LSQUnit(const LSQUnit &l) : stats(nullptr)
+LSQUnit::LSQUnit(const LSQUnit &l) : stats(nullptr), customStats(&stats)
 { panic("LSQUnit is not copy-able"); }
 
 } // namespace o3

@@ -63,6 +63,7 @@
 #include "cpu/o3/free_list.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/iew.hh"
+#include "cpu/o3/instruction_timing.hh"
 #include "cpu/o3/rename.hh"
 #include "cpu/o3/rob.hh"
 #include "cpu/o3/scoreboard.hh"
@@ -95,6 +96,10 @@ class ThreadContext;
 class CPU : public BaseCPU
 {
   public:
+    std::array<const InstructionTiming *, unsigned(InstructionForm::Count)>
+        instructionTimings{};
+    const InstructionTiming *timingEntry(InstructionForm form) const
+    { return instructionTimings[unsigned(form)]; }
     CustomUopStats customStats;
     TaskStatsObserver taskStats;
     typedef std::list<DynInstPtr>::iterator ListIt;

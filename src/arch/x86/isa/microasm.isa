@@ -51,6 +51,15 @@ let {{
     import sys
     sys.path[0:0] = ["src/arch/x86/isa/"]
     from insts import microcode
+}};
+
+##include "calibration/imul.isa"
+##include "calibration/integer_decomposition.isa"
+##include "calibration/idiv.isa"
+##include "calibration/setz.isa"
+##include "calibration/zero_idiom.isa"
+
+let {{
     # print microcode
     from micro_asm import MicroAssembler, RomMacroop
     mainRom = X86MicrocodeRom('main ROM')
