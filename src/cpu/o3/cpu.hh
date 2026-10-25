@@ -592,6 +592,16 @@ class CPU : public BaseCPU
                 flags, res, std::move(amo_op), byte_enable);
     }
 
+    /** Read the stalled retirement frontier for model diagnostics. */
+    Addr getCommitHeadPC(ThreadID tid);
+
+    /** Supply independently scheduled data to a logical store. */
+    Fault
+    writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+    {
+        return iew.ldstQueue.writeStoreData(inst, data, size);
+    }
+
     /** Used by the fetch unit to get a hold of the instruction port. */
     Port &
     getInstPort() override

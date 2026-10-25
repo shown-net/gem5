@@ -40,13 +40,13 @@ microcode = """
 #
 
 def macroop MOV_R_MI {
-    limm t1, imm, dataSize=asz
-    ld reg, seg, [1, t0, t1]
+    ld reg, seg, [0, t0, t0], imm
 };
 
 def macroop MOV_MI_R {
     limm t1, imm, dataSize=asz
-    st reg, seg, [1, t0, t1]
+    sta seg, [1, t0, t1]
+    storedata reg
 };
 
 def macroop MOV_R_R {
@@ -54,12 +54,13 @@ def macroop MOV_R_R {
 };
 
 def macroop MOV_M_R {
-    st reg, seg, sib, disp
+    sta seg, sib, disp
+    storedata reg
 };
 
 def macroop MOV_P_R {
-    rdip t7
-    st reg, seg, riprel, disp
+    starip seg, riprel, disp
+    storedata reg
 };
 
 def macroop MOV_R_M {
@@ -75,14 +76,13 @@ def macroop MOV_R_I {
 };
 
 def macroop MOV_M_I {
-    limm t1, imm
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    storedatawide imm
 };
 
 def macroop MOV_P_I {
-    rdip t7
-    limm t1, imm
-    st t1, seg, riprel, disp
+    starip seg, riprel, disp
+    storedatawide imm
 };
 
 #
@@ -94,23 +94,23 @@ def macroop MOVSXD_R_R {
 };
 
 def macroop MOVSXD_R_M {
-    ldsxd reg, seg, sib, disp, dataSize=4
+    ldsxd reg, seg, sib, disp
 };
 
 def macroop MOVSXD_R_P {
-    ldsxdrip reg, seg, riprel, disp, dataSize=4
+    ldsxdrip reg, seg, riprel, disp
 };
 
 def macroop MOVSX_B_R_R {
-    sexti reg, regm, 7
+    sextbyte reg, byteregm
 };
 
 def macroop MOVSX_B_R_M {
-    ldsxb reg, seg, sib, disp, dataSize=1
+    ldsxb reg, seg, sib, disp
 };
 
 def macroop MOVSX_B_R_P {
-    ldsxbrip reg, seg, riprel, disp, dataSize=1
+    ldsxbrip reg, seg, riprel, disp
 };
 
 def macroop MOVSX_W_R_R {
@@ -118,11 +118,11 @@ def macroop MOVSX_W_R_R {
 };
 
 def macroop MOVSX_W_R_M {
-    ldsxw reg, seg, sib, disp, dataSize=2
+    ldsxw reg, seg, sib, disp
 };
 
 def macroop MOVSX_W_R_P {
-    ldsxwrip reg, seg, riprel, disp, dataSize=2
+    ldsxwrip reg, seg, riprel, disp
 };
 
 #
@@ -130,15 +130,15 @@ def macroop MOVSX_W_R_P {
 #
 
 def macroop MOVZX_B_R_R {
-    zexti reg, regm, 7
+    zextbyte reg, byteregm
 };
 
 def macroop MOVZX_B_R_M {
-    ldzxb reg, seg, sib, disp, dataSize=1
+    ldzxb reg, seg, sib, disp
 };
 
 def macroop MOVZX_B_R_P {
-    ldzxbrip reg, seg, riprel, disp, dataSize=1
+    ldzxbrip reg, seg, riprel, disp
 };
 
 def macroop MOVZX_W_R_R {
@@ -146,11 +146,11 @@ def macroop MOVZX_W_R_R {
 };
 
 def macroop MOVZX_W_R_M {
-    ldzxw reg, seg, sib, disp, dataSize=2
+    ldzxw reg, seg, sib, disp
 };
 
 def macroop MOVZX_W_R_P {
-    ldzxwrip reg, seg, riprel, disp, dataSize=2
+    ldzxwrip reg, seg, riprel, disp
 };
 
 def macroop MOV_C_R {
@@ -433,5 +433,92 @@ microcode += """
 def macroop MOVSXD_R_P_16 {
     ldrip t1, seg, riprel, disp, dataSize=2
     sexti reg, t1, 15
+};
+"""
+
+microcode += """
+def macroop CRC32_B_R_R {
+    crc32value reg, reg, byteregm, 1
+};
+def macroop CRC32_B_R_M {
+    ld t1, seg, sib, disp, dataSize=1
+    crc32value reg, reg, t1, 1
+};
+def macroop CRC32_B_R_P {
+    ldrip t1, seg, riprel, disp, dataSize=1
+    crc32value reg, reg, t1, 1
+};
+def macroop CRC32_V_R_R {
+    crc32value reg, reg, regm, crcSourceSize
+};
+def macroop CRC32_V_R_M {
+    ld t1, seg, sib, disp, dataSize=crcSourceSize
+    crc32value reg, reg, t1, crcSourceSize
+};
+def macroop CRC32_V_R_P {
+    ldrip t1, seg, riprel, disp, dataSize=crcSourceSize
+    crc32value reg, reg, t1, crcSourceSize
+};
+
+def macroop MOVBE_R_M {
+    ld t1, seg, sib, disp
+    bswapvalue reg, t1, dataSize=4
+};
+def macroop MOVBE_R_M_16 {
+    ldzxw t1, seg, sib, disp, dataSize=4
+    bswapword t1, t1
+    mov reg, reg, t1
+};
+def macroop MOVBE_R_M_64 {
+    ld t1, seg, sib, disp, dataSize=8
+    bswaplow t2, t1, dataSize=8
+    bswapjoin reg, t1, t2, dataSize=8
+};
+def macroop MOVBE_M_R {
+    sta seg, sib, disp
+    bswapvalue t1, reg, dataSize=4
+    storedata t1
+};
+def macroop MOVBE_M_R_16 {
+    sta seg, sib, disp, dataSize=2
+    bswapword t1, reg
+    storedata t1
+};
+def macroop MOVBE_M_R_64 {
+    sta seg, sib, disp, dataSize=8
+    bswaplow t1, reg, dataSize=8
+    bswapjoin t1, reg, t1, dataSize=8
+    storedata t1
+};
+
+def macroop MOVBE_R_P {
+    ldrip t1, seg, riprel, disp
+    bswapvalue reg, t1, dataSize=4
+};
+def macroop MOVBE_R_P_16 {
+    ldzxwrip t1, seg, riprel, disp, dataSize=4
+    bswapword t1, t1
+    mov reg, reg, t1
+};
+def macroop MOVBE_R_P_64 {
+    ldrip t1, seg, riprel, disp, dataSize=8
+    bswaplow t2, t1, dataSize=8
+    bswapjoin reg, t1, t2, dataSize=8
+};
+def macroop MOVBE_P_R {
+    starip seg, riprel, disp
+    bswapvalue t1, reg, dataSize=4
+    storedata t1
+};
+def macroop MOVBE_P_R_16 {
+    starip seg, riprel, disp, dataSize=2
+    bswapword t1, reg
+    storedata t1
+};
+def macroop MOVBE_P_R_64 {
+    starip seg, riprel, disp, dataSize=8
+    bswaplow t1, reg, dataSize=8
+    bswapjoin t1, reg, t1, dataSize=8
+    storedata t1
 };
 """

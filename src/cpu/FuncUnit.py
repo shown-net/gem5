@@ -106,6 +106,8 @@ class OpClass(Enum):
         "MatrixOP",
         "MemRead",
         "MemWrite",
+        "X86StoreAddress",
+        "X86StoreData",
         "FloatMemRead",
         "FloatMemWrite",
         "InstPrefetch",
@@ -137,6 +139,15 @@ class OpClass(Enum):
         "SimdBf16MultAcc",
         "Bf16Cvt",
         "System",
+        "X86IntShift",
+        "X86IntDoubleShift",
+        "X86ByteSwap32",
+        "X86Crc32",
+        "X86IntBoolean",
+        "X86IntBitExtract",
+        "X86IntBitManip",
+        "X86IntMulResult64",
+        "X86IntCarry",
     ]
 
 

@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/inst_queue.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 
 #include <vector>
 
@@ -719,6 +720,45 @@ InstructionQueue::isFull(const DynInstPtr &inst)
     return numFreeEntries(inst) == 0;
 }
 
+bool
+InstructionQueue::canInsertGroup(const FrontendInstGroup &group)
+{
+    // Singleton admission retains the ordinary per-instruction check.
+    if (group.size == 1)
+        return !isFull(group.members[0]);
+
+    std::vector<unsigned> reserved(iqs.size(), 0);
+    for (unsigned member = 0; member < group.size; ++member) {
+        const auto &inst = group.members[member];
+        bool capable = false;
+        for (auto iq : iqs)
+            capable |= iq->isCapable(inst->opClass());
+
+        size_t selected = iqs.size();
+        unsigned best_load = 0;
+        for (size_t i = 0; i < iqs.size(); ++i) {
+            auto iq = iqs[i];
+            if (capable && !iq->isCapable(inst->opClass()))
+                continue;
+            unsigned free = capable ? iq->numFreeEntries(inst) :
+                iq->numFreeEntries(inst->threadNumber);
+            if (free <= reserved[i])
+                continue;
+            unsigned load = iq->numEntries() - free + reserved[i];
+            if (selected == iqs.size() || load < best_load) {
+                selected = i;
+                best_load = load;
+            }
+            if (!capable || insertionPolicy == IQInsertionPolicy::FirstMatch)
+                break;
+        }
+        if (selected == iqs.size())
+            return false;
+        ++reserved[selected];
+    }
+    return true;
+}
+
 std::vector<FUPool *>
 InstructionQueue::allFUPools()
 {
@@ -831,7 +871,7 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
     // register(s).
     addToProducers(new_inst);
 
-    if (new_inst->isMemRef()) {
+    if (new_inst->hasMemoryRequest()) {
         memDepUnit[new_inst->threadNumber].insert(new_inst);
     } else {
         addIfReady(new_inst);
@@ -873,7 +913,7 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
 
     // If it's a memory instruction, add it to the memory dependency
     // unit.
-    if (new_inst->isMemRef()) {
+    if (new_inst->hasMemoryRequest()) {
         memDepUnit[new_inst->threadNumber].insertNonSpec(new_inst);
     }
 
@@ -1186,23 +1226,19 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
-            // Fast builds disable the legacy tracing assignment below.
-            // Covered forms still expose their actual admission timestamp.
-            if (timing)
-                issuing_inst->issueTick = curTick() - issuing_inst->fetchTick;
+            // Marker lifecycle observation needs the actual last admission
+            // of every real scheduled uop, including unprofiled FP and loads.
+            // Replays update this timestamp; firstIssue retains the original.
+            issuing_inst->issueTick = curTick() - issuing_inst->fetchTick;
             cpu->customStats.scheduled(
                 idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU,
                 issuing_inst->isZeroIdiom());
             ++total_issued;
 
-#if TRACING_ON
-            issuing_inst->issueTick = curTick() - issuing_inst->fetchTick;
-#endif
-
             if (issuing_inst->firstIssue == -1)
                 issuing_inst->firstIssue = curTick();
 
-            if (!issuing_inst->isMemRef()) {
+            if (!issuing_inst->hasMemoryRequest()) {
                 // Memory instructions can not be freed from the IQ until they
                 // complete.
                 issuing_inst->clearInIQ();
@@ -1250,7 +1286,7 @@ InstructionQueue::scheduleNonSpec(const InstSeqNum &inst)
 
     (*inst_it).second->setCanIssue();
 
-    if (!(*inst_it).second->isMemRef()) {
+    if (!(*inst_it).second->hasMemoryRequest()) {
         addIfReady((*inst_it).second);
     } else {
         memDepUnit[tid].nonSpecInstReady((*inst_it).second);
@@ -1343,7 +1379,7 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
     // instruction if it is a memory instruction.  Also complete the memory
     // instruction at this point since we know it executed without issues.
     ThreadID tid = completed_inst->threadNumber;
-    if (completed_inst->isMemRef()) {
+    if (completed_inst->hasMemoryRequest()) {
         memDepUnit[tid].completeInst(completed_inst);
 
         DPRINTF(IQ, "Completing mem instruction PC: %s [sn:%llu]\n",
@@ -1440,6 +1476,18 @@ void
 InstructionQueue::replayMemInst(const DynInstPtr &replay_inst)
 {
     memDepUnit[replay_inst->threadNumber].replay();
+}
+
+void
+InstructionQueue::replayStoreData(const DynInstPtr &store_inst)
+{
+    memDepUnit[store_inst->threadNumber].replay(store_inst->seqNum);
+}
+
+void
+InstructionQueue::replayStoreWriteback(const DynInstPtr &store_inst)
+{
+    memDepUnit[store_inst->threadNumber].replay(store_inst->seqNum, true);
 }
 
 void
@@ -1568,7 +1616,7 @@ InstructionQueue::doSquash(ThreadID tid)
         }
 
         if (!squashed_inst->isIssued() ||
-            (squashed_inst->isMemRef() &&
+            (squashed_inst->hasMemoryRequest() &&
              !squashed_inst->memOpDone())) {
 
             DPRINTF(IQ, "[tid:%i] Instruction [sn:%llu] PC %s squashed.\n",
@@ -1627,7 +1675,7 @@ InstructionQueue::doSquash(ThreadID tid)
                     // head is the common case. Memory references may
                     // also have been removed after becoming ready.
                     assert(squashed_inst->getFault() != NoFault ||
-                           squashed_inst->isMemRef() ||
+                           squashed_inst->hasMemoryRequest() ||
                            squashed_inst->isAtCommit());
                 } else {
 
@@ -1772,7 +1820,7 @@ InstructionQueue::addIfReady(const DynInstPtr &inst)
     if (inst->readyToIssue()) {
 
         //Add the instruction to the proper ready list.
-        if (inst->isMemRef()) {
+        if (inst->hasMemoryRequest()) {
 
             DPRINTF(IQ, "Checking if memory instruction can issue.\n");
 
@@ -1861,7 +1909,7 @@ InstructionQueue::dumpInsts()
                 if (!(*inst_list_it)->isIssued()) {
                     ++valid_num;
                     cprintf("Count:%i\n", valid_num);
-                } else if ((*inst_list_it)->isMemRef() &&
+                } else if ((*inst_list_it)->hasMemoryRequest() &&
                            !(*inst_list_it)->memOpDone()) {
                     // Loads that have not been marked as executed
                     // still count towards the total instructions.
@@ -1878,7 +1926,7 @@ InstructionQueue::dumpInsts()
                     (*inst_list_it)->isIssued(),
                     (*inst_list_it)->isSquashed());
 
-            if ((*inst_list_it)->isMemRef()) {
+            if ((*inst_list_it)->hasMemoryRequest()) {
                 cprintf("MemOpDone:%i\n", (*inst_list_it)->memOpDone());
             }
 
@@ -1903,7 +1951,7 @@ InstructionQueue::dumpInsts()
             if (!(*inst_list_it)->isIssued()) {
                 ++valid_num;
                 cprintf("Count:%i\n", valid_num);
-            } else if ((*inst_list_it)->isMemRef() &&
+            } else if ((*inst_list_it)->hasMemoryRequest() &&
                        !(*inst_list_it)->memOpDone()) {
                 // Loads that have not been marked as executed
                 // still count towards the total instructions.
@@ -1920,7 +1968,7 @@ InstructionQueue::dumpInsts()
                 (*inst_list_it)->isIssued(),
                 (*inst_list_it)->isSquashed());
 
-        if ((*inst_list_it)->isMemRef()) {
+        if ((*inst_list_it)->hasMemoryRequest()) {
             cprintf("MemOpDone:%i\n", (*inst_list_it)->memOpDone());
         }
 

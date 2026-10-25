@@ -104,7 +104,7 @@ let {{
                 "cc" : self.cond}
             return allocator
 
-    iop = InstObjParams("fault", "MicroFaultFlags",
+    iop = X86InstObjParams("fault", "MicroFaultFlags",
             "X86ISA::InstOperands<X86ISA::MicroCondBase, X86ISA::FaultOp>",
             {"code": "",
              "cond_test": "checkCondition(ccFlagBits | cfofBits | dfBit | \
@@ -112,7 +112,7 @@ let {{
     exec_output = MicroFaultExecute.subst(iop)
     header_output = MicroFaultDeclare.subst(iop)
     decoder_output = MicroFaultConstructor.subst(iop)
-    iop = InstObjParams("fault", "MicroFault",
+    iop = X86InstObjParams("fault", "MicroFault",
             "X86ISA::InstOperands<X86ISA::MicroCondBase, X86ISA::FaultOp>",
             {"code": "",
              "cond_test": "true"})
@@ -186,7 +186,7 @@ let {{
 
 let {{
     # Build up the all register version of this micro op
-    iop = InstObjParams("mfence", "Mfence", 'X86MicroopBase',
+    iop = X86InstObjParams("mfence", "Mfence", 'X86MicroopBase',
             {"code" : ""})
     header_output += MicroFenceOpDeclare.subst(iop)
     decoder_output += MicroFenceOpConstructor.subst(iop)
@@ -216,7 +216,7 @@ let {{
 
 let {{
     # Build up the all register version of this micro op
-    iop = InstObjParams("sfence", "Sfence", 'X86MicroopBase',
+    iop = X86InstObjParams("sfence", "Sfence", 'X86MicroopBase',
             {"code" : ""})
     header_output += MicroFenceOpDeclare.subst(iop)
     decoder_output += MicroFenceOpConstructor.subst(iop)
@@ -246,7 +246,7 @@ let {{
 
 let {{
     # Build up the all register version of this micro op
-    iop = InstObjParams("lfence", "Lfence", 'X86MicroopBase',
+    iop = X86InstObjParams("lfence", "Lfence", 'X86MicroopBase',
             {"code" : ""})
     header_output += MicroFenceOpDeclare.subst(iop)
     decoder_output += MicroFenceOpConstructor.subst(iop)
@@ -276,7 +276,7 @@ let {{
 
 let {{
     # Build up the all register version of this micro op
-    iop = InstObjParams("serialize", "Serialize", 'X86MicroopBase',
+    iop = X86InstObjParams("serialize", "Serialize", 'X86MicroopBase',
             {"code" : ""})
     header_output += MicroFenceOpDeclare.subst(iop)
     decoder_output += MicroFenceOpConstructor.subst(iop)

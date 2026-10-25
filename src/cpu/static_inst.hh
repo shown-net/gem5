@@ -149,10 +149,13 @@ class StaticInst : public RefCounted, public StaticInstFlags
     bool
     isMemRef() const
     {
-        return flags[IsLoad] || flags[IsStore] || flags[IsAtomic];
+        return flags[IsLoad] || flags[IsStore] || flags[IsAtomic] ||
+               flags[IsStoreData];
     }
     bool isLoad()         const { return flags[IsLoad]; }
     bool isStore()        const { return flags[IsStore]; }
+    bool isStoreAddress() const { return flags[IsStoreAddress]; }
+    bool isStoreData()    const { return flags[IsStoreData]; }
     bool isAtomic()       const { return flags[IsAtomic]; }
     bool isStoreConditional()     const { return flags[IsStoreConditional]; }
     bool isInstPrefetch() const { return flags[IsInstPrefetch]; }

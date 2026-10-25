@@ -63,13 +63,26 @@ LSQUnit::ordinaryLoad(LSQRequest *request) const
         !req->isCacheMaintenance();
 }
 
-LSQUnit::LoadServiceRequestEvent::LoadServiceRequestEvent(
-        LSQRequest *request, LSQUnit *owner)
-    : Event(Default_Pri, AutoDelete), request(request), owner(owner)
+LSQUnit::LoadServiceRequestEvent::LoadServiceRequestEvent(LSQUnit *owner)
+    : Event(Default_Pri), owner(owner)
+{
+}
+
+void
+LSQUnit::enqueueLoadServiceRequest(LSQRequest *request)
 {
     assert(!request->serviceScheduled());
     request->scheduleService();
-    ++owner->pendingLoadServiceRequests;
+    ++pendingLoadServiceRequests;
+    const auto position = std::lower_bound(
+        loadServiceRequests.begin(), loadServiceRequests.end(),
+        request->instruction()->seqNum,
+        [](LSQRequest *queued, InstSeqNum sequence) {
+            return queued->instruction()->seqNum < sequence;
+        });
+    loadServiceRequests.insert(position, request);
+    if (!loadServiceEvent.scheduled())
+        schedule(loadServiceEvent, cpu->clockEdge(Cycles(1)));
 }
 
 void
@@ -77,33 +90,43 @@ LSQUnit::LoadServiceRequestEvent::process()
 {
     assert(!owner->cpu->switchedOut());
     owner->cpu->wakeCPU();
-    if (request->isReleased() || request->instruction()->isSquashed()) {
-        ++owner->serviceStats->serviceSquashed;
-        --owner->pendingLoadServiceRequests;
-        request->finishService();
-        return;
-    }
-    if (!owner->lsq->cacheBlocked()) {
-        auto decision = owner->loadService.accept(request->getVaddr(),
-            request->mainReq()->getSize(), owner->cpu->clockEdge());
-        if (decision == OrdinaryLoadService::Decision::AdmissionRetry) {
-            ++owner->serviceStats->serviceAdmissionRetries;
-        } else if (decision == OrdinaryLoadService::Decision::ArbitrationRetry) {
-            ++owner->serviceStats->serviceArbitrationRetries;
-        } else {
-            ++owner->serviceStats->serviceAccepted;
-            request->sendPacketToCache();
-            if (request->isSent()) {
-                --owner->pendingLoadServiceRequests;
-                request->finishService();
-                return;
-            }
-            ++owner->serviceStats->serviceCacheRetries;
+    std::vector<LSQRequest *> waiting;
+    waiting.reserve(owner->loadServiceRequests.size());
+    // A single clocked arbiter visits ready requests in instruction age order.
+    // Per-request equal-priority EventQueue bins are LIFO and do not express
+    // LSU arbitration; their retries could starve the LQ/ROB head.
+    for (auto *request : owner->loadServiceRequests) {
+        if (request->isReleased() || request->instruction()->isSquashed()) {
+            ++owner->serviceStats->serviceSquashed;
+            --owner->pendingLoadServiceRequests;
+            request->finishService();
+            continue;
         }
+        if (!owner->lsq->cacheBlocked()) {
+            auto decision = owner->loadService.accept(request->getVaddr(),
+                request->mainReq()->getSize(), owner->cpu->clockEdge());
+            if (decision == OrdinaryLoadService::Decision::AdmissionRetry) {
+                ++owner->serviceStats->serviceAdmissionRetries;
+            } else if (decision == OrdinaryLoadService::Decision::ArbitrationRetry) {
+                ++owner->serviceStats->serviceArbitrationRetries;
+            } else {
+                ++owner->serviceStats->serviceAccepted;
+                request->sendPacketToCache();
+                if (request->isSent()) {
+                    --owner->pendingLoadServiceRequests;
+                    request->finishService();
+                    continue;
+                }
+                ++owner->serviceStats->serviceCacheRetries;
+            }
+        }
+        // Backpressure retains the same native request and its lifetime flag.
+        waiting.push_back(request);
     }
-    // Capacity rejection and native Ruby backpressure retain the SAME request.
-    // No early wakeup, duplicate packet or IQ replay is manufactured.
-    owner->schedule(*this, owner->cpu->clockEdge(Cycles(1)));
+    owner->loadServiceRequests.swap(waiting);
+    assert(owner->pendingLoadServiceRequests == owner->loadServiceRequests.size());
+    if (!owner->loadServiceRequests.empty())
+        owner->schedule(*this, owner->cpu->clockEdge(Cycles(1)));
 }
 
 LSQUnit::LoadResultEvent::LoadResultEvent(

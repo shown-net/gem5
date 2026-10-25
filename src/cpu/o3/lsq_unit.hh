@@ -153,9 +153,21 @@ class SQEntry : public LSQEntry
      * style instructs (ARM DC ZVA; ALPHA WH64)
      */
     bool _isAllZeros = false;
+    DynInstPtr _dataInstruction;
+    bool _addressReady = false;
+    bool _dataReady = false;
+    unsigned _dataBytes = 0;
 
   public:
     static constexpr size_t DataSize = sizeof(_data);
+    DynInstPtr &dataInstruction() { return _dataInstruction; }
+    const DynInstPtr &dataInstruction() const { return _dataInstruction; }
+    bool &addressReady() { return _addressReady; }
+    bool addressReady() const { return _addressReady; }
+    bool &dataReady() { return _dataReady; }
+    bool dataReady() const { return _dataReady; }
+    unsigned &dataBytes() { return _dataBytes; }
+    unsigned dataBytes() const { return _dataBytes; }
     /** Constructs an empty store queue entry. */
     SQEntry();
 
@@ -338,6 +350,10 @@ class LSQUnit
     /** Squashes all instructions younger than a specific sequence number. */
     void squash(const InstSeqNum &squashed_num);
 
+    void insertStoreData(const DynInstPtr &inst);
+    Fault writeStoreData(const DynInstPtr &inst, uint8_t *data,
+                         unsigned size);
+
     /** Returns if there is a memory ordering violation. Value is reset upon
      * call to getMemDepViolator().
      */
@@ -496,17 +512,19 @@ class LSQUnit
 
     OrdinaryLoadService loadService;
     unsigned pendingLoadServiceRequests = 0;
+    std::vector<LSQRequest *> loadServiceRequests;
     bool ordinaryLoad(LSQRequest *request) const;
+    void enqueueLoadServiceRequest(LSQRequest *request);
     class LoadServiceRequestEvent : public Event
     {
       public:
-        LoadServiceRequestEvent(LSQRequest *request, LSQUnit *owner);
+        explicit LoadServiceRequestEvent(LSQUnit *owner);
         void process() override;
         const char *description() const override { return "Ordinary load request stage"; }
       private:
-        LSQRequest *request;
         LSQUnit *owner;
     };
+    LoadServiceRequestEvent loadServiceEvent{this};
 
     Cycles ordinaryLoadMinLatency = Cycles(0);
     unsigned pendingLoadResults = 0;
@@ -603,6 +621,7 @@ class LSQUnit
 
     /** Whether or not the LSQ is stalled. */
     bool stalled;
+    bool stallingOnStoreData = false;
     /** The store that causes the stall due to partial store to load
      * forwarding.
      */
@@ -618,6 +637,7 @@ class LSQUnit
 
     /** Number of committed stores awaiting cache responses. */
     unsigned storesInFlight;
+    bool serializedStoreInFlight = false;
 
     /** Selected TSO committed-store implementation. */
     enums::TSOStore tsoStore;
@@ -668,6 +688,9 @@ class LSQUnit
 
         /** Number of loads that were rescheduled. */
         statistics::Scalar rescheduledLoads;
+        statistics::Scalar splitStoreAddressFirst;
+        statistics::Scalar splitStoreDataFirst;
+        statistics::Scalar storeDataWaitRetries;
 
         /** Number of times the LSQ is blocked due to the cache. */
         statistics::Scalar blockedByCache;

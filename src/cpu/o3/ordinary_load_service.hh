@@ -3,9 +3,7 @@
 #define __CPU_O3_ORDINARY_LOAD_SERVICE_HH__
 
 #include <algorithm>
-#include <set>
 #include <vector>
-#include "base/intmath.hh"
 #include "base/types.hh"
 
 namespace gem5::o3
@@ -19,12 +17,11 @@ class OrdinaryLoadService
     bool admission = true;
     bool arbitration = true;
     bool propagation = true;
+    unsigned readPorts = 2;
 
-    void geometry(unsigned line_bytes, unsigned sets)
+    void geometry(unsigned line_bytes)
     {
-        lineBits = floorLog2(line_bytes);
-        setMask = sets - 1;
-        occupied.resize(line_bytes / BankBytes, false);
+        occupied.resize(line_bytes / ReadWindowBytes, 0);
     }
 
     Decision accept(Addr vaddr, unsigned size, Tick edge)
@@ -32,42 +29,36 @@ class OrdinaryLoadService
         if (edge != epoch) {
             epoch = edge;
             accepted = 0;
-            std::fill(occupied.begin(), occupied.end(), false);
-            recent.clear();
+            std::fill(occupied.begin(), occupied.end(), 0);
         }
         if (admission && accepted == AdmissionWidth)
             return Decision::AdmissionRetry;
-        // xs-gem5 LSQ::loadBankConflictedCheck: probe the entire access before
-        // claiming resources; repeated set/bank keys reuse this cycle's read.
-        std::vector<std::pair<unsigned, Addr>> touched;
+        // Probe the entire access before claiming resources. Each real load
+        // consumes a read slot, including repeated reads of the same bytes.
+        std::vector<unsigned> touched;
         for (unsigned offset = 0; offset < size;) {
             Addr addr = vaddr + offset;
-            unsigned bank = (addr / BankBytes) % occupied.size();
-            Addr key = (((addr >> lineBits) & setMask) * occupied.size()) + bank;
-            if (arbitration && occupied[bank] && !recent.count(key))
+            unsigned window = (addr / ReadWindowBytes) % occupied.size();
+            if (arbitration && occupied[window] >= readPorts)
                 return Decision::ArbitrationRetry;
-            touched.emplace_back(bank, key);
-            offset += BankBytes - (addr % BankBytes);
+            touched.push_back(window);
+            offset += ReadWindowBytes - (addr % ReadWindowBytes);
         }
-        for (auto [bank, key] : touched) {
-            occupied[bank] = true;
-            recent.insert(key);
-        }
+        for (auto window : touched)
+            ++occupied[window];
         ++accepted;
         return Decision::Accepted;
     }
 
   private:
-    // Width: Intel SPR maximum scalar-load admission. BankBytes: xs reference
-    // default, held fixed as an alien-architecture hypothesis, never fitted.
+    // Width: Intel SPR maximum scalar-load admission. Eight-byte read-window
+    // overlap models the measured layout/alignment response. Its granularity
+    // and two-read limit do not establish the physical SPR bank topology.
     static constexpr unsigned AdmissionWidth = 3;
-    static constexpr unsigned BankBytes = 2;
-    unsigned lineBits = 0;
-    Addr setMask = 0;
+    static constexpr unsigned ReadWindowBytes = 8;
     Tick epoch = Tick(-1);
     unsigned accepted = 0;
-    std::vector<bool> occupied;
-    std::set<Addr> recent;
+    std::vector<unsigned> occupied;
 };
 }
 #endif

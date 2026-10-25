@@ -135,6 +135,17 @@ let {{
         "ssz" : "env.stackSize"
     }
     assembler.symbols.update(symbols)
+    assembler.symbols["byteregm"] = gpRegIdx(
+        "intRegFolded(env.regm, machInst.rex.present ? 0 : (1 << 6))")
+    assembler.symbols["bytereg"] = gpRegIdx(
+        "intRegFolded(env.reg, machInst.rex.present ? 0 : (1 << 6))")
+    assembler.symbols["crcSourceSize"] = (
+        "(machInst.rex.w ? 8 : (machInst.legacy.op ? 2 : 4))")
+    assembler.symbols["vreg"] = gpRegIdx("machInst.vex.v")
+    assembler.symbols["bmiOsz"] = '''
+        env.dataSize = machInst.mode.submode == SixtyFourBitMode &&
+            machInst.rex.w ? 8 : 4;
+    '''
 
     assembler.symbols["ldsz"] = \
         "((env.dataSize == 8) ? 3 : (env.dataSize == 4) ? 2 : 1)"
@@ -204,6 +215,12 @@ let {{
     assembler.symbols["oszIn64Override"] = '''
     if (machInst.mode.submode == SixtyFourBitMode &&
             env.dataSize == 4)
+        env.dataSize = 8;
+    '''
+
+    # Intel near CALL/JMP/Jcc targets remain 64 bit in long mode even with 66.
+    assembler.symbols["oszNearControl"] = '''
+    if (machInst.mode.submode == SixtyFourBitMode)
         env.dataSize = 8;
     '''
 

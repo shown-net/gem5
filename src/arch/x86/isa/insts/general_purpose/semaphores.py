@@ -43,20 +43,19 @@ def macroop CMPXCHG_R_R {
 
 def macroop CMPXCHG_M_R {
     ldst t1, seg, sib, disp
-    sub t0, rax, t1, flags=(OF, SF, ZF, AF, PF, CF)
-
-    mov t1, t1, reg, flags=(CZF,)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    sub t0, rax, t1, flags=(OF,SF,ZF,AF,PF,CF)
+    cmovzvalue t2, t1, reg
+    storedata t2
     mov rax, rax, t1, flags=(nCZF,)
 };
 
 def macroop CMPXCHG_P_R {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    sub t0, rax, t1, flags=(OF, SF, ZF, AF, PF, CF)
-
-    mov t1, t1, reg, flags=(CZF,)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    sub t0, rax, t1, flags=(OF,SF,ZF,AF,PF,CF)
+    cmovzvalue t2, t1, reg
+    storedata t2
     mov rax, rax, t1, flags=(nCZF,)
 };
 
@@ -84,16 +83,17 @@ def macroop CMPXCHG_LOCKED_P_R {
 
 def macroop XADD_M_R {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     add t2, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t2, seg, sib, disp
+    storedata t2
     mov reg, reg, t1
 };
 
 def macroop XADD_P_R {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     add t2, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t2, seg, riprel, disp
+    storedata t2
     mov reg, reg, t1
 };
 

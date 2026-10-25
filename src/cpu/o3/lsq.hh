@@ -724,6 +724,9 @@ class LSQ
     void insertLoad(const DynInstPtr &load_inst);
     /** Inserts a store into the LSQ. */
     void insertStore(const DynInstPtr &store_inst);
+    void insertStoreData(const DynInstPtr &store_inst);
+    Fault writeStoreData(const DynInstPtr &inst, uint8_t *data,
+                         unsigned size);
 
     /** Executes a load. */
     Fault executeLoad(const DynInstPtr &inst);

@@ -285,10 +285,13 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
     loadService.admission = params.loadServiceAdmission;
     loadService.arbitration = params.loadServiceArbitration;
     loadService.propagation = params.loadServicePropagation;
-    fatal_if(loadService.enabled && ordinaryLoadMinLatency != Cycles(0),
-             "service stages and historical minimum latency are exclusive");
-    loadService.geometry(cpu->cacheLineSize(),
-        params.loadServiceCacheSets);
+    loadService.readPorts = params.loadServiceBankPorts;
+    fatal_if(loadService.readPorts == 0,
+             "ordinary load service requires at least one read port");
+    fatal_if(loadService.enabled && loadService.propagation &&
+                 ordinaryLoadMinLatency != Cycles(0),
+             "clocked propagation and minimum result latency are exclusive");
+    loadService.geometry(cpu->cacheLineSize());
     fatal_if(tsoStore == enums::TSOStore::buffer && !needsTSO,
              "buffer TSO store mode requires needsTSO=true");
     fatal_if(tsoStore == enums::TSOStore::buffer &&
@@ -307,6 +310,7 @@ LSQUnit::resetState()
     committedStoreBuffer.clear();
     nextStoreBufferEntryId = 1;
     storesInFlight = 0;
+    serializedStoreInFlight = false;
     storesToWB = 0;
 
     // hardware transactional memory
@@ -348,6 +352,12 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Number of stores squashed"),
       ADD_STAT(rescheduledLoads, statistics::units::Count::get(),
                "Number of loads that were rescheduled"),
+      ADD_STAT(splitStoreAddressFirst, statistics::units::Count::get(),
+               "Split stores with translated address ready before data"),
+      ADD_STAT(splitStoreDataFirst, statistics::units::Count::get(),
+               "Split stores with data ready before translated address"),
+      ADD_STAT(storeDataWaitRetries, statistics::units::Count::get(),
+               "Matching load attempts rescheduled for late store data"),
       ADD_STAT(blockedByCache, statistics::units::Count::get(),
                "Number of times an access to memory failed due to the cache "
                "being blocked"),
@@ -410,7 +420,7 @@ LSQUnit::LoadServiceStats::LoadServiceStats(statistics::Group *parent)
       ADD_STAT(serviceAdmissionRetries, statistics::units::Count::get(),
                "Ordinary-load admission-width rejections"),
       ADD_STAT(serviceArbitrationRetries, statistics::units::Count::get(),
-               "xs reference address-bank arbitration rejections"),
+               "Concurrent line-offset read-window rejections"),
       ADD_STAT(serviceCacheRetries, statistics::units::Count::get(),
                "Admitted service attempts rejected by native cache ports"),
       ADD_STAT(serviceSquashed, statistics::units::Count::get(),
@@ -543,6 +553,54 @@ LSQUnit::insertStore(const DynInstPtr& store_inst)
     storeQueue.back().set(store_inst);
 
     stats.sqAvgOccupancy = queueOccupancy(storeQueue);
+}
+
+void
+LSQUnit::insertStoreData(const DynInstPtr &inst)
+{
+    // Dispatch is ordered: the last unmatched STA identifies this dynamic
+    // logical store. Its sequence number remains the SQ/request identity.
+    auto it = storeQueue.end();
+    while (it != storeQueue.begin()) {
+        --it;
+        auto address = it->instruction();
+        if (!address->isStoreAddress() || it->dataInstruction())
+            continue;
+        panic_if(address->macroop != inst->macroop ||
+                 address->pcState().instAddr() != inst->pcState().instAddr(),
+                 "STD does not belong to the unmatched STA macro instruction");
+        it->dataInstruction() = inst;
+        inst->sqIdx = address->sqIdx;
+        inst->sqIt = address->sqIt;
+        return;
+    }
+    panic("STD dispatched without its logical store address");
+}
+
+Fault
+LSQUnit::writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+{
+    auto &entry = storeQueue[inst->sqIdx];
+    panic_if(!entry.valid() || entry.dataInstruction() != inst ||
+             !entry.instruction()->isStoreAddress(),
+             "STD [sn:%llu] writes a stale or different SQ identity idx=%d",
+             inst->seqNum, inst->sqIdx);
+    panic_if(size > SQEntry::DataSize ||
+             (entry.addressReady() && entry.size() != size),
+             "STA/STD access sizes disagree");
+    memcpy(entry.data(), data, size);
+    if (!entry.dataReady() && !entry.addressReady())
+        ++stats.splitStoreDataFirst;
+    entry.dataBytes() = size;
+    entry.dataReady() = true;
+    if (stalled && stallingOnStoreData &&
+        stallingStoreIsn == entry.instruction()->seqNum) {
+        stalled = false;
+        stallingOnStoreData = false;
+        stallingStoreIsn = 0;
+    }
+    iewStage->replayStoreData(entry.instruction());
+    return NoFault;
 }
 
 DynInstPtr
@@ -965,7 +1023,17 @@ LSQUnit::commitStores(InstSeqNum &youngest_inst)
         // Mark any stores that are now committed and have not yet
         // been marked as able to write back.
         if (!x.canWB()) {
-            if (x.instruction()->seqNum > youngest_inst) {
+            InstSeqNum publication_seq = x.instruction()->seqNum;
+            if (x.instruction()->isStoreAddress()) {
+                // STA may retire while its real STD is still waiting for
+                // a producer, or has not reached dispatch yet. Its address
+                // alone cannot authorize copying/publishing SQ data. The
+                // actual STD retirement grants the logical store permission.
+                if (!x.dataInstruction())
+                    break;
+                publication_seq = x.dataInstruction()->seqNum;
+            }
+            if (publication_seq > youngest_inst) {
                 break;
             }
             DPRINTF(LSQUnit, "Marking store as able to write back, PC "
@@ -974,6 +1042,10 @@ LSQUnit::commitStores(InstSeqNum &youngest_inst)
                     x.instruction()->seqNum);
 
             x.canWB() = true;
+
+            panic_if(x.instruction()->isStoreAddress() && x.size() != 0 &&
+                     (!x.addressReady() || !x.dataReady()),
+                     "Retired logical store lacks its STA/STD result");
 
             ++storesToWB;
         }
@@ -1203,6 +1275,7 @@ LSQUnit::writebackStores()
            storeWBIt.dereferenceable() &&
            storeWBIt->valid() &&
            storeWBIt->canWB() &&
+           (!needsTSO || !serializedStoreInFlight) &&
            ((!needsTSO) || (storesInFlight < tsoStoreMaxInFlight)) &&
            lsq->cachePortAvailable(false)) {
 
@@ -1225,6 +1298,10 @@ LSQUnit::writebackStores()
         if (storeWBIt->instruction()->isDataPrefetch()) {
             storeWBIt++;
             continue;
+        }
+
+        if (needsTSO && !bufferableStore(*storeWBIt) && storesInFlight) {
+            break;
         }
 
         assert(storeWBIt->hasRequest());
@@ -1477,7 +1554,9 @@ LSQUnit::squash(const InstSeqNum &squashed_num)
     }
 
     while (storeQueue.size() != 0 &&
-           storeQueue.back().instruction()->seqNum > squashed_num) {
+           (storeQueue.back().instruction()->seqNum > squashed_num ||
+            (storeQueue.back().dataInstruction() &&
+             storeQueue.back().dataInstruction()->seqNum > squashed_num))) {
         // Instructions marked as can WB are already committed.
         if (storeQueue.back().canWB()) {
             break;
@@ -1499,6 +1578,8 @@ LSQUnit::squash(const InstSeqNum &squashed_num)
 
         // Clear the smart pointer to make sure it is decremented.
         storeQueue.back().instruction()->setSquashed();
+        if (storeQueue.back().dataInstruction())
+            storeQueue.back().dataInstruction()->setSquashed();
 
         // Must delete request now that it wasn't handed off to
         // memory.  This is quite ugly.  @todo: Figure out the proper
@@ -1543,6 +1624,7 @@ LSQUnit::storePostSend()
     }
 
     if (needsTSO) {
+        serializedStoreInFlight = !bufferableStore(*storeWBIt);
         storeWBIt->storeRequestInFlight() = true;
         ++storesInFlight;
     }
@@ -1619,6 +1701,8 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
 {
     assert(store_idx->valid());
     const bool store_request_in_flight = store_idx->storeRequestInFlight();
+    const bool serialized_request_in_flight = store_request_in_flight &&
+        !bufferableStore(*store_idx);
     store_idx->completed() = true;
     --storesToWB;
     // A bit conservative because a store completion may not free up entries,
@@ -1659,10 +1743,13 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
     }
 
     store_inst->setCompleted();
+    iewStage->replayStoreWriteback(store_inst);
 
     if (needsTSO && store_request_in_flight) {
         assert(storesInFlight > 0);
         --storesInFlight;
+        if (serialized_request_in_flight)
+            serializedStoreInFlight = false;
     }
 
     // Tell the checker we've completed this instruction.  Some stores
@@ -1959,21 +2046,28 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
 
     // Check the SQ for any previous stores that might lead to forwarding
     auto store_it = load_inst->sqIt;
-    assert (store_it >= storeWBIt);
+    panic_if(store_it < storeWBIt,
+             "Load [sn:%llu] SQ boundary %d precedes writeback boundary %d",
+             load_inst->seqNum, store_it._idx, storeWBIt._idx);
     // End once we've reached the top of the LSQ
     while (store_it != storeWBIt && !load_inst->isDataPrefetch()) {
         // Move the index to one younger
         store_it--;
-        assert(store_it->valid());
-        assert(store_it->instruction()->seqNum < load_inst->seqNum);
+        panic_if(!store_it->valid() ||
+                 store_it->instruction()->seqNum >= load_inst->seqNum,
+                 "Load [sn:%llu] scans an invalid or younger SQ entry idx=%d",
+                 load_inst->seqNum, store_it._idx);
         int store_size = store_it->size();
 
-        // Cache maintenance instructions go down via the store
-        // path but they carry no data and they shouldn't be
-        // considered for forwarding
+        // Cache maintenance and NO_ACCESS address checks use SQ resources
+        // without publishing memory bytes. In particular POP_M's CDA checks
+        // the old-SP address; its zero payload cannot forward over an earlier
+        // real store to the subsequently loaded stack slot.
         if (store_size != 0 && !store_it->instruction()->strictlyOrdered() &&
             !(store_it->request()->mainReq() &&
-              store_it->request()->mainReq()->isCacheMaintenance())) {
+              (store_it->request()->mainReq()->isCacheMaintenance() ||
+               (store_it->request()->mainReq()->getFlags() &
+                Request::NO_ACCESS)))) {
             assert(store_it->instruction()->effAddrValid());
 
             // Check if the store data is within the lower and upper bounds of
@@ -2023,7 +2117,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 coverage = AddrRangeCoverage::PartialAddrRangeCoverage;
             }
 
-            if (coverage == AddrRangeCoverage::FullAddrRangeCoverage) {
+            if (coverage == AddrRangeCoverage::FullAddrRangeCoverage &&
+                store_it->dataReady()) {
                 // Get shift amount for offset into the store's data.
                 int shift_amt = request->mainReq()->getVaddr() -
                     store_it->instruction()->effAddr;
@@ -2102,7 +2197,9 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
 
                 return NoFault;
             } else if (
-                    coverage == AddrRangeCoverage::PartialAddrRangeCoverage) {
+                    coverage == AddrRangeCoverage::PartialAddrRangeCoverage ||
+                    (coverage == AddrRangeCoverage::FullAddrRangeCoverage &&
+                     !store_it->dataReady())) {
                 // If it's already been written back, then don't worry about
                 // stalling on it.
                 if (store_it->completed()) {
@@ -2119,15 +2216,26 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                     stalled = true;
                     stallingStoreIsn = store_it->instruction()->seqNum;
                     stallingLoadIdx = load_idx;
+                    stallingOnStoreData =
+                        coverage == AddrRangeCoverage::FullAddrRangeCoverage;
                 }
 
                 // Tell IQ/mem dep unit that this instruction will need to be
                 // rescheduled eventually
+                load_inst->waitStoreDataSeqNum =
+                    coverage == AddrRangeCoverage::FullAddrRangeCoverage ?
+                        store_it->instruction()->seqNum : 0;
+                load_inst->waitStoreWritebackSeqNum =
+                    coverage == AddrRangeCoverage::PartialAddrRangeCoverage ?
+                        store_it->instruction()->seqNum : 0;
                 iewStage->rescheduleMemInst(load_inst);
                 load_inst->clearIssued();
                 load_inst->effAddrValid(false);
                 ++stats.rescheduledLoads;
-                ++customStats.partialForwardRetries;
+                if (coverage == AddrRangeCoverage::FullAddrRangeCoverage)
+                    ++stats.storeDataWaitRetries;
+                else
+                    ++customStats.partialForwardRetries;
 
                 // Do not generate a writeback event as this instruction is not
                 // complete.
@@ -2179,8 +2287,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
     request->buildPackets();
     if (loadService.enabled && ordinaryLoad(request)) {
         if (!request->serviceScheduled())
-            schedule(*new LoadServiceRequestEvent(request, this),
-                     cpu->clockEdge(Cycles(1)));
+            enqueueLoadServiceRequest(request);
         return NoFault;
     }
     request->sendPacketToCache();
@@ -2208,6 +2315,17 @@ LSQUnit::write(LSQRequest *request, uint8_t *data, ssize_t store_idx)
     storeQueue[store_idx].setRequest(request);
     unsigned size = request->_size;
     storeQueue[store_idx].size() = size;
+    if (storeQueue[store_idx].instruction()->isStoreAddress() &&
+        !storeQueue[store_idx].addressReady() &&
+        !storeQueue[store_idx].dataReady())
+        ++stats.splitStoreAddressFirst;
+    storeQueue[store_idx].addressReady() = true;
+    if (storeQueue[store_idx].instruction()->isStoreAddress()) {
+        panic_if(storeQueue[store_idx].dataReady() &&
+                 storeQueue[store_idx].dataBytes() != size,
+                 "STA/STD access sizes disagree");
+        return NoFault;
+    }
     bool store_no_data =
         request->mainReq()->getFlags() & Request::STORE_NO_DATA;
     storeQueue[store_idx].isAllZeros() = store_no_data;
@@ -2218,6 +2336,9 @@ LSQUnit::write(LSQRequest *request, uint8_t *data, ssize_t store_idx)
         !request->req()->isCacheMaintenance() &&
         !request->req()->isAtomic())
         memcpy(storeQueue[store_idx].data(), data, size);
+
+    storeQueue[store_idx].dataReady() = true;
+    storeQueue[store_idx].dataBytes() = size;
 
     // This function only writes the data to the store queue, so no fault
     // can happen here.
@@ -2284,6 +2405,9 @@ SQEntry::clear()
     LSQEntry::clear();
     _canWB = _completed = _committed = _storePrepareIssued =
         _storeRequestInFlight = _isAllZeros = false;
+    _dataInstruction = nullptr;
+    _addressReady = _dataReady = false;
+    _dataBytes = 0;
 }
 
 LSQUnit::LSQUnit(const LSQUnit &l) : stats(nullptr), customStats(&stats)

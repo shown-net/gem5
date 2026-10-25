@@ -309,6 +309,18 @@ LSQ::executeLoad(const DynInstPtr &inst)
     return thread[tid]->executeLoad(inst);
 }
 
+void
+LSQ::insertStoreData(const DynInstPtr &inst)
+{
+    thread[inst->threadNumber]->insertStoreData(inst);
+}
+
+Fault
+LSQ::writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+{
+    return thread[inst->threadNumber]->writeStoreData(inst, data, size);
+}
+
 Fault
 LSQ::executeStore(const DynInstPtr &inst)
 {

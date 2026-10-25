@@ -42,6 +42,7 @@
 #define __MEM_RUBY_SYSTEM_SEQUENCER_HH__
 
 #include <iostream>
+#include <deque>
 #include <list>
 #include <unordered_map>
 
@@ -326,6 +327,21 @@ class Sequencer : public RubyPort
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
     int m_store_prepare_outstanding;
+
+    // Pending real ST packets share the existing request-table budget. Only
+    // the head enters the protocol; its data callback releases the next head
+    // before the previous CPU response has returned.
+    bool m_ordered_stores;
+    unsigned m_ordered_store_width;
+    std::deque<PacketPtr> orderedStorePackets;
+    PacketPtr activeOrderedStore = nullptr;
+    bool orderedStore(const SequencerRequest &request) const;
+    void issueNextOrderedStore();
+    struct StoreOrderStats : public statistics::Group
+    {
+        StoreOrderStats(statistics::Group *parent);
+        statistics::Scalar admitted, issued, applied, coalesced, outstandingAtDump;
+    } storeOrderStats;
 
     // Bounded observer state, ordinary cacheable LD requests only. No events
     // are scheduled by this observer and no request identities are retained.

@@ -376,6 +376,7 @@ class Rename
      * and ROB, but are not yet included in their occupancy counts.
      */
     int instsInProgress[MaxThreads];
+    int robEntriesInProgress[MaxThreads];
 
     /** Count of Load instructions in progress that have been sent off to the
      * IQ and ROB, but are not yet included in their occupancy counts.
@@ -443,11 +444,13 @@ class Rename
 
     /** Rename width, in instructions. */
     unsigned renameWidth;
+    const bool robFrontendGroups;
 
     /** The index of the instruction in the time buffer to IEW that rename is
      * currently using.
      */
     unsigned toIEWIndex;
+    unsigned toIEWGroups = 0;
 
     /** Whether or not rename needs to block this cycle. */
     bool blockThisCycle;
@@ -478,6 +481,9 @@ class Rename
      * the stall.
      */
     void incrFullStat(const FullSource &source);
+    /** Diagnose actual destination demand at a failed group admission. */
+    void recordRegisterShortage(const DynInstPtr *members, unsigned count,
+                                ThreadID tid);
 
     struct RenameStats : public statistics::Group
     {
@@ -490,6 +496,9 @@ class Rename
         statistics::Vector status;
         /** Stat for total number of renamed instructions. */
         statistics::Scalar renamedInsts;
+        statistics::Scalar frontendGroups;
+        statistics::Scalar frontendStoreGroups;
+        statistics::Scalar frontendLoadAluGroups;
         /** Stat for total number of squashed instructions that rename
          * discards. */
         statistics::Scalar squashedInsts;
@@ -508,6 +517,7 @@ class Rename
         /** Stat for total number of times that rename runs out of free
          *  registers to use to rename. */
         statistics::Scalar fullRegistersEvents;
+        statistics::Vector fullRegistersByClass;
         /** Stat for total number of renamed destination registers. */
         statistics::Scalar renamedOperands;
         /** Stat for total number of source register rename lookups. */

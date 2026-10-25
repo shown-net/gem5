@@ -364,6 +364,43 @@ let {{
             blocks.decoder_output = macroop.getDefinition(env)
             macroop.declared = True
         blocks.decode_block = "return %s;\n" % macroop.getAllocator(env)
+        if Name in ("MOVBE_R_M", "MOVBE_R_P", "MOVBE_M_R", "MOVBE_P_R"):
+            wide = genMacroop(Name + "_64", env)
+            word = genMacroop(Name + "_16", env)
+            wide.decode_block = ("if (%s == 8) {\n" % env.dataSize +
+                                 wide.decode_block + "}\n")
+            word.decode_block = ("if (%s == 2) {\n" % env.dataSize +
+                                 word.decode_block + "}\n")
+            wide.append(word)
+            wide.append(blocks)
+            return wide
+        if Name in ("MULX_R_R", "MULX_R_M", "MULX_R_P"):
+            wide = genMacroop(Name + "_64", env)
+            wide.decode_block = ("if (machInst.mode.submode == "
+                                 "SixtyFourBitMode && machInst.rex.w) {\n" +
+                                 wide.decode_block + "}\n")
+            wide.append(blocks)
+            return wide
+        if Name == "ROR_R_I":
+            byte = genMacroop(Name + "_BYTE", env)
+            byte.decode_block = ("if (%s == 1) {\n" % env.dataSize +
+                                 byte.decode_block + "}\n")
+            byte.append(blocks)
+            return byte
+        if Name == "CALL_NEAR_R":
+            stack_target = genMacroop("CALL_NEAR_RSP", env)
+            stack_target.decode_block = (
+                "if (machInst.modRM.rm == 4 && !machInst.rex.b) {\n" +
+                stack_target.decode_block + "}\n")
+            stack_target.append(blocks)
+            return stack_target
+        if Name == "POP_R":
+            full = genMacroop(Name + "_FULL", env)
+            full.decode_block = (
+                "if (machInst.mode.submode == SixtyFourBitMode && "
+                "machInst.opSize != 2) {\n" + full.decode_block + "}\n")
+            full.append(blocks)
+            return full
         if Name in ("XOR_R_R", "SUB_R_R"):
             dependency = genMacroop(Name + "_ZERO", env)
             full_reg = ("((machInst.modRM.reg | (machInst.rex.r << 3)) == "

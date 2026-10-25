@@ -132,6 +132,53 @@ let {{
             super().__init__(idx, id, 'dest == 0', ctype)
 }};
 
+let {{
+    # Existing microcode uses logical CF|OF expressions. Lower those values
+    # to two ordinary CC operands before ISA operand discovery: the same
+    # StaticInst/DynInst executes and writes the individually renamed bits.
+    def split_cfof_code(code):
+        import re
+        pairs = {
+            'cfofBits': ('cfBit', 'ofBit'),
+            'PredcfofBits': ('PredcfBit', 'PredofBit'),
+            'ShiftcfofBits': ('ShiftcfBit', 'ShiftofBit'),
+            'ImmShiftcfofBits': ('ImmShiftcfBit', 'ImmShiftofBit'),
+            'RotImmCfofBits': ('RotImmCfBit', 'RotImmOfBit'),
+        }
+        def reads(text):
+            for name, (cf, of) in pairs.items():
+                text = re.sub(r'\b' + name + r'\s*&\s*CFBit\b',
+                              '(' + cf + ' & CFBit)', text)
+                text = re.sub(r'\b' + name + r'\s*&\s*OFBit\b',
+                              '(' + of + ' & OFBit)', text)
+                text = re.sub(r'\b' + name + r'\b',
+                              '(' + cf + ' | ' + of + ')', text)
+            return text
+        pattern = re.compile(r'\b(' + '|'.join(pairs) +
+            r')\s*(=(?!=)|\|=|&=|\^=)\s*([^;]+);')
+        def assignment(match):
+            name, op, rhs = match.groups()
+            cf, of = pairs[name]
+            rhs = reads(rhs)
+            if op != '=':
+                rhs = '(' + cf + ' | ' + of + ') ' + op[0] + ' (' + rhs + ')'
+            return ('{ const uint64_t cfofValue = ' + rhs + '; ' +
+                    cf + ' = cfofValue & CFBit; ' +
+                    of + ' = cfofValue & OFBit; }')
+        return reads(pattern.sub(assignment, code))
+
+    def X86InstObjParams(*args, **kwargs):
+        args = list(args)
+        if len(args) > 3:
+            snippets = args[3]
+            if isinstance(snippets, dict):
+                args[3] = {k: split_cfof_code(v) if isinstance(v, str) else v
+                           for k, v in snippets.items()}
+            elif isinstance(snippets, str):
+                args[3] = split_cfof_code(snippets)
+        return InstObjParams(*args, **kwargs)
+}};
+
 def operands {{
         'SrcReg1':       IntReg('src1', 1),
         'PSrcReg1':      PickedReg('src1', 1),
@@ -154,6 +201,11 @@ def operands {{
         'Divisor':       IntReg('X86ISA::int_reg::Divisor', 11),
         'DoubleBits':    IntReg('X86ISA::int_reg::Doublebits', 11),
         'ConditionValue': IntReg('X86ISA::intRegMicro(14)', 11),
+        'ArithmeticResult': IntReg('X86ISA::intRegMicro(2)', 12),
+        'CarryInput': IntReg('X86ISA::intRegMicro(3)', 13),
+        'ShiftState': IntReg('X86ISA::intRegMicro(3)', 13),
+        'BmiControl': IntReg('X86ISA::intRegMicro(3)', 13),
+        'DivisionSign': IntReg('X86ISA::intRegMicro(12)', 13),
         'Rax':           IntReg('X86ISA::int_reg::Rax', 12),
         'Rbx':           IntReg('X86ISA::int_reg::Rbx', 13),
         'Rcx':           IntReg('X86ISA::int_reg::Rcx', 14),
@@ -178,7 +230,8 @@ def operands {{
         # These registers hold the condition code portion of the flag
         # register. The nccFlagBits version holds the rest.
         'ccFlagBits':    CCReg('X86ISA::cc_reg::Zaps', 60),
-        'cfofBits':      CCReg('X86ISA::cc_reg::Cfof', 61),
+        'cfBit':        CCReg('X86ISA::cc_reg::Cf', 61),
+        'ofBit':        CCReg('X86ISA::cc_reg::Of', 65),
         'dfBit':         CCReg('X86ISA::cc_reg::Df', 62),
         'ecfBit':        CCReg('X86ISA::cc_reg::Ecf', 63),
         'ezfBit':        CCReg('X86ISA::cc_reg::Ezf', 64),
@@ -202,10 +255,33 @@ def operands {{
                 read_predicate='(ext & X86ISA::CcFlagMask) != '
                 'X86ISA::CcFlagMask && (ext & X86ISA::CcFlagMask) != 0',
                 write_predicate='(ext & X86ISA::CcFlagMask) != 0'),
-        'PredcfofBits':  CCRegPred('X86ISA::cc_reg::Cfof', 61,
-                read_predicate='(ext & X86ISA::CfofMask) '
-                '!= X86ISA::CfofMask && (ext & X86ISA::CfofMask) != 0',
-                write_predicate='(ext & X86ISA::CfofMask) != 0'),
+        'PredcfBit': CCRegPred('X86ISA::cc_reg::Cf', 61,
+                read_predicate='false',
+                write_predicate='(ext & X86ISA::CFBit) != 0'),
+        'PredofBit': CCRegPred('X86ISA::cc_reg::Of', 65,
+                read_predicate='false',
+                write_predicate='(ext & X86ISA::OFBit) != 0'),
+        # Shifts/rotates may preserve all CF/OF bits when count masks to zero.
+        'ShiftcfBit': CCRegPred('X86ISA::cc_reg::Cf', 61,
+                read_predicate='(ext & X86ISA::CFBit) != 0',
+                write_predicate='(ext & X86ISA::CFBit) != 0'),
+        'ShiftofBit': CCRegPred('X86ISA::cc_reg::Of', 65,
+                read_predicate='(ext & X86ISA::OFBit) != 0',
+                write_predicate='(ext & X86ISA::OFBit) != 0'),
+        'ImmShiftcfBit': CCRegPred('X86ISA::cc_reg::Cf', 61,
+                read_predicate='(ext & X86ISA::CFBit) != 0 && '
+                '(imm64 & (dataSize == 8 ? 63 : 31)) == 0',
+                write_predicate='(ext & X86ISA::CFBit) != 0'),
+        'ImmShiftofBit': CCRegPred('X86ISA::cc_reg::Of', 65,
+                read_predicate='(ext & X86ISA::OFBit) != 0 && '
+                '(imm64 & (dataSize == 8 ? 63 : 31)) == 0',
+                write_predicate='(ext & X86ISA::OFBit) != 0'),
+        'RotImmCfBit': CCRegPred('X86ISA::cc_reg::Cf', 61,
+                read_predicate='(imm64 & (dataSize == 8 ? 63 : 31)) == 0',
+                write_predicate='true'),
+        'RotImmOfBit': CCRegPred('X86ISA::cc_reg::Of', 65,
+                read_predicate='(imm64 & (dataSize == 8 ? 63 : 31)) == 0',
+                write_predicate='true'),
         'PreddfBit':     CCRegPred('X86ISA::cc_reg::Df', 62,
                 read_predicate='false',
                 write_predicate='(ext & X86ISA::DFBit) != 0'),

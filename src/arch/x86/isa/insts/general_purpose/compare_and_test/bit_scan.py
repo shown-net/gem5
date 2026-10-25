@@ -85,3 +85,18 @@ def macroop POPCNT_R_P {
     popcnt reg, t1, reg, flags=(OF,SF,ZF,PF,CF,AF)
 };
 """
+
+for name, operation in (("TZCNT", "tzcntvalue"), ("LZCNT", "lzcntvalue")):
+    microcode += f"""
+def macroop {name}_R_R {{
+    {operation} reg, regm, reg
+}};
+def macroop {name}_R_M {{
+    ld t1, seg, sib, disp
+    {operation} reg, t1, reg
+}};
+def macroop {name}_R_P {{
+    ldrip t1, seg, riprel, disp
+    {operation} reg, t1, reg
+}};
+"""

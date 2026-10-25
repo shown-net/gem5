@@ -261,15 +261,15 @@ def macroop IDIV_B_%(suffix)s
     sub t2, t0, ah, dataSize=1
     sub t2, t2, t4
 
-    %(readOp1)s
+    %(readSignedOp1)s
 
     #Find the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,), dataSize=1
+    idivsign %(signedOp1)s, dataSize=1
 
     # Negate divisor
-    sub t3, t0, %(op1)s, dataSize=1
+    sub t3, t0, %(signedOp1)s, dataSize=1
     # Put the divisor's absolute value into t3
-    mov t3, t3, %(op1)s, flags=(nCECF,), dataSize=1
+    mov t3, t3, %(signedOp1)s, flags=(nCECF,), dataSize=1
 
     #Find the sign of the dividend
     slli t0, ah, 1, flags=(ECF,), dataSize=1
@@ -293,7 +293,7 @@ divLoopTop:
     br label("divLoopTop"), flags=(nCEZF,)
 
     #Unload the answer
-    divq t5, dataSize=1
+    idivq t5, dataSize=1
     divr t6, dataSize=1
 
     # Fix up signs. The sign of the dividend is still lying around in ECF.
@@ -314,7 +314,7 @@ divLoopTop:
     mov t5, t5, t4, (CECF,), dataSize=1
 
     # Check the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,), dataSize=1
+    divisorsign
 
     # Negate the (possibly already negated) quotient
     sub t4, t0, t5, dataSize=1
@@ -338,15 +338,15 @@ def macroop IDIV_%(suffix)s
     sub t2, t0, rdx
     sub t2, t2, t4
 
-    %(readOp1)s
+    %(readSignedOp1)s
 
     #Find the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,)
+    idivsign %(signedOp1)s
 
     # Negate divisor
-    sub t3, t0, %(op1)s
+    sub t3, t0, %(signedOp1)s
     # Put the divisor's absolute value into t3
-    mov t3, t3, %(op1)s, flags=(nCECF,)
+    mov t3, t3, %(signedOp1)s, flags=(nCECF,)
 
     #Find the sign of the dividend
     slli t0, rdx, 1, flags=(ECF,)
@@ -372,7 +372,7 @@ divLoopTop:
     br label("divLoopTop"), flags=(nCEZF,)
 
     #Unload the answer
-    divq t5
+    idivq t5
     divr t6
 
     # Fix up signs. The sign of the dividend is still lying around in ECF.
@@ -393,7 +393,7 @@ divLoopTop:
     mov t5, t5, t4, (CECF,)
 
     # Check the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,)
+    divisorsign
 
     # Negate the (possibly already negated) quotient
     sub t4, t0, t5
@@ -404,9 +404,15 @@ divLoopTop:
 };
 """
 
-microcode += divcode % {"suffix": "R", "readOp1": "", "op1": "reg"}
-microcode += divcode % {"suffix": "M", "readOp1": sibRel % "t2", "op1": "t2"}
-microcode += divcode % {"suffix": "P", "readOp1": pcRel % "t2", "op1": "t2"}
+microcode += divcode % {"suffix": "R", "readOp1": "", "op1": "reg",
+                       "readSignedOp1": "", "signedOp1": "reg"}
+# Signed division keeps the absolute high dividend in t2. Memory divisor
+# reads must use a different register, and its original sign has a separate
+# functional snapshot before any dividend preparation overwrites inputs.
+microcode += divcode % {"suffix": "M", "readOp1": sibRel % "t2", "op1": "t2",
+                       "readSignedOp1": sibRel % "t7", "signedOp1": "t7"}
+microcode += divcode % {"suffix": "P", "readOp1": pcRel % "t2", "op1": "t2",
+                       "readSignedOp1": pcRel % "t7", "signedOp1": "t7"}
 
 microcode += """
 def macroop DIV_R_32 {
@@ -448,7 +454,7 @@ def macroop DIV_M_64 {
 };
 
 def macroop DIV_B_M_ALIGNED {
-    ld t1, seg, sib, disp
+    ld t1, seg, sib, disp, dataSize=1
     divprepare ah, t0, dataSize=1
     divquot32 t0, t1, dataSize=1
     divremainder dataSize=1
@@ -472,7 +478,7 @@ def macroop DIV_P_64 {
 };
 
 def macroop DIV_B_P_ALIGNED {
-    ldrip t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp, dataSize=1
     divprepare ah, t0, dataSize=1
     divquot32 t0, t1, dataSize=1
     divremainder dataSize=1
@@ -518,7 +524,7 @@ def macroop IDIV_M_64 {
 };
 
 def macroop IDIV_B_M_ALIGNED {
-    ld t1, seg, sib, disp
+    ld t1, seg, sib, disp, dataSize=1
     divprepare ah, t0, dataSize=1
     idivquot32 t0, t1, dataSize=1
     divremainder dataSize=1
@@ -542,7 +548,7 @@ def macroop IDIV_P_64 {
 };
 
 def macroop IDIV_B_P_ALIGNED {
-    ldrip t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp, dataSize=1
     divprepare ah, t0, dataSize=1
     idivquot32 t0, t1, dataSize=1
     divremainder dataSize=1

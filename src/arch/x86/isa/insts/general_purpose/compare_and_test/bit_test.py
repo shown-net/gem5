@@ -76,27 +76,17 @@ def macroop BTC_R_I {
 };
 
 def macroop BTC_M_I {
-    limm t1, imm, dataSize=asz
-    # This fudges just a tiny bit, but it's reasonable to expect the
-    # microcode generation logic to have the log of the various sizes
-    # floating around as well.
-    limm t4, 1
-    roli t4, t4, imm
     ldst t1, seg, sib, disp
-    sexti t0, t1, imm, flags=(CF,)
-    xor t1, t1, t4
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    btcvaluei t1, t1, imm
+    storedata t1
 };
 
 def macroop BTC_P_I {
-    rdip t7, dataSize=asz
-    limm t1, imm, dataSize=asz
-    limm t4, 1
-    roli t4, t4, imm
-    ldst t1, seg, riprel, disp
-    sexti t0, t1, imm, flags=(CF,)
-    xor t1, t1, t4
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    btcvaluei t1, t1, imm
+    storedata t1
 };
 
 def macroop BTC_LOCKED_M_I {
@@ -185,24 +175,17 @@ def macroop BTR_R_I {
 };
 
 def macroop BTR_M_I {
-    limm t1, imm, dataSize=asz
-    limm t4, "(uint64_t(-(2ULL)))"
-    roli t4, t4, imm
     ldst t1, seg, sib, disp
-    sexti t0, t1, imm, flags=(CF,)
-    and t1, t1, t4
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    btrvaluei t1, t1, imm
+    storedata t1
 };
 
 def macroop BTR_P_I {
-    rdip t7, dataSize=asz
-    limm t1, imm, dataSize=asz
-    limm t4, "(uint64_t(-(2ULL)))"
-    roli t4, t4, imm
-    ldst t1, seg, riprel, disp
-    sexti t0, t1, imm, flags=(CF,)
-    and t1, t1, t4
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    btrvaluei t1, t1, imm
+    storedata t1
 };
 
 def macroop BTR_LOCKED_M_I {
@@ -291,24 +274,17 @@ def macroop BTS_R_I {
 };
 
 def macroop BTS_M_I {
-    limm t1, imm, dataSize=asz
-    limm t4, 1
-    roli t4, t4, imm
     ldst t1, seg, sib, disp
-    sexti t0, t1, imm, flags=(CF,)
-    or t1, t1, t4
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    btsvaluei t1, t1, imm
+    storedata t1
 };
 
 def macroop BTS_P_I {
-    rdip t7, dataSize=asz
-    limm t1, imm, dataSize=asz
-    limm t4, 1
-    roli t4, t4, imm
-    ldst t1, seg, riprel, disp
-    sexti t0, t1, imm, flags=(CF,)
-    or t1, t1, t4
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    btsvaluei t1, t1, imm
+    storedata t1
 };
 
 def macroop BTS_LOCKED_M_I {

@@ -838,8 +838,14 @@
                     default: UD2();
                 }
                 0x3: BTC(Ev,Gv);
-                0x4: BSF(Gv,Ev);
-                0x5: BSR(Gv,Ev);
+                0x4: decode LEGACY_REP {
+                    0x1: TZCNT(Gv,Ev);
+                    default: BSF(Gv,Ev);
+                }
+                0x5: decode LEGACY_REP {
+                    0x1: LZCNT(Gv,Ev);
+                    default: BSR(Gv,Ev);
+                }
                 //The size of the second operand in these instructions
                 //should really be "b" or "w", but it's set to v in order
                 //to have a consistent register size. This shouldn't

@@ -42,6 +42,7 @@
 #define __CPU_O3_ROB_HH__
 
 #include <string>
+#include <deque>
 #include <utility>
 #include <vector>
 
@@ -62,6 +63,7 @@ namespace o3
 {
 
 class CPU;
+struct FrontendInstGroup;
 
 struct DerivO3CPUParams;
 
@@ -114,7 +116,8 @@ class ROB
      *  ROB for the new instruction.
      *  @param inst The instruction being inserted into the ROB.
      */
-    void insertInst(const DynInstPtr &inst);
+    /** Admit all real members and allocate their actual ROB resource entries. */
+    void insertGroup(const FrontendInstGroup &group);
 
     /** Returns pointer to the head instruction within the ROB.  There is
      *  no guarantee as to the return value if the ROB is empty.
@@ -180,15 +183,15 @@ class ROB
 
     /** Returns the number of entries being used by a specific thread. */
     unsigned getThreadEntries(ThreadID tid)
-    { return threadEntries[tid]; }
+    { return entries[tid].size(); }
 
     /** Returns if the ROB is full. */
     bool isFull()
-    { return numInstsInROB == numEntries; }
+    { return entriesInUse == numEntries; }
 
     /** Returns if a specific thread's partition is full. */
     bool isFull(ThreadID tid)
-    { return threadEntries[tid] == numEntries; }
+    { return entries[tid].size() == maxEntries[tid]; }
 
     /** Returns if the ROB is empty. */
     bool isEmpty() const
@@ -269,6 +272,8 @@ class ROB
   private:
     /** Reset the ROB state */
     void resetState();
+    /** Insert one actual member into the precise program-order traversal. */
+    void insertInst(const DynInstPtr &inst);
 
     /** Pointer to the CPU. */
     CPU *cpu;
@@ -278,6 +283,18 @@ class ROB
 
     /** Number of instructions in the ROB. */
     unsigned numEntries;
+    const bool robFrontendGroups;
+    unsigned entriesInUse = 0;
+
+    /** The resource entry owns its actual remaining retirement members.
+     * The existing instList provides individual program-order traversal for
+     * precise faults and squash; it does not allocate another timing object.
+     */
+    struct Entry
+    {
+        std::deque<DynInstPtr> members;
+    };
+    std::deque<Entry> entries[MaxThreads];
 
     /** Entries Per Thread */
     unsigned threadEntries[MaxThreads];
@@ -340,6 +357,13 @@ class ROB
         statistics::Scalar reads;
         // The number of rob_writes
         statistics::Scalar writes;
+        statistics::Scalar entriesAllocated;
+        statistics::Scalar entriesReleased;
+        statistics::Scalar groupedEntries;
+        statistics::Scalar occupiedEntries;
+        statistics::Scalar residentDynInsts;
+        statistics::Scalar maxOccupiedEntries;
+        statistics::Scalar maxResidentDynInsts;
     } stats;
 };
 

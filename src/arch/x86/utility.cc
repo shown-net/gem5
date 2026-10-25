@@ -59,14 +59,15 @@ getRFlags(ThreadContext *tc)
 {
     const uint64_t ncc_flags(tc->readMiscRegNoEffect(misc_reg::Rflags));
     const uint64_t cc_flags(tc->getReg(X86ISA::cc_reg::Zaps));
-    const uint64_t cfof_bits(tc->getReg(X86ISA::cc_reg::Cfof));
+    const uint64_t cf_bit(tc->getReg(X86ISA::cc_reg::Cf));
+    const uint64_t of_bit(tc->getReg(X86ISA::cc_reg::Of));
     const uint64_t df_bit(tc->getReg(X86ISA::cc_reg::Df));
     // ecf (PSEUDO(3)) & ezf (PSEUDO(4)) are only visible to
     // microcode, so we can safely ignore them.
 
     // Reconstruct the real rflags state, mask out internal flags, and
     // make sure reserved bits have the expected values.
-    return ((ncc_flags | cc_flags | cfof_bits | df_bit) & 0x3F7FD5)
+    return ((ncc_flags | cc_flags | cf_bit | of_bit | df_bit) & 0x3F7FD5)
         | 0x2;
 }
 
@@ -74,7 +75,8 @@ void
 setRFlags(ThreadContext *tc, uint64_t val)
 {
     tc->setReg(X86ISA::cc_reg::Zaps, val & CcFlagMask);
-    tc->setReg(X86ISA::cc_reg::Cfof, val & CfofMask);
+    tc->setReg(X86ISA::cc_reg::Cf, val & CFBit);
+    tc->setReg(X86ISA::cc_reg::Of, val & OFBit);
     tc->setReg(X86ISA::cc_reg::Df, val & DFBit);
 
     // Internal microcode registers (ECF & EZF)

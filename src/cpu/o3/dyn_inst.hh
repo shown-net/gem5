@@ -334,6 +334,16 @@ class DynInst : public ExecContext, public RefCounted
     bool fetchedFromUser = false;
     /** Page-table root at fetch, excluding x86 CR3 control/PCID bits. */
     uint64_t fetchedAddressSpaceId = 0;
+    /** Actual frontend transfer group; execution and retirement stay per uop. */
+    InstSeqNum frontendGroupHead = 0;
+    enum class FrontendGroupKind { Single, Store, LoadAlu };
+    FrontendGroupKind frontendGroupKind = FrontendGroupKind::Single;
+    unsigned frontendGroupSize = 1;
+    unsigned frontendGroupIndex = 0;
+    /** Logical store whose data must arrive before this load can replay. */
+    InstSeqNum waitStoreDataSeqNum = 0;
+    /** Partial forwarding must wait for this store's cache publication. */
+    InstSeqNum waitStoreWritebackSeqNum = 0;
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -420,6 +430,10 @@ class DynInst : public ExecContext, public RefCounted
             const std::vector<bool> &byte_enable) override;
 
     Fault initiateMemMgmtCmd(Request::Flags flags) override;
+
+    Fault initiateStoreAddress(Addr addr, unsigned size,
+                               Request::Flags flags) override;
+    Fault writeStoreData(uint8_t *data, unsigned size) override;
 
     Fault writeMem(uint8_t *data, unsigned size, Addr addr,
                    Request::Flags flags, uint64_t *res,
@@ -584,8 +598,15 @@ class DynInst : public ExecContext, public RefCounted
     bool isNop()          const { return staticInst->isNop(); }
     bool isZeroIdiom()    const { return staticInst->isZeroIdiom(); }
     bool isMemRef()       const { return staticInst->isMemRef(); }
+    bool hasMemoryRequest() const
+    {
+        return staticInst->isLoad() || staticInst->isStore() ||
+               staticInst->isAtomic();
+    }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
+    bool isStoreAddress() const { return staticInst->isStoreAddress(); }
+    bool isStoreData()    const { return staticInst->isStoreData(); }
     bool isAtomic()       const { return staticInst->isAtomic(); }
     bool isStoreConditional() const
     { return staticInst->isStoreConditional(); }

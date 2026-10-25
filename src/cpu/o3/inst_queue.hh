@@ -83,6 +83,7 @@ namespace o3
 class FUPool;
 class CPU;
 class IEW;
+struct FrontendInstGroup;
 
 class IQUnit : public SimObject
 {
@@ -270,6 +271,8 @@ class InstructionQueue
      * instruction type (OpClass)
      */
     bool isFull(const DynInstPtr &inst);
+    /** Reserve-capacity check using the same IQ routing as real insertion. */
+    bool canInsertGroup(const FrontendInstGroup &group);
 
     /** Returns a vector of FU pools */
     std::vector<FUPool *> allFUPools();
@@ -354,6 +357,8 @@ class InstructionQueue
 
     /** Replays a memory instruction. It must be rescheduled first. */
     void replayMemInst(const DynInstPtr &replay_inst);
+    void replayStoreData(const DynInstPtr &store_inst);
+    void replayStoreWriteback(const DynInstPtr &store_inst);
 
     /**
      * Defers a memory instruction when its DTB translation incurs a hw

@@ -37,171 +37,154 @@ microcode = """
 def macroop JZ_I
 {
     # Make the defualt data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CZF,)
+    relbranch imm, flags=(CZF,)
 };
 
 def macroop JNZ_I
 {
     # Make the defualt data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCZF,)
+    relbranch imm, flags=(nCZF,)
 };
 
 def macroop JB_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CCF,)
+    relbranch imm, flags=(CCF,)
 };
 
 def macroop JNB_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCCF,)
+    relbranch imm, flags=(nCCF,)
 };
 
 def macroop JBE_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CCvZF,)
+    relbranch imm, flags=(CCvZF,)
 };
 
 def macroop JNBE_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCCvZF,)
+    relbranch imm, flags=(nCCvZF,)
 };
 
 def macroop JS_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CSF,)
+    relbranch imm, flags=(CSF,)
 };
 
 def macroop JNS_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCSF,)
+    relbranch imm, flags=(nCSF,)
 };
 
 def macroop JP_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CPF,)
+    relbranch imm, flags=(CPF,)
 };
 
 def macroop JNP_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCPF,)
+    relbranch imm, flags=(nCPF,)
 };
 
 def macroop JL_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CSxOF,)
+    relbranch imm, flags=(CSxOF,)
 };
 
 def macroop JNL_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCSxOF,)
+    relbranch imm, flags=(nCSxOF,)
 };
 
 def macroop JLE_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(CSxOvZF,)
+    relbranch imm, flags=(CSxOvZF,)
 };
 
 def macroop JNLE_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCSxOvZF,)
+    relbranch imm, flags=(nCSxOvZF,)
 };
 
 def macroop JO_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(COF,)
+    relbranch imm, flags=(COF,)
 };
 
 def macroop JNO_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    wripi t1, imm, flags=(nCOF,)
+    relbranch imm, flags=(nCOF,)
 };
 
 def macroop JRCXZ_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
     add t0, t0, rcx, flags=(EZF,), dataSize=asz
-    wripi t1, imm, flags=(CEZF,)
+    relbranch imm, flags=(CEZF,)
 };
 """

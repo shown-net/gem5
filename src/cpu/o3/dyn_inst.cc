@@ -463,6 +463,20 @@ DynInst::writeMem(uint8_t *data, unsigned size, Addr addr,
 }
 
 Fault
+DynInst::initiateStoreAddress(Addr addr, unsigned size,
+                             Request::Flags flags)
+{
+    return writeMem(nullptr, size, addr, flags, nullptr,
+                    std::vector<bool>(size, true));
+}
+
+Fault
+DynInst::writeStoreData(uint8_t *data, unsigned size)
+{
+    return cpu->writeStoreData(this, data, size);
+}
+
+Fault
 DynInst::initiateMemAMO(Addr addr, unsigned size, Request::Flags flags,
                               AtomicOpFunctorPtr amo_op)
 {
