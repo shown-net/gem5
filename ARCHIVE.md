@@ -94,3 +94,13 @@ The checked-out source is the former calibration-v26 tree. Use the index below t
 | `remote-live/origin/calibration` | `2ca9e9404479c55aadb3545ac706cfc5b6ec1932` | `2ca9e9404479c55aadb3545ac706cfc5b6ec1932` |
 | `remote-live/origin/calibration-v26` | `cefea43af27383e5b9704081bd83298a2675fd6e` | `cefea43af27383e5b9704081bd83298a2675fd6e` |
 | `remote-live/origin/tao` | `9ab668a6890ad0cc7244080de60ba83771256463` | `9ab668a6890ad0cc7244080de60ba83771256463` |
+
+## Source-only initialization superseded by official v25 ancestry
+
+These references were deployed before restoring the official v25 parent.
+
+| Previous reference | Commit |
+| --- | --- |
+| `pre-v25-ancestry/fastsim-v25` | `2f6bec5331b6399f2dbdcc280908661e836104ee` |
+| `pre-v25-ancestry/calibration-v25` | `842c7427bb3066fe90a4f30af0fb0f83139986f6` |
+| `pre-v25-ancestry/calibration-dev` | `6e7d34bd4537888efa982a6a8fba7332141c805c` |
