@@ -343,6 +343,10 @@ class DynInst : public ExecContext, public RefCounted
     InstSeqNum waitStoreDataSeqNum = 0;
     /** Partial forwarding must wait for this store's cache publication. */
     InstSeqNum waitStoreWritebackSeqNum = 0;
+    /** User-mode state at fetch, before the instruction can change it. */
+    bool fetchedFromUser = false;
+    /** Page-table root at fetch, excluding x86 CR3 control/PCID bits. */
+    uint64_t fetchedAddressSpaceId = 0;
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -350,6 +354,14 @@ class DynInst : public ExecContext, public RefCounted
     ////////////////////// Branch Data ///////////////
     /** Predicted PC state after this instruction. */
     std::unique_ptr<PCStateBase> predPC;
+
+    // Immutable observations of the original fetch prediction. Decode may
+    // subsequently repair predPC. None of these fields drive the pipeline.
+    std::unique_ptr<PCStateBase> originalBranchPredPC;
+    bool branchDirectionPredictionValid = false;
+    bool originalBranchDirectionPrediction = false;
+    bool branchBtbHit = false;
+    bool branchCommitSquash = false;
 
     /** The Macroop if one exists */
     const StaticInstPtr macroop;

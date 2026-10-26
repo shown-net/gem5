@@ -763,7 +763,7 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 bool
 BAC::updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
                      const StaticInstPtr &inst, PCStateBase &pc,
-                     const FetchTargetPtr &ft)
+                     const FetchTargetPtr &ft, const DynInstPtr &dyn_inst)
 {
     assert(ft != nullptr);
     // The PC must be in the range of the fetch target.
@@ -897,6 +897,9 @@ BAC::updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
     }
 
     DPRINTF(BAC, "%s done. next PC:%s\n", __func__, pc);
+    dyn_inst->branchDirectionPredictionValid = hist->condPredValid;
+    dyn_inst->originalBranchDirectionPrediction = hist->condPred;
+    dyn_inst->branchBtbHit = hist->btbHit;
     return hist->predTaken;
 }
 
@@ -918,12 +921,18 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
             // while creating the fetch target. Now update the prediction
             // with the information from the predecoding.
             predict_taken = updatePreDecode(tid, inst->seqNum,
-                                            inst->staticInst, fetch_pc, ft);
+                                            inst->staticInst, fetch_pc, ft,
+                                            inst);
         } else {
             // With a coupled front-end we need to make the branch prediction
             // here.
-            predict_taken =
-                bpu->predict(inst->staticInst, inst->seqNum, fetch_pc, tid);
+            BPredUnit::PredictorHistory *hist = nullptr;
+            predict_taken = bpu->predict(inst->staticInst, inst->seqNum,
+                                        fetch_pc, tid, hist);
+            bpu->insertPredictorHistory(tid, hist);
+            inst->branchDirectionPredictionValid = hist->condPredValid;
+            inst->originalBranchDirectionPrediction = hist->condPred;
+            inst->branchBtbHit = hist->btbHit;
         }
 
         DPRINTF(BAC,
@@ -933,6 +942,7 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                 predict_taken ? "taken" : "not taken", fetch_pc);
         inst->setPredTarg(fetch_pc);
         inst->setPredTaken(predict_taken);
+        set(inst->originalBranchPredPC, fetch_pc);
 
         ++stats.branches;
 

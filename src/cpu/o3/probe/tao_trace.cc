@@ -11,6 +11,7 @@
  *   <name>.diag.jsonl     诊断（tick）
  */
 #include "cpu/o3/probe/tao_trace.hh"
+#include "cpu/o3/probe/calibration_marker.hh"
 #include "cpu/o3/probe/fst_dependencies.hh"
 #include "cpu/o3/probe/fst_memory_requests.hh"
 #include "cpu/o3/probe/fst_retirement.hh"
@@ -710,6 +711,10 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       output_dir_(params.output_dir),
       uarch_profile_path_(params.uarch_profile_path)
 {
+    if (params.marker_pc) {
+        calibration_marker_ = std::make_unique<CalibrationMarker>(*this, params);
+        return;
+    }
     live_instances_ += 1;
     wrong_path_core_id_ = parseFstCoreIdFromName(name());
     if (functional_user_only_ && functional_include_kernel_) {
@@ -770,6 +775,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
 
 TaoTrace::~TaoTrace()
 {
+    if (calibration_marker_) return;
     for (auto it = wrong_path_instances_.begin();
          it != wrong_path_instances_.end();) {
         if (it->second == this) {
@@ -1066,7 +1072,7 @@ TaoTrace::openOutput()
 // emit 必须查询该 core 自己的 depth，避免先结束的 core 把 join/futex 尾部
 // 混入仍在执行的其他 core 的 ROI。
 void
-TaoTrace::traceSourceRoiCheckpoint(gem5::ThreadContext *tc)
+TaoTrace::traceFstSourceRoiCheckpoint(gem5::ThreadContext *tc)
 {
     if (!tc || !tc->getSystemPtr()) return;
     X86ISA::Efer efer =
@@ -1347,6 +1353,10 @@ TaoTrace::getL1iMshr(uint32_t cid)
 void
 TaoTrace::regProbeListeners()
 {
+    if (calibration_marker_) {
+        calibration_marker_->regProbeListeners();
+        return;
+    }
     // 在第一个 callback 触发之前装载 uarch_profile.json：保证后续 LRU/TLB/walker
     // 视图均按 schema v2 配置。
     ensureUarchLoaded(output_dir_, uarch_profile_path_);
@@ -8004,3 +8014,32 @@ TaoTrace::onCommit(const DynInstPtr &inst)
 
 } // namespace o3
 } // namespace gem5
+
+namespace gem5 { namespace o3 {
+void TaoTrace::startMarkerCapture(const std::string &directory)
+{
+    fatal_if(!calibration_marker_, "Marker capture requires marker_pc");
+    calibration_marker_->startMarkerCapture(directory);
+}
+void TaoTrace::selectMarkerWindow(uint64_t begin, uint64_t end)
+{
+    fatal_if(!calibration_marker_, "Marker window requires marker_pc");
+    calibration_marker_->selectMarkerWindow(begin, end);
+}
+void TaoTrace::resumeMarkerHandoff()
+{
+    fatal_if(!calibration_marker_, "Marker handoff requires marker_pc");
+    calibration_marker_->resumeMarkerHandoff();
+}
+void TaoTrace::traceMarkerHandoff(gem5::ThreadContext *tc)
+{
+    CalibrationMarker::traceMarkerHandoff(tc);
+}
+void TaoTrace::traceSourceRoiCheckpoint(gem5::ThreadContext *tc)
+{
+    if (CalibrationMarker::hasInstances())
+        CalibrationMarker::traceSourceRoiCheckpoint(tc);
+    else
+        traceFstSourceRoiCheckpoint(tc);
+}
+} }

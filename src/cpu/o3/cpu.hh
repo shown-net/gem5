@@ -52,6 +52,8 @@
 
 #include "arch/generic/pcstate.hh"
 #include "base/statistics.hh"
+#include "cpu/o3/task_uop_stats.hh"
+#include "cpu/o3/task_stats.hh"
 #include "cpu/activity.hh"
 #include "cpu/base.hh"
 #include "cpu/o3/bac.hh"
@@ -101,6 +103,8 @@ class CPU : public BaseCPU
         instructionTimings{};
     const InstructionTiming *timingEntry(InstructionForm form) const
     { return instructionTimings[unsigned(form)]; }
+    CustomUopStats customStats;
+    TaskStatsObserver taskStats;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -179,7 +183,6 @@ class CPU : public BaseCPU
   public:
     /** Constructs a CPU with the given parameters. */
     CPU(const BaseO3CPUParams &params);
-
     ProbePointArg<PacketPtr> *ppInstAccessComplete;
     ProbePointArg<std::pair<DynInstPtr, PacketPtr> > *ppDataAccessComplete;
 
@@ -613,6 +616,8 @@ class CPU : public BaseCPU
     {
         return iew.ldstQueue.getDataPort();
     }
+
+    void preDumpStats() override;
 
     struct CPUStats : public statistics::Group
     {

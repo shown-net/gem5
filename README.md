@@ -43,6 +43,8 @@ Development uses the CPU repository's `compile_gem5.sh`, producing
 supports checking a staged development tree before deployment. The existing
 CPU Marker API selects the independent calibration module when `marker_pc`
 is nonzero; the FastSim producer remains the default path when it is zero.
+The development build uses C++20 to match the canonical protobuf/Abseil
+installation; the pure producer and deployment builds retain v25's C++17.
 
 The reconstruction is checked by compilation, native parameter smoke checks,
 reference reachability and source/interface inspection. Those checks do not

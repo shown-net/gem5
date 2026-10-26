@@ -16,7 +16,15 @@ class TaoTrace(ProbeListenerObject):
     cxx_class = "gem5::o3::TaoTrace"
     cxx_header = "cpu/o3/probe/tao_trace.hh"
 
-    cxx_exports = [PyBindMethod("startFunctionalMeasurement")]
+    cxx_exports = [PyBindMethod("startFunctionalMeasurement"),
+                   PyBindMethod("startMarkerCapture"),
+                   PyBindMethod("selectMarkerWindow"),
+                   PyBindMethod("resumeMarkerHandoff")]
+
+    marker_pc = Param.Addr(0, "CPU calibration Marker PC; zero selects FastSim producer")
+    marker_pc_trace_file = Param.String("", "Committed PC protobuf stream")
+    branch_observation = Param.Bool(False, "Observe retired conditional branches")
+    marker_branch_trace_file = Param.String("", "Committed branch protobuf stream")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "

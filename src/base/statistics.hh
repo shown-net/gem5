@@ -120,9 +120,15 @@ class ScalarInfoProxy : public InfoProxy<Stat, ScalarInfo>
   public:
     ScalarInfoProxy(Stat &stat) : InfoProxy<Stat, ScalarInfo>(stat) {}
 
-    Counter value() const { return this->s.value(); }
-    Result result() const { return this->s.result(); }
-    Result total() const { return this->s.total(); }
+    Counter rawValue() const override { return this->s.value(); }
+    Counter value() const override
+    { return this->taskValue ? *this->taskValue : rawValue(); }
+    Result result() const override
+    { return this->taskValue ? *this->taskValue : this->s.result(); }
+    Result total() const override
+    { return this->taskValue ? *this->taskValue : this->s.total(); }
+    bool zero() const override
+    { return this->taskValue ? *this->taskValue == 0 : this->s.zero(); }
 };
 
 template <class Stat>
@@ -140,6 +146,13 @@ class VectorInfoProxy : public InfoProxy<Stat, VectorInfo>
     VCounter &
     value() const
     {
+        if (this->taskValues) cvec = *this->taskValues;
+        else this->s.value(cvec);
+        return cvec;
+    }
+
+    const VCounter &rawValue() const override
+    {
         this->s.value(cvec);
         return cvec;
     }
@@ -147,11 +160,25 @@ class VectorInfoProxy : public InfoProxy<Stat, VectorInfo>
     const VResult &
     result() const
     {
-        this->s.result(rvec);
+        if (this->taskValues)
+            rvec.assign(this->taskValues->begin(), this->taskValues->end());
+        else this->s.result(rvec);
         return rvec;
     }
 
-    Result total() const { return this->s.total(); }
+    Result total() const
+    {
+        if (!this->taskValues) return this->s.total();
+        Result sum = 0;
+        for (auto v : *this->taskValues) sum += v;
+        return sum;
+    }
+    bool zero() const override
+    {
+        if (!this->taskValues) return this->s.zero();
+        for (auto v : *this->taskValues) if (v != 0) return false;
+        return true;
+    }
 };
 
 template <class Stat>

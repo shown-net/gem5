@@ -866,6 +866,8 @@ Commit::commit()
                      toIEW->commitInfo[tid].branchTaken = true;
                 }
                 ++stats.branchMispredicts;
+                toIEW->commitInfo[tid].mispredictInst->branchCommitSquash =
+                    true;
             }
 
             set(toIEW->commitInfo[tid].pc, fromIEW->pc[tid]);
@@ -1123,6 +1125,7 @@ Commit::commitInsts()
                 if (!interrupt && avoidQuiesceLiveLock &&
                     onInstBoundary && cpu->checkInterrupts(0))
                     squashAfter(tid, head_inst);
+
             } else {
                 DPRINTF(Commit, "Unable to commit head instruction PC:%s "
                         "[tid:%i] [sn:%llu].\n",
@@ -1407,6 +1410,8 @@ Commit::updateComInstStats(const DynInstPtr &inst)
     }
 
     cpu->commitStats[tid]->numOps++;
+    cpu->customStats.retired(
+        !inst->isMicroop() || inst->isLastMicroop());
     if (in_user_mode) {
         cpu->commitStats[tid]->numUserOps++;
     }

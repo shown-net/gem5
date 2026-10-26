@@ -1079,6 +1079,8 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
+            cpu->customStats.scheduled(
+                idx == FUPool::NoNeedFU, idx == FUPool::NoCapableFU);
             ++total_issued;
 
             if (issuing_inst->firstIssue == -1)
