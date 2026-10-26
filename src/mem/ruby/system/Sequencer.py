@@ -1,4 +1,4 @@
-# Copyright (c) 2020 ARM Limited
+# Copyright (c) 2020,2026 Arm Limited
 # All rights reserved.
 #
 # The license below extends only to copyright in the software and shall
@@ -71,6 +71,10 @@ class RubyPort(ClockedObject):
 
     pio_response_port = ResponsePort("Ruby pio response port")
 
+    response_latency = Param.Cycles(
+        0, "Latency for enqueueing response pkts to peer"
+    )
+
     using_ruby_tester = Param.Bool(False, "")
     no_retry_on_stall = Param.Bool(False, "")
     ruby_system = Param.RubySystem("Parent RubySystem object")
@@ -105,6 +109,12 @@ class RubySequencer(RubyPort):
     # id used by protocols that support multiple sequencers per controller
     # 99 is the dummy default value
     coreid = Param.Int(99, "CorePair core id")
+    ordered_stores = Param.Bool(
+        False, "Apply ordinary stores in admission order before issuing the next store"
+    )
+    ordered_store_width = Param.Unsigned(
+        2, "Maximum consecutive same-line stores applied by one ordered callback"
+    )
 
     def connectCpuPorts(self, cpu):
         """

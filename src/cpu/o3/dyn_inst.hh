@@ -42,26 +42,22 @@
 #ifndef __CPU_O3_DYN_INST_HH__
 #define __CPU_O3_DYN_INST_HH__
 
-#include <algorithm>
-#include <array>
-#include <deque>
+#include <cstdint>
 #include <list>
+#include <queue>
 #include <string>
 
 #include "base/refcnt.hh"
 #include "base/trace.hh"
-#include "cpu/checker/cpu.hh"
+#include "cpu/base.hh"
 #include "cpu/exec_context.hh"
-#include "cpu/exetrace.hh"
 #include "cpu/inst_res.hh"
 #include "cpu/inst_seq.hh"
-#include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/lsq_unit.hh"
 #include "cpu/op_class.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst.hh"
-#include "cpu/translation.hh"
 #include "debug/HtmCpu.hh"
 
 namespace gem5
@@ -69,9 +65,21 @@ namespace gem5
 
 class Packet;
 
+namespace trace
+{
+class InstRecord;
+}
+
 namespace o3
 {
 
+class CPU;
+class IQUnit;
+class LSQUnit;
+class LSQRequest;
+class ThreadState;
+class LSQEntry;
+class SQEntry;
 class InstructionTiming;
 
 class DynInst : public ExecContext, public RefCounted
@@ -132,7 +140,7 @@ class DynInst : public ExecContext, public RefCounted
     /** Pointer to the Impl's CPU object. */
     CPU *cpu = nullptr;
 
-    BaseCPU *getCpuPtr() { return cpu; }
+    BaseCPU *getCpuPtr();
 
     /** Pointer to the thread state. */
     ThreadState *thread = nullptr;
@@ -179,7 +187,6 @@ class DynInst : public ExecContext, public RefCounted
         NotAnInst,
         TranslationStarted,
         TranslationCompleted,
-        DataTlbMissObserved,
         PossibleLoadViolation,
         HitExternalSnoop,
         EffAddrValid,
@@ -327,6 +334,16 @@ class DynInst : public ExecContext, public RefCounted
     bool fetchedFromUser = false;
     /** Page-table root at fetch, excluding x86 CR3 control/PCID bits. */
     uint64_t fetchedAddressSpaceId = 0;
+    /** Actual frontend transfer group; execution and retirement stay per uop. */
+    InstSeqNum frontendGroupHead = 0;
+    enum class FrontendGroupKind { Single, Store, LoadAlu };
+    FrontendGroupKind frontendGroupKind = FrontendGroupKind::Single;
+    unsigned frontendGroupSize = 1;
+    unsigned frontendGroupIndex = 0;
+    /** Logical store whose data must arrive before this load can replay. */
+    InstSeqNum waitStoreDataSeqNum = 0;
+    /** Partial forwarding must wait for this store's cache publication. */
+    InstSeqNum waitStoreWritebackSeqNum = 0;
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -358,7 +375,7 @@ class DynInst : public ExecContext, public RefCounted
     Addr physEffAddr = 0;
 
     /** The memory request flags (from translation). */
-    unsigned memReqFlags = 0;
+    Request::Flags memReqFlags = 0;
 
     /** The size of the request */
     unsigned effSize;
@@ -368,19 +385,18 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Load queue index. */
     ssize_t lqIdx = -1;
-    typename LSQUnit::LQIterator lqIt;
+    LQIterator lqIt;
 
     /** Store queue index. */
     ssize_t sqIdx = -1;
-    typename LSQUnit::SQIterator sqIt;
-
+    SQIterator sqIt;
 
     /////////////////////// TLB Miss //////////////////////
     /**
      * Saved memory request (needed when the DTB address translation is
      * delayed due to a hw page table walk).
      */
-    LSQ::LSQRequest *savedRequest;
+    LSQRequest *savedRequest = nullptr;
 
     /////////////////////// Checker //////////////////////
     // Need a copy of main request pointer to verify on writes.
@@ -408,16 +424,16 @@ class DynInst : public ExecContext, public RefCounted
     //
     ////////////////////////////////////////////
 
-    void
-    demapPage(Addr vaddr, uint64_t asn) override
-    {
-        cpu->demapPage(vaddr, asn);
-    }
+    void demapPage(Addr vaddr, uint64_t asn) override;
 
     Fault initiateMemRead(Addr addr, unsigned size, Request::Flags flags,
             const std::vector<bool> &byte_enable) override;
 
     Fault initiateMemMgmtCmd(Request::Flags flags) override;
+
+    Fault initiateStoreAddress(Addr addr, unsigned size,
+                               Request::Flags flags) override;
+    Fault writeStoreData(uint8_t *data, unsigned size) override;
 
     Fault writeMem(uint8_t *data, unsigned size, Addr addr,
                    Request::Flags flags, uint64_t *res,
@@ -437,15 +453,6 @@ class DynInst : public ExecContext, public RefCounted
         return instFlags[TranslationCompleted];
     }
     void translationCompleted(bool f) { instFlags[TranslationCompleted] = f; }
-
-    /** True when at least one data-translation fragment required a hardware
-     * page-table walk. Unlike isTranslationDelayed(), this sticky retirement
-     * fact remains available after translation completes. */
-    bool dataTlbMissObserved() const
-    {
-        return instFlags[DataTlbMissObserved];
-    }
-    void dataTlbMissObserved(bool f) { instFlags[DataTlbMissObserved] = f; }
 
     /** True if this address was found to match a previous load and they issued
      * out of order. If that happend, then it's only a problem if an incoming
@@ -515,16 +522,16 @@ class DynInst : public ExecContext, public RefCounted
     void dump(std::string &outstring);
 
     /** Read this CPU's ID. */
-    int cpuId() const { return cpu->cpuId(); }
+    int cpuId() const;
 
     /** Read this CPU's Socket ID. */
-    uint32_t socketId() const { return cpu->socketId(); }
+    uint32_t socketId() const;
 
     /** Read this CPU's data requestor ID */
-    RequestorID requestorId() const { return cpu->dataRequestorId(); }
+    RequestorID requestorId() const;
 
     /** Read this context's system-wide ID **/
-    ContextID contextId() const { return thread->contextId(); }
+    ContextID contextId() const;
 
     /** Returns the fault type. */
     Fault getFault() const { return fault; }
@@ -591,8 +598,15 @@ class DynInst : public ExecContext, public RefCounted
     bool isNop()          const { return staticInst->isNop(); }
     bool isZeroIdiom()    const { return staticInst->isZeroIdiom(); }
     bool isMemRef()       const { return staticInst->isMemRef(); }
+    bool hasMemoryRequest() const
+    {
+        return staticInst->isLoad() || staticInst->isStore() ||
+               staticInst->isAtomic();
+    }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
+    bool isStoreAddress() const { return staticInst->isStoreAddress(); }
+    bool isStoreData()    const { return staticInst->isStoreData(); }
     bool isAtomic()       const { return staticInst->isAtomic(); }
     bool isStoreConditional() const
     { return staticInst->isStoreConditional(); }
@@ -845,23 +859,10 @@ class DynInst : public ExecContext, public RefCounted
     //Instruction Queue Entry
     //-----------------------
     /** Sets this instruction as a entry the IQ. */
-    void
-    setInIQ(IQUnit *_iq)
-    {
-        assert(!iq);
-        status.set(IqEntry);
-        iq = _iq;
-    }
+    void setInIQ(IQUnit *_iq);
 
     /** Clears this instruction as a entry the IQ. */
-    void
-    clearInIQ()
-    {
-        assert(iq);
-        status.reset(IqEntry);
-        iq->remove(this);
-        iq = nullptr;
-    }
+    void clearInIQ();
 
     /** Returns whether or not this instruction has issued. */
     bool isInIQ() const { return status[IqEntry]; }
@@ -1000,7 +1001,7 @@ class DynInst : public ExecContext, public RefCounted
     void setThreadState(ThreadState *state) { thread = state; }
 
     /** Returns the thread context. */
-    gem5::ThreadContext *tcBase() const override { return thread->getTC(); }
+    gem5::ThreadContext *tcBase() const override;
 
   public:
     /** Is this instruction's memory access strictly ordered? */
@@ -1011,6 +1012,15 @@ class DynInst : public ExecContext, public RefCounted
     bool hasRequest() const { return instFlags[ReqMade]; }
     /** Assert this instruction has generated a memory request. */
     void setRequest() { instFlags[ReqMade] = true; }
+    /** Clear request and translation bookkeeping after request release. */
+    void
+    clearRequest()
+    {
+        instFlags.reset(ReqMade);
+        translationStarted(false);
+        translationCompleted(false);
+        savedRequest = nullptr;
+    }
 
     /** Returns iterator to this instruction in the list of all insts. */
     ListIt &getInstListIt() { return instListIt; }
@@ -1020,41 +1030,17 @@ class DynInst : public ExecContext, public RefCounted
 
   public:
     /** Returns the number of consecutive store conditional failures. */
-    unsigned int
-    readStCondFailures() const override
-    {
-        return thread->storeCondFailures;
-    }
+    unsigned int readStCondFailures() const override;
 
     /** Sets the number of consecutive store conditional failures. */
-    void
-    setStCondFailures(unsigned int sc_failures) override
-    {
-        thread->storeCondFailures = sc_failures;
-    }
+    void setStCondFailures(unsigned int sc_failures) override;
 
   public:
     // monitor/mwait funtions
-    void
-    armMonitor(Addr address) override
-    {
-        cpu->armMonitor(threadNumber, address);
-    }
-    bool
-    mwait(PacketPtr pkt) override
-    {
-        return cpu->mwait(threadNumber, pkt);
-    }
-    void
-    mwaitAtomic(gem5::ThreadContext *tc) override
-    {
-        return cpu->mwaitAtomic(threadNumber, tc, cpu->mmu);
-    }
-    AddressMonitor *
-    getAddrMonitor() override
-    {
-        return cpu->getCpuAddrMonitor(threadNumber);
-    }
+    void armMonitor(Addr address) override;
+    bool mwait(PacketPtr pkt) override;
+    void mwaitAtomic(gem5::ThreadContext *tc) override;
+    AddressMonitor *getAddrMonitor() override;
 
   private:
     // hardware transactional memory
@@ -1085,114 +1071,27 @@ class DynInst : public ExecContext, public RefCounted
     /** Reads a misc. register, including any side-effects the read
      * might have as defined by the architecture.
      */
-    RegVal
-    readMiscReg(int misc_reg) override
-    {
-        return cpu->readMiscReg(misc_reg, threadNumber);
-    }
+    RegVal readMiscReg(int misc_reg) override;
 
     /** Sets a misc. register, including any side-effects the write
      * might have as defined by the architecture.
      */
-    void
-    setMiscReg(int misc_reg, RegVal val) override
-    {
-        /** Writes to misc. registers are recorded and deferred until the
-         * commit stage, when updateMiscRegs() is called. First, check if
-         * the misc reg has been written before and update its value to be
-         * committed instead of making a new entry. If not, make a new
-         * entry and record the write.
-         */
-        for (auto &idx: _destMiscRegIdx) {
-            if (idx == misc_reg)
-                return;
-        }
-
-        _destMiscRegIdx.push_back(misc_reg);
-        _destMiscRegVal.push_back(val);
-    }
+    void setMiscReg(int misc_reg, RegVal val) override;
 
     /** Reads a misc. register, including any side-effects the read
      * might have as defined by the architecture.
      */
-    RegVal
-    readMiscRegOperand(const StaticInst *si, int idx) override
-    {
-        const RegId& reg = si->srcRegIdx(idx);
-        assert(reg.is(MiscRegClass));
-        return cpu->readMiscReg(reg.index(), threadNumber);
-    }
+    RegVal readMiscRegOperand(const StaticInst *si, int idx) override;
 
     /** Sets a misc. register, including any side-effects the write
      * might have as defined by the architecture.
      */
-    void
-    setMiscRegOperand(const StaticInst *si, int idx, RegVal val) override
-    {
-        const RegId& reg = si->destRegIdx(idx);
-        assert(reg.is(MiscRegClass));
-        setMiscReg(reg.index(), val);
-
-        /** If the MiscReg allows non-serializing updates, we
-         * can update the value immediately without waiting
-         * for commit, but only if the instruction is non
-         * speculative
-         */
-        if (!reg.regClass().isSerializing(reg)) {
-            assert(isNonSpeculative());
-
-            bool no_squash_from_TC = thread->noSquashFromTC;
-            thread->noSquashFromTC = true;
-
-            /** Update the architectural state with the new value */
-            cpu->setMiscReg(reg.index(), val, threadNumber);
-
-            thread->noSquashFromTC = no_squash_from_TC;
-        }
-    }
+    void setMiscRegOperand(const StaticInst *si, int idx, RegVal val) override;
 
     /** Called at the commit stage to update the misc. registers. */
-    void
-    updateMiscRegs()
-    {
-        // @todo: Pretty convoluted way to avoid squashing from happening when
-        // using the TC during an instruction's execution (specifically for
-        // instructions that have side-effects that use the TC).  Fix this.
-        // See cpu/o3/dyn_inst_impl.hh.
-        bool no_squash_from_TC = thread->noSquashFromTC;
-        thread->noSquashFromTC = true;
+    void updateMiscRegs();
 
-        for (int i = 0; i < _destMiscRegIdx.size(); i++)
-            cpu->setMiscReg(
-                _destMiscRegIdx[i], _destMiscRegVal[i], threadNumber);
-
-        thread->noSquashFromTC = no_squash_from_TC;
-    }
-
-    void
-    forwardOldRegs()
-    {
-
-        for (int idx = 0; idx < numDestRegs(); idx++) {
-            PhysRegIdPtr prev_phys_reg = prevDestIdx(idx);
-            const RegId& original_dest_reg = staticInst->destRegIdx(idx);
-            const auto bytes = original_dest_reg.regClass().regBytes();
-
-            // Registers which aren't renamed don't need to be forwarded.
-            if (!original_dest_reg.isRenameable())
-                continue;
-
-            if (bytes == sizeof(RegVal)) {
-                setRegOperand(staticInst.get(), idx,
-                        cpu->getReg(prev_phys_reg, threadNumber));
-            } else {
-                const size_t size = original_dest_reg.regClass().regBytes();
-                auto val = std::make_unique<uint8_t[]>(size);
-                cpu->getReg(prev_phys_reg, val.get(), threadNumber);
-                setRegOperand(staticInst.get(), idx, val.get());
-            }
-        }
-    }
+    void forwardOldRegs();
     /** Traps to handle specified fault. */
     void trap(const Fault &fault);
 
@@ -1209,52 +1108,19 @@ class DynInst : public ExecContext, public RefCounted
     // storage (which is pretty hard to imagine they would have reason
     // to do).
 
-    RegVal
-    getRegOperand(const StaticInst *si, int idx) override
-    {
-        const PhysRegIdPtr reg = renamedSrcIdx(idx);
-        if (reg->is(InvalidRegClass))
-            return 0;
-        return cpu->getReg(reg, threadNumber);
-    }
+    RegVal getRegOperand(const StaticInst *si, int idx) override;
 
-    void
-    getRegOperand(const StaticInst *si, int idx, void *val) override
-    {
-        const PhysRegIdPtr reg = renamedSrcIdx(idx);
-        if (reg->is(InvalidRegClass))
-            return;
-        cpu->getReg(reg, val, threadNumber);
-    }
+    void getRegOperand(const StaticInst *si, int idx, void *val) override;
 
-    void *
-    getWritableRegOperand(const StaticInst *si, int idx) override
-    {
-        return cpu->getWritableReg(renamedDestIdx(idx), threadNumber);
-    }
+    void *getWritableRegOperand(const StaticInst *si, int idx) override;
 
     /** @todo: Make results into arrays so they can handle multiple dest
      *  registers.
      */
-    void
-    setRegOperand(const StaticInst *si, int idx, RegVal val) override
-    {
-        const PhysRegIdPtr reg = renamedDestIdx(idx);
-        if (reg->is(InvalidRegClass))
-            return;
-        cpu->setReg(reg, val, threadNumber);
-        setResult(reg->regClass(), val);
-    }
+    void setRegOperand(const StaticInst *si, int idx, RegVal val) override;
 
-    void
-    setRegOperand(const StaticInst *si, int idx, const void *val) override
-    {
-        const PhysRegIdPtr reg = renamedDestIdx(idx);
-        if (reg->is(InvalidRegClass))
-            return;
-        cpu->setReg(reg, val, threadNumber);
-        setResult(reg->regClass(), val);
-    }
+    void setRegOperand(const StaticInst *si, int idx,
+                       const void *val) override;
 };
 
 } // namespace o3

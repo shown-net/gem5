@@ -44,10 +44,8 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
-#include <iostream>
 #include <list>
 #include <queue>
-#include <set>
 #include <vector>
 
 #include "arch/generic/pcstate.hh"
@@ -65,7 +63,6 @@
 #include "cpu/o3/free_list.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/iew.hh"
-#include "cpu/o3/limits.hh"
 #include "cpu/o3/instruction_timing.hh"
 #include "cpu/o3/rename.hh"
 #include "cpu/o3/rob.hh"
@@ -120,7 +117,7 @@ class CPU : public BaseCPU
     };
 
     BaseMMU *mmu;
-    using LSQRequest = LSQ::LSQRequest;
+    using LSQRequest = gem5::o3::LSQRequest;
 
     using PerThreadUnifiedRenameMap =
         UnifiedRenameMap::PerThreadUnifiedRenameMap;
@@ -593,6 +590,16 @@ class CPU : public BaseCPU
     {
         return iew.ldstQueue.pushRequest(inst, isLoad, data, size, addr,
                 flags, res, std::move(amo_op), byte_enable);
+    }
+
+    /** Read the stalled retirement frontier for model diagnostics. */
+    Addr getCommitHeadPC(ThreadID tid);
+
+    /** Supply independently scheduled data to a logical store. */
+    Fault
+    writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+    {
+        return iew.ldstQueue.writeStoreData(inst, data, size);
     }
 
     /** Used by the fetch unit to get a hold of the instruction port. */

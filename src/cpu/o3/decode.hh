@@ -42,7 +42,7 @@
 #ifndef __CPU_O3_DECODE_HH__
 #define __CPU_O3_DECODE_HH__
 
-#include <queue>
+#include <deque>
 
 #include "base/statistics.hh"
 #include "cpu/o3/comm.hh"
@@ -241,10 +241,10 @@ class Decode
     TimeBuffer<FetchStruct>::wire fromFetch;
 
     /** Queue of all instructions coming from fetch this cycle. */
-    std::queue<DynInstPtr> insts[MaxThreads];
+    std::deque<DynInstPtr> insts[MaxThreads];
 
     /** Skid buffer between fetch and decode. */
-    std::queue<DynInstPtr> skidBuffer[MaxThreads];
+    std::deque<DynInstPtr> skidBuffer[MaxThreads];
 
     /** Variable that tracks if decode has written to the time buffer this
      * cycle. Used to tell CPU if there is activity this cycle.
@@ -277,6 +277,7 @@ class Decode
 
     /** Index of instructions being sent to rename. */
     unsigned toRenameIndex;
+    unsigned toRenameGroups = 0;
 
     /** number of Active Threads*/
     ThreadID numThreads;
@@ -318,6 +319,9 @@ class Decode
         statistics::Scalar controlMispred;
         /** Stat for total number of decoded instructions. */
         statistics::Scalar decodedInsts;
+        statistics::Scalar frontendGroups;
+        statistics::Scalar frontendStoreGroups;
+        statistics::Scalar frontendLoadAluGroups;
         /** Stat for total number of squashed instructions. */
         statistics::Scalar squashedInsts;
     } stats;

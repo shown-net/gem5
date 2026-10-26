@@ -42,6 +42,7 @@
  */
 
 #include "cpu/o3/cpu.hh"
+#include "arch/x86/regs/int.hh"
 
 #include "cpu/activity.hh"
 #include "cpu/checker/cpu.hh"
@@ -90,7 +91,7 @@ CPU::CPU(const BaseO3CPUParams &params)
       iew(this, params),
       commit(this, params),
 
-      regFile(params.numPhysIntRegs, params.numPhysFloatRegs,
+      regFile(this, params.numPhysIntRegs, params.numPhysFloatRegs,
               params.numPhysVecRegs, params.numPhysVecPredRegs,
               params.numPhysMatRegs, params.numPhysCCRegs,
               params.isa[0]->regClasses()),
@@ -349,7 +350,6 @@ CPU::regProbePoints()
     fetch.regProbePoints();
     rename.regProbePoints();
     iew.regProbePoints();
-    iew.instQueue.regProbePoints();
     commit.regProbePoints();
 }
 
@@ -443,6 +443,25 @@ CPU::tick()
         updateThreadPriority();
 
     tryDrain();
+}
+
+Addr
+CPU::getCommitHeadPC(ThreadID tid)
+{
+    if (rob.isEmpty(tid))
+        return 0;
+    const auto &inst = rob.readHeadInst(tid);
+    inform("Frontier sn=%llu issued=%d executed=%d canIssue=%d "
+           "waitStoreData=%llu memoryEntries=%d storesToWB=%d stalled=%d",
+           inst->seqNum, inst->isIssued(), inst->isExecuted(),
+           inst->readyToIssue(), inst->waitStoreDataSeqNum,
+           iew.ldstQueue.getCount(tid), iew.ldstQueue.numStoresToWB(tid),
+           iew.ldstQueue.isStalled(tid));
+    inform("Frontier architectural RAX=%#llx RBP=%#llx R12=%#llx",
+           tcBase(tid)->getReg(X86ISA::int_reg::Rax),
+           tcBase(tid)->getReg(X86ISA::int_reg::Rbp),
+           tcBase(tid)->getReg(X86ISA::int_reg::R12));
+    return inst->pcState().instAddr();
 }
 
 void
@@ -1186,7 +1205,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
         thread[tid]->comInstEventQueue.serviceEvents(thread[tid]->numInst);
     }
 
-    if (inst->isMemRef()) {
+    if (inst->hasMemoryRequest()) {
         thread[tid]->threadStats.numMemRefs++;
     }
 

@@ -60,7 +60,8 @@ class TSOStore(Enum):
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
-    cxx_header = "cpu/o3/dyn_inst.hh"
+    cxx_header = "cpu/o3/cpu.hh"
+    cxx_exports = [PyBindMethod("getCommitHeadPC")]
 
     @classmethod
     def memory_mode(cls):
@@ -74,12 +75,12 @@ class BaseO3CPU(BaseCPU):
     def support_take_over(cls):
         return True
 
-    # Research model: SPR admission scale, xs reference address arbitration.
+    # Research model: SPR admission scale and measured address responses.
     ordinaryLoadService = Param.Bool(False, "Enable ordinary load service stages")
     loadServiceAdmission = Param.Bool(True, "Limit service admission to three per cycle")
-    loadServiceArbitration = Param.Bool(True, "Use xs reference bank arbitration")
+    loadServiceArbitration = Param.Bool(True, "Limit concurrent reads of overlapping eight-byte line-offset windows")
     loadServicePropagation = Param.Bool(True, "Use a clocked result-completion stage")
-    loadServiceCacheSets = Param.Unsigned(64, "L1D sets for xs reference arbitration")
+    loadServiceBankPorts = Param.Unsigned(2, "Reads per line-offset window per cycle in the research service")
 
     activity = Param.Unsigned(0, "Initial count")
     taskStatsSwitchPc = Param.Addr(0, "x86 Linux __switch_to; zero disables TASK observer")
@@ -100,9 +101,15 @@ class BaseO3CPU(BaseCPU):
     iewToFetchDelay = Param.Cycles(1, "Issue/Execute/Writeback to fetch delay")
     commitToFetchDelay = Param.Cycles(1, "Commit to fetch delay")
     fetchWidth = Param.Unsigned(8, "Fetch width")
+    frontendStoreGroups = Param.Bool(
+        False, "Accept adjacent ordinary STA/STD DynInsts as one frontend group")
+    robFrontendGroups = Param.Bool(
+        False, "One ROB resource entry holds all real frontend group members")
+    frontendLoadAluGroups = Param.Bool(
+        False, "Group a selected scalar integer load and final ALU in the frontend")
     fetchBufferSize = Param.Unsigned(64, "Fetch buffer size in bytes")
     fetchQueueSize = Param.Unsigned(
-        32, "Fetch queue size in micro-ops per-thread"
+        32, "Fetch queue capacity in frontend groups per-thread"
     )
 
     renameToDecodeDelay = Param.Cycles(1, "Rename to decode delay")
@@ -201,6 +208,9 @@ class BaseO3CPU(BaseCPU):
     # most ISAs don't use condition-code regs, so default is 0
     numPhysCCRegs = Param.Unsigned(0, "Number of physical cc registers")
     instQueues = VectorParam.IQUnit(IQUnit(), "Vector of IQs")
+    iqInsertionPolicy = Param.IQInsertionPolicy(
+        "FirstMatch", "Policy for inserting instructions to IQs"
+    )
     numROBEntries = Param.Unsigned(192, "Number of reorder buffer entries")
 
     smtNumFetchingThreads = Param.Unsigned(1, "SMT Number of Fetching Threads")
@@ -233,17 +243,12 @@ class BaseO3CPU(BaseCPU):
         "Maximum committed stores awaiting cache responses; experimental "
         "buffer-mode drain overlap",
     )
-    divsdLatency = Param.Unsigned(14, "Dedicated register DIVSD result latency")
-    divsdIssueInterval = Param.Unsigned(4, "Dedicated register DIVSD initiation interval")
-    divsdActivityDuration = Param.Unsigned(
-        8, "Dedicated register DIVSD observable activity duration"
-    )
-    intDiv32QuotientLatency = Param.Unsigned(13, "Compact 32-bit DIV/IDIV quotient latency")
-    intDiv32RemainderLatency = Param.Unsigned(15, "Compact 32-bit DIV/IDIV remainder latency")
-    intDiv64QuotientLatency = Param.Unsigned(15, "Compact 64-bit DIV/IDIV quotient latency")
-    intDiv64RemainderLatency = Param.Unsigned(18, "Compact 64-bit DIV/IDIV remainder latency")
-    intDiv32IssueInterval = Param.Unsigned(6, "Compact 32-bit DIV/IDIV initiation interval")
-    intDiv64IssueInterval = Param.Unsigned(10, "Compact 64-bit DIV/IDIV initiation interval")
+    intDiv32QuotientLatency = Param.Unsigned(13, "Integer 32-bit DIV/IDIV quotient latency")
+    intDiv32RemainderLatency = Param.Unsigned(15, "Integer 32-bit DIV/IDIV remainder latency")
+    intDiv64QuotientLatency = Param.Unsigned(15, "Integer 64-bit DIV/IDIV quotient latency")
+    intDiv64RemainderLatency = Param.Unsigned(18, "Integer 64-bit DIV/IDIV remainder latency")
+    intDiv32IssueInterval = Param.Unsigned(6, "Integer 32-bit DIV/IDIV initiation interval")
+    intDiv64IssueInterval = Param.Unsigned(10, "Integer 64-bit DIV/IDIV initiation interval")
 
     sbufferOffloadWidth = Param.Unsigned(
         1, "Maximum committed SQ stores transferred to SBuffer per cycle"
@@ -274,6 +279,11 @@ class BaseO3CPU(BaseCPU):
 
     ## Parameters for decoupled front-end
     decoupledFrontEnd = Param.Bool(False, "Enables the decoupled front-end")
+    fetchLookahead = Param.Bool(
+        False, "Overlap the next sequential fetch-buffer read with current bytes"
+    )
+    fetchLookaheadDepth = Param.Unsigned(
+        1, "Actual future instruction byte buffers, requested one per cycle")
     numFTQEntries = Param.Unsigned(
         8,
         "Number of entries in the Fetch target queue. (only used for "

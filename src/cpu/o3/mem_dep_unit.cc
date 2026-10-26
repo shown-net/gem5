@@ -26,16 +26,24 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "cpu/o3/mem_dep_unit.hh"
+
 #include <map>
 #include <memory>
 #include <vector>
 
-#include "base/compiler.hh"
-#include "base/debug.hh"
+#include "base/cprintf.hh"
+#include "base/logging.hh"
+#include "base/stats/group.hh"
+#include "base/stats/units.hh"
+#include "base/trace.hh"
+#include "base/types.hh"
+#include "cpu/inst_seq.hh"
+#include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/inst_queue.hh"
 #include "cpu/o3/limits.hh"
-#include "cpu/o3/mem_dep_unit.hh"
 #include "debug/MemDepUnit.hh"
 #include "params/BaseO3CPU.hh"
 
@@ -384,13 +392,21 @@ MemDepUnit::reschedule(const DynInstPtr &inst)
 }
 
 void
-MemDepUnit::replay()
+MemDepUnit::replay(InstSeqNum store_seq, bool writeback)
 {
-    DynInstPtr temp_inst;
-
-    // For now this replay function replays all waiting memory ops.
-    while (!instsToReplay.empty()) {
-        temp_inst = instsToReplay.front();
+    auto it = instsToReplay.begin();
+    while (it != instsToReplay.end()) {
+        DynInstPtr temp_inst = *it;
+        const bool ready = writeback ?
+            temp_inst->waitStoreWritebackSeqNum == store_seq :
+            temp_inst->waitStoreDataSeqNum == store_seq &&
+                temp_inst->waitStoreWritebackSeqNum == 0;
+        if (!ready) {
+            ++it;
+            continue;
+        }
+        temp_inst->waitStoreDataSeqNum = 0;
+        temp_inst->waitStoreWritebackSeqNum = 0;
 
         MemDepEntryPtr inst_entry = findInHash(temp_inst);
 
@@ -399,7 +415,7 @@ MemDepUnit::replay()
 
         moveToReady(inst_entry);
 
-        instsToReplay.pop_front();
+        it = instsToReplay.erase(it);
     }
 }
 

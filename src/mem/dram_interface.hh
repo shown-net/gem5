@@ -47,6 +47,7 @@
 #define __DRAM_INTERFACE_HH__
 
 #include "mem/drampower.hh"
+#include "mem/mem_ctrl.hh"
 #include "mem/mem_interface.hh"
 #include "params/DRAMInterface.hh"
 
@@ -547,9 +548,6 @@ class DRAMInterface : public MemInterface
 
     /** Enable or disable DRAM powerdown states. */
     bool enableDRAMPowerdown;
-
-    /** Enable or disable DRAMPower command replay and power stats. */
-    bool enableDRAMPowerStats;
 
     /** The time when stats were last reset used to calculate average power */
     Tick lastStatsResetTick;

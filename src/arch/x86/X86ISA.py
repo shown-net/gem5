@@ -48,9 +48,8 @@ class X86ISA(BaseISA):
     # genuine CPUID, an error is returned. This change
     # https://gem5-review.googlesource.com/c/public/gem5/+/64831 changed this
     # to "GenuineAMD" but due to issues with booting the Linux Kernel using
-    # this vector string (highlighted here:
-    # https://gem5.atlassian.net/browse/GEM5-1300) we opted to use
-    # "HygonGenuine" instead.
+    # this vector string, we opted to use "HygonGenuine" instead. See
+    # https://github.com/gem5/gem5/issues/3445.
     vendor_string = Param.String(
         "HygonGenuine", "Vendor string for CPUID instruction"
     )
@@ -73,7 +72,9 @@ class X86ISA(BaseISA):
     #     https://sandpile.org/x86/cpuid.htm
     # 0000_0001h
     FamilyModelStepping = VectorParam.UInt32(
-        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00000209],
+        # MOVBE and POPCNT are implemented scalar forms. CRC32 alone does
+        # not justify setting the complete SSE4.2 feature bit.
+        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00C00209],
         "type/family/model/stepping and feature flags",
     )
     # 0000_0004h
@@ -83,7 +84,8 @@ class X86ISA(BaseISA):
     )
     # 0000_0007h
     ExtendedFeatures = VectorParam.UInt32(
-        [0x00000000, 0x01800000, 0x00000000, 0x00000000], "feature flags"
+        # BMI1, BMI2 and ADX are supported by the native scalar microcode.
+        [0x00000000, 0x01880109, 0x00000000, 0x00000000], "feature flags"
     )
     # 0000_000Dh - This uses ECX index, so the last entry must be all zeros
     ExtendedState = VectorParam.UInt32(
@@ -101,7 +103,8 @@ class X86ISA(BaseISA):
     )
     # 8000_0001h
     FamilyModelSteppingBrandFeatures = VectorParam.UInt32(
-        [0x00020F51, 0x00000405, 0xEBD3FBFF, 0x00020001],
+        # Extended ECX[5] advertises LZCNT.
+        [0x00020F51, 0x00000405, 0xEBD3FBFF, 0x00020021],
         "family/model/stepping and features flags",
     )
     # 8000_0005h

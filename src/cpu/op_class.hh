@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010, 2017-2018, 2020, 2022, 2025 Arm Limited
+ * Copyright (c) 2010, 2017-2018, 2020, 2022, 2025-2026 Arm Limited
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
@@ -58,17 +58,23 @@ static const OpClass IntMultOp = enums::IntMult;
 static const OpClass IntDivOp = enums::IntDiv;
 static const OpClass X86IntDiv32Op = enums::X86IntDiv32;
 static const OpClass X86IntDiv64Op = enums::X86IntDiv64;
-static const OpClass X86IntDivQuotOp = enums::X86IntDivQuot;
 static const OpClass X86IntDivRem32Op = enums::X86IntDivRem32;
 static const OpClass X86IntDivRem64Op = enums::X86IntDivRem64;
-static const OpClass X86ZeroIdiomOp = enums::X86ZeroIdiom;
+static const OpClass X86IntShiftOp = enums::X86IntShift;
+static const OpClass X86IntDoubleShiftOp = enums::X86IntDoubleShift;
+static const OpClass X86ByteSwap32Op = enums::X86ByteSwap32;
+static const OpClass X86Crc32Op = enums::X86Crc32;
+static const OpClass X86IntBooleanOp = enums::X86IntBoolean;
+static const OpClass X86IntBitExtractOp = enums::X86IntBitExtract;
+static const OpClass X86IntBitManipOp = enums::X86IntBitManip;
+static const OpClass X86IntMulResult64Op = enums::X86IntMulResult64;
+static const OpClass X86IntCarryOp = enums::X86IntCarry;
 static const OpClass FloatAddOp = enums::FloatAdd;
 static const OpClass FloatCmpOp = enums::FloatCmp;
 static const OpClass FloatCvtOp = enums::FloatCvt;
 static const OpClass FloatMultOp = enums::FloatMult;
 static const OpClass FloatMultAccOp = enums::FloatMultAcc;
 static const OpClass FloatDivOp = enums::FloatDiv;
-static const OpClass X86DivsdOp = enums::X86Divsd;
 static const OpClass FloatMiscOp = enums::FloatMisc;
 static const OpClass FloatSqrtOp = enums::FloatSqrt;
 static const OpClass SimdAddOp = enums::SimdAdd;
@@ -107,7 +113,9 @@ static const OpClass SimdSha256HashOp = enums::SimdSha256Hash;
 static const OpClass SimdSha256Hash2Op = enums::SimdSha256Hash2;
 static const OpClass SimdShaSigma2Op = enums::SimdShaSigma2;
 static const OpClass SimdShaSigma3Op = enums::SimdShaSigma3;
+static const OpClass SimdSha512HashOp = enums::SimdSha512Hash;
 static const OpClass SimdSha3Op = enums::SimdSha3;
+static const OpClass SimdSm3Op = enums::SimdSm3;
 static const OpClass SimdSm4eOp = enums::SimdSm4e;
 static const OpClass SimdCrcOp = enums::SimdCrc;
 static const OpClass SimdPredAluOp = enums::SimdPredAlu;
@@ -116,6 +124,8 @@ static const OpClass MatrixMovOp = enums::MatrixMov;
 static const OpClass MatrixOPOp = enums::MatrixOP;
 static const OpClass MemReadOp = enums::MemRead;
 static const OpClass MemWriteOp = enums::MemWrite;
+static const OpClass X86StoreAddressOp = enums::X86StoreAddress;
+static const OpClass X86StoreDataOp = enums::X86StoreData;
 static const OpClass FloatMemReadOp = enums::FloatMemRead;
 static const OpClass FloatMemWriteOp = enums::FloatMemWrite;
 static const OpClass SimdUnitStrideLoadOp = enums::SimdUnitStrideLoad;

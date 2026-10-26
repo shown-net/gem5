@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010-2020 ARM Limited
+ * Copyright (c) 2010-2020, 2026 Arm Limited
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
@@ -46,6 +46,7 @@
 #include "debug/DRAM.hh"
 #include "debug/DRAMPower.hh"
 #include "debug/DRAMState.hh"
+#include "mem/mem_ctrl.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -204,10 +205,8 @@ DRAMInterface::activateBank(Rank& rank_ref, Bank& bank_ref,
             "%d active\n", bank_ref.bank, rank_ref.rank, act_at,
             ranks[rank_ref.rank]->numBanksActive);
 
-    if (enableDRAMPowerStats) {
-        rank_ref.cmdList.push_back(Command(MemCommand::ACT, bank_ref.bank,
-                                   act_at));
-    }
+    rank_ref.cmdList.push_back(Command(MemCommand::ACT, bank_ref.bank,
+                               act_at));
 
     DPRINTF(DRAMPower, "%llu,ACT,%d,%d\n", divCeil(act_at, tCK) -
             timeStampOffset, bank_ref.bank, rank_ref.rank);
@@ -323,10 +322,9 @@ DRAMInterface::prechargeBank(Rank& rank_ref, Bank& bank, Tick pre_tick,
             rank_ref.numBanksActive);
 
     if (trace) {
-        if (enableDRAMPowerStats) {
-            rank_ref.cmdList.push_back(Command(MemCommand::PRE, bank.bank,
-                                       pre_at));
-        }
+
+        rank_ref.cmdList.push_back(Command(MemCommand::PRE, bank.bank,
+                                   pre_at));
         DPRINTF(DRAMPower, "%llu,PRE,%d,%d\n", divCeil(pre_at, tCK) -
                 timeStampOffset, bank.bank, rank_ref.rank);
     }
@@ -555,11 +553,10 @@ DRAMInterface::doBurstAccess(MemPacket* mem_pkt, Tick next_burst_at,
     std::string mem_cmd = mem_pkt->isRead() ? "RD" : "WR";
 
     // MemCommand required for DRAMPower library
-    if (enableDRAMPowerStats) {
-        MemCommand::cmds command = (mem_cmd == "RD") ? MemCommand::RD :
-                                                       MemCommand::WR;
-        rank_ref.cmdList.push_back(Command(command, mem_pkt->bank, cmd_at));
-    }
+    MemCommand::cmds command = (mem_cmd == "RD") ? MemCommand::RD :
+                                                   MemCommand::WR;
+
+    rank_ref.cmdList.push_back(Command(command, mem_pkt->bank, cmd_at));
 
     DPRINTF(DRAMPower, "%llu,%s,%d,%d\n", divCeil(cmd_at, tCK) -
             timeStampOffset, mem_cmd, mem_pkt->bank, mem_pkt->rank);
@@ -661,7 +658,6 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
       maxAccessesPerRow(_p.max_accesses_per_row),
       timeStampOffset(0), activeRank(0),
       enableDRAMPowerdown(_p.enable_dram_powerdown),
-      enableDRAMPowerStats(_p.enable_dram_power_stats),
       lastStatsResetTick(0),
       stats(*this)
 {
@@ -721,16 +717,22 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
                   "groups per rank (%d) for equal banks per bank group\n",
                   banksPerRank, bankGroupsPerRank);
         }
-        // tCCD_L should be greater than minimal, back-to-back burst delay
-        if (tCCD_L <= tBURST) {
-            fatal("tCCD_L (%d) should be larger than the minimum bus delay "
+        // tCCD_L must not be shorter than the burst delay, otherwise
+        // back-to-back CAS in the same bank group would overlap on the
+        // data bus. The boundary case tCCD_L == tBURST is JEDEC-legal
+        // (tight-packed back-to-back CAS, zero overlap, zero gap) and
+        // occurs at speed bins where the nCK floor of tCCD_L lines up
+        // exactly with BL/2 * tCK — e.g. HBM3 6.4 Gbps
+        // (tCCD_L = 4 nCK = 2.5 ns = tBURST @ tCK = 0.625 ns).
+        if (tCCD_L < tBURST) {
+            fatal("tCCD_L (%d) must be at least the minimum bus delay "
                   "(%d) when bank groups per rank (%d) is greater than 1\n",
                   tCCD_L, tBURST, bankGroupsPerRank);
         }
-        // tCCD_L_WR should be greater than minimal, back-to-back burst delay
-        if (tCCD_L_WR <= tBURST) {
-            fatal("tCCD_L_WR (%d) should be larger than the minimum bus delay "
-                  " (%d) when bank groups per rank (%d) is greater than 1\n",
+        // Same argument for tCCD_L_WR.
+        if (tCCD_L_WR < tBURST) {
+            fatal("tCCD_L_WR (%d) must be at least the minimum bus delay "
+                  "(%d) when bank groups per rank (%d) is greater than 1\n",
                   tCCD_L_WR, tBURST, bankGroupsPerRank);
         }
         // tRRD_L is greater than minimal, same bank group ACT-to-ACT delay
@@ -1369,9 +1371,7 @@ DRAMInterface::Rank::processRefreshEvent()
             }
 
             // precharge all banks in rank
-            if (dram.enableDRAMPowerStats) {
-                cmdList.push_back(Command(MemCommand::PREA, 0, pre_at));
-            }
+            cmdList.push_back(Command(MemCommand::PREA, 0, pre_at));
 
             DPRINTF(DRAMPower, "%llu,PREA,0,%d\n",
                     divCeil(pre_at, dram.tCK) -
@@ -1418,9 +1418,7 @@ DRAMInterface::Rank::processRefreshEvent()
         }
 
         // at the moment this affects all ranks
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::REF, 0, curTick()));
-        }
+        cmdList.push_back(Command(MemCommand::REF, 0, curTick()));
 
         // Update the stats
         updatePowerStats();
@@ -1527,9 +1525,7 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
     if (pwr_state == PWR_ACT_PDN) {
         schedulePowerEvent(pwr_state, tick);
         // push command to DRAMPower
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::PDN_F_ACT, 0, tick));
-        }
+        cmdList.push_back(Command(MemCommand::PDN_F_ACT, 0, tick));
         DPRINTF(DRAMPower, "%llu,PDN_F_ACT,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwr_state == PWR_PRE_PDN) {
@@ -1538,9 +1534,7 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
         // This is neglected here.
         schedulePowerEvent(pwr_state, tick);
         //push Command to DRAMPower
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
-        }
+        cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
         DPRINTF(DRAMPower, "%llu,PDN_F_PRE,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwr_state == PWR_REF) {
@@ -1550,9 +1544,7 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
         // this is not considered.
         schedulePowerEvent(PWR_PRE_PDN, tick);
         //push Command to DRAMPower
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
-        }
+        cmdList.push_back(Command(MemCommand::PDN_F_PRE, 0, tick));
         DPRINTF(DRAMPower, "%llu,PDN_F_PRE,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwr_state == PWR_SREF) {
@@ -1562,9 +1554,7 @@ DRAMInterface::Rank::powerDownSleep(PowerState pwr_state, Tick tick)
         // this is not considered.
         schedulePowerEvent(PWR_SREF, tick);
         // push Command to DRAMPower
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::SREN, 0, tick));
-        }
+        cmdList.push_back(Command(MemCommand::SREN, 0, tick));
         DPRINTF(DRAMPower, "%llu,SREN,0,%d\n", divCeil(tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     }
@@ -1614,22 +1604,16 @@ DRAMInterface::Rank::scheduleWakeUpEvent(Tick exit_delay)
     // use pwrStateTrans for cases where we have a power event scheduled
     // to enter low power that has not yet been processed
     if (pwrStateTrans == PWR_ACT_PDN) {
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::PUP_ACT, 0, wake_up_tick));
-        }
+        cmdList.push_back(Command(MemCommand::PUP_ACT, 0, wake_up_tick));
         DPRINTF(DRAMPower, "%llu,PUP_ACT,0,%d\n", divCeil(wake_up_tick,
                 dram.tCK) - dram.timeStampOffset, rank);
 
     } else if (pwrStateTrans == PWR_PRE_PDN) {
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::PUP_PRE, 0, wake_up_tick));
-        }
+        cmdList.push_back(Command(MemCommand::PUP_PRE, 0, wake_up_tick));
         DPRINTF(DRAMPower, "%llu,PUP_PRE,0,%d\n", divCeil(wake_up_tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     } else if (pwrStateTrans == PWR_SREF) {
-        if (dram.enableDRAMPowerStats) {
-            cmdList.push_back(Command(MemCommand::SREX, 0, wake_up_tick));
-        }
+        cmdList.push_back(Command(MemCommand::SREX, 0, wake_up_tick));
         DPRINTF(DRAMPower, "%llu,SREX,0,%d\n", divCeil(wake_up_tick,
                 dram.tCK) - dram.timeStampOffset, rank);
     }
@@ -1789,11 +1773,6 @@ DRAMInterface::Rank::processPowerEvent()
 void
 DRAMInterface::Rank::updatePowerStats()
 {
-    if (!dram.enableDRAMPowerStats) {
-        cmdList.clear();
-        return;
-    }
-
     // All commands up to refresh have completed
     // flush cmdList to DRAMPower
     flushCmdList();
@@ -1849,11 +1828,6 @@ DRAMInterface::Rank::computeStats()
 
 void
 DRAMInterface::Rank::resetStats() {
-    if (!dram.enableDRAMPowerStats) {
-        cmdList.clear();
-        return;
-    }
-
     // The only way to clear the counters in DRAMPower is to call
     // calcWindowEnergy function as that then calls clearCounters. The
     // clearCounters method itself is private.
@@ -1877,71 +1851,77 @@ DRAMInterface::DRAMStats::resetStats()
 
 DRAMInterface::DRAMStats::DRAMStats(DRAMInterface &_dram)
     : statistics::Group(&_dram),
-    dram(_dram),
+      dram(_dram),
 
-    ADD_STAT(readBursts, statistics::units::Count::get(),
-             "Number of DRAM read bursts"),
-    ADD_STAT(writeBursts, statistics::units::Count::get(),
-             "Number of DRAM write bursts"),
+      ADD_STAT(readBursts, statistics::units::Count::get(),
+               "Number of DRAM read bursts"),
+      ADD_STAT(writeBursts, statistics::units::Count::get(),
+               "Number of DRAM write bursts"),
 
-    ADD_STAT(perBankRdBursts, statistics::units::Count::get(),
-             "Per bank write bursts"),
-    ADD_STAT(perBankWrBursts, statistics::units::Count::get(),
-             "Per bank write bursts"),
+      ADD_STAT(perBankRdBursts, statistics::units::Count::get(),
+               "Per bank write bursts"),
+      ADD_STAT(perBankWrBursts, statistics::units::Count::get(),
+               "Per bank write bursts"),
 
-    ADD_STAT(totQLat, statistics::units::Tick::get(),
-             "Total ticks spent queuing"),
-    ADD_STAT(totBusLat, statistics::units::Tick::get(),
-             "Total ticks spent in databus transfers"),
-    ADD_STAT(totMemAccLat, statistics::units::Tick::get(),
-             "Total ticks spent from burst creation until serviced "
-             "by the DRAM"),
+      ADD_STAT(totQLat, statistics::units::Tick::get(),
+               "Total ticks spent queuing"),
+      ADD_STAT(totBusLat, statistics::units::Tick::get(),
+               "Total ticks spent in databus transfers"),
+      ADD_STAT(totMemAccLat, statistics::units::Tick::get(),
+               "Total ticks spent from burst creation until serviced "
+               "by the DRAM"),
 
-    ADD_STAT(avgQLat, statistics::units::Rate<
-                statistics::units::Tick, statistics::units::Count>::get(),
-             "Average queueing delay per DRAM burst"),
-    ADD_STAT(avgBusLat, statistics::units::Rate<
-                statistics::units::Tick, statistics::units::Count>::get(),
-             "Average bus latency per DRAM burst"),
-    ADD_STAT(avgMemAccLat, statistics::units::Rate<
-                statistics::units::Tick, statistics::units::Count>::get(),
-             "Average memory access latency per DRAM burst"),
+      ADD_STAT(avgQLat,
+               statistics::units::Rate<statistics::units::Tick,
+                                       statistics::units::Count>::get(),
+               "Average queueing delay per DRAM burst"),
+      ADD_STAT(avgBusLat,
+               statistics::units::Rate<statistics::units::Tick,
+                                       statistics::units::Count>::get(),
+               "Average bus latency per DRAM burst"),
+      ADD_STAT(avgMemAccLat,
+               statistics::units::Rate<statistics::units::Tick,
+                                       statistics::units::Count>::get(),
+               "Average memory access latency per DRAM burst"),
 
-    ADD_STAT(readRowHits, statistics::units::Count::get(),
-             "Number of row buffer hits during reads"),
-    ADD_STAT(writeRowHits, statistics::units::Count::get(),
-             "Number of row buffer hits during writes"),
-    ADD_STAT(readRowHitRate, statistics::units::Ratio::get(),
-             "Row buffer hit rate for reads"),
-    ADD_STAT(writeRowHitRate, statistics::units::Ratio::get(),
-             "Row buffer hit rate for writes"),
+      ADD_STAT(readRowHits, statistics::units::Count::get(),
+               "Number of row buffer hits during reads"),
+      ADD_STAT(writeRowHits, statistics::units::Count::get(),
+               "Number of row buffer hits during writes"),
+      ADD_STAT(readRowHitRate, statistics::units::Ratio::get(),
+               "Row buffer hit rate for reads"),
+      ADD_STAT(writeRowHitRate, statistics::units::Ratio::get(),
+               "Row buffer hit rate for writes"),
 
-    ADD_STAT(bytesPerActivate, statistics::units::Byte::get(),
-             "Bytes accessed per row activation"),
-    ADD_STAT(dramBytesRead, statistics::units::Byte::get(),
-            "Total bytes read"),
-    ADD_STAT(dramBytesWritten, statistics::units::Byte::get(),
-            "Total bytes written"),
+      ADD_STAT(bytesPerActivate, statistics::units::Byte::get(),
+               "Bytes accessed per row activation"),
+      ADD_STAT(dramBytesRead, statistics::units::Byte::get(),
+               "Total bytes read"),
+      ADD_STAT(dramBytesWritten, statistics::units::Byte::get(),
+               "Total bytes written"),
 
-    ADD_STAT(avgRdBW, statistics::units::Rate<
-                statistics::units::Byte, statistics::units::Second>::get(),
-             "Average DRAM read bandwidth in MiBytes/s"),
-    ADD_STAT(avgWrBW, statistics::units::Rate<
-                statistics::units::Byte, statistics::units::Second>::get(),
-             "Average DRAM write bandwidth in MiBytes/s"),
-    ADD_STAT(peakBW,  statistics::units::Rate<
-                statistics::units::Byte, statistics::units::Second>::get(),
-             "Theoretical peak bandwidth in MiByte/s"),
+      ADD_STAT(avgRdBW,
+               statistics::units::Rate<statistics::units::Byte,
+                                       statistics::units::Second>::get(),
+               "Average DRAM read bandwidth in MBytes/s"),
+      ADD_STAT(avgWrBW,
+               statistics::units::Rate<statistics::units::Byte,
+                                       statistics::units::Second>::get(),
+               "Average DRAM write bandwidth in MBytes/s"),
+      ADD_STAT(peakBW,
+               statistics::units::Rate<statistics::units::Byte,
+                                       statistics::units::Second>::get(),
+               "Theoretical peak bandwidth in MByte/s"),
 
-    ADD_STAT(busUtil, statistics::units::Ratio::get(),
-             "Data bus utilization in percentage"),
-    ADD_STAT(busUtilRead, statistics::units::Ratio::get(),
-             "Data bus utilization in percentage for reads"),
-    ADD_STAT(busUtilWrite, statistics::units::Ratio::get(),
-             "Data bus utilization in percentage for writes"),
+      ADD_STAT(busUtil, statistics::units::Ratio::get(),
+               "Data bus utilization in percentage"),
+      ADD_STAT(busUtilRead, statistics::units::Ratio::get(),
+               "Data bus utilization in percentage for reads"),
+      ADD_STAT(busUtilWrite, statistics::units::Ratio::get(),
+               "Data bus utilization in percentage for writes"),
 
-    ADD_STAT(pageHitRate, statistics::units::Ratio::get(),
-             "Row buffer hit rate, read and write combined")
+      ADD_STAT(pageHitRate, statistics::units::Ratio::get(),
+               "Row buffer hit rate, read and write combined")
 
 {
 }

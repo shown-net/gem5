@@ -42,16 +42,17 @@ def macroop SAL_R_I
 def macroop SAL_M_I
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     slli t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SAL_P_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     slli t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SAL_1_R
@@ -62,82 +63,91 @@ def macroop SAL_1_R
 def macroop SAL_1_M
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     slli t1, t1, 1, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SAL_1_P
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     slli t1, t1, 1, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SAL_R_R
 {
-    sll reg, reg, regm, flags=(CF,OF,SF,ZF,PF)
+    sllvalue reg, reg, regm
+    shiftflags
 };
 
 def macroop SAL_M_R
 {
     ldst t1, seg, sib, disp
-    sll t1, t1, reg, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    sllvalue t1, t1, reg
+    shiftflags
+    storedata t1
 };
 
 def macroop SAL_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    sll t1, t1, reg, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    sllvalue t1, t1, reg
+    shiftflags
+    storedata t1
 };
 
 def macroop SHLD_R_R
 {
     mdbi regm, 0
-    sld reg, reg, rcx, flags=(CF,OF,SF,ZF,PF)
+    sldvalue reg, reg, rcx
+    shiftflags
 };
 
 def macroop SHLD_M_R
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     mdbi reg, 0
-    sld t1, t1, rcx, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    sldvalue t1, t1, rcx
+    shiftflags
+    storedata t1
 };
 
 def macroop SHLD_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     mdbi reg, 0
-    sld t1, t1, rcx, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    sldvalue t1, t1, rcx
+    shiftflags
+    storedata t1
 };
 
 def macroop SHLD_R_R_I
 {
-    mdbi regm, 0
-    sldi reg, reg, imm, flags=(CF,OF,SF,ZF,PF)
+    sldimmediate reg, reg, regm, imm, flags=(CF,OF,SF,ZF,PF)
 };
 
 def macroop SHLD_M_R_I
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     mdbi reg, 0
     sldi t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SHLD_P_R_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     mdbi reg, 0
     sldi t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SHR_R_I
@@ -148,16 +158,17 @@ def macroop SHR_R_I
 def macroop SHR_M_I
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     srli t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SHR_P_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     srli t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SHR_1_R
@@ -168,82 +179,91 @@ def macroop SHR_1_R
 def macroop SHR_1_M
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     srli t1, t1, 1, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SHR_1_P
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     srli t1, t1, 1, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SHR_R_R
 {
-    srl reg, reg, regm, flags=(CF,OF,SF,ZF,PF)
+    srlvalue reg, reg, regm
+    shiftflags
 };
 
 def macroop SHR_M_R
 {
     ldst t1, seg, sib, disp
-    srl t1, t1, reg, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    srlvalue t1, t1, reg
+    shiftflags
+    storedata t1
 };
 
 def macroop SHR_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    srl t1, t1, reg, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    srlvalue t1, t1, reg
+    shiftflags
+    storedata t1
 };
 
 def macroop SHRD_R_R
 {
     mdbi regm, 0
-    srd reg, reg, rcx, flags=(CF,OF,SF,ZF,PF)
+    srdvalue reg, reg, rcx
+    shiftflags
 };
 
 def macroop SHRD_M_R
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     mdbi reg, 0
-    srd t1, t1, rcx, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    srdvalue t1, t1, rcx
+    shiftflags
+    storedata t1
 };
 
 def macroop SHRD_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     mdbi reg, 0
-    srd t1, t1, rcx, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    srdvalue t1, t1, rcx
+    shiftflags
+    storedata t1
 };
 
 def macroop SHRD_R_R_I
 {
-    mdbi regm, 0
-    srdi reg, reg, imm, flags=(CF,OF,SF,ZF,PF)
+    srdimmediate reg, reg, regm, imm, flags=(CF,OF,SF,ZF,PF)
 };
 
 def macroop SHRD_M_R_I
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     mdbi reg, 0
     srdi t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SHRD_P_R_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     mdbi reg, 0
     srdi t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SAR_R_I
@@ -254,16 +274,17 @@ def macroop SAR_R_I
 def macroop SAR_M_I
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     srai t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SAR_P_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     srai t1, t1, imm, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SAR_1_R
@@ -274,35 +295,40 @@ def macroop SAR_1_R
 def macroop SAR_1_M
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     srai t1, t1, 1, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SAR_1_P
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     srai t1, t1, 1, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SAR_R_R
 {
-    sra reg, reg, regm, flags=(CF,OF,SF,ZF,PF)
+    sravalue reg, reg, regm
+    shiftflags
 };
 
 def macroop SAR_M_R
 {
     ldst t1, seg, sib, disp
-    sra t1, t1, reg, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    sravalue t1, t1, reg
+    shiftflags
+    storedata t1
 };
 
 def macroop SAR_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    sra t1, t1, reg, flags=(CF,OF,SF,ZF,PF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    sravalue t1, t1, reg
+    shiftflags
+    storedata t1
 };
 """

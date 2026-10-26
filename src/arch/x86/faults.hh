@@ -291,9 +291,6 @@ class PageFault : public X86Fault
         errorCode = code;
     }
 
-    Addr getAddress() const { return addr; }
-    uint64_t getErrorCode() const { return errorCode; }
-
     void
     invoke(ThreadContext *tc, const StaticInstPtr &inst=
                 nullStaticInstPtr);

@@ -42,6 +42,7 @@
 #define __MEM_RUBY_SYSTEM_SEQUENCER_HH__
 
 #include <iostream>
+#include <deque>
 #include <list>
 #include <unordered_map>
 
@@ -102,37 +103,86 @@ class Sequencer : public RubyPort
     void preDumpStats() override;
     void collateStats();
 
-    void writeCallback(Addr address,
-                       DataBlock& data,
-                       const bool externalHit = false,
-                       const MachineType mach = MachineType_NUM,
-                       const Cycles initialRequestTime = Cycles(0),
-                       const Cycles forwardRequestTime = Cycles(0),
-                       const Cycles firstResponseTime = Cycles(0),
-                       const bool noCoales = false);
+    void writeCallbackCBusy(Addr address, DataBlock &data,
+                            const bool externalHit = false,
+                            const int cBusy = -1,
+                            const MachineType mach = MachineType_NUM,
+                            const Cycles initialRequestTime = Cycles(0),
+                            const Cycles forwardRequestTime = Cycles(0),
+                            const Cycles firstResponseTime = Cycles(0),
+                            const bool noCoales = false);
+
+    void
+    writeCallback(Addr address, DataBlock &data,
+                  const bool externalHit = false,
+                  const MachineType mach = MachineType_NUM,
+                  const Cycles initialRequestTime = Cycles(0),
+                  const Cycles forwardRequestTime = Cycles(0),
+                  const Cycles firstResponseTime = Cycles(0),
+                  const bool noCoales = false)
+    {
+        writeCallbackCBusy(address, data, externalHit, -1, mach,
+                           initialRequestTime, forwardRequestTime,
+                           firstResponseTime, noCoales);
+    }
 
     // Write callback that prevents coalescing
     void writeUniqueCallback(Addr address, DataBlock& data)
     {
-        writeCallback(address, data, true, MachineType_NUM, Cycles(0),
-                      Cycles(0), Cycles(0), true);
+        writeCallbackCBusy(address, data, true, -1, MachineType_NUM, Cycles(0),
+                           Cycles(0), Cycles(0), true);
     }
 
-    void readCallback(Addr address,
-                      DataBlock& data,
-                      const bool externalHit = false,
-                      const MachineType mach = MachineType_NUM,
-                      const Cycles initialRequestTime = Cycles(0),
-                      const Cycles forwardRequestTime = Cycles(0),
-                      const Cycles firstResponseTime = Cycles(0));
+    void
+    writeUniqueCallbackCBusy(Addr address, DataBlock &data,
+                             const int cBusy = -1)
+    {
+        writeCallbackCBusy(address, data, true, cBusy, MachineType_NUM,
+                           Cycles(0), Cycles(0), Cycles(0), true);
+    }
 
-    void atomicCallback(Addr address,
-                        DataBlock& data,
-                        const bool externalHit = false,
-                        const MachineType mach = MachineType_NUM,
-                        const Cycles initialRequestTime = Cycles(0),
-                        const Cycles forwardRequestTime = Cycles(0),
-                        const Cycles firstResponseTime = Cycles(0));
+    void stashCallback(Addr address);
+
+    void readCallbackCBusy(Addr address, DataBlock &data,
+                           const bool externalHit = false,
+                           const int cBusy = -1,
+                           const MachineType mach = MachineType_NUM,
+                           const Cycles initialRequestTime = Cycles(0),
+                           const Cycles forwardRequestTime = Cycles(0),
+                           const Cycles firstResponseTime = Cycles(0));
+
+    void
+    readCallback(Addr address, DataBlock &data, const bool externalHit = false,
+                 const MachineType mach = MachineType_NUM,
+                 const Cycles initialRequestTime = Cycles(0),
+                 const Cycles forwardRequestTime = Cycles(0),
+                 const Cycles firstResponseTime = Cycles(0))
+    {
+        readCallbackCBusy(address, data, externalHit, -1, mach,
+                          initialRequestTime, forwardRequestTime,
+                          firstResponseTime);
+    }
+
+    void atomicCallbackCBusy(Addr address, DataBlock &data,
+                             const bool externalHit = false,
+                             const int cBusy = -1,
+                             const MachineType mach = MachineType_NUM,
+                             const Cycles initialRequestTime = Cycles(0),
+                             const Cycles forwardRequestTime = Cycles(0),
+                             const Cycles firstResponseTime = Cycles(0));
+
+    void
+    atomicCallback(Addr address, DataBlock &data,
+                   const bool externalHit = false,
+                   const MachineType mach = MachineType_NUM,
+                   const Cycles initialRequestTime = Cycles(0),
+                   const Cycles forwardRequestTime = Cycles(0),
+                   const Cycles firstResponseTime = Cycles(0))
+    {
+        atomicCallbackCBusy(address, data, externalHit, -1, mach,
+                            initialRequestTime, forwardRequestTime,
+                            firstResponseTime);
+    }
 
     void unaddressedCallback(Addr unaddressedReqId,
                              RubyRequestType requestType,
@@ -216,9 +266,10 @@ class Sequencer : public RubyPort
 
   protected:
     void issueRequest(PacketPtr pkt, RubyRequestType type);
-    virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
-                             bool llscSuccess,
-                             const MachineType mach, const bool externalHit,
+
+    virtual void hitCallback(SequencerRequest *srequest, DataBlock &data,
+                             bool llscSuccess, const MachineType mach,
+                             const bool externalHit, const int cBusy,
                              const Cycles initialRequestTime,
                              const Cycles forwardRequestTime,
                              const Cycles firstResponseTime,
@@ -257,8 +308,6 @@ class Sequencer : public RubyPort
                                         RubyRequestType primary_type,
                                         RubyRequestType secondary_type);
 
-    RubySystem *m_ruby_system;
-
   private:
     int m_max_outstanding_requests;
 
@@ -278,6 +327,21 @@ class Sequencer : public RubyPort
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
     int m_store_prepare_outstanding;
+
+    // Pending real ST packets share the existing request-table budget. Only
+    // the head enters the protocol; its data callback releases the next head
+    // before the previous CPU response has returned.
+    bool m_ordered_stores;
+    unsigned m_ordered_store_width;
+    std::deque<PacketPtr> orderedStorePackets;
+    PacketPtr activeOrderedStore = nullptr;
+    bool orderedStore(const SequencerRequest &request) const;
+    void issueNextOrderedStore();
+    struct StoreOrderStats : public statistics::Group
+    {
+        StoreOrderStats(statistics::Group *parent);
+        statistics::Scalar admitted, issued, applied, coalesced, outstandingAtDump;
+    } storeOrderStats;
 
     // Bounded observer state, ordinary cacheable LD requests only. No events
     // are scheduled by this observer and no request identities are retained.

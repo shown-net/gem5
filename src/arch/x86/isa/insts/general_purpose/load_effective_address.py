@@ -43,3 +43,10 @@ def macroop LEA_R_P {
     lea reg, seg, riprel, disp
 };
 """
+
+microcode += """
+def macroop LEA_R_M_16 {
+    lea t1, seg, sib, disp, dataSize=8
+    mov reg, reg, t1
+};
+"""

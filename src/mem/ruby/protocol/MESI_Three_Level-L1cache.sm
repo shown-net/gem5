@@ -450,9 +450,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
-        out_msg.TraceValid := in_msg.TraceValid;
-        out_msg.TraceContextId := in_msg.TraceContextId;
-        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -471,9 +468,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
-        out_msg.TraceValid := in_msg.TraceValid;
-        out_msg.TraceContextId := in_msg.TraceContextId;
-        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -491,9 +485,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
         out_msg.Prefetch := in_msg.Prefetch;
-        out_msg.TraceValid := in_msg.TraceValid;
-        out_msg.TraceContextId := in_msg.TraceContextId;
-        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }
@@ -904,27 +895,11 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
-    peek(messageBufferFromL0_in, CoherenceMsg) {
-      cache.profileDemandMiss(in_msg.ObserverType);
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
-          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
-    }
+    cache.profileDemandMiss();
   }
 
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
-    peek(messageBufferFromL0_in, CoherenceMsg) {
-      cache.profileDemandHit(in_msg.ObserverType);
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
-          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 0);
-    }
-  }
-
-  action(uu_profileUpgrade, "\uu", desc="Profile permission upgrade") {
-    peek(messageBufferFromL0_in, CoherenceMsg) {
-      cache.profileDemandUpgrade(in_msg.ObserverType);
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
-          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 2);
-    }
+    cache.profileDemandHit();
   }
 
 
@@ -969,7 +944,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   transition({S,SS}, Store, SM) {
     i_allocateTBE;
     c_issueUPGRADE;
-    uu_profileUpgrade;
+    uu_profileMiss;
     k_popL0RequestQueue;
   }
 

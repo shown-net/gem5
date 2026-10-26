@@ -39,11 +39,11 @@ microcode = """
 
 def macroop XCHG_R_R
 {
-    # Use the xor trick instead of moves to reduce register pressure.
-    # This probably doesn't make much of a difference, but it's easy.
-    xor reg, reg, regm
-    xor regm, regm, reg
-    xor reg, reg, regm
+    # The operands may refer to the same architectural register. An
+    # xor-swap would zero it, so use a microcode temporary.
+    mov t1, t1, reg
+    mov reg, reg, regm
+    mov regm, regm, t1
 };
 
 def macroop XCHG_R_M
@@ -57,7 +57,6 @@ def macroop XCHG_R_M
 
 def macroop XCHG_R_P
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     stul reg, seg, riprel, disp
@@ -76,7 +75,6 @@ def macroop XCHG_M_R
 
 def macroop XCHG_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     stul reg, seg, riprel, disp
@@ -95,7 +93,6 @@ def macroop XCHG_LOCKED_M_R
 
 def macroop XCHG_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     stul reg, seg, riprel, disp

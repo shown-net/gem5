@@ -53,6 +53,7 @@
 #include "cpu/exetrace.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/thread_state.hh"
@@ -158,16 +159,12 @@ std::string Commit::name() const { return cpu->name() + ".commit"; }
 void
 Commit::regProbePoints()
 {
-    ppPreCommit = new ProbePointArg<DynInstPtr>(
-            cpu->getProbeManager(), "PreCommit");
     ppCommit = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Commit");
     ppCommitStall = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "CommitStall");
     ppSquash = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Squash");
-    ppKernelEntry = new ProbePointArg<KernelEntryEvent>(
-            cpu->getProbeManager(), "KernelEntry");
 }
 
 Commit::CommitStats::CommitStats(CPU *cpu, Commit *commit)
@@ -700,15 +697,10 @@ Commit::handleInterrupt()
             cpu->checker->handlePendingInt();
         }
 
-        // Re-read the interrupt at the acceptance point. Besides avoiding a
-        // stale local copy, this gives probes the exact event that is about
-        // to enter privileged execution.
-        Fault accepted_interrupt = cpu->getInterrupts();
-        ppKernelEntry->notify(KernelEntryEvent{
-            uint32_t(cpu->cpuId()), 0, accepted_interrupt,
-            KernelEntrySource::ExternalInterrupt, curTick(),
-            cpu->clockPeriod(), cpu->inUserMode(0)});
-        cpu->processInterrupts(accepted_interrupt);
+        // CPU will handle interrupt. Note that we ignore the local copy of
+        // interrupt. This is because the local copy may no longer be the
+        // interrupt that the interrupt controller thinks is being handled.
+        cpu->processInterrupts(cpu->getInterrupts());
 
         thread[0]->noSquashFromTC = false;
 
@@ -817,27 +809,11 @@ Commit::commit()
 
             // If we want to include the squashing instruction in the squash,
             // then use one older sequence number.
-            const InstSeqNum cause_seq = fromIEW->squashedSeqNum[tid];
-            const InstSeqNum rob_youngest_seq = youngestSeqNum[tid];
-            DynInstPtr oracle_cause_inst = fromIEW->mispredictInst[tid];
-            if (!oracle_cause_inst) {
-                oracle_cause_inst = rob->findInst(tid, cause_seq);
-            }
-            InstSeqNum squashed_inst = cause_seq;
+            InstSeqNum squashed_inst = fromIEW->squashedSeqNum[tid];
 
             if (fromIEW->includeSquashInst[tid]) {
                 squashed_inst--;
             }
-
-            TaoTrace::traceSquashEpisode(
-                cpu, uint32_t(tid),
-                bool(fromIEW->mispredictInst[tid]),
-                fromIEW->includeSquashInst[tid], uint64_t(cause_seq),
-                uint64_t(squashed_inst), uint64_t(rob_youngest_seq),
-                oracle_cause_inst
-                    ? uint64_t(oracle_cause_inst->pcState().instAddr()) : 0,
-                fromIEW->pc[tid]
-                    ? uint64_t(fromIEW->pc[tid]->instAddr()) : 0);
 
             // All younger instructions will be squashed. Set the sequence
             // number as the youngest instruction in the ROB.
@@ -1008,12 +984,6 @@ Commit::commitInsts()
         } else {
             set(pc[tid], head_inst->pcState());
 
-            // Notify before commitHead updates the committed rename map.  A
-            // privilege-return consumer can therefore sample the syscall
-            // return register before the first user instruction overwrites
-            // it.  This probe is observational and must not mutate state.
-            ppPreCommit->notify(head_inst);
-
             // Try to commit the head instruction.
             bool commit_success = commitHead(head_inst, num_committed);
 
@@ -1057,6 +1027,9 @@ Commit::commitInsts()
 
                 // Updates misc. registers.
                 head_inst->updateMiscRegs();
+                if (head_inst->numDestRegs(MiscRegClass)) {
+                    iewStage->wakeCommittedMiscRegDependents(head_inst);
+                }
 
                 // Check instruction execution if it successfully commits and
                 // is not carrying a fault.
@@ -1250,10 +1223,6 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         // needed to update the state as soon as possible.  This
         // prevents external agents from changing any specific state
         // that the trap need.
-        ppKernelEntry->notify(KernelEntryEvent{
-            uint32_t(cpu->cpuId()), tid, inst_fault,
-            KernelEntrySource::SynchronousFault, curTick(),
-            cpu->clockPeriod(), cpu->inUserMode(tid)});
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
                       head_inst->staticInst);
@@ -1336,13 +1305,20 @@ Commit::getInsts()
     DPRINTF(Commit, "Getting instructions from Rename stage.\n");
 
     // Read any renamed instructions and place them into the ROB.
-    int insts_to_process = std::min((int)renameWidth, fromRename->size);
+    // Rename accepts complete frontend groups. This transport contains all
+    // real members, which can exceed renameWidth without exceeding MaxWidth.
+    int insts_to_process = fromRename->size;
 
-    for (int inst_num = 0; inst_num < insts_to_process; ++inst_num) {
-        const DynInstPtr &inst = fromRename->insts[inst_num];
+    for (int inst_num = 0; inst_num < insts_to_process;) {
+        FrontendInstGroup group(fromRename->insts + inst_num,
+                                insts_to_process - inst_num);
+        const DynInstPtr &inst = group.members[0];
         ThreadID tid = inst->threadNumber;
+        bool all_squashed = true;
+        for (unsigned member = 0; member < group.size; ++member)
+            all_squashed &= group.members[member]->isSquashed();
 
-        if (!inst->isSquashed() &&
+        if (!all_squashed &&
             commitStatus[tid] != ROBSquashing &&
             commitStatus[tid] != TrapPending) {
             changedROBNumEntries[tid] = true;
@@ -1350,16 +1326,17 @@ Commit::getInsts()
             DPRINTF(Commit, "[tid:%i] [sn:%llu] Inserting PC %s into ROB.\n",
                     tid, inst->seqNum, inst->pcState());
 
-            rob->insertInst(inst);
+            rob->insertGroup(group);
 
             assert(rob->getThreadEntries(tid) <= rob->getMaxEntries(tid));
 
-            youngestSeqNum[tid] = inst->seqNum;
+            youngestSeqNum[tid] = group.members[group.size - 1]->seqNum;
         } else {
             DPRINTF(Commit, "[tid:%i] [sn:%llu] "
                     "Instruction PC %s was squashed, skipping.\n",
                     tid, inst->seqNum, inst->pcState());
         }
+        inst_num += group.size;
     }
 }
 
@@ -1387,7 +1364,7 @@ void
 Commit::updateComInstStats(const DynInstPtr &inst)
 {
     const ThreadID tid = inst->threadNumber;
-    const bool in_user_mode = cpu->inUserMode(tid);
+    const bool in_user_mode = inst->fetchedFromUser;
 
     // Count number of instructions, ensure we don't
     // double count Microops as insts.

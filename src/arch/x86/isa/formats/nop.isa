@@ -78,7 +78,8 @@ def template NopExecute {{
 }};
 
 def format NopInst(*opt_flags) {{
-    iop = InstObjParams(name, Name, 'NopInst', "", opt_flags)
+    iop = InstObjParams(name, Name, 'NopInst', "",
+                        list(opt_flags) + ['IsNop', 'No_OpClass'])
     header_output = BasicDeclare.subst(iop)
     decoder_output = BasicConstructor.subst(iop)
     decode_block = BasicDecode.subst(iop)

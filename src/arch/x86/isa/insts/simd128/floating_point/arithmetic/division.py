@@ -53,10 +53,6 @@ def macroop DIVSD_XMM_XMM {
     mdivf xmml, xmml, xmmlm, size=8, ext=Scalar
 };
 
-def macroop DIVSD_XMM_XMM_INDEPENDENT {
-    mdivsd xmml, xmml, xmmlm, size=8, ext=Scalar
-};
-
 def macroop DIVSD_XMM_M {
     ldfp ufp1, seg, sib, disp, dataSize=8
     mdivf xmml, xmml, ufp1, size=8, ext=Scalar

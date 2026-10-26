@@ -28,7 +28,155 @@
 //
 // Decode the three byte opcodes with the 0f38 prefix.
 //
-'X86ISA::ThreeByte0F38Opcode': decode LEGACY_OP {
+'X86ISA::ThreeByte0F38Opcode': decode OPCODE_OP {
+    0xF0: decode VEX_PRESENT {
+        0: decode LEGACY_LOCK {
+            0: decode LEGACY_REPNE {
+                1: Inst::CRC32_B(Gdp, Edp);
+                default: decode LEGACY_REP {
+                    0: Inst::MOVBE(Gv, Mv);
+                    default: Inst::UD2();
+                }
+            }
+            default: Inst::UD2();
+        }
+        default: Inst::UD2();
+    }
+    0xF1: decode VEX_PRESENT {
+        0: decode LEGACY_LOCK {
+            0: decode LEGACY_REPNE {
+                1: Inst::CRC32_V(Gdp, Edp);
+                default: decode LEGACY_REP {
+                    0: Inst::MOVBE(Mv, Gv);
+                    default: Inst::UD2();
+                }
+            }
+            default: Inst::UD2();
+        }
+        default: Inst::UD2();
+    }
+    0xF2: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        1: Inst::UD2();
+                        default: decode LEGACY_REPNE {
+                            1: Inst::UD2();
+                            default: decode LEGACY_REP {
+                                1: Inst::UD2();
+                                default: Inst::ANDN(Gdp, Edp);
+                            }
+                        }
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: Inst::UD2();
+    }
+    0xF3: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        1: Inst::UD2();
+                        default: decode LEGACY_REPNE {
+                            1: Inst::UD2();
+                            default: decode LEGACY_REP {
+                                1: Inst::UD2();
+                                default: decode MODRM_REG {
+                                    1: Inst::BLSR(Edp);
+                                    2: Inst::BLSMSK(Edp);
+                                    3: Inst::BLSI(Edp);
+                                    default: Inst::UD2();
+                                }
+                            }
+                        }
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: Inst::UD2();
+    }
+    0xF5: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        1: Inst::UD2();
+                        default: decode LEGACY_REPNE {
+                            1: Inst::PDEP(Gdp, Edp);
+                            default: decode LEGACY_REP {
+                                1: Inst::PEXT(Gdp, Edp);
+                                default: Inst::BZHI(Gdp, Edp);
+                            }
+                        }
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: Inst::UD2();
+    }
+    0xF6: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        1: Inst::UD2();
+                        default: decode LEGACY_REPNE {
+                            1: Inst::MULX(Gdp, Edp);
+                            default: decode LEGACY_REP {
+                                1: Inst::UD2();
+                                default: Inst::UD2();
+                            }
+                        }
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: decode LEGACY_OP {
+            1: Inst::ADCX(Gdp, Edp);
+            default: decode LEGACY_REP {
+                1: Inst::ADOX(Gdp, Edp);
+                default: Inst::UD2();
+            }
+        }
+    }
+    0xF7: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        1: Inst::SHLX(Gdp, Edp);
+                        default: decode LEGACY_REPNE {
+                            1: Inst::SHRX(Gdp, Edp);
+                            default: decode LEGACY_REP {
+                                1: Inst::SARX(Gdp, Edp);
+                                default: Inst::BEXTR(Gdp, Edp);
+                            }
+                        }
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: Inst::UD2();
+    }
+    default: decode LEGACY_OP {
     format WarnUnimpl {
         1: decode OPCODE_OP {
             0x00: Inst::PSHUFB(Vo, Wo);
@@ -142,11 +290,7 @@
             default: Inst::UD2();
         }
         default: decode LEGACY_REPNE {
-            1: decode OPCODE_OP {
-                0xF0: crc32_Gd_Eb();
-                0xF1: crc32_Gd_Ev();
-                default: Inst::UD2();
-            }
+            1: Inst::UD2();
             default: decode OPCODE_OP {
                 0x00: pshufb_Pq_Qq();
                 0x01: phaddw_Pq_Qq();
@@ -167,4 +311,5 @@
             }
         }
     }
+}
 }

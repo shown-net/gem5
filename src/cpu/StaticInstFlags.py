@@ -66,6 +66,8 @@ class StaticInstFlags(Enum):
         "IsMatrix",  # References Matrix regs.
         "IsLoad",  # Reads from memory (load or prefetch).
         "IsStore",  # Writes to memory.
+        "IsStoreAddress",  # Address/translation member of a split store.
+        "IsStoreData",  # Data member of the same logical store.
         "IsAtomic",  # Does atomic RMW to memory.
         "IsStoreConditional",  # Store conditional instruction.
         "IsInstPrefetch",  # Instruction-cache prefetch.

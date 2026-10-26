@@ -48,22 +48,19 @@ def macroop STD {
     wruflags t1, t0, dataSize=8
 };
 
-def macroop CLC {
-    ruflags t1, dataSize=8
-    limm t2, "~((uint64_t)CFBit)", dataSize=8
-    and t1, t1, t2, dataSize=8
-    wruflags t1, t0, dataSize=8
+def macroop CLC
+{
+    clcflag
 };
 
-def macroop STC {
-    ruflags t1, dataSize=8
-    ori t1, t1, "CFBit", dataSize=8
-    wruflags t1, t0, dataSize=8
+def macroop STC
+{
+    stcflag
 };
 
-def macroop CMC {
-    ruflags t1, dataSize=8
-    wruflagsi t1, "CFBit", dataSize=8
+def macroop CMC
+{
+    cmcflag
 };
 
 def macroop STI {
@@ -71,7 +68,7 @@ def macroop STI {
 
     # Extract the IOPL.
     srli t2, t1, 12, dataSize=8
-    andi t2, t1, 0x3, dataSize=8
+    andi t2, t2, 0x3, dataSize=8
 
     # Find the CPL.
     rdm5reg t3, dataSize=8
@@ -87,12 +84,12 @@ def macroop STI {
 
     # Check CR4.PVI
     rdcr t4, cr4, dataSize=8
-    andi t0, t4, 0x1, flags=(CEZF,)
+    andi t0, t4, 0x1, flags=(EZF,)
     fault "std::make_shared<GeneralProtection>(0)", flags=(CEZF,)
 
     # Check CPL.
     andi t4, t3, 0x3, dataSize=8
-    xori t4, t4, 0x3, dataSize=8, flags=(CEZF,)
+    xori t4, t4, 0x3, dataSize=8, flags=(EZF,)
     fault "std::make_shared<GeneralProtection>(0)", flags=(nCEZF,)
 
     #     if (RFLAGS.VIP == 1)
@@ -129,7 +126,7 @@ def macroop CLI {
 
     # Extract the IOPL.
     srli t2, t1, 12, dataSize=8
-    andi t2, t1, 0x3, dataSize=8
+    andi t2, t2, 0x3, dataSize=8
 
     # Find the CPL.
     rdm5reg t3, dataSize=8
@@ -145,12 +142,12 @@ def macroop CLI {
 
     # Check CR4.PVI
     rdcr t4, cr4, dataSize=8
-    andi t0, t4, 0x1, flags=(CEZF,)
+    andi t0, t4, 0x1, flags=(EZF,)
     fault "std::make_shared<GeneralProtection>(0)", flags=(CEZF,)
 
     # Check CPL.
     andi t4, t3, 0x3, dataSize=8
-    xori t4, t4, 0x3, dataSize=8, flags=(CEZF,)
+    xori t4, t4, 0x3, dataSize=8, flags=(EZF,)
     fault "std::make_shared<GeneralProtection>(0)", flags=(nCEZF,)
 
     # RFLAGS.VIF = 0

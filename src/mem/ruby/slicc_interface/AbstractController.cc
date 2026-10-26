@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017,2019-2022 ARM Limited
+ * Copyright (c) 2017,2019-2022, 2026 Arm Limited
  * All rights reserved.
  *
  * The license below extends only to copyright in the software and shall
@@ -45,7 +45,6 @@
 #include "mem/ruby/protocol/MemoryMsg.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "mem/ruby/system/Sequencer.hh"
-#include "mem/taotrace_response.hh"
 #include "sim/system.hh"
 
 namespace gem5
@@ -118,6 +117,16 @@ AbstractController::init()
     upstreamDestinations.resize();
     for (auto abs_cntrl : params().upstream_destinations) {
         upstreamDestinations.add(abs_cntrl->getMachineID());
+    }
+}
+
+DrainState
+AbstractController::drain()
+{
+    if (noInTransactions()) {
+        return DrainState::Drained;
+    } else {
+        return DrainState::Draining;
     }
 }
 
@@ -307,12 +316,6 @@ AbstractController::serviceMemoryQueue()
         scheduleEvent(Cycles(1));
         recvTimingResp(pkt);
     } else if (memoryPort.sendTimingReq(pkt)) {
-        if (mem_msg->getType() == MemoryRequestType_MEMORY_READ &&
-            mem_msg->m_TraceValid && mem_msg->m_TraceContextId >= 0) {
-            TaoTraceNativeAccessRegistry::noteMemoryReadTransaction(
-                uint32_t(mem_msg->m_TraceContextId),
-                uint64_t(mem_msg->m_TraceInstSeqNum));
-        }
         mem_queue->dequeue(clockEdge());
         // Since the queue was popped the controller may be able
         // to make more progress. Make sure it wakes up
@@ -460,7 +463,6 @@ const
     fatal("%s: couldn't find mapping for address %x mtype=%s\n",
         name(), addr, mtype);
 }
-
 
 void
 AbstractController::memRespQueueDequeued() {

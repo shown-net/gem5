@@ -1,4 +1,4 @@
-# Copyright (c) 2010, 2017, 2020, 2024-2025 Arm Limited
+# Copyright (c) 2010, 2017, 2020, 2024-2026 Arm Limited
 # All rights reserved.
 #
 # The license below extends only to copyright in the software and shall
@@ -43,7 +43,10 @@ from m5.SimObject import SimObject
 
 
 class IntALU(FUDesc):
-    opList = [OpDesc(opClass="IntAlu")]
+    opList = [OpDesc(opClass="IntAlu"), OpDesc(opClass="X86IntShift"),
+              OpDesc(opClass="X86IntBoolean"),
+              OpDesc(opClass="X86IntMulResult64"),
+              OpDesc(opClass="X86IntCarry")]
     count = 6
 
 
@@ -119,7 +122,9 @@ class SIMD_Unit(FUDesc):
         OpDesc(opClass="SimdSha256Hash2"),
         OpDesc(opClass="SimdShaSigma2"),
         OpDesc(opClass="SimdShaSigma3"),
+        OpDesc(opClass="SimdSha512Hash"),
         OpDesc(opClass="SimdSha3"),
+        OpDesc(opClass="SimdSm3"),
         OpDesc(opClass="SimdSm4e"),
         OpDesc(opClass="SimdCrc"),
         OpDesc(opClass="SimdBf16Add"),
@@ -182,6 +187,16 @@ class WritePort(FUDesc):
         OpDesc(opClass="SimdStrideSegmentedStore"),
     ]
     count = 0
+
+
+class StoreAddressPort(FUDesc):
+    opList = [OpDesc(opClass="X86StoreAddress")]
+    count = 2
+
+
+class StoreDataPort(FUDesc):
+    opList = [OpDesc(opClass="X86StoreData")]
+    count = 2
 
 
 class RdWrPort(FUDesc):

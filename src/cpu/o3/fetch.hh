@@ -42,6 +42,8 @@
 #ifndef __CPU_O3_FETCH_HH__
 #define __CPU_O3_FETCH_HH__
 
+#include <vector>
+
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"
 #include "base/random.hh"
@@ -49,6 +51,7 @@
 #include "cpu/o3/bac.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/pc_event.hh"
@@ -121,6 +124,21 @@ class Fetch
         {
             assert(mode == BaseMMU::Execute);
             fetch->finishTranslation(fault, req);
+            delete this;
+        }
+    };
+
+    class LookaheadTranslation : public BaseMMU::Translation
+    {
+        Fetch *fetch;
+      public:
+        LookaheadTranslation(Fetch *_fetch) : fetch(_fetch) {}
+        void markDelayed() override {}
+        void finish(const Fault &fault, const RequestPtr &req,
+                    gem5::ThreadContext *tc, BaseMMU::Mode mode) override
+        {
+            assert(mode == BaseMMU::Execute);
+            fetch->finishLookaheadTranslation(fault, req);
             delete this;
         }
     };
@@ -429,7 +447,6 @@ class Fetch
     Addr fetchOffset[MaxThreads];
 
     StaticInstPtr macroop[MaxThreads];
-    bool macroopFromUser[MaxThreads] = {};
 
     /** Can the fetch stage redirect from an interrupt on this instruction? */
     bool delayedCommit[MaxThreads];
@@ -475,6 +492,11 @@ class Fetch
 
     /** The width of decode in instructions. */
     const unsigned decodeWidth;
+    const bool frontendStoreGroups;
+    const bool frontendLoadAluGroups;
+    unsigned numFetchGroups = 0;
+    const bool fetchLookahead;
+    const unsigned fetchLookaheadDepth;
 
     /** Is the cache blocked?  If so no threads can access it. */
     bool cacheBlocked;
@@ -499,14 +521,31 @@ class Fetch
     /** The fetch data that is being fetched and buffered. */
     uint8_t *fetchBuffer[MaxThreads];
 
+    struct LookaheadBlock
+    {
+        std::vector<uint8_t> data;
+        Addr pc = 0;
+        RequestPtr request;
+        bool valid = false;
+        bool discard = false;
+        bool demanded = false;
+    };
+    std::vector<LookaheadBlock> lookahead[MaxThreads];
+    bool lookaheadCacheBlocked = false;
+    void requestLookahead(ThreadID tid);
+    void finishLookaheadTranslation(const Fault &fault, const RequestPtr &req);
+    LookaheadBlock *findLookahead(ThreadID tid, Addr address);
+    void useLookahead(ThreadID tid, LookaheadBlock &slot);
+    void invalidateLookahead(ThreadID tid);
+
     /** The PC of the first instruction loaded into the fetch buffer. */
     Addr fetchBufferPC[MaxThreads];
 
-    /** The size of the fetch queue in micro-ops */
+    /** Actual frontend group entries in the fetch queue. */
     unsigned fetchQueueSize;
 
     /** Queue of fetched instructions. Per-thread to prevent HoL blocking. */
-    std::deque<DynInstPtr> fetchQueue[MaxThreads];
+    std::deque<FrontendInstGroup> fetchQueue[MaxThreads];
 
     /** Whether or not the fetch buffer data is valid. */
     bool fetchBufferValid[MaxThreads];
@@ -560,6 +599,9 @@ class Fetch
         statistics::Vector status;
         /** Stat for total number of predicted branches. */
         statistics::Scalar predictedBranches;
+        statistics::Scalar frontendGroups;
+        statistics::Scalar frontendStoreGroups;
+        statistics::Scalar frontendLoadAluGroups;
         /** Total number of cycles spent in any other state. */
         statistics::Scalar miscStallCycles;
         /** Total number of cycles spent in waiting for drains. */
@@ -568,6 +610,9 @@ class Fetch
         statistics::Scalar noActiveThreadStallCycles;
         // /** Stat for total number of fetched cache lines. */
         statistics::Scalar cacheLines;
+        statistics::Scalar lookaheadIssued, lookaheadUsed, lookaheadDiscarded;
+        statistics::Scalar lookaheadFaults, lookaheadBlocked;
+        statistics::Scalar lookaheadStitches;
         /** Total number of outstanding icache accesses that were dropped
          * due to a squash.
          */

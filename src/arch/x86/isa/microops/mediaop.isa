@@ -111,7 +111,7 @@ let {{
             opt_args = []
             if self.op_class:
                 opt_args.append(self.op_class)
-            iop = InstObjParams(name, Name + suffix, base, {"code" : code},
+            iop = X86InstObjParams(name, Name + suffix, base, {"code" : code},
                                 opt_args)
 
             # Generate the actual code (finally!)
@@ -922,9 +922,6 @@ let {{
             }
             FpDestReg_uqw = result;
         '''
-
-    class Mdivsd(Mdivf):
-        op_class = 'X86DivsdOp'
 
     class Maddi(Media3Op):
         op_class = 'SimdAddOp'

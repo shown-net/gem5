@@ -49,6 +49,7 @@
 #include <queue>
 
 #include "arch/generic/tlb.hh"
+#include "arch/x86/insts/static_inst.hh"
 #include "arch/x86/regs/misc.hh"
 #include "base/types.hh"
 #include "cpu/base.hh"
@@ -56,13 +57,13 @@
 #include "cpu/nop_static_inst.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/limits.hh"
 #include "debug/Activity.hh"
 #include "debug/Drain.hh"
 #include "debug/Fetch.hh"
 #include "debug/O3CPU.hh"
 #include "mem/packet.hh"
-#include "mem/taotrace_response.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/byteswap.hh"
 #include "sim/core.hh"
@@ -75,6 +76,20 @@ namespace gem5
 
 namespace o3
 {
+
+namespace
+{
+class LookaheadSenderState : public Packet::SenderState {};
+
+bool
+decodedFromUser(CPU *cpu, ThreadID tid, const StaticInstPtr &instruction)
+{
+    if (const auto *x86 =
+            dynamic_cast<const X86ISA::X86StaticInst *>(instruction.get()))
+        return x86->machInst.mode.cpl == 3;
+    return cpu->inUserMode(tid);
+}
+}
 
 // clang-format off
 std::string Fetch::FetchStatGroup::statusStrings[ThreadStatusMax] = {
@@ -126,6 +141,10 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
       commitToFetchDelay(params.commitToFetchDelay),
       fetchWidth(params.fetchWidth),
       decodeWidth(params.decodeWidth),
+      frontendStoreGroups(params.frontendStoreGroups),
+      frontendLoadAluGroups(params.frontendLoadAluGroups),
+      fetchLookahead(params.fetchLookahead),
+      fetchLookaheadDepth(params.fetchLookaheadDepth),
       retryPkt(NULL),
       retryTid(InvalidThreadID),
       cacheBlkSize(cpu->cacheLineSize()),
@@ -148,6 +167,10 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
         fatal("fetchWidth (%d) is larger than compiled limit (%d),\n"
              "\tincrease MaxWidth in src/cpu/o3/limits.hh\n",
              fetchWidth, static_cast<int>(MaxWidth));
+    fatal_if((frontendStoreGroups || frontendLoadAluGroups) &&
+             (2 * fetchWidth > MaxWidth || 2 * decodeWidth > MaxWidth ||
+              fetchQueueSize < 1),
+             "Frontend groups require room for both real store uops");
     if (fetchBufferSize > cacheBlkSize)
         fatal("fetch buffer size (%u bytes) is greater than the cache "
               "block size (%u bytes)\n", fetchBufferSize, cacheBlkSize);
@@ -179,6 +202,13 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
         // Create space to buffer the cache line data,
         // which may not hold the entire cache line.
         fetchBuffer[tid] = new uint8_t[fetchBufferSize];
+        if (fetchLookahead) {
+            fatal_if(fetchLookaheadDepth == 0,
+                     "Lookahead requires at least one real byte buffer");
+            lookahead[tid].resize(fetchLookaheadDepth);
+            for (auto &slot : lookahead[tid])
+                slot.data.resize(fetchBufferSize);
+        }
     }
 
     // Get the size of an instruction.
@@ -201,6 +231,12 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
       ADD_STAT(status, statistics::units::Cycle::get(), "Fetch status cycles"),
       ADD_STAT(predictedBranches, statistics::units::Count::get(),
                "Number of branches that fetch has predicted taken"),
+      ADD_STAT(frontendGroups, statistics::units::Count::get(),
+               "Complete frontend groups constructed by fetch"),
+      ADD_STAT(frontendStoreGroups, statistics::units::Count::get(),
+               "Real STA/STD pairs constructed as frontend groups"),
+      ADD_STAT(frontendLoadAluGroups, statistics::units::Count::get(),
+               "Real load/ALU pairs constructed as frontend groups"),
       ADD_STAT(
           miscStallCycles, statistics::units::Cycle::get(),
           "Number of cycles fetch has spent waiting on interrupts, or bad "
@@ -211,6 +247,18 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
                "Number of stall cycles due to no active thread to fetch from"),
       ADD_STAT(cacheLines, statistics::units::Count::get(),
                "Number of cache lines fetched"),
+      ADD_STAT(lookaheadIssued, statistics::units::Count::get(),
+               "Next-buffer instruction reads accepted by the cache"),
+      ADD_STAT(lookaheadUsed, statistics::units::Count::get(),
+               "Lookahead byte buffers promoted into the demand buffer"),
+      ADD_STAT(lookaheadDiscarded, statistics::units::Count::get(),
+               "Lookahead cache responses discarded after invalidation"),
+      ADD_STAT(lookaheadFaults, statistics::units::Count::get(),
+               "Speculative lookahead translation faults ignored"),
+      ADD_STAT(lookaheadBlocked, statistics::units::Count::get(),
+               "Lookahead reads rejected by cache backpressure"),
+      ADD_STAT(lookaheadStitches, statistics::units::Count::get(),
+               "Ready next buffers consumed within the same fetch cycle"),
       ADD_STAT(icacheSquashes, statistics::units::Count::get(),
                "Number of outstanding Icache misses that were squashed"),
       ADD_STAT(tlbSquashes, statistics::units::Count::get(),
@@ -237,7 +285,8 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
     ftNumber.init(0, fetch->maxFTPerCycle, 1);
     nisnDist
         .init(/* base value */ 0,
-              /* last value */ fetch->fetchWidth,
+              /* last value */ fetch->fetchWidth *
+                  ((fetch->frontendStoreGroups || fetch->frontendLoadAluGroups) ? 2 : 1),
               /* bucket size */ 1)
         .flags(statistics::pdf);
     idleRate.prereq(idleRate);
@@ -306,6 +355,7 @@ Fetch::clearStates(ThreadID tid)
     stalls[tid].drain = false;
     fetchBufferPC[tid] = 0;
     fetchBufferValid[tid] = false;
+    invalidateLookahead(tid);
     fetchQueue[tid].clear();
 
     // TODO not sure what to do with priorityList for now
@@ -323,6 +373,7 @@ void
 Fetch::resetStage()
 {
     numInst = 0;
+    numFetchGroups = 0;
     interruptPending = false;
     cacheBlocked = false;
 
@@ -344,6 +395,8 @@ Fetch::resetStage()
         fetchBufferPC[tid] = 0;
         fetchBufferValid[tid] = false;
 
+        invalidateLookahead(tid);
+
         fetchQueue[tid].clear();
 
         priorityList.push_back(tid);
@@ -358,6 +411,38 @@ Fetch::processCacheCompletion(PacketPtr pkt)
 {
     ThreadID tid = cpu->contextToThread(pkt->req->contextId());
 
+    if (dynamic_cast<LookaheadSenderState *>(pkt->senderState)) {
+        const auto found = std::find_if(lookahead[tid].begin(),
+            lookahead[tid].end(), [&pkt](const auto &slot) {
+                return slot.request == pkt->req;
+            });
+        panic_if(found == lookahead[tid].end(),
+                 "Lookahead response has no owning byte buffer");
+        auto &slot = *found;
+        slot.request = nullptr;
+        if (!slot.discard && !cpu->switchedOut()) {
+            memcpy(slot.data.data(), pkt->getConstPtr<uint8_t>(),
+                   fetchBufferSize);
+            slot.valid = true;
+            if (slot.demanded) {
+                useLookahead(tid, slot);
+                fetchStatus[tid] = checkStall(tid) ? Blocked :
+                    IcacheAccessComplete;
+            }
+            pkt->req->setAccessLatency();
+            cpu->ppInstAccessComplete->notify(pkt);
+        } else {
+            ++fetchStats.lookaheadDiscarded;
+        }
+        slot.discard = false;
+        slot.demanded = false;
+        delete pkt->popSenderState();
+        delete pkt;
+        cpu->wakeCPU();
+        switchToActive();
+        return;
+    }
+
     DPRINTF(Fetch, "[tid:%i] Waking up from cache miss.\n", tid);
     assert(!cpu->switchedOut());
 
@@ -365,10 +450,6 @@ Fetch::processCacheCompletion(PacketPtr pkt)
     // to return.
     if (fetchStatus[tid] != IcacheWaitResponse ||
         pkt->req != memReq[tid]) {
-        TaoTraceFrontendRegistry::noteTerminal(
-            pkt->req,
-            TaoTraceFrontendRegistry::Terminal::SquashedResponse,
-            uint64_t(curTick()));
         ++fetchStats.icacheSquashes;
         delete pkt;
         return;
@@ -395,9 +476,6 @@ Fetch::processCacheCompletion(PacketPtr pkt)
 
     pkt->req->setAccessLatency();
     cpu->ppInstAccessComplete->notify(pkt);
-    TaoTraceFrontendRegistry::noteTerminal(
-        pkt->req, TaoTraceFrontendRegistry::Terminal::Response,
-        uint64_t(curTick()));
     // Reset the mem req to NULL.
     delete pkt;
     memReq[tid] = NULL;
@@ -438,6 +516,9 @@ Fetch::isDrained() const
      */
     for (ThreadID i = 0; i < numThreads; ++i) {
         // Verify fetch queues are drained
+        for (const auto &slot : lookahead[i])
+            if (slot.request)
+                return false;
         if (!fetchQueue[i].empty())
             return false;
 
@@ -454,7 +535,7 @@ Fetch::isDrained() const
      * cycle if the finish translation event is scheduled, so make
      * sure that's not the case.
      */
-    return !finishTranslationEvent.scheduled();
+    return !finishTranslationEvent.scheduled() && !lookaheadCacheBlocked;
 }
 
 void
@@ -462,7 +543,7 @@ Fetch::takeOverFrom()
 {
     assert(cpu->getInstPort().isConnected());
     resetStage();
-
+    switchToActive();
 }
 
 void
@@ -559,6 +640,20 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
     // Align the fetch address to the start of a fetch buffer segment.
     Addr fetchBufferBlockPC = fetchBufferAlignPC(vaddr);
 
+    if (fetchLookahead) {
+        auto *slot = findLookahead(tid, fetchBufferBlockPC);
+        if (slot && slot->valid) {
+            useLookahead(tid, *slot);
+            fetchStatus[tid] = IcacheAccessComplete;
+            return true;
+        }
+        if (slot && slot->request) {
+            slot->demanded = true;
+            fetchStatus[tid] = IcacheWaitResponse;
+            return true;
+        }
+    }
+
     DPRINTF(Fetch, "[tid:%i] Fetching cache line %#x for addr %#x\n",
             tid, fetchBufferBlockPC, vaddr);
 
@@ -569,11 +664,6 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
         fetchBufferBlockPC, fetchBufferSize,
         Request::INST_FETCH, cpu->instRequestorId(), pc,
         cpu->thread[tid]->contextId());
-
-    TaoTraceFrontendRegistry::noteRequestStart(
-        mem_req, cpu->inUserMode(tid),
-        fetchBufferValid[tid], fetchBufferBlockPC == fetchBufferPC[tid],
-        uint64_t(curTick()));
 
     mem_req->taskId(cpu->taskId());
 
@@ -598,16 +688,10 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
     // Wake up CPU if it was idle
     cpu->wakeCPU();
 
-    TaoTraceFrontendRegistry::noteTranslationComplete(mem_req);
-
     if (fetchStatus[tid] != ItlbWait || mem_req != memReq[tid] ||
         mem_req->getVaddr() != memReq[tid]->getVaddr()) {
         DPRINTF(Fetch, "[tid:%i] Ignoring itlb completed after squash\n",
                 tid);
-        TaoTraceFrontendRegistry::noteTerminal(
-            mem_req,
-            TaoTraceFrontendRegistry::Terminal::TranslationSquash,
-            uint64_t(curTick()));
         ++fetchStats.tlbSquashes;
         return;
     }
@@ -621,9 +705,6 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         if (!cpu->system->isMemAddr(mem_req->getPaddr())) {
             warn("Address %#x is outside of physical memory, stopping fetch\n",
                     mem_req->getPaddr());
-            TaoTraceFrontendRegistry::noteTerminal(
-                mem_req, TaoTraceFrontendRegistry::Terminal::NoGoodAddress,
-                uint64_t(curTick()));
             fetchStatus[tid] = NoGoodAddr;
             memReq[tid] = NULL;
             return;
@@ -640,9 +721,7 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         fetchStats.cacheLines++;
 
         // Access the cache.
-        const bool accepted = icachePort.sendTimingReq(data_pkt);
-        TaoTraceFrontendRegistry::noteSendAttempt(mem_req, accepted);
-        if (!accepted) {
+        if (lookaheadCacheBlocked || !icachePort.sendTimingReq(data_pkt)) {
             assert(retryPkt == NULL);
             assert(retryTid == InvalidThreadID);
             DPRINTF(Fetch, "[tid:%i] Out of MSHRs!\n", tid);
@@ -663,7 +742,7 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         }
     } else {
         // Don't send an instruction to decode if we can't handle it.
-        if (!(numInst < fetchWidth) ||
+        if (!(numFetchGroups < fetchWidth) ||
                 !(fetchQueue[tid].size() < fetchQueueSize)) {
             assert(!finishTranslationEvent.scheduled());
             finishTranslationEvent.setFault(fault);
@@ -676,9 +755,6 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
                 "[tid:%i] Got back req with addr %#x but expected %#x\n",
                 tid, mem_req->getVaddr(), memReq[tid]->getVaddr());
         // Translation faulted, icache request won't be sent.
-        TaoTraceFrontendRegistry::noteTerminal(
-            mem_req, TaoTraceFrontendRegistry::Terminal::TranslationFault,
-            uint64_t(curTick()));
         memReq[tid] = NULL;
 
         // Send the fault to commit.  This thread will not do anything
@@ -690,6 +766,11 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         // We will use a nop in order to carry the fault.
         DynInstPtr instruction = buildInst(tid, nopStaticInstPtr, nullptr,
                 fetch_pc, fetch_pc, false);
+        const DynInstPtr members[] = {instruction};
+        fetchQueue[tid].emplace_back(members, 1);
+        ++fetchStats.frontendGroups;
+        ++numInst;
+        ++numFetchGroups;
         instruction->setNotAnInst();
 
         instruction->setPredTarg(fetch_pc);
@@ -740,19 +821,15 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     DPRINTF(Fetch, "[tid:%i] Squashing, setting PC to: %s.\n",
             tid, new_pc);
 
-    TaoTraceFrontendRegistry::noteSquash(
-        uint32_t(cpu->thread[tid]->contextId()), memReq[tid] != nullptr);
-
     set(pc[tid], new_pc);
     fetchOffset[tid] = 0;
     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
-        !squashInst->isLastMicroop()) {
+        !squashInst->isLastMicroop())
         macroop[tid] = squashInst->macroop;
-        macroopFromUser[tid] = squashInst->fetchedFromUser;
-    } else {
+    else
         macroop[tid] = NULL;
-    }
     decoder[tid]->reset();
+    invalidateLookahead(tid);
 
     // Clear the icache miss if it's outstanding.
     if (fetchStatus[tid] == IcacheWaitResponse) {
@@ -769,10 +846,6 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     if (retryTid == tid) {
         assert(cacheBlocked);
         if (retryPkt) {
-            TaoTraceFrontendRegistry::noteTerminal(
-                retryPkt->req,
-                TaoTraceFrontendRegistry::Terminal::RetryDiscard,
-                uint64_t(curTick()));
             delete retryPkt;
         }
         retryPkt = NULL;
@@ -902,6 +975,17 @@ Fetch::tick()
         if (issuePipelinedIfetch[i]) {
             pipelineIcacheAccesses(i);
         }
+        const auto *pending_bytes = fetchLookahead ?
+            findLookahead(i, fetchBufferAlignPC(
+                (pc[i]->instAddr() + fetchOffset[i]) & decoder[i]->pcMask())) : nullptr;
+        const bool awaiting_lookahead = pending_bytes &&
+            pending_bytes->request && pending_bytes->demanded;
+        if (fetchLookahead && !stalls[i].drain && fetchBufferValid[i] &&
+            (fetchStatus[i] == Running ||
+             fetchStatus[i] == IcacheAccessComplete ||
+             (fetchStatus[i] == IcacheWaitResponse && awaiting_lookahead))) {
+            requestLookahead(i);
+        }
     }
 
     // Send instructions enqueued into the fetch queue to decode.
@@ -923,16 +1007,19 @@ Fetch::tick()
     while (available_insts != 0 && insts_to_decode < decodeWidth) {
         ThreadID tid = *tid_itr;
         if (!stalls[tid].decode && !fetchQueue[tid].empty()) {
-            const auto& inst = fetchQueue[tid].front();
-            toDecode->insts[toDecode->size++] = inst;
-            DPRINTF(Fetch, "[tid:%i] [sn:%llu] Sending instruction to decode "
-                    "from fetch queue. Fetch queue size: %i.\n",
-                    tid, inst->seqNum, fetchQueue[tid].size());
-
-            wroteToTimeBuffer = true;
+            const auto &group = fetchQueue[tid].front();
+            assert(toDecode->size + group.size <= MaxWidth);
+            for (unsigned i = 0; i < group.size; ++i) {
+                const auto &inst = group.members[i];
+                toDecode->insts[toDecode->size++] = inst;
+                DPRINTF(Fetch, "[tid:%i] [sn:%llu] Sending group member to "
+                        "decode. Fetch queue size: %i.\n", tid,
+                        inst->seqNum, fetchQueue[tid].size());
+            }
             fetchQueue[tid].pop_front();
+            wroteToTimeBuffer = true;
             insts_to_decode++;
-            available_insts--;
+            --available_insts;
         }
 
         tid_itr++;
@@ -949,14 +1036,7 @@ Fetch::tick()
 
     // Reset the number of the instruction we've fetched.
     numInst = 0;
-
-    // One sample per O3 clock and thread, gated by TaoTrace's exact per-core
-    // measurement window rather than the process-wide stats reset/dump.
-    for (ThreadID tid = 0; tid < numThreads; ++tid) {
-        TaoTraceFrontendRegistry::noteStatusCycle(
-            uint32_t(cpu->thread[tid]->contextId()),
-            static_cast<unsigned>(fetchStatus[tid]));
-    }
+    numFetchGroups = 0;
 }
 
 bool
@@ -1061,7 +1141,9 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
     instruction->setTid(tid);
-    instruction->fetchedFromUser = cpu->inUserMode(tid);
+    instruction->frontendGroupHead = seq;
+    instruction->fetchedFromUser = decodedFromUser(
+        cpu, tid, curMacroop ? curMacroop : staticInst);
     instruction->fetchedAddressSpaceId =
         cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
         ~uint64_t(0xfff);
@@ -1087,14 +1169,10 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     // Add instruction to the CPU's list of instructions.
     instruction->setInstListIt(cpu->addInst(instruction));
 
-    // Write the instruction to the first slot in the queue
-    // that heads to decode.
-    assert(numInst < fetchWidth);
-    fetchQueue[tid].push_back(instruction);
-    assert(fetchQueue[tid].size() <= fetchQueueSize);
-    DPRINTF(Fetch, "[tid:%i] Fetch queue entry created (%i/%i).\n",
-            tid, fetchQueue[tid].size(), fetchQueueSize);
-    //toDecode->insts[toDecode->size++] = instruction;
+    // The caller inserts the complete group after constructing every real
+    // member. Translation faults are singleton groups at that boundary.
+    assert(numInst < fetchWidth *
+        ((frontendStoreGroups || frontendLoadAluGroups) ? 2 : 1));
 
     // Keep track of if we can take an interrupt at this boundary
     delayedCommit[tid] = instruction->isDelayedCommit();
@@ -1159,6 +1237,12 @@ Fetch::fetch(bool &status_change)
     // If returning from the delay of a cache miss, then update the status
     // to running, otherwise do the cache access.  Possibly move this up
     // to tick() function.
+    if (fetchLookahead && fetchStatus[tid] == Running) {
+        auto *slot = findLookahead(tid, fetchBufferAlignPC(fetchAddr));
+        if (slot && slot->valid && (!fetchBufferValid[tid] ||
+            fetchBufferPC[tid] != slot->pc))
+            useLookahead(tid, *slot);
+    }
     if (fetchStatus[tid] == IcacheAccessComplete) {
         DPRINTF(Fetch, "[tid:%i] Icache miss is complete.\n", tid);
 
@@ -1214,8 +1298,6 @@ Fetch::fetch(bool &status_change)
 
     StaticInstPtr staticInst = NULL;
     StaticInstPtr curMacroop = macroop[tid];
-    bool curMacroopFromUser = curMacroop ? macroopFromUser[tid] :
-        cpu->inUserMode(tid);
 
     // If the read of the first instruction was successful, then grab the
     // instructions from the rest of the cache line and put them into the
@@ -1243,7 +1325,9 @@ Fetch::fetch(bool &status_change)
     // Loop through instruction memory from the cache.
     // Keep issuing while fetchWidth is available and branch is not
     // predicted taken
-    while (numInst < fetchWidth && fetchQueue[tid].size() < fetchQueueSize
+    bool groupQueueFull = false;
+    while (numFetchGroups < fetchWidth &&
+           fetchQueue[tid].size() < fetchQueueSize && !groupQueueFull
            && !predictedBranch && !quiesce) {
 
         // For the decoupled front-end also check if the FTQ
@@ -1265,6 +1349,18 @@ Fetch::fetch(bool &status_change)
         Addr fetchBufferBlockPC = fetchBufferAlignPC(fetchAddr);
 
         if (needMem) {
+            // Fill the remaining fetch width across a buffer boundary when
+            // the translated next bytes are already present. Stopping here
+            // would turn the avoided cache wait into an empty running cycle.
+            if (fetchLookahead) {
+                auto *slot = findLookahead(tid, fetchBufferBlockPC);
+                if (slot && slot->valid && (!fetchBufferValid[tid] ||
+                    fetchBufferPC[tid] != fetchBufferBlockPC)) {
+                    useLookahead(tid, *slot);
+                    blkOffset = (fetchAddr - fetchBufferPC[tid]) / instSize;
+                    ++fetchStats.lookaheadStitches;
+                }
+            }
             // If buffer is no longer valid or fetchAddr has moved to point
             // to the next cache block then start fetch from icache.
             if (!fetchBufferValid[tid] ||
@@ -1290,6 +1386,7 @@ Fetch::fetch(bool &status_change)
 
         // Extract as many instructions and/or microops as we can from
         // the memory we've processed so far.
+        bool stopExtraction = false;
         do {
             if (!(curMacroop || inRom)) {
                 if (dec_ptr->instReady()) {
@@ -1300,7 +1397,6 @@ Fetch::fetch(bool &status_change)
 
                     if (staticInst->isMacroop()) {
                         curMacroop = staticInst;
-                        curMacroopFromUser = cpu->inUserMode(tid);
                     } else {
                         pcOffset = 0;
                     }
@@ -1324,86 +1420,164 @@ Fetch::fetch(bool &status_change)
                 newMacro |= staticInst->isLastMicroop();
             }
 
-            DynInstPtr instruction = buildInst(
-                    tid, staticInst, curMacroop, this_pc, *next_pc, true);
-            if (curMacroop)
-                instruction->fetchedFromUser = curMacroopFromUser;
-
-            ppFetch->notify(instruction);
-            numInst++;
-
-            instruction->fetchTick = curTick();
-
-            set(next_pc, this_pc);
-
-            // If we're branching after this instruction, quit fetching
-            // from the same block.
-            predictedBranch |= this_pc.branching();
-
-            // Get the next PC from the BAC stage.
-            predictedBranch |= bac->updatePC(instruction, *next_pc, curFT);
-
-            if (instruction->isControl()) {
-                cpu->fetchStats[tid]->numBranches++;
+            unsigned groupSize = 1;
+            auto groupKind = DynInst::FrontendGroupKind::Single;
+            if (frontendStoreGroups && curMacroop && !inRom &&
+                staticInst->isStore() && !staticInst->isLastMicroop() &&
+                !staticInst->isAtomic() &&
+                !staticInst->isStoreConditional() &&
+                !staticInst->isSerializeBefore() &&
+                !staticInst->isSerializeAfter() &&
+                !staticInst->isNonSpeculative() &&
+                staticInst->numDestRegs() == 0) {
+                auto data = curMacroop->fetchMicroop(this_pc.microPC() + 1);
+                if (data->isStoreData() && data->numDestRegs() == 0 &&
+                    !data->isSerializeBefore() &&
+                    !data->isSerializeAfter() && !data->isNonSpeculative()) {
+                    groupSize = 2;
+                    groupKind = DynInst::FrontendGroupKind::Store;
+                }
             }
-            if (predictedBranch) {
-                DPRINTF(Fetch, "Branch detected with PC = %s -> targ: %s, \n",
-                        this_pc, *next_pc);
-                ++fetchStats.predictedBranches;
+            if (frontendLoadAluGroups && curMacroop && !inRom &&
+                this_pc.microPC() == 0 &&
+                staticInst->isLoad() && !staticInst->isLastMicroop() &&
+                !staticInst->isAtomic() && !staticInst->isFloating() &&
+                !staticInst->isVector() && !staticInst->isSerializeBefore() &&
+                !staticInst->isSerializeAfter() && !staticInst->isNonSpeculative()) {
+                // These scalar memory forms have two actual execution uops
+                // and one frontend uop in the local SPR instruction priors.
+                // Retain the exact load and final ALU members; RMW, partial
+                // expansions and other instruction families stay separate.
+                const auto &name = curMacroop->getName();
+                const bool scalarAlu = name == "add" || name == "adc" ||
+                    name == "sub" || name == "sbb" || name == "and" ||
+                    name == "or" || name == "xor" || name == "cmp" ||
+                    name == "test";
+                auto alu = curMacroop->fetchMicroop(this_pc.microPC() + 1);
+                if (scalarAlu && alu->isLastMicroop() && !alu->isMemRef() &&
+                    !alu->isControl() && !alu->isSerializeBefore() &&
+                    !alu->isSerializeAfter() && !alu->isNonSpeculative() &&
+                    alu->numDestRegs(MiscRegClass) == 0) {
+                    groupSize = 2;
+                    groupKind = DynInst::FrontendGroupKind::LoadAlu;
+                }
             }
-
-            newMacro |= this_pc.instAddr() != next_pc->instAddr();
-
-            // Move to the next instruction, unless we have a branch.
-            set(this_pc, *next_pc);
-            inRom = isRomMicroPC(this_pc.microPC());
-
-            if (newMacro) {
-                fetchAddr = this_pc.instAddr() & pc_mask;
-                blkOffset = (fetchAddr - fetchBufferPC[tid]) / instSize;
-                pcOffset = 0;
-                curMacroop = NULL;
-            }
-
-            // Check if the PC exceed the fetch target.
-            // The pointer is null in the non-decoupled case.
-            if (curFT && !curFT->inRange(this_pc.instAddr())) {
-                DPRINTF(Fetch, "Run out of fetch target: %s. Get next one\n",
-                        curFT->toString());
-                curFT = nullptr;
-            }
-
-            if (instruction->isQuiesce()) {
-                DPRINTF(Fetch,
-                        "Quiesce instruction encountered, halting fetch!\n");
-                fetchStatus[tid] = QuiescePending;
-                status_change = true;
-                quiesce = true;
+            if (fetchQueue[tid].size() >= fetchQueueSize) {
+                groupQueueFull = true;
                 break;
             }
-            // If the current FT is consumed, try pop the head and read the
-            // next one until we reach the maximum bandwidth configure.
-            if (decoupledFrontEnd && !curFT) {
-                num_ft++;
+
+            // Reserve the complete group before constructing either member.
+            // The inner loop advances the real micro-PC and creates both
+            // DynInsts in this cycle, including at the final width slot.
+            InstSeqNum groupHead = 0;
+            std::array<DynInstPtr, 2> members;
+            ++numFetchGroups;
+            ++fetchStats.frontendGroups;
+            if (groupKind == DynInst::FrontendGroupKind::Store)
+                ++fetchStats.frontendStoreGroups;
+            if (groupKind == DynInst::FrontendGroupKind::LoadAlu)
+                ++fetchStats.frontendLoadAluGroups;
+            for (unsigned member = 0; member < groupSize; ++member) {
+                if (member) {
+                    assert(curMacroop && !inRom);
+                    staticInst = curMacroop->fetchMicroop(this_pc.microPC());
+                    newMacro = staticInst->isLastMicroop();
+                }
+                DynInstPtr instruction = buildInst(
+                        tid, staticInst, curMacroop, this_pc, *next_pc, true);
+                if (!member)
+                    groupHead = instruction->seqNum;
+                instruction->frontendGroupHead = groupHead;
+                instruction->frontendGroupKind = groupKind;
+                instruction->frontendGroupSize = groupSize;
+                instruction->frontendGroupIndex = member;
+                members[member] = instruction;
+
+                ppFetch->notify(instruction);
+                numInst++;
+
+                instruction->fetchTick = curTick();
+
+                set(next_pc, this_pc);
+
+                // If we're branching after this instruction, quit fetching
+                // from the same block.
+                predictedBranch |= this_pc.branching();
+
+                // Get the next PC from the BAC stage.
+                predictedBranch |= bac->updatePC(instruction, *next_pc, curFT);
+
+                if (instruction->isControl()) {
+                    cpu->fetchStats[tid]->numBranches++;
+                }
                 if (predictedBranch) {
-                    num_taken++;
+                    DPRINTF(Fetch, "Branch detected with PC = %s -> targ: %s, \n",
+                            this_pc, *next_pc);
+                    ++fetchStats.predictedBranches;
                 }
 
-                DPRINTF(Fetch, "Update FTQ head\n");
-                if (ftq->popHead(tid)) {
-                    if ((num_ft < maxFTPerCycle) &&
-                        (num_taken < maxTakenPredPerCycle)) {
-                        curFT = ftq->readHead(tid);
-                    }
-                } else {
-                    // Poping the head FT was not successful. The BPU predicted
-                    // something wrong. Squash the FTQ.
-                    mispredict = true;
+                newMacro |= this_pc.instAddr() != next_pc->instAddr();
+
+                // Move to the next instruction, unless we have a branch.
+                set(this_pc, *next_pc);
+                inRom = isRomMicroPC(this_pc.microPC());
+
+                if (newMacro) {
+                    fetchAddr = this_pc.instAddr() & pc_mask;
+                    blkOffset = (fetchAddr - fetchBufferPC[tid]) / instSize;
+                    pcOffset = 0;
+                    curMacroop = NULL;
                 }
-                break;
-            }
+
+                // Check if the PC exceed the fetch target.
+                // The pointer is null in the non-decoupled case.
+                if (curFT && !curFT->inRange(this_pc.instAddr())) {
+                    DPRINTF(Fetch, "Run out of fetch target: %s. Get next one\n",
+                            curFT->toString());
+                    curFT = nullptr;
+                }
+
+                if (instruction->isQuiesce()) {
+                    DPRINTF(Fetch,
+                            "Quiesce instruction encountered, halting fetch!\n");
+                    fetchStatus[tid] = QuiescePending;
+                    status_change = true;
+                    quiesce = true;
+                    break;
+                }
+                // If the current FT is consumed, try pop the head and read the
+                // next one until we reach the maximum bandwidth configure.
+                if (decoupledFrontEnd && !curFT) {
+                    stopExtraction = true;
+                    num_ft++;
+                    if (predictedBranch) {
+                        num_taken++;
+                    }
+
+                    DPRINTF(Fetch, "Update FTQ head\n");
+                    if (ftq->popHead(tid)) {
+                        if ((num_ft < maxFTPerCycle) &&
+                            (num_taken < maxTakenPredPerCycle)) {
+                            curFT = ftq->readHead(tid);
+                        }
+                    } else {
+                        // Poping the head FT was not successful. The BPU predicted
+                        // something wrong. Squash the FTQ.
+                        mispredict = true;
+                    }
+                    break;
+                }
+            } // all real members of the admitted group
+            fetchQueue[tid].emplace_back(members.data(), groupSize);
+            panic_if(fetchQueue[tid].size() > fetchQueueSize,
+                     "Fetch exceeded its frontend group queue capacity");
+            DPRINTF(Fetch, "[tid:%i] Fetch group created (%i/%i), "
+                    "%u real members.\n", tid, fetchQueue[tid].size(),
+                    fetchQueueSize, groupSize);
         } while ((curMacroop || dec_ptr->instReady()) &&
-                 numInst < fetchWidth &&
+                 numFetchGroups < fetchWidth && !groupQueueFull &&
+                 !quiesce && !stopExtraction &&
                  fetchQueue[tid].size() < fetchQueueSize);
 
         // Re-evaluate whether the next instruction to fetch is in micro-op ROM
@@ -1414,7 +1588,7 @@ Fetch::fetch(bool &status_change)
     if (predictedBranch) {
         DPRINTF(Fetch, "[tid:%i] Done fetching, predicted branch "
                 "instruction encountered.\n", tid);
-    } else if (numInst >= fetchWidth) {
+    } else if (numFetchGroups >= fetchWidth) {
         DPRINTF(Fetch, "[tid:%i] Done fetching, reached fetch bandwidth "
                 "for this cycle.\n", tid);
     } else if (blkOffset >= fetchBufferSize) {
@@ -1434,7 +1608,6 @@ Fetch::fetch(bool &status_change)
     }
 
     macroop[tid] = curMacroop;
-    macroopFromUser[tid] = curMacroopFromUser;
     fetchOffset[tid] = pcOffset;
 
     if (numInst > 0) {
@@ -1456,11 +1629,13 @@ Fetch::fetch(bool &status_change)
 void
 Fetch::recvReqRetry()
 {
+    if (lookaheadCacheBlocked) {
+        lookaheadCacheBlocked = false;
+        cpu->wakeCPU();
+        switchToActive();
+    }
     // If a trap is pending to execute, discard the retry
     if (retryPkt != NULL && fetchStatus[retryTid] == TrapPending) {
-        TaoTraceFrontendRegistry::noteTerminal(
-            retryPkt->req, TaoTraceFrontendRegistry::Terminal::RetryDiscard,
-            uint64_t(curTick()));
         delete retryPkt;
         retryPkt = NULL;
         retryTid = InvalidThreadID;
@@ -1471,9 +1646,7 @@ Fetch::recvReqRetry()
         assert(retryTid != InvalidThreadID);
         assert(fetchStatus[retryTid] == IcacheWaitRetry);
 
-        const bool accepted = icachePort.sendTimingReq(retryPkt);
-        TaoTraceFrontendRegistry::noteSendAttempt(retryPkt->req, accepted);
-        if (accepted) {
+        if (icachePort.sendTimingReq(retryPkt)) {
             fetchStatus[retryTid] = IcacheWaitResponse;
             // Notify Fetch Request probe when a retryPkt is successfully sent.
             // Note that notify must be called before retryPkt is set to NULL.
@@ -1627,6 +1800,140 @@ Fetch::branchCount()
 {
     panic("Branch Count Fetch policy unimplemented\n");
     return InvalidThreadID;
+}
+
+void
+Fetch::invalidateLookahead(ThreadID tid)
+{
+    for (auto &slot : lookahead[tid]) {
+        slot.valid = false;
+        slot.demanded = false;
+        // Keep accepted/translating requests until completion for drain. Their
+        // data can no longer be promoted after a squash or context reset.
+        slot.discard = bool(slot.request);
+    }
+}
+
+Fetch::LookaheadBlock *
+Fetch::findLookahead(ThreadID tid, Addr address)
+{
+    for (auto &slot : lookahead[tid])
+        if (!slot.discard && slot.pc == address &&
+            (slot.request || slot.valid))
+            return &slot;
+    return nullptr;
+}
+
+void
+Fetch::useLookahead(ThreadID tid, LookaheadBlock &slot)
+{
+    assert(slot.valid && !slot.request);
+    memcpy(fetchBuffer[tid], slot.data.data(), fetchBufferSize);
+    fetchBufferPC[tid] = slot.pc;
+    fetchBufferValid[tid] = true;
+    slot.valid = false;
+    ++fetchStats.lookaheadUsed;
+}
+
+void
+Fetch::requestLookahead(ThreadID tid)
+{
+    if (cacheBlocked || lookaheadCacheBlocked)
+        return;
+    std::vector<Addr> future;
+    future.reserve(fetchLookaheadDepth);
+    for (unsigned offset = 1; offset <= fetchLookaheadDepth; ++offset)
+        future.push_back((fetchBufferPC[tid] +
+            Addr(offset) * fetchBufferSize) & decoder[tid]->pcMask());
+    for (auto &slot : lookahead[tid]) {
+        if (slot.valid && std::find(future.begin(), future.end(), slot.pc) ==
+                future.end())
+            slot.valid = false;
+    }
+    auto available = std::find_if(lookahead[tid].begin(),
+        lookahead[tid].end(), [](const auto &slot) {
+            return !slot.request && !slot.valid;
+        });
+    if (available == lookahead[tid].end())
+        return;
+    for (Addr next : future) {
+        if (findLookahead(tid, next))
+            continue;
+        auto &slot = *available;
+        slot.valid = false;
+        slot.discard = false;
+        slot.demanded = false;
+        slot.pc = next;
+        RequestPtr req = std::make_shared<Request>(next, fetchBufferSize,
+            Request::INST_FETCH, cpu->instRequestorId(), pc[tid]->instAddr(),
+            cpu->thread[tid]->contextId());
+        req->taskId(cpu->taskId());
+        slot.request = req;
+        cpu->mmu->translateTiming(req, cpu->thread[tid]->getTC(),
+            new LookaheadTranslation(this), BaseMMU::Execute);
+        // The request port admits one new future block per cycle. Queue
+        // depth changes overlap without inventing extra fetch bandwidth.
+        return;
+    }
+}
+
+void
+Fetch::finishLookaheadTranslation(const Fault &fault, const RequestPtr &req)
+{
+    const ThreadID tid = cpu->contextToThread(req->contextId());
+    auto found = std::find_if(lookahead[tid].begin(), lookahead[tid].end(),
+        [&req](const auto &slot) { return slot.request == req; });
+    panic_if(found == lookahead[tid].end(),
+             "Lookahead translation has no owning byte buffer");
+    auto &slot = *found;
+    const bool demanded = slot.demanded && !slot.discard;
+    const bool translation_fault = fault != NoFault ||
+        !cpu->system->isMemAddr(req->getPaddr());
+    if (translation_fault || slot.discard || cpu->switchedOut()) {
+        slot.request = nullptr;
+        slot.demanded = false;
+        slot.discard = false;
+        if (translation_fault)
+            ++fetchStats.lookaheadFaults;
+        // A speculative fault has no architectural instruction to fault.
+        // If fetch now needs these bytes, start the normal demand path with
+        // its current PC and translation/fault handling.
+        if (demanded) {
+            fetchStatus[tid] = Running;
+            const Addr addr = (pc[tid]->instAddr() + fetchOffset[tid]) &
+                decoder[tid]->pcMask();
+            fetchCacheLine(addr, tid, pc[tid]->instAddr());
+        }
+        cpu->wakeCPU();
+        switchToActive();
+        return;
+    }
+    PacketPtr pkt = new Packet(req, MemCmd::ReadReq);
+    pkt->dataDynamic(new uint8_t[fetchBufferSize]);
+    pkt->senderState = new LookaheadSenderState;
+    // A translation may finish after another thread has blocked the port.
+    const bool already_blocked = cacheBlocked || lookaheadCacheBlocked;
+    if (already_blocked || !icachePort.sendTimingReq(pkt)) {
+        if (!already_blocked)
+            lookaheadCacheBlocked = true;
+        delete pkt->popSenderState();
+        delete pkt;
+        slot.request = nullptr;
+        slot.demanded = false;
+        ++fetchStats.lookaheadBlocked;
+        if (demanded) {
+            fetchStatus[tid] = Running;
+            const Addr addr = (pc[tid]->instAddr() + fetchOffset[tid]) &
+                decoder[tid]->pcMask();
+            fetchCacheLine(addr, tid, pc[tid]->instAddr());
+        }
+        cpu->wakeCPU();
+        switchToActive();
+        return;
+    }
+    ++fetchStats.lookaheadIssued;
+    ++fetchStats.cacheLines;
+    ppFetchRequestSent->notify(req);
 }
 
 void

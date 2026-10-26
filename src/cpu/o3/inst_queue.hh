@@ -59,7 +59,9 @@
 #include "cpu/o3/mem_dep_unit.hh"
 #include "cpu/o3/store_set.hh"
 #include "cpu/op_class.hh"
+#include "cpu/reg_class.hh"
 #include "cpu/timebuf.hh"
+#include "enums/IQInsertionPolicy.hh"
 #include "enums/SMTQueuePolicy.hh"
 #include "sim/eventq.hh"
 #include "sim/probe/probe.hh"
@@ -81,16 +83,7 @@ namespace o3
 class FUPool;
 class CPU;
 class IEW;
-
-struct ExecutionFUEvent
-{
-    OpClass opClass;
-    int fuIndex;
-    Cycles opLatency;
-    bool pipelined;
-    Addr macroPC;
-    MicroPC microPC;
-};
+struct FrontendInstGroup;
 
 class IQUnit : public SimObject
 {
@@ -144,6 +137,8 @@ class IQUnit : public SimObject
     {
         return _fuPool;
     }
+
+    bool isCapable(OpClass op_class) const;
 
   private:
     /** IQ sharing policy for SMT. */
@@ -276,12 +271,13 @@ class InstructionQueue
      * instruction type (OpClass)
      */
     bool isFull(const DynInstPtr &inst);
+    /** Reserve-capacity check using the same IQ routing as real insertion. */
+    bool canInsertGroup(const FrontendInstGroup &group);
 
     /** Returns a vector of FU pools */
     std::vector<FUPool *> allFUPools();
 
     /** Register scheduler-to-FU events for optional calibration listeners. */
-    void regProbePoints();
 
     /** Returns if there are any ready instructions in the IQ. */
     bool hasReadyInsts();
@@ -347,6 +343,9 @@ class InstructionQueue
     /** Wakes all dependents of a completed instruction. */
     int wakeDependents(const DynInstPtr &completed_inst);
 
+    /** Wakes all dependents waiting on a destination register. */
+    int wakeDependents(PhysRegIdPtr dest_reg);
+
     /** Adds a ready memory instruction to the ready list. */
     void addReadyMemInst(const DynInstPtr &ready_inst);
 
@@ -358,6 +357,8 @@ class InstructionQueue
 
     /** Replays a memory instruction. It must be rescheduled first. */
     void replayMemInst(const DynInstPtr &replay_inst);
+    void replayStoreData(const DynInstPtr &store_inst);
+    void replayStoreWriteback(const DynInstPtr &store_inst);
 
     /**
      * Defers a memory instruction when its DTB translation incurs a hw
@@ -408,6 +409,9 @@ class InstructionQueue
 
     /** List of Instruction Queues */
     std::vector<IQUnit *> iqs;
+
+    /** Insertion policy for routing instructions to IQs */
+    IQInsertionPolicy insertionPolicy;
 
     /** The memory dependence unit, which tracks/predicts memory dependences
      *  between instructions.
@@ -654,29 +658,9 @@ class InstructionQueue
     } iqIOStats;
 
   private:
-    // One logical divider admission resource, independent of result latency.
-    const unsigned divsdIssueInterval;
-    const unsigned divsdActivityDuration;
-    uint64_t divsdNextIssue = 0;
-    uint64_t divsdInFlightUntil = 0;
-    uint64_t divsdActivityUntil = 0;
-    std::unordered_map<InstSeqNum, uint64_t> divsdIssuedAt;
-
-    struct DivsdStats : public statistics::Group
-    {
-        InstructionQueue &iq;
-        uint64_t lastCycle = 0;
-        DivsdStats(CPU *cpu, InstructionQueue &owner);
-        void account();
-        void preDumpStats() override;
-        void resetStats() override;
-        statistics::Scalar divsdIssued, divsdFuCompleted, divsdSquashedAtCompletion;
-        statistics::Scalar divsdAdmissionRejected, divsdAdmissionCycles;
-        statistics::Scalar divsdInFlightCycles, divsdActivityCycles;
-        statistics::Scalar divsdIssueToCompletionCycles;
-        statistics::Scalar divsdInFlightAtDump;
-    } divsdStats;
-
+    // Integer-divider service is owned by O3, independently of ISA stages.
+    const unsigned intDiv32QuotientLatency, intDiv64QuotientLatency;
+    const unsigned intDiv32RemainderLatency, intDiv64RemainderLatency;
     const unsigned intDiv32IssueInterval;
     const unsigned intDiv64IssueInterval;
     uint64_t intDivNextIssue = 0;
@@ -698,8 +682,6 @@ class InstructionQueue
         statistics::Scalar issueToCompletionCycles, inFlightAtDump;
     } intDivStats;
 
-    ProbePointArg<ExecutionFUEvent> *ppExecutionIssue;
-    ProbePointArg<ExecutionFUEvent> *ppExecutionFUBlocked;
 };
 
 } // namespace o3

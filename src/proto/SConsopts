@@ -39,8 +39,8 @@ with gem5_scons.Configure(main) as conf:
     except Exception as e:
         warning('While checking protoc version:', str(e))
 
-    # Based on the availability of the compress stream wrappers, require 2.1.0.
-    min_protoc_version = '2.1.0'
+    # Match the protobuf version shipped with the oldest supported Ubuntu LTS.
+    min_protoc_version = '3.12'
 
     # First two words should be "libprotoc x.y.z"
     if len(protoc_version) < 2 or protoc_version[0] != 'libprotoc':
@@ -64,12 +64,6 @@ with gem5_scons.Configure(main) as conf:
             conf.CheckLibWithHeader('protobuf', 'google/protobuf/message.h',
                                     'C++', call='GOOGLE_PROTOBUF_VERIFY_VERSION;'))
     )
-    conf.env['CONF']['HAVE_ZSTD'] = bool(
-        (conf.env['HAVE_PKG_CONFIG'] and
-        conf.CheckPkgConfig('libzstd', '--cflags', '--libs')) or
-        conf.CheckLibWithHeader('zstd', 'zstd.h', 'C++',
-                                call='ZSTD_versionNumber();')
-    )
 
 # If we have the compiler but not the library, print another warning.
 if main['HAVE_PROTOC'] and not main['CONF']['HAVE_PROTOBUF']:
@@ -83,7 +77,3 @@ if main['CONF']['HAVE_PROTOBUF']:
     # warnings.
     main.Append(CCFLAGS='-DPROTOBUF_INLINE_NOT_IN_HEADERS=0')
     main.Append(CCFLAGS='-DPROTOBUF_ENABLE_DEBUG_LOGGING_MAY_LEAK_PII=0')
-
-if not main['CONF']['HAVE_ZSTD']:
-    warning('Did not find zstd library and headers.\n'
-            'Marker PC trace support requires libzstd-dev.')

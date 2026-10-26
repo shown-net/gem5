@@ -245,9 +245,8 @@ let {{
                 micropc += 1
             timing_forms = {
                 "ADD_R_R": ("Add64Reg", "env.dataSize == 8"),
-                "IMUL_R_R_SINGLE": ("Imul64Reg", "env.dataSize == 8"),
+                "IMUL_R_R": ("Imul64Reg", "env.dataSize == 8"),
                 "DIVSD_XMM_XMM": ("DivsdReg", "!machInst.vex.present"),
-                "DIVSD_XMM_XMM_INDEPENDENT": ("DivsdReg", "!machInst.vex.present"),
             }
             if self.name in timing_forms:
                 form, condition = timing_forms[self.name]
@@ -365,79 +364,104 @@ let {{
             blocks.decoder_output = macroop.getDefinition(env)
             macroop.declared = True
         blocks.decode_block = "return %s;\n" % macroop.getAllocator(env)
-        if Name in ("ADD_R_I", "SUB_R_I", "AND_R_I", "OR_R_I",
-                    "XOR_R_I", "CMP_R_I", "TEST_R_I"):
-            candidate = genMacroop(Name + "_DIRECT", env)
-            # Byte operands keep their own width even when the default
-            # architectural operand size is 32 bits (for example TEST AL, Ib).
-            candidate.decode_block = "if (singleUopAluImmediate && (%s) >= 4) {\n" % env.dataSize + candidate.decode_block + "}\n"
-            candidate.append(blocks)
-            return candidate
+        if Name in ("MOVBE_R_M", "MOVBE_R_P", "MOVBE_M_R", "MOVBE_P_R"):
+            wide = genMacroop(Name + "_64", env)
+            word = genMacroop(Name + "_16", env)
+            wide.decode_block = ("if (%s == 8) {\n" % env.dataSize +
+                                 wide.decode_block + "}\n")
+            word.decode_block = ("if (%s == 2) {\n" % env.dataSize +
+                                 word.decode_block + "}\n")
+            wide.append(word)
+            wide.append(blocks)
+            return wide
+        if Name in ("MULX_R_R", "MULX_R_M", "MULX_R_P"):
+            wide = genMacroop(Name + "_64", env)
+            wide.decode_block = ("if (machInst.mode.submode == "
+                                 "SixtyFourBitMode && machInst.rex.w) {\n" +
+                                 wide.decode_block + "}\n")
+            wide.append(blocks)
+            return wide
+        if Name == "ROR_R_I":
+            byte = genMacroop(Name + "_BYTE", env)
+            byte.decode_block = ("if (%s == 1) {\n" % env.dataSize +
+                                 byte.decode_block + "}\n")
+            byte.append(blocks)
+            return byte
+        if Name == "CALL_NEAR_R":
+            stack_target = genMacroop("CALL_NEAR_RSP", env)
+            stack_target.decode_block = (
+                "if (machInst.modRM.rm == 4 && !machInst.rex.b) {\n" +
+                stack_target.decode_block + "}\n")
+            stack_target.append(blocks)
+            return stack_target
+        if Name == "POP_R":
+            full = genMacroop(Name + "_FULL", env)
+            full.decode_block = (
+                "if (machInst.mode.submode == SixtyFourBitMode && "
+                "machInst.opSize != 2) {\n" + full.decode_block + "}\n")
+            full.append(blocks)
+            return full
         if Name in ("XOR_R_R", "SUB_R_R"):
-            dependency = genMacroop(Name + "_ZERO_DEP", env)
-            no_fu = genMacroop(Name + "_ZERO_NOFU", env)
+            dependency = genMacroop(Name + "_ZERO", env)
             full_reg = ("((machInst.modRM.reg | (machInst.rex.r << 3)) == "
                         "(machInst.modRM.rm | (machInst.rex.b << 3)))")
             eligible = ("(%s == 4 || %s == 8) && %s" %
                         (env.dataSize, env.dataSize, full_reg))
-            no_fu.decode_block = (
-                "if (gprZeroIdiomMode == 2 && %s) {\n" % eligible +
-                no_fu.decode_block + "}\n")
-            dependency.decode_block = (
-                "if (gprZeroIdiomMode == 1 && %s) {\n" % eligible +
-                dependency.decode_block + "}\n")
-            no_fu.append(dependency)
-            no_fu.append(blocks)
-            return no_fu
-        if Name in ("IMUL_R_R_I", "IMUL_R_M_I"):
-            direct = genMacroop(Name + "_DIRECT", env)
-            split = genMacroop(Name + "_SPLIT16", env)
-            direct.decode_block = "if ((machInst.opSize == 2 && imul16ImmediateMode == 1) || (machInst.opSize >= 4 && singleResultImulForms)) {\n" + direct.decode_block + "}\n"
-            split.decode_block = "if (machInst.opSize == 2 && imul16ImmediateMode == 2) {\n" + split.decode_block + "}\n"
-            direct.append(split)
-            direct.append(blocks)
-            return direct
-        if Name == "IMUL_R_M":
-            candidate = genMacroop(Name + "_DIRECT", env)
-            candidate.decode_block = "if (singleResultImulForms) {\n" + candidate.decode_block + "}\n"
-            candidate.append(blocks)
-            return candidate
-        if Name == "IMUL_R_R":
-            candidate = genMacroop("IMUL_R_R_SINGLE", env)
-            candidate.decode_block = "if (singleResultImul) {\n" + candidate.decode_block + "}\n"
-            candidate.append(blocks)
-            return candidate
-        if Name == "IDIV_R":
-            compact64 = genMacroop("IDIV_R_COMPACT64", env)
-            compact32 = genMacroop("IDIV_R_COMPACT32", env)
-            compact64.decode_block = "if (compactIntDiv && machInst.opSize == 8) {\n" + compact64.decode_block + "}\n"
-            compact32.decode_block = "if (compactIntDiv && machInst.opSize == 4) {\n" + compact32.decode_block + "}\n"
-            compact64.append(compact32)
-            compact64.append(blocks)
-            return compact64
-        if Name == "DIV_R":
-            compact64 = genMacroop("DIV_R_COMPACT64", env)
-            compact32 = genMacroop("DIV_R_COMPACT32", env)
-            compact64.decode_block = "if (compactIntDiv && machInst.opSize == 8) {\n" + compact64.decode_block + "}\n"
-            compact32.decode_block = "if (compactIntDiv && machInst.opSize == 4) {\n" + compact32.decode_block + "}\n"
-            compact64.append(compact32)
-            compact64.append(blocks)
-            return compact64
-        if Name == "DIVSD_XMM_XMM":
-            candidate = genMacroop("DIVSD_XMM_XMM_INDEPENDENT", env)
-            candidate.decode_block = "if (independentDivsd && !machInst.vex.present) {\n" + candidate.decode_block + "}\n"
-            candidate.append(blocks)
-            return candidate
-        if Name == "SETZ_R":
-            single_zf = genMacroop("SETZ_R_SINGLE", env)
-            single_wide = genMacroop("SETZ_R_SINGLE_WIDE", env)
-            two_zf = genMacroop("SETZ_R_TWO_ZF", env)
-            single_zf.decode_block = "if (singleUopSetz && zfOnlySetz) {\n" + single_zf.decode_block + "}\n"
-            single_wide.decode_block = "if (singleUopSetz) {\n" + single_wide.decode_block + "}\n"
-            two_zf.decode_block = "if (zfOnlySetz) {\n" + two_zf.decode_block + "}\n"
-            single_zf.append(single_wide)
-            single_zf.append(two_zf)
-            single_zf.append(blocks)
-            return single_zf
+            dependency.decode_block = ("if (%s) {\n" % eligible +
+                                       dependency.decode_block + "}\n")
+            dependency.append(blocks)
+            return dependency
+        if Name in ("IMUL_R_R_I", "IMUL_R_M_I", "IMUL_R_P_I"):
+            partial = genMacroop(Name + "_16", env)
+            partial.decode_block = ("if (machInst.opSize == 2) {\n" +
+                                    partial.decode_block + "}\n")
+            partial.append(blocks)
+            return partial
+        if Name in ("CQO_R_R", "LEA_R_M"):
+            partial = genMacroop(Name + "_16", env)
+            partial.decode_block = ("if (machInst.opSize == 2) {\n" +
+                                    partial.decode_block + "}\n")
+            partial.append(blocks)
+            return partial
+        if Name in ("MOV_R_M", "MOV_R_P"):
+            partial = genMacroop(Name + "_PARTIAL", env)
+            partial.decode_block = ("if (%s < 4) {\n" % env.dataSize +
+                                    partial.decode_block + "}\n")
+            partial.append(blocks)
+            return partial
+        if Name in ("MUL_R", "MUL_M", "MUL_P", "IMUL_R", "IMUL_M",
+                    "IMUL_P"):
+            wide = genMacroop(Name + "_64", env)
+            partial = genMacroop(Name + "_16", env)
+            wide.decode_block = ("if (machInst.opSize == 8) {\n" +
+                                 wide.decode_block + "}\n")
+            partial.decode_block = ("if (machInst.opSize == 2) {\n" +
+                                    partial.decode_block + "}\n")
+            wide.append(partial)
+            wide.append(blocks)
+            return wide
+        if Name in ("MOVSX_B_R_M", "MOVSX_B_R_P", "MOVSX_W_R_M",
+                    "MOVSX_W_R_P", "MOVZX_B_R_M", "MOVZX_B_R_P",
+                    "MOVZX_W_R_M", "MOVZX_W_R_P", "MOVSXD_R_M",
+                    "MOVSXD_R_P"):
+            partial = genMacroop(Name + "_16", env)
+            partial.decode_block = ("if (machInst.opSize == 2) {\n" +
+                                    partial.decode_block + "}\n")
+            partial.append(blocks)
+            return partial
+        if Name in ("DIV_R", "DIV_M", "DIV_P",
+                    "IDIV_R", "IDIV_M", "IDIV_P"):
+            wide = genMacroop(Name + "_64", env)
+            normal = genMacroop(Name + "_32", env)
+            wide.decode_block = ("if (machInst.opSize == 8) {\n" +
+                                 wide.decode_block + "}\n")
+            normal.decode_block = ("if (machInst.opSize == 4) {\n" +
+                                   normal.decode_block + "}\n")
+            wide.append(normal)
+            wide.append(blocks)
+            return wide
+        if Name in ("DIV_B_R", "DIV_B_M", "DIV_B_P",
+                    "IDIV_B_R", "IDIV_B_M", "IDIV_B_P"):
+            return genMacroop(Name + "_ALIGNED", env)
         return blocks
 }};
