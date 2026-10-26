@@ -41,6 +41,8 @@
 #include "cpu/o3/fu_pool.hh"
 
 #include <sstream>
+#include <map>
+#include <set>
 
 #include "cpu/func_unit.hh"
 
@@ -91,6 +93,7 @@ FUPool::FUPool(const Params &p)
 
     maxOpLatencies.fill(Cycles(0));
     pipelined.fill(true);
+    std::map<std::string, int> namedPorts;
 
     //
     //  Iterate through the list of FUDescData structures
@@ -100,6 +103,12 @@ FUPool::FUPool(const Params &p)
         //  Don't bother with this if we're not going to create any FU's
         //
         if (i->number) {
+            const auto &port = i->timingPort;
+            if (!port.empty()) {
+                fatal_if(i->number != 1 || namedPorts.count(port),
+                         "Timing ports must name unique single FU instances");
+                namedPorts[port] = numFU;
+            }
             //
             //  Create the FuncUnit object from this structure
             //   - add the capabilities listed in the FU's operation
@@ -147,7 +156,27 @@ FUPool::FUPool(const Params &p)
     }
 
     unitBusy.resize(numFU);
-
+    std::map<std::string, int> units;
+    for (const auto &name : p.timingUnits) {
+        fatal_if(name.empty() || units.count(name), "Invalid timing unit name");
+        units[name] = nextAccept.size();
+        nextAccept.emplace_back(0);
+    }
+    for (const auto *entry : p.instructionTimings) {
+        auto &binding = timingBindings[unsigned(entry->form)];
+        fatal_if(binding.entry, "Duplicate instruction timing form");
+        binding.entry = entry;
+        std::set<std::string> seen;
+        for (const auto &port : entry->ports) {
+            fatal_if(!namedPorts.count(port) || !seen.insert(port).second,
+                     "Unknown or duplicate timing port: %s", port);
+            binding.ports.push_back(namedPorts.at(port));
+        }
+        if (!entry->unit.empty()) {
+            fatal_if(!units.count(entry->unit), "Unknown timing unit: %s", entry->unit);
+            binding.unit = units.at(entry->unit);
+        }
+    }
     for (int i = 0; i < numFU; i++) {
         unitBusy[i] = false;
     }
@@ -194,6 +223,28 @@ FUPool::freeUnitNextCycle(int fu_idx)
 {
     assert(unitBusy[fu_idx]);
     unitsToBeFreed.push_back(fu_idx);
+}
+
+int
+FUPool::getUnit(const InstructionTiming &entry, OpClass capability, Cycles now)
+{
+    auto &binding = timingBindings[unsigned(entry.form)];
+    assert(binding.entry == &entry);
+    if (binding.unit >= 0 && now < nextAccept[binding.unit]) {
+        return NoFreeFU;
+    }
+    for (unsigned n = 0; n < binding.ports.size(); ++n) {
+        const unsigned pos = (binding.cursor + n) % binding.ports.size();
+        const int idx = binding.ports[pos];
+        if (unitBusy[idx]) continue;
+        // Commit both constraints only after all have passed.
+        unitBusy[idx] = true;
+        binding.cursor = (pos + 1) % binding.ports.size();
+        if (binding.unit >= 0)
+            nextAccept[binding.unit] = now + entry.issueInterval;
+        return idx;
+    }
+    return NoFreeFU;
 }
 
 void

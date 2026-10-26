@@ -61,6 +61,8 @@ DynInst::DynInst(const Arrays &arrays, const StaticInstPtr &static_inst,
       _prevDestIdx(arrays.prevDestIdx), _srcIdx(arrays.srcIdx),
       _readySrcIdx(arrays.readySrcIdx), macroop(_macroop)
 {
+    if (cpu)
+        instructionTiming = cpu->timingEntry(staticInst->instructionForm());
     std::fill(_readySrcIdx, _readySrcIdx + (numSrcs() + 7) / 8, 0);
 
     status.reset();
@@ -438,6 +440,20 @@ DynInst::writeMem(uint8_t *data, unsigned size, Addr addr,
         dynamic_cast<DynInstPtr::PtrType>(this),
         /* st */ false, data, size, addr, flags, res, nullptr,
         byte_enable);
+}
+
+Fault
+DynInst::initiateStoreAddress(Addr addr, unsigned size,
+                             Request::Flags flags)
+{
+    return writeMem(nullptr, size, addr, flags, nullptr,
+                    std::vector<bool>(size, true));
+}
+
+Fault
+DynInst::writeStoreData(uint8_t *data, unsigned size)
+{
+    return cpu->writeStoreData(this, data, size);
 }
 
 Fault

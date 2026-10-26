@@ -376,6 +376,7 @@ class Rename
      * and ROB, but are not yet included in their occupancy counts.
      */
     int instsInProgress[MaxThreads];
+    int robEntriesInProgress[MaxThreads];
 
     /** Count of Load instructions in progress that have been sent off to the
      * IQ and ROB, but are not yet included in their occupancy counts.
@@ -443,11 +444,13 @@ class Rename
 
     /** Rename width, in instructions. */
     unsigned renameWidth;
+    const bool robFrontendGroups;
 
     /** The index of the instruction in the time buffer to IEW that rename is
      * currently using.
      */
     unsigned toIEWIndex;
+    unsigned toIEWGroups = 0;
 
     /** Whether or not rename needs to block this cycle. */
     bool blockThisCycle;
@@ -482,6 +485,7 @@ class Rename
      * the stall.
      */
     void incrFullStat(const FullSource &source);
+    /** Diagnose actual destination demand at a failed group admission. */
 
     struct RenameStats : public statistics::Group
     {

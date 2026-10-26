@@ -42,11 +42,13 @@
  */
 
 #include "cpu/o3/cpu.hh"
+#include "arch/x86/regs/int.hh"
 
 #include "cpu/activity.hh"
 #include "cpu/checker/cpu.hh"
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/fu_pool.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/simple_thread.hh"
@@ -115,6 +117,15 @@ CPU::CPU(const BaseO3CPUParams &params)
       lastRunningCycle(curCycle()),
       cpuStats(this)
 {
+    for (auto *iq : params.instQueues) {
+        for (unsigned f = 1; f < unsigned(InstructionForm::Count); ++f) {
+            const auto *entry = iq->fuPool()->timing(InstructionForm(f));
+            if (!entry) continue;
+            fatal_if(instructionTimings[f],
+                     "Instruction timing currently requires a single owning IQ pool");
+            instructionTimings[f] = entry;
+        }
+    }
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
 
@@ -423,6 +434,7 @@ CPU::tick()
 
     tryDrain();
 }
+
 
 void
 CPU::init()
@@ -1165,7 +1177,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
         thread[tid]->comInstEventQueue.serviceEvents(thread[tid]->numInst);
     }
 
-    if (inst->isMemRef()) {
+    if (inst->hasMemoryRequest()) {
         thread[tid]->threadStats.numMemRefs++;
     }
 

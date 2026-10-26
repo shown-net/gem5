@@ -42,56 +42,67 @@ def macroop ROL_R_I
 def macroop ROL_M_I
 {
     ldst t1, seg, sib, disp
-    roli t1, t1, imm, flags=(OF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    rolvaluei t1, t1, imm
+    rotateflagsimm imm
+    storedata t1
 };
 
 def macroop ROL_P_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    roli t1, t1, imm, flags=(OF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    rolvaluei t1, t1, imm
+    rotateflagsimm imm
+    storedata t1
 };
 
 def macroop ROL_1_R
 {
-    roli reg, reg, 1, flags=(OF,CF)
+    rolvaluei reg, reg, 1
+    rotateflagsimm 1
 };
 
 def macroop ROL_1_M
 {
     ldst t1, seg, sib, disp
-    roli t1, t1, 1, flags=(OF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    rolvaluei t1, t1, 1
+    rotateflagsimm 1
+    storedata t1
 };
 
 def macroop ROL_1_P
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    roli t1, t1, 1, flags=(OF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    rolvaluei t1, t1, 1
+    rotateflagsimm 1
+    storedata t1
 };
 
 def macroop ROL_R_R
 {
-    rol reg, reg, regm, flags=(OF,CF)
+    rolvalue reg, reg, regm
+    rotateflags
 };
 
 def macroop ROL_M_R
 {
     ldst t1, seg, sib, disp
-    rol t1, t1, reg, flags=(OF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    rolvalue t1, t1, reg
+    rotateflags
+    storedata t1
 };
 
 def macroop ROL_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    rol t1, t1, reg, flags=(OF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    rolvalue t1, t1, reg
+    rotateflags
+    storedata t1
 };
 
 def macroop ROR_R_I
@@ -102,56 +113,67 @@ def macroop ROR_R_I
 def macroop ROR_M_I
 {
     ldst t1, seg, sib, disp
-    rori t1, t1, imm, flags=(OF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    rorvaluei t1, t1, imm
+    rotateflagsimm imm
+    storedata t1
 };
 
 def macroop ROR_P_I
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    rori t1, t1, imm, flags=(OF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    rorvaluei t1, t1, imm
+    rotateflagsimm imm
+    storedata t1
 };
 
 def macroop ROR_1_R
 {
-    rori reg, reg, 1, flags=(OF,CF)
+    rorvaluei reg, reg, 1
+    rotateflagsimm 1
 };
 
 def macroop ROR_1_M
 {
     ldst t1, seg, sib, disp
-    rori t1, t1, 1, flags=(OF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    rorvaluei t1, t1, 1
+    rotateflagsimm 1
+    storedata t1
 };
 
 def macroop ROR_1_P
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    rori t1, t1, 1, flags=(OF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    rorvaluei t1, t1, 1
+    rotateflagsimm 1
+    storedata t1
 };
 
 def macroop ROR_R_R
 {
-    ror reg, reg, regm, flags=(OF,CF)
+    rorvalue reg, reg, regm
+    rotateflags
 };
 
 def macroop ROR_M_R
 {
     ldst t1, seg, sib, disp
-    ror t1, t1, reg, flags=(OF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    rorvalue t1, t1, reg
+    rotateflags
+    storedata t1
 };
 
 def macroop ROR_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    ror t1, t1, reg, flags=(OF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    rorvalue t1, t1, reg
+    rotateflags
+    storedata t1
 };
 
 def macroop RCL_R_I
@@ -176,7 +198,9 @@ def macroop RCL_P_I
 
 def macroop RCL_1_R
 {
-    rcli reg, reg, 1, flags=(OF,CF)
+    carryinput
+    rclonevalue reg, reg
+    rotateflagsimm 1
 };
 
 def macroop RCL_1_M
@@ -236,7 +260,9 @@ def macroop RCR_P_I
 
 def macroop RCR_1_R
 {
-    rcri reg, reg, 1, flags=(OF,CF)
+    carryinput
+    rcronevalue reg, reg
+    rotateflagsimm 1
 };
 
 def macroop RCR_1_M
@@ -272,5 +298,15 @@ def macroop RCR_P_R
     ldst t1, seg, riprel, disp
     rcr t1, t1, reg, flags=(OF,CF)
     st t1, seg, riprel, disp
+};
+"""
+
+
+microcode += """
+def macroop ROR_R_I_BYTE
+{
+    zextbyte t1, bytereg, dataSize=8
+    rori t1, t1, imm, flags=(OF,CF), dataSize=1
+    mov reg, reg, t1
 };
 """

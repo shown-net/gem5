@@ -138,10 +138,8 @@ class MemDepUnit
     /** Reschedules an instruction to be re-executed. */
     void reschedule(const DynInstPtr &inst);
 
-    /** Replays all instructions that have been rescheduled by moving them to
-     *  the ready list.
-     */
-    void replay();
+    /** Replay ordinary retries, or loads waiting for one store's data. */
+    void replay(InstSeqNum store_seq = 0, bool writeback = false);
 
     /** Notifies completion of an instruction. */
     void completeInst(const DynInstPtr &inst);

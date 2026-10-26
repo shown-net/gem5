@@ -320,7 +320,10 @@
             }
         }
         0x12: decode OPCODE_OP_BOTTOM3 {
-            0x0: NopInst::NOP(); //XXX repe makes this a "pause"
+            0x0: decode REX_B {
+                0x0: NopInst::NOP(); //XXX repe makes this a "pause"
+                0x1: XCHG(Bv,rAv);
+            }
             default: XCHG(Bv,rAv);
         }
         0x13: decode OPCODE_OP_BOTTOM3 {
@@ -442,7 +445,7 @@
                         0xffffffffffffff80:
                             SyscallInst::int80({{
                                 return std::make_shared<SESyscallFault>();
-                            }});
+                            }}, IsSyscall);
                     }
 
                     default: decode MODE_MODE {
@@ -596,8 +599,7 @@
                 0x3: NEG(Eb);
                 0x4: MUL_B(Eb);
                 0x5: IMUL_B(Eb);
-                //This should be Eb, but it access the entire word value ax.
-                0x6: DIV_B(Ew);
+                0x6: DIV_B(Eb);
                 0x7: IDIV_B(Eb);
             }
             //0x7: group3_Ev();

@@ -128,5 +128,18 @@ UnifiedRenameMap::canRename(DynInstPtr inst) const
     return true;
 }
 
+bool
+UnifiedRenameMap::canRename(const DynInstPtr *insts, unsigned count) const
+{
+    for (int i = 0; i < renameMaps.size(); ++i) {
+        unsigned destinations = 0;
+        for (unsigned member = 0; member < count; ++member)
+            destinations += insts[member]->numDestRegs((RegClassType)i);
+        if (destinations > renameMaps[i].numFreeEntries())
+            return false;
+    }
+    return true;
+}
+
 } // namespace o3
 } // namespace gem5

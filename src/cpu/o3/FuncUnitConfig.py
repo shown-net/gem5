@@ -43,7 +43,10 @@ from m5.SimObject import SimObject
 
 
 class IntALU(FUDesc):
-    opList = [OpDesc(opClass="IntAlu")]
+    opList = [OpDesc(opClass="IntAlu"), OpDesc(opClass="X86IntShift"),
+              OpDesc(opClass="X86IntBoolean"),
+              OpDesc(opClass="X86IntMulResult64"),
+              OpDesc(opClass="X86IntCarry")]
     count = 6
 
 
@@ -182,6 +185,16 @@ class WritePort(FUDesc):
         OpDesc(opClass="SimdStrideSegmentedStore"),
     ]
     count = 0
+
+
+class StoreAddressPort(FUDesc):
+    opList = [OpDesc(opClass="X86StoreAddress")]
+    count = 2
+
+
+class StoreDataPort(FUDesc):
+    opList = [OpDesc(opClass="X86StoreData")]
+    count = 2
 
 
 class RdWrPort(FUDesc):

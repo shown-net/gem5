@@ -37,43 +37,56 @@ microcode = """
 def macroop CALL_NEAR_I
 {
     # Make the default data size of calls 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .function_call
     .control_direct
 
-    limm t1, imm
-    rdip t7
     # Check target of call
-    st t7, ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    storepc
     subi rsp, rsp, dsz, dataSize=ssz
-    wrip t7, t1
+    relbranch imm
 };
 
 def macroop CALL_NEAR_R
 {
     # Make the default data size of calls 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .function_call
     .control_indirect
 
-    rdip t1
     # Check target of call
-    st t1, ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    storepc
     subi rsp, rsp, dsz, dataSize=ssz
     wripi reg, 0
+};
+
+def macroop CALL_NEAR_RSP
+{
+    .adjust_env oszNearControl
+    .function_call
+    .control_indirect
+
+    # The target uses the old SP, before the return address is pushed.
+    mov t1, t1, reg
+    sta ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    storepc
+    subi rsp, rsp, dsz, dataSize=ssz
+    wripi t1, 0
 };
 
 def macroop CALL_NEAR_M
 {
     # Make the default data size of calls 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .function_call
     .control_indirect
 
-    rdip t7
     ld t1, seg, sib, disp
     # Check target of call
-    st t7, ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    storepc
     subi rsp, rsp, dsz, dataSize=ssz
     wripi t1, 0
 };
@@ -81,14 +94,14 @@ def macroop CALL_NEAR_M
 def macroop CALL_NEAR_P
 {
     # Make the default data size of calls 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .function_call
     .control_indirect
 
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     # Check target of call
-    st t7, ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
+    storepc
     subi rsp, rsp, dsz, dataSize=ssz
     wripi t1, 0
 };

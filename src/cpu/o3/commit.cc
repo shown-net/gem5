@@ -53,6 +53,7 @@
 #include "cpu/exetrace.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/thread_state.hh"
@@ -1334,13 +1335,20 @@ Commit::getInsts()
     DPRINTF(Commit, "Getting instructions from Rename stage.\n");
 
     // Read any renamed instructions and place them into the ROB.
-    int insts_to_process = std::min((int)renameWidth, fromRename->size);
+    // Rename accepts complete frontend groups. This transport contains all
+    // real members, which can exceed renameWidth without exceeding MaxWidth.
+    int insts_to_process = fromRename->size;
 
-    for (int inst_num = 0; inst_num < insts_to_process; ++inst_num) {
-        const DynInstPtr &inst = fromRename->insts[inst_num];
+    for (int inst_num = 0; inst_num < insts_to_process;) {
+        FrontendInstGroup group(fromRename->insts + inst_num,
+                                insts_to_process - inst_num);
+        const DynInstPtr &inst = group.members[0];
         ThreadID tid = inst->threadNumber;
+        bool all_squashed = true;
+        for (unsigned member = 0; member < group.size; ++member)
+            all_squashed &= group.members[member]->isSquashed();
 
-        if (!inst->isSquashed() &&
+        if (!all_squashed &&
             commitStatus[tid] != ROBSquashing &&
             commitStatus[tid] != TrapPending) {
             changedROBNumEntries[tid] = true;
@@ -1348,16 +1356,17 @@ Commit::getInsts()
             DPRINTF(Commit, "[tid:%i] [sn:%llu] Inserting PC %s into ROB.\n",
                     tid, inst->seqNum, inst->pcState());
 
-            rob->insertInst(inst);
+            rob->insertGroup(group);
 
             assert(rob->getThreadEntries(tid) <= rob->getMaxEntries(tid));
 
-            youngestSeqNum[tid] = inst->seqNum;
+            youngestSeqNum[tid] = group.members[group.size - 1]->seqNum;
         } else {
             DPRINTF(Commit, "[tid:%i] [sn:%llu] "
                     "Instruction PC %s was squashed, skipping.\n",
                     tid, inst->seqNum, inst->pcState());
         }
+        inst_num += group.size;
     }
 }
 

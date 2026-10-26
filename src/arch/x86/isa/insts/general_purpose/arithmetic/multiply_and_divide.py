@@ -39,28 +39,18 @@ microcode = """
 # Byte version of one operand unsigned multiply.
 #
 
-def macroop MUL_B_R
-{
-    mul1u rax, reg, flags=(OF,CF)
-    mulel rax
-    muleh ah
+def macroop MUL_B_R {
+    mulubyte t0, rax, reg, dataSize=1
 };
 
-def macroop MUL_B_M
-{
+def macroop MUL_B_M {
     ld t1, seg, sib, disp
-    mul1u rax, t1, flags=(OF,CF)
-    mulel rax
-    muleh ah
+    mulubyte t0, rax, t1, dataSize=1
 };
 
-def macroop MUL_B_P
-{
-    rdip t7
-    ld t1, seg, riprel, disp
-    mul1u rax, t1, flags=(OF,CF)
-    mulel rax
-    muleh ah
+def macroop MUL_B_P {
+    ldrip t1, seg, riprel, disp
+    mulubyte t0, rax, t1, dataSize=1
 };
 
 #
@@ -84,8 +74,7 @@ def macroop MUL_M
 
 def macroop MUL_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     mul1u rax, t1, flags=(OF,CF)
     mulel rax
     muleh rdx
@@ -95,28 +84,18 @@ def macroop MUL_P
 # Byte version of one operand signed multiply.
 #
 
-def macroop IMUL_B_R
-{
-    mul1s rax, reg, flags=(OF,CF)
-    mulel rax
-    muleh ah
+def macroop IMUL_B_R {
+    mulsimplicitbyte t0, rax, reg, dataSize=1
 };
 
-def macroop IMUL_B_M
-{
+def macroop IMUL_B_M {
     ld t1, seg, sib, disp
-    mul1s rax, t1, flags=(OF,CF)
-    mulel rax
-    muleh ah
+    mulsimplicitbyte t0, rax, t1, dataSize=1
 };
 
-def macroop IMUL_B_P
-{
-    rdip t7
-    ld t1, seg, riprel, disp
-    mul1s rax, t1, flags=(OF,CF)
-    mulel rax
-    muleh ah
+def macroop IMUL_B_P {
+    ldrip t1, seg, riprel, disp
+    mulsimplicitbyte t0, rax, t1, dataSize=1
 };
 
 #
@@ -140,8 +119,7 @@ def macroop IMUL_M
 
 def macroop IMUL_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     mul1s rax, t1, flags=(OF,CF)
     mulel rax
     muleh rdx
@@ -149,26 +127,19 @@ def macroop IMUL_P
 
 def macroop IMUL_R_R
 {
-    mul1s reg, regm, flags=(OF,CF)
-    mulel reg
-    muleh t0
+    muls reg, reg, regm, flags=(OF,CF)
 };
 
 def macroop IMUL_R_M
 {
     ld t1, seg, sib, disp
-    mul1s reg, t1, flags=(CF,OF)
-    mulel reg
-    muleh t0
+    muls reg, reg, t1, flags=(OF,CF)
 };
 
 def macroop IMUL_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mul1s reg, t1, flags=(CF,OF)
-    mulel reg
-    muleh t0
+    ldrip t1, seg, riprel, disp
+    muls reg, reg, t1, flags=(OF,CF)
 };
 
 #
@@ -177,29 +148,36 @@ def macroop IMUL_R_P
 
 def macroop IMUL_R_R_I
 {
-    limm t1, imm
-    mul1s regm, t1, flags=(OF,CF)
-    mulel reg
-    muleh t0
+    mulswide reg, regm, imm, flags=(OF,CF)
 };
 
 def macroop IMUL_R_M_I
 {
-    limm t1, imm
-    ld t2, seg, sib, disp
-    mul1s t2, t1, flags=(OF,CF)
-    mulel reg
-    muleh t0
+    ld t1, seg, sib, disp
+    mulswide reg, t1, imm, flags=(OF,CF)
 };
 
 def macroop IMUL_R_P_I
 {
-    rdip t7
-    limm t1, imm
-    ld t2, seg, riprel, disp
-    mul1s t2, t1, flags=(OF,CF)
-    mulel reg
-    muleh t0
+    ldrip t1, seg, riprel, disp
+    mulswide reg, t1, imm, flags=(OF,CF)
+};
+"""
+
+microcode += """
+def macroop IMUL_R_R_I_16 {
+    mulswidetemp t1, regm, imm, flags=(OF,CF)
+    mov reg, reg, t1
+};
+def macroop IMUL_R_M_I_16 {
+    ld t1, seg, sib, disp
+    mulswidetemp t2, t1, imm, flags=(OF,CF)
+    mov reg, reg, t2
+};
+def macroop IMUL_R_P_I_16 {
+    ldrip t1, seg, riprel, disp
+    mulswidetemp t2, t1, imm, flags=(OF,CF)
+    mov reg, reg, t2
 };
 """
 
@@ -283,15 +261,15 @@ def macroop IDIV_B_%(suffix)s
     sub t2, t0, ah, dataSize=1
     sub t2, t2, t4
 
-    %(readOp1)s
+    %(readSignedOp1)s
 
     #Find the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,), dataSize=1
+    idivsign %(signedOp1)s, dataSize=1
 
     # Negate divisor
-    sub t3, t0, %(op1)s, dataSize=1
+    sub t3, t0, %(signedOp1)s, dataSize=1
     # Put the divisor's absolute value into t3
-    mov t3, t3, %(op1)s, flags=(nCECF,), dataSize=1
+    mov t3, t3, %(signedOp1)s, flags=(nCECF,), dataSize=1
 
     #Find the sign of the dividend
     slli t0, ah, 1, flags=(ECF,), dataSize=1
@@ -315,7 +293,7 @@ divLoopTop:
     br label("divLoopTop"), flags=(nCEZF,)
 
     #Unload the answer
-    divq t5, dataSize=1
+    idivq t5, dataSize=1
     divr t6, dataSize=1
 
     # Fix up signs. The sign of the dividend is still lying around in ECF.
@@ -336,7 +314,7 @@ divLoopTop:
     mov t5, t5, t4, (CECF,), dataSize=1
 
     # Check the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,), dataSize=1
+    divisorsign
 
     # Negate the (possibly already negated) quotient
     sub t4, t0, t5, dataSize=1
@@ -360,15 +338,15 @@ def macroop IDIV_%(suffix)s
     sub t2, t0, rdx
     sub t2, t2, t4
 
-    %(readOp1)s
+    %(readSignedOp1)s
 
     #Find the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,)
+    idivsign %(signedOp1)s
 
     # Negate divisor
-    sub t3, t0, %(op1)s
+    sub t3, t0, %(signedOp1)s
     # Put the divisor's absolute value into t3
-    mov t3, t3, %(op1)s, flags=(nCECF,)
+    mov t3, t3, %(signedOp1)s, flags=(nCECF,)
 
     #Find the sign of the dividend
     slli t0, rdx, 1, flags=(ECF,)
@@ -394,7 +372,7 @@ divLoopTop:
     br label("divLoopTop"), flags=(nCEZF,)
 
     #Unload the answer
-    divq t5
+    idivq t5
     divr t6
 
     # Fix up signs. The sign of the dividend is still lying around in ECF.
@@ -415,7 +393,7 @@ divLoopTop:
     mov t5, t5, t4, (CECF,)
 
     # Check the sign of the divisor
-    slli t0, %(op1)s, 1, flags=(ECF,)
+    divisorsign
 
     # Negate the (possibly already negated) quotient
     sub t4, t0, t5
@@ -426,6 +404,246 @@ divLoopTop:
 };
 """
 
-microcode += divcode % {"suffix": "R", "readOp1": "", "op1": "reg"}
-microcode += divcode % {"suffix": "M", "readOp1": sibRel % "t2", "op1": "t2"}
-microcode += divcode % {"suffix": "P", "readOp1": pcRel % "t2", "op1": "t2"}
+microcode += divcode % {"suffix": "R", "readOp1": "", "op1": "reg",
+                       "readSignedOp1": "", "signedOp1": "reg"}
+# Signed division keeps the absolute high dividend in t2. Memory divisor
+# reads must use a different register, and its original sign has a separate
+# functional snapshot before any dividend preparation overwrites inputs.
+microcode += divcode % {"suffix": "M", "readOp1": sibRel % "t2", "op1": "t2",
+                       "readSignedOp1": sibRel % "t7", "signedOp1": "t7"}
+microcode += divcode % {"suffix": "P", "readOp1": pcRel % "t2", "op1": "t2",
+                       "readSignedOp1": pcRel % "t7", "signedOp1": "t7"}
+
+microcode += """
+def macroop DIV_R_32 {
+    divprepare rdx, t0
+    divquot32 t0, reg
+    divremainder
+    divwrite
+};
+
+def macroop DIV_R_64 {
+    divprepare rdx, t0
+    divcheck reg, t0
+    divquot64 t0, divisor
+    divremainder64
+    divwrite
+};
+
+def macroop DIV_B_R_ALIGNED {
+    divprepare ah, t0, dataSize=1
+    divquot32 t0, reg, dataSize=1
+    divremainder dataSize=1
+    divwritebyte
+};
+
+def macroop DIV_M_32 {
+    ld t1, seg, sib, disp
+    divprepare rdx, t0
+    divquot32 t0, t1
+    divremainder
+    divwrite
+};
+
+def macroop DIV_M_64 {
+    ld t1, seg, sib, disp
+    divprepare rdx, t0
+    divquot64 t0, t1
+    divremainder64
+    divwrite
+};
+
+def macroop DIV_B_M_ALIGNED {
+    ld t1, seg, sib, disp, dataSize=1
+    divprepare ah, t0, dataSize=1
+    divquot32 t0, t1, dataSize=1
+    divremainder dataSize=1
+    divwritebyte
+};
+
+def macroop DIV_P_32 {
+    ldrip t1, seg, riprel, disp
+    divprepare rdx, t0
+    divquot32 t0, t1
+    divremainder
+    divwrite
+};
+
+def macroop DIV_P_64 {
+    ldrip t1, seg, riprel, disp
+    divprepare rdx, t0
+    divquot64 t0, t1
+    divremainder64
+    divwrite
+};
+
+def macroop DIV_B_P_ALIGNED {
+    ldrip t1, seg, riprel, disp, dataSize=1
+    divprepare ah, t0, dataSize=1
+    divquot32 t0, t1, dataSize=1
+    divremainder dataSize=1
+    divwritebyte
+};
+
+def macroop IDIV_R_32 {
+    divprepare rdx, t0
+    idivquot32 t0, reg
+    divremainder
+    divwrite
+};
+
+def macroop IDIV_R_64 {
+    divprepare rdx, t0
+    divcheck reg, t0
+    idivquot64 t0, divisor
+    divremainder64
+    divwrite
+};
+
+def macroop IDIV_B_R_ALIGNED {
+    divprepare ah, t0, dataSize=1
+    idivquot32 t0, reg, dataSize=1
+    divremainder dataSize=1
+    divwritebyte
+};
+
+def macroop IDIV_M_32 {
+    ld t1, seg, sib, disp
+    divprepare rdx, t0
+    idivquot32 t0, t1
+    divremainder
+    divwrite
+};
+
+def macroop IDIV_M_64 {
+    ld t1, seg, sib, disp
+    divprepare rdx, t0
+    idivquot64 t0, t1
+    divremainder64
+    divwrite
+};
+
+def macroop IDIV_B_M_ALIGNED {
+    ld t1, seg, sib, disp, dataSize=1
+    divprepare ah, t0, dataSize=1
+    idivquot32 t0, t1, dataSize=1
+    divremainder dataSize=1
+    divwritebyte
+};
+
+def macroop IDIV_P_32 {
+    ldrip t1, seg, riprel, disp
+    divprepare rdx, t0
+    idivquot32 t0, t1
+    divremainder
+    divwrite
+};
+
+def macroop IDIV_P_64 {
+    ldrip t1, seg, riprel, disp
+    divprepare rdx, t0
+    idivquot64 t0, t1
+    divremainder64
+    divwrite
+};
+
+def macroop IDIV_B_P_ALIGNED {
+    ldrip t1, seg, riprel, disp, dataSize=1
+    divprepare ah, t0, dataSize=1
+    idivquot32 t0, t1, dataSize=1
+    divremainder dataSize=1
+    divwritebyte
+};
+"""
+
+microcode += """
+def macroop MUL_R_16 {
+    mul1u rax, reg
+    muluproductflags
+    mulel rax
+    muleh rdx
+};
+
+def macroop MUL_R_64 {
+    mululow64 t0, rax, reg
+    mulhighwrite
+};
+"""
+
+microcode += """
+def macroop MUL_M_16 {
+    ld t1, seg, sib, disp
+    mul1u rax, t1
+    muluproductflags
+    mulel rax
+    muleh rdx
+};
+
+def macroop MUL_M_64 {
+    ld t1, seg, sib, disp
+    mululow64 t0, rax, t1
+    mulhighwrite
+};
+"""
+
+microcode += """
+def macroop MUL_P_16 {
+    ldrip t1, seg, riprel, disp
+    mul1u rax, t1
+    muluproductflags
+    mulel rax
+    muleh rdx
+};
+
+def macroop MUL_P_64 {
+    ldrip t1, seg, riprel, disp
+    mululow64 t0, rax, t1
+    mulhighwrite
+};
+"""
+
+microcode += """
+def macroop IMUL_R_16 {
+    mul1s rax, reg
+    mulsproductflags
+    mulel rax
+    muleh rdx
+};
+
+def macroop IMUL_R_64 {
+    mulsimplicitlow64 t0, rax, reg
+    mulhighwrite
+};
+"""
+
+microcode += """
+def macroop IMUL_M_16 {
+    ld t1, seg, sib, disp
+    mul1s rax, t1
+    mulsproductflags
+    mulel rax
+    muleh rdx
+};
+
+def macroop IMUL_M_64 {
+    ld t1, seg, sib, disp
+    mulsimplicitlow64 t0, rax, t1
+    mulhighwrite
+};
+"""
+
+microcode += """
+def macroop IMUL_P_16 {
+    ldrip t1, seg, riprel, disp
+    mul1s rax, t1
+    mulsproductflags
+    mulel rax
+    muleh rdx
+};
+
+def macroop IMUL_P_64 {
+    ldrip t1, seg, riprel, disp
+    mulsimplicitlow64 t0, rax, t1
+    mulhighwrite
+};
+"""

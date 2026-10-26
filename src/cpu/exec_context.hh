@@ -70,6 +70,14 @@ namespace gem5
  */
 class ExecContext
 {
+  private:
+    // Sequential CPU contexts retain one address between STA and STD.
+    // O3 overrides these operations with its per-dynamic-store SQ state.
+    Addr splitStoreAddress = 0;
+    unsigned splitStoreSize = 0;
+    Request::Flags splitStoreFlags = 0;
+    bool splitStoreAddressValid = false;
+
   public:
     virtual ~ExecContext() = default;
 
@@ -158,6 +166,34 @@ class ExecContext
     virtual Fault writeMem(uint8_t *data, unsigned int size, Addr addr,
                            Request::Flags flags, uint64_t *res,
                            const std::vector<bool>& byte_enable) = 0;
+
+    virtual Fault
+    initiateStoreAddress(Addr addr, unsigned size, Request::Flags flags)
+    {
+        splitStoreAddressValid = false;
+        splitStoreAddress = addr;
+        splitStoreSize = size;
+        splitStoreFlags = flags;
+        // NO_ACCESS may complete synchronously and advance to STD.
+        splitStoreAddressValid = true;
+        std::vector<uint8_t> unused(size, 0);
+        Fault fault = writeMem(unused.data(), size, addr,
+                flags | Request::NO_ACCESS, nullptr,
+                std::vector<bool>(size, true));
+        if (fault != NoFault)
+            splitStoreAddressValid = false;
+        return fault;
+    }
+
+    virtual Fault
+    writeStoreData(uint8_t *data, unsigned size)
+    {
+        panic_if(!splitStoreAddressValid || size != splitStoreSize,
+                 "STD has no matching store address");
+        splitStoreAddressValid = false;
+        return writeMem(data, size, splitStoreAddress, splitStoreFlags,
+                        nullptr, std::vector<bool>(size, true));
+    }
 
     /**
      * For atomic-mode contexts, perform an atomic AMO (a.k.a., Atomic

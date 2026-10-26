@@ -48,22 +48,19 @@ def macroop STD {
     wruflags t1, t0, dataSize=8
 };
 
-def macroop CLC {
-    ruflags t1, dataSize=8
-    limm t2, "~((uint64_t)CFBit)", dataSize=8
-    and t1, t1, t2, dataSize=8
-    wruflags t1, t0, dataSize=8
+def macroop CLC
+{
+    clcflag
 };
 
-def macroop STC {
-    ruflags t1, dataSize=8
-    ori t1, t1, "CFBit", dataSize=8
-    wruflags t1, t0, dataSize=8
+def macroop STC
+{
+    stcflag
 };
 
-def macroop CMC {
-    ruflags t1, dataSize=8
-    wruflagsi t1, "CFBit", dataSize=8
+def macroop CMC
+{
+    cmcflag
 };
 
 def macroop STI {

@@ -53,6 +53,7 @@
 #include "base/logging.hh"
 #include "base/refcnt.hh"
 #include "cpu/op_class.hh"
+#include "cpu/instruction_form.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "enums/StaticInstFlags.hh"
@@ -105,6 +106,9 @@ class StaticInst : public RefCounted, public StaticInstFlags
     /// See opClass().
     OpClass _opClass;
 
+    // Semantic form tag only. Per-CPU timing never mutates a StaticInst.
+    InstructionForm _instructionForm = InstructionForm::None;
+
     /// See numSrcRegs().
     uint8_t _numSrcRegs = 0;
 
@@ -116,6 +120,8 @@ class StaticInst : public RefCounted, public StaticInstFlags
   public:
 
     /// @name Register information.
+    InstructionForm instructionForm() const { return _instructionForm; }
+    void instructionForm(InstructionForm form) { _instructionForm = form; }
     /// The sum of the different numDestRegs([type])-s equals numDestRegs().
     /// The per-type function is used to track physical register usage.
     //@{
@@ -138,14 +144,18 @@ class StaticInst : public RefCounted, public StaticInstFlags
     //@{
 
     bool isNop()          const { return flags[IsNop]; }
+    bool isZeroIdiom()    const { return flags[IsZeroIdiom]; }
 
     bool
     isMemRef() const
     {
-        return flags[IsLoad] || flags[IsStore] || flags[IsAtomic];
+        return flags[IsLoad] || flags[IsStore] || flags[IsAtomic] ||
+               flags[IsStoreData];
     }
     bool isLoad()         const { return flags[IsLoad]; }
     bool isStore()        const { return flags[IsStore]; }
+    bool isStoreAddress() const { return flags[IsStoreAddress]; }
+    bool isStoreData()    const { return flags[IsStoreData]; }
     bool isAtomic()       const { return flags[IsAtomic]; }
     bool isStoreConditional()     const { return flags[IsStoreConditional]; }
     bool isInstPrefetch() const { return flags[IsInstPrefetch]; }

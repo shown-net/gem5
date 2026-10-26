@@ -105,6 +105,12 @@ class RubySequencer(RubyPort):
     # id used by protocols that support multiple sequencers per controller
     # 99 is the dummy default value
     coreid = Param.Int(99, "CorePair core id")
+    ordered_stores = Param.Bool(
+        False, "Apply ordinary stores in admission order before issuing the next store"
+    )
+    ordered_store_width = Param.Unsigned(
+        2, "Maximum consecutive same-line stores applied by one ordered callback"
+    )
 
     def connectCpuPorts(self, cpu):
         """
