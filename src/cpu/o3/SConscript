@@ -43,7 +43,7 @@ import sys
 Import('*')
 
 if env['CONF']['BUILD_ISA']:
-    SimObject('FUPool.py', sim_objects=['FUPool'])
+    SimObject('FUPool.py', sim_objects=['FUPool', 'InstructionTiming'])
     SimObject('FuncUnitConfig.py', sim_objects=[])
     SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
         enums=['TSOStore'])
@@ -57,6 +57,7 @@ if env['CONF']['BUILD_ISA']:
     Source('decode.cc')
     Source('dyn_inst.cc')
     Source('fetch.cc')
+    Source('frontend_inst_group.cc')
     Source('free_list.cc')
     Source('ftq.cc')
     Source('fu_pool.cc')
@@ -64,6 +65,7 @@ if env['CONF']['BUILD_ISA']:
     Source('inst_queue.cc')
     Source('lsq.cc')
     Source('lsq_unit.cc')
+    Source('ordinary_load_timing.cc')
     Source('mem_dep_unit.cc')
     Source('regfile.cc')
     Source('rename.cc')

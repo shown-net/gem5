@@ -66,13 +66,17 @@ namespace ruby
 {
 
 Sequencer::Sequencer(const Params &p)
-    : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
+    : RubyPort(p),
+      m_IncompleteTimes(MachineType_NUM),
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
     m_store_prepare_outstanding = 0;
 
     m_ruby_system = p.ruby_system;
+    m_ordered_stores = p.ordered_stores;
+    m_ordered_store_width = p.ordered_store_width;
+    fatal_if(m_ordered_store_width == 0, "ordered_store_width must be positive");
 
     m_dataCache_ptr = p.dcache;
     m_max_outstanding_requests = p.max_outstanding_requests;
@@ -146,6 +150,30 @@ Sequencer::Sequencer(const Params &p)
         }
     }
 
+}
+
+bool
+Sequencer::orderedStore(const SequencerRequest &request) const
+{
+    return m_ordered_stores && request.m_type == RubyRequestType_ST &&
+        request.pkt->isWrite() && !request.pkt->isAtomicOp() &&
+        !request.pkt->req->isSwap();
+}
+
+void
+Sequencer::issueNextOrderedStore()
+{
+    if (activeOrderedStore || orderedStorePackets.empty())
+        return;
+    PacketPtr pkt = orderedStorePackets.front();
+    auto it = m_RequestTable.find(makeLineAddress(pkt->getAddr()));
+    panic_if(it == m_RequestTable.end(),
+             "ordered store packet is absent from the request table");
+    // A preceding load or atomic on this line retains its native callback.
+    if (it->second.front().pkt != pkt)
+        return;
+    activeOrderedStore = pkt;
+    issueRequest(pkt, it->second.front().m_second_type);
 }
 
 Sequencer::~Sequencer()
@@ -384,6 +412,7 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
         secondary_type, curCycle());
     m_outstanding_count++;
 
+
     if (seq_req_list.size() > 1) {
         return RequestStatus_Aliased;
     }
@@ -500,12 +529,22 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     // ruby request was outstanding. Since only 1 ruby request was made,
     // profile the ruby latency once.
     bool ruby_request = true;
+    unsigned ordered_applied = 0;
     while (!seq_req_list.empty()) {
         SequencerRequest &seq_req = seq_req_list.front();
         // Atomic Request may be executed remotly in the cache hierarchy
         bool atomic_req =
            ((seq_req.m_type == RubyRequestType_ATOMIC_RETURN) ||
             (seq_req.m_type == RubyRequestType_ATOMIC_NO_RETURN));
+
+        // A line callback may contain stores separated by another line's
+        // store. Do not let line coalescing bypass the global store head.
+        if (orderedStore(seq_req) &&
+            (orderedStorePackets.empty() ||
+             seq_req.pkt != orderedStorePackets.front() ||
+             ordered_applied >= m_ordered_store_width ||
+             (ordered_applied == 0 && seq_req.pkt != activeOrderedStore)))
+            break;
 
         if ((noCoales || atomic_req) && !ruby_request) {
             // Do not process follow-up requests
@@ -563,9 +602,12 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
             }
 
             markRemoved();
+            const bool ordered_store = orderedStore(seq_req);
             hitCallback(&seq_req, data, success, mach, externalHit,
                         initialRequestTime, forwardRequestTime,
                         firstResponseTime, !ruby_request);
+            if (ordered_store)
+                ++ordered_applied;
             ruby_request = false;
         } else {
             // handle read request
@@ -582,6 +624,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     if (seq_req_list.empty()) {
         m_RequestTable.erase(address);
     }
+    issueNextOrderedStore();
 }
 
 bool
@@ -604,7 +647,10 @@ Sequencer::processReadCallback(SequencerRequest &seq_req,
         (seq_req.m_type != RubyRequestType_IFETCH) &&
         (seq_req.m_type != RubyRequestType_REPLACEMENT)) {
         // Write request: reissue request to the cache hierarchy
-        issueRequest(seq_req.pkt, seq_req.m_second_type);
+        if (orderedStore(seq_req))
+            issueNextOrderedStore();
+        else
+            issueRequest(seq_req.pkt, seq_req.m_second_type);
         return true;
     }
     return false;
@@ -691,7 +737,10 @@ Sequencer::atomicCallback(Addr address, DataBlock& data,
             // Read, Write or Atomic request:
             // reissue request to the cache hierarchy
             // (we don't know if op was performed remotly)
-            issueRequest(seq_req.pkt, seq_req.m_second_type);
+            if (orderedStore(seq_req))
+                issueNextOrderedStore();
+            else
+                issueRequest(seq_req.pkt, seq_req.m_second_type);
             break;
         }
 
@@ -808,6 +857,17 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
             data.setData(pkt);
             DPRINTF(RubySequencer, "set data %s\n", data);
         }
+    }
+
+    if (orderedStore(*srequest)) {
+        panic_if(orderedStorePackets.empty() ||
+                 orderedStorePackets.front() != pkt ||
+                 (activeOrderedStore && activeOrderedStore != pkt),
+                 "ordinary store applied outside admission order");
+        // The real DataBlock has been updated above. The next head can now
+        // enter the protocol while this packet's CPU response is in transit.
+        orderedStorePackets.pop_front();
+        activeOrderedStore = nullptr;
     }
 
     // If using the RubyTester, update the RubyTester sender state's
@@ -1130,10 +1190,15 @@ Sequencer::makeRequest(PacketPtr pkt)
         TaoTraceNativeAccessRegistry::noteAdmission(
             pkt->req, status == RequestStatus_Aliased);
     }
-    // non-aliased with any existing request in the request table, just issue
-    // to the cache
-    if (status != RequestStatus_Aliased)
+    const bool ordered_store = m_ordered_stores &&
+        primary_type == RubyRequestType_ST && pkt->isWrite() &&
+        !pkt->isAtomicOp() && !pkt->req->isSwap();
+    if (ordered_store) {
+        orderedStorePackets.push_back(pkt);
+        issueNextOrderedStore();
+    } else if (status != RequestStatus_Aliased) {
         issueRequest(pkt, secondary_type);
+    }
 
     // TODO: issue hardware prefetches here
     return RequestStatus_Issued;

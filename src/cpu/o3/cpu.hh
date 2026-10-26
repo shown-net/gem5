@@ -64,6 +64,7 @@
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/iew.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/instruction_timing.hh"
 #include "cpu/o3/rename.hh"
 #include "cpu/o3/rob.hh"
 #include "cpu/o3/scoreboard.hh"
@@ -96,6 +97,10 @@ class ThreadContext;
 class CPU : public BaseCPU
 {
   public:
+    std::array<const InstructionTiming *, unsigned(InstructionForm::Count)>
+        instructionTimings{};
+    const InstructionTiming *timingEntry(InstructionForm form) const
+    { return instructionTimings[unsigned(form)]; }
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -111,7 +116,6 @@ class CPU : public BaseCPU
     };
 
     BaseMMU *mmu;
-    using LSQRequest = LSQ::LSQRequest;
 
     using PerThreadUnifiedRenameMap =
         UnifiedRenameMap::PerThreadUnifiedRenameMap;
@@ -585,6 +589,15 @@ class CPU : public BaseCPU
     {
         return iew.ldstQueue.pushRequest(inst, isLoad, data, size, addr,
                 flags, res, std::move(amo_op), byte_enable);
+    }
+
+    /** Read the stalled retirement frontier for model diagnostics. */
+
+    /** Supply independently scheduled data to a logical store. */
+    Fault
+    writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+    {
+        return iew.ldstQueue.writeStoreData(inst, data, size);
     }
 
     /** Used by the fetch unit to get a hold of the instruction port. */

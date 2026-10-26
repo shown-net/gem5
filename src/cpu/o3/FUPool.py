@@ -42,11 +42,25 @@ from m5.params import *
 from m5.SimObject import SimObject
 
 
+class InstructionTiming(SimObject):
+    type = "InstructionTiming"
+    cxx_class = "gem5::o3::InstructionTiming"
+    cxx_header = "cpu/o3/instruction_timing.hh"
+    form = Param.String("Exact supported instruction form")
+    latency = Param.Cycles("Result dependency latency")
+    throughput = Param.Float("Reference reciprocal throughput, cycles/instruction")
+    ports = VectorParam.String("Alternative named FU instances; acquire one")
+    unit = Param.String("", "Optional shared admission service")
+    issue_interval = Param.Cycles(0, "Service spacing after this operation")
+
+
 class FUPool(SimObject):
     type = "FUPool"
     cxx_class = "gem5::o3::FUPool"
     cxx_header = "cpu/o3/fu_pool.hh"
     FUList = VectorParam.FUDesc("list of FU's for this pool")
+    instructionTimings = VectorParam.InstructionTiming([], "Selected per-form priors")
+    timingUnits = VectorParam.String([], "Shared single-channel admission services")
 
 
 class DefaultFUPool(FUPool):
@@ -62,4 +76,6 @@ class DefaultFUPool(FUPool):
         PredALU(),
         WritePort(),
         RdWrPort(),
+        StoreAddressPort(),
+        StoreDataPort(),
     ]

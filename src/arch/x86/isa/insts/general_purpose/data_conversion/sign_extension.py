@@ -38,10 +38,15 @@ def macroop CDQE_R {
     sexti reg, reg, "env.dataSize * 4 - 1"
 };
 
-def macroop CQO_R_R {
-    # A shift might be slower than, for example, an explicit sign extension,
-    # so it might be worthwhile to try to find an alternative.
-    mov regm, regm, reg
-    srai regm, regm, "env.dataSize * 8 - 1"
+def macroop CQO_R_R
+{
+    srai regm, reg, "env.dataSize * 8 - 1"
+};
+"""
+
+microcode += """
+def macroop CQO_R_R_16 {
+    srai t1, reg, 15
+    mov regm, regm, t1
 };
 """

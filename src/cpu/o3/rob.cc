@@ -44,6 +44,8 @@
 
 #include "base/logging.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/limits.hh"
 #include "debug/Fetch.hh"
 #include "debug/ROB.hh"
@@ -59,11 +61,15 @@ ROB::ROB(CPU *_cpu, const BaseO3CPUParams &params)
     : robPolicy(params.smtROBPolicy),
       cpu(_cpu),
       numEntries(params.numROBEntries),
+      robFrontendGroups(params.robFrontendGroups),
       squashWidth(params.squashWidth),
       numInstsInROB(0),
       numThreads(params.numThreads),
       stats(_cpu)
 {
+    fatal_if(robFrontendGroups &&
+             !(params.frontendStoreGroups || params.frontendLoadAluGroups),
+             "Grouped ROB entries require actual frontend groups");
     assert(!squashWidth.has_value() || (squashWidth > 0));
     //Figure out rob policy
     if (robPolicy == SMTQueuePolicy::Dynamic) {
@@ -106,11 +112,13 @@ ROB::resetState()
 {
     for (ThreadID tid = 0; tid  < MaxThreads; tid++) {
         threadEntries[tid] = 0;
+        entries[tid].clear();
         squashIt[tid] = instList[tid].end();
         squashedSeqNum[tid] = 0;
         doneSquashing[tid] = true;
     }
     numInstsInROB = 0;
+    entriesInUse = 0;
 
     // Initialize the "universal" ROB head & tail point to invalid
     // pointers
@@ -135,7 +143,9 @@ void
 ROB::drainSanityCheck() const
 {
     for (ThreadID tid = 0; tid  < numThreads; tid++)
-        assert(instList[tid].empty());
+        panic_if(!instList[tid].empty() || !entries[tid].empty(),
+                 "ROB retained real members or entries after drain");
+    panic_if(entriesInUse != 0, "ROB retained occupied entries after drain");
     assert(isEmpty());
 }
 
@@ -198,8 +208,6 @@ ROB::insertInst(const DynInstPtr &inst)
 
     DPRINTF(ROB, "Adding inst PC %s to the ROB.\n", inst->pcState());
 
-    assert(numInstsInROB != numEntries);
-
     ThreadID tid = inst->threadNumber;
 
     instList[tid].push_back(inst);
@@ -227,6 +235,31 @@ ROB::insertInst(const DynInstPtr &inst)
 }
 
 void
+ROB::insertGroup(const FrontendInstGroup &group)
+{
+    ThreadID tid = group.members[0]->threadNumber;
+    unsigned needed = robFrontendGroups ? 1 : group.size;
+    panic_if(entriesInUse + needed > numEntries ||
+             entries[tid].size() + needed > maxEntries[tid],
+             "ROB group admission exceeds its resource capacity");
+    if (robFrontendGroups) {
+        Entry entry;
+        for (unsigned member = 0; member < group.size; ++member)
+            entry.members.push_back(group.members[member]);
+        entries[tid].push_back(std::move(entry));
+    } else {
+        for (unsigned member = 0; member < group.size; ++member) {
+            Entry entry;
+            entry.members.push_back(group.members[member]);
+            entries[tid].push_back(std::move(entry));
+        }
+    }
+    entriesInUse += needed;
+    for (unsigned member = 0; member < group.size; ++member)
+        insertInst(group.members[member]);
+}
+
+void
 ROB::retireHead(ThreadID tid)
 {
     stats.writes++;
@@ -247,6 +280,15 @@ ROB::retireHead(ThreadID tid)
 
     --numInstsInROB;
     --threadEntries[tid];
+    panic_if(entries[tid].empty() || entries[tid].front().members.empty() ||
+             entries[tid].front().members.front() != head_inst,
+             "ROB entry and real retirement order disagree");
+    auto &entry = entries[tid].front();
+    entry.members.pop_front();
+    if (entry.members.empty()) {
+        entries[tid].pop_front();
+        --entriesInUse;
+    }
 
     head_inst->clearInROB();
     head_inst->setCommitted();
@@ -287,13 +329,13 @@ ROB::canCommit()
 unsigned
 ROB::numFreeEntries()
 {
-    return numEntries - numInstsInROB;
+    return numEntries - entriesInUse;
 }
 
 unsigned
 ROB::numFreeEntries(ThreadID tid)
 {
-    return maxEntries[tid] - threadEntries[tid];
+    return maxEntries[tid] - entries[tid].size();
 }
 
 void
@@ -317,14 +359,14 @@ ROB::doSquash(ThreadID tid)
 
     bool robTailUpdate = false;
 
-    auto numInstsToSquash = squashWidth.has_value() ? squashWidth : numEntries;
+    unsigned numInstsToSquash = squashWidth.value_or(numInstsInROB);
 
     // If the CPU is exiting, squash all of the instructions
     // it is told to, even if that exceeds the squashWidth.
     // Set the number to the number of entries (the max).
     if (cpu->isThreadExiting(tid))
     {
-        numInstsToSquash = numEntries;
+        numInstsToSquash = numInstsInROB;
     }
 
     for (int numSquashed = 0;

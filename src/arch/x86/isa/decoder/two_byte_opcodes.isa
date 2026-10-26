@@ -167,7 +167,7 @@
             0x05: decode FullSystemInt {
                 0: SyscallInst::syscall({{
                     return std::make_shared<SESyscallFault>();
-                }});
+                }}, IsSyscall);
                 default: decode MODE_MODE {
                     0x0: decode MODE_SUBMODE {
                         0x0: Inst::SYSCALL_64();
@@ -366,7 +366,7 @@
             0x4: decode FullSystemInt {
                 0: SyscallInst::sysenter({{
                     return std::make_shared<SESyscallFault>();
-                }});
+                }}, IsSyscall);
                 default: sysenter();
             }
             0x5: sysexit(); // privileged
@@ -805,8 +805,14 @@
                     default: UD2();
                 }
                 0x3: BTC(Ev,Gv);
-                0x4: BSF(Gv,Ev);
-                0x5: BSR(Gv,Ev);
+                0x4: decode LEGACY_REP {
+                    0x1: TZCNT(Gv,Ev);
+                    default: BSF(Gv,Ev);
+                }
+                0x5: decode LEGACY_REP {
+                    0x1: LZCNT(Gv,Ev);
+                    default: BSR(Gv,Ev);
+                }
                 //The size of the second operand in these instructions
                 //should really be "b" or "w", but it's set to v in order
                 //to have a consistent register size. This shouldn't

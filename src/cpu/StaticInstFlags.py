@@ -58,6 +58,7 @@ class StaticInstFlags(Enum):
 
     vals = [
         "IsNop",  # Is a no-op (no effect at all).
+        "IsZeroIdiom",  # x86 calibration zero-result dependency-breaking op.
         "IsInteger",  # References integer regs.
         "IsFloating",  # References FP regs.
         "IsVector",  # References Vector regs.
@@ -65,6 +66,8 @@ class StaticInstFlags(Enum):
         "IsMatrix",  # References Matrix regs.
         "IsLoad",  # Reads from memory (load or prefetch).
         "IsStore",  # Writes to memory.
+        "IsStoreAddress",  # Address/translation member of a split store.
+        "IsStoreData",  # Data member of the same logical store.
         "IsAtomic",  # Does atomic RMW to memory.
         "IsStoreConditional",  # Store conditional instruction.
         "IsInstPrefetch",  # Instruction-cache prefetch.

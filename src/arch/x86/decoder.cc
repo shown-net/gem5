@@ -451,6 +451,16 @@ Decoder::processOpcode(ByteTable &immTable, ByteTable &modrmTable,
     else
         immediateSize = SizeTypeToSize[logOpSize - 1][immType];
 
+    // Intel long-mode near relative branches always carry a rel32 immediate.
+    // A 66 prefix must not shorten E8/E9 or 0F 80..8F to a rel16.
+    if (submode == SixtyFourBitMode &&
+        ((emi.opcode.type == OneByteOpcode &&
+          (opcode == 0xe8 || opcode == 0xe9)) ||
+         (emi.opcode.type == TwoByteOpcode &&
+          opcode >= 0x80 && opcode <= 0x8f))) {
+        immediateSize = 4;
+    }
+
     // Determine what to expect next.
     if (modrmTable[opcode]) {
         nextState = ModRMState;

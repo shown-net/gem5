@@ -54,7 +54,7 @@ from m5.SimObject import *
 
 
 class TSOStore(Enum):
-    vals = ["serial", "buffer"]
+    vals = ["serial", "buffer", "sbuffer"]
 
 
 class BaseO3CPU(BaseCPU):
@@ -74,12 +74,21 @@ class BaseO3CPU(BaseCPU):
     def support_take_over(cls):
         return True
 
+    # Research model: SPR admission scale and measured address responses.
+    ordinaryLoadService = Param.Bool(False, "Enable ordinary load service stages")
+    loadServiceAdmission = Param.Bool(True, "Limit service admission to three per cycle")
+    loadServiceArbitration = Param.Bool(True, "Limit concurrent reads of overlapping eight-byte line-offset windows")
+    loadServicePropagation = Param.Bool(True, "Use a clocked result-completion stage")
+    loadServiceBankPorts = Param.Unsigned(2, "Reads per line-offset window per cycle in the research service")
+
     activity = Param.Unsigned(0, "Initial count")
 
     cacheStorePorts = Param.Unsigned(
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
+    ordinaryLoadMinLatency = Param.Cycles(
+        0, "Minimum issue-to-result latency for ordinary non-split 8-byte loads; zero disables")
 
     # Backward pipeline delays
     fetchToBacDelay = Param.Cycles(1, "Fetch to Branch address calc. delay")
@@ -88,9 +97,15 @@ class BaseO3CPU(BaseCPU):
     iewToFetchDelay = Param.Cycles(1, "Issue/Execute/Writeback to fetch delay")
     commitToFetchDelay = Param.Cycles(1, "Commit to fetch delay")
     fetchWidth = Param.Unsigned(8, "Fetch width")
+    frontendStoreGroups = Param.Bool(
+        False, "Accept adjacent ordinary STA/STD DynInsts as one frontend group")
+    robFrontendGroups = Param.Bool(
+        False, "One ROB resource entry holds all real frontend group members")
+    frontendLoadAluGroups = Param.Bool(
+        False, "Group a selected scalar integer load and final ALU in the frontend")
     fetchBufferSize = Param.Unsigned(64, "Fetch buffer size in bytes")
     fetchQueueSize = Param.Unsigned(
-        32, "Fetch queue size in micro-ops per-thread"
+        32, "Fetch queue capacity in frontend groups per-thread"
     )
 
     renameToDecodeDelay = Param.Cycles(1, "Rename to decode delay")
@@ -216,6 +231,33 @@ class BaseO3CPU(BaseCPU):
     tsoStoreBufferSize = Param.Unsigned(
         114, "Store-buffer entries used only by the buffer TSO implementation"
     )
+    tsoStoreMaxInFlight = Param.Unsigned(
+        1,
+        "Maximum committed stores awaiting cache responses; experimental "
+        "buffer-mode drain overlap",
+    )
+    intDiv32QuotientLatency = Param.Unsigned(13, "Integer 32-bit DIV/IDIV quotient latency")
+    intDiv32RemainderLatency = Param.Unsigned(15, "Integer 32-bit DIV/IDIV remainder latency")
+    intDiv64QuotientLatency = Param.Unsigned(15, "Integer 64-bit DIV/IDIV quotient latency")
+    intDiv64RemainderLatency = Param.Unsigned(18, "Integer 64-bit DIV/IDIV remainder latency")
+    intDiv32IssueInterval = Param.Unsigned(6, "Integer 32-bit DIV/IDIV initiation interval")
+    intDiv64IssueInterval = Param.Unsigned(10, "Integer 64-bit DIV/IDIV initiation interval")
+
+    sbufferOffloadWidth = Param.Unsigned(
+        1, "Maximum committed SQ stores transferred to SBuffer per cycle"
+    )
+    sbufferDrainWidth = Param.Unsigned(
+        1, "Maximum SBuffer writes issued to the cache per cycle"
+    )
+    sbufferMerge = Param.Bool(
+        True, "Merge an ordinary store into the unsent same-line FIFO tail"
+    )
+    sbufferForwarding = Param.Bool(
+        True, "Forward younger ordinary loads from committed SBuffer entries"
+    )
+    sbufferPrepare = Param.Bool(
+        False, "Issue the inherited store-permission preparation in SBuffer mode"
+    )
 
     recvRespThrottling = Param.Bool(
         False, "Enable load receive response throttling in the LSQ"
@@ -230,6 +272,11 @@ class BaseO3CPU(BaseCPU):
 
     ## Parameters for decoupled front-end
     decoupledFrontEnd = Param.Bool(False, "Enables the decoupled front-end")
+    fetchLookahead = Param.Bool(
+        False, "Overlap the next sequential fetch-buffer read with current bytes"
+    )
+    fetchLookaheadDepth = Param.Unsigned(
+        1, "Actual future instruction byte buffers, requested one per cycle")
     numFTQEntries = Param.Unsigned(
         8,
         "Number of entries in the Fetch target queue. (only used for "

@@ -64,16 +64,32 @@ class X86IntMultDiv(IntMultDiv):
     # of the quotient.
     opList = [
         OpDesc(opClass="IntMult", opLat=3),
+        OpDesc(opClass="X86IntDoubleShift", opLat=3),
+        OpDesc(opClass="X86ByteSwap32", opLat=1),
+        OpDesc(opClass="X86Crc32", opLat=3),
+        OpDesc(opClass="X86IntBitExtract", opLat=1),
+        OpDesc(opClass="X86IntBitManip", opLat=3),
         OpDesc(opClass="IntDiv", opLat=1, pipelined=False),
+        OpDesc(opClass="X86IntDiv32", opLat=12, pipelined=True),
+        OpDesc(opClass="X86IntDiv64", opLat=14, pipelined=True),
     ]
 
     count = 2
+
+
+class X86IntDivResult(FUDesc):
+    opList = [
+        OpDesc(opClass="X86IntDivRem32", opLat=2),
+        OpDesc(opClass="X86IntDivRem64", opLat=3),
+    ]
+    count = 1
 
 
 class DefaultX86FUPool(FUPool):
     FUList = [
         IntALU(),
         X86IntMultDiv(),
+        X86IntDivResult(),
         FP_ALU(),
         FP_MultDiv(),
         ReadPort(),
@@ -81,6 +97,8 @@ class DefaultX86FUPool(FUPool):
         PredALU(),
         WritePort(),
         RdWrPort(),
+        StoreAddressPort(),
+        StoreDataPort(),
         System_Unit(),
     ]
 

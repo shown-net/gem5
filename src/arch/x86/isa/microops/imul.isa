@@ -1,0 +1,102 @@
+// Signed result multiply; architectural result and CF/OF share one operation.
+let {{
+    class Muls(BasicRegOp):
+        op_class = 'IntMultOp'
+        product_code = '''
+            int64_t hi, low;
+            switch (dataSize) {
+              case 8:
+                std::tie(hi, low) = mulSigned<int64_t>(PSrcReg1, op2);
+                break;
+              case 4:
+                std::tie(hi, low) = mulSigned<int32_t>(PSrcReg1, op2);
+                break;
+              case 2:
+                std::tie(hi, low) = mulSigned<int16_t>(PSrcReg1, op2);
+                break;
+              default:
+                panic("Unrecognized IMUL data size %d.", dataSize);
+            }
+        '''
+        code = product_code + 'DestReg = merge(DestReg, dest, low, dataSize);'
+        big_code = product_code + 'DestReg = uint64_t(low) & mask(dataSize * 8);'
+        flag_code = '''
+            const unsigned n = dataSize * 8;
+            const bool overflow = (uint64_t(hi) & mask(n)) !=
+                (bits(uint64_t(low), n - 1) ? mask(n) : 0);
+            cfofBits = overflow ? CfofMask : 0;
+        '''
+
+    for name, base in (("Mulswide", Muls),):
+        fields = {field: getattr(base, field).replace("op2", "imm64")
+                  for field in ("code", "big_code", "flag_code")}
+        fields["operand_types"] = (FoldedDestOp, FoldedSrc1Op, Imm64Op)
+        globals()[name] = type(name, (base,), fields)
+
+    class Mulswidetemp(Mulswide):
+        # The second op performs the architectural partial-register merge;
+        # the multiply writes a complete temporary without an old-dest input.
+        code = Mulswide.product_code.replace("op2", "imm64") + \
+               'DestReg = uint64_t(low) & mask(dataSize * 8);'
+        big_code = code
+
+}};
+
+let {{
+    class Mulubyte(BasicRegOp):
+        op_class = 'IntMultOp'
+        code = """
+            uint64_t hi, low;
+            std::tie(hi, low) = mulUnsigned<uint8_t>(PSrcReg1, op2);
+            Rax = (Rax & ~uint64_t(0xffff)) |
+                  ((uint64_t(hi) & 0xff) << 8) | (uint64_t(low) & 0xff);
+            cfofBits = (hi != 0) ? CfofMask : 0;
+        """
+
+    class Mululow64(BasicRegOp):
+        op_class = 'IntMultOp'
+        code = """
+            uint64_t hi, low;
+            std::tie(hi, low) = mulUnsigned<uint64_t>(PSrcReg1, op2);
+            Rax = uint64_t(low);
+            ProdHi = uint64_t(hi);
+            cfofBits = (hi != 0) ? CfofMask : 0;
+        """
+
+    class Mulsimplicitbyte(BasicRegOp):
+        op_class = 'IntMultOp'
+        code = """
+            int64_t hi, low;
+            std::tie(hi, low) = mulSigned<int8_t>(PSrcReg1, op2);
+            Rax = (Rax & ~uint64_t(0xffff)) |
+                  ((uint64_t(hi) & 0xff) << 8) | (uint64_t(low) & 0xff);
+            cfofBits = ((uint64_t(hi) & 0xff) != (bits(uint64_t(low), 7) ? 0xff : 0)) ? CfofMask : 0;
+        """
+
+    class Mulsimplicitlow64(BasicRegOp):
+        op_class = 'IntMultOp'
+        code = """
+            int64_t hi, low;
+            std::tie(hi, low) = mulSigned<int64_t>(PSrcReg1, op2);
+            Rax = uint64_t(low);
+            ProdHi = uint64_t(hi);
+            cfofBits = (uint64_t(hi) != (bits(uint64_t(low), 63) ? ~uint64_t(0) : 0)) ? CfofMask : 0;
+        """
+
+    class Mulhighwrite(RegOp):
+        operand_types = ()
+        code = 'Rdx = ProdHi;'
+
+    class Mulsproductflags(RegOp):
+        operand_types = ()
+        code = """
+            const unsigned width = dataSize * 8;
+            const bool overflow = (ProdHi & mask(width)) !=
+                (bits(ProdLow, width - 1) ? mask(width) : 0);
+            cfofBits = overflow ? CfofMask : 0;
+        """
+
+    class Muluproductflags(RegOp):
+        operand_types = ()
+        code = 'cfofBits = (ProdHi & mask(dataSize * 8)) ? CfofMask : 0;'
+}};
