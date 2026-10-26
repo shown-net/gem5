@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/inst_queue.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 
 #include <limits>
 #include <vector>
@@ -229,8 +230,20 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       totalWidth(params.issueWidth),
       commitToIEWDelay(params.commitToIEWDelay),
       iqStats(cpu, totalWidth),
-      iqIOStats(cpu)
+      iqIOStats(cpu),
+      intDiv32QuotientLatency(params.intDiv32QuotientLatency),
+      intDiv64QuotientLatency(params.intDiv64QuotientLatency),
+      intDiv32RemainderLatency(params.intDiv32RemainderLatency),
+      intDiv64RemainderLatency(params.intDiv64RemainderLatency),
+      intDiv32IssueInterval(params.intDiv32IssueInterval),
+      intDiv64IssueInterval(params.intDiv64IssueInterval),
+      intDivStats(cpu, *this)
 {
+    panic_if(intDiv32QuotientLatency < 3 || intDiv64QuotientLatency < 3 ||
+             intDiv32RemainderLatency <= intDiv32QuotientLatency ||
+             intDiv64RemainderLatency <= intDiv64QuotientLatency ||
+             intDiv32IssueInterval == 0 || intDiv64IssueInterval == 0,
+             "Integer divide needs positive service intervals and ordered results");
     const auto &reg_classes = params.isa[0]->regClasses();
     // Set the number of total physical registers
     // As the vector registers have two addressing modes, they are added twice
@@ -256,6 +269,48 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     }
 
     resetState();
+}
+
+InstructionQueue::IntDivStats::IntDivStats(CPU *cpu, InstructionQueue &owner)
+    : statistics::Group(&owner.iqStats, "intDiv"), iq(owner),
+      ADD_STAT(issued32, statistics::units::Count::get(), "Integer 32-bit DIV/IDIV core issues"),
+      ADD_STAT(issued64, statistics::units::Count::get(), "Integer 64-bit DIV/IDIV core issues"),
+      ADD_STAT(fuCompleted, statistics::units::Count::get(), "Integer DIV/IDIV core completions including squashed work"),
+      ADD_STAT(squashedAtCompletion, statistics::units::Count::get(), "Integer DIV/IDIV cores squashed at completion"),
+      ADD_STAT(admissionRejected32, statistics::units::Count::get(), "Integer 32-bit divider admission rejection attempts"),
+      ADD_STAT(admissionRejected64, statistics::units::Count::get(), "Integer 64-bit divider admission rejection attempts"),
+      ADD_STAT(admissionCycles, statistics::units::Cycle::get(), "Union of integer integer-divider admission intervals"),
+      ADD_STAT(inFlightCycles, statistics::units::Cycle::get(), "Union of integer integer-divider core execution intervals"),
+      ADD_STAT(issueToCompletionCycles, statistics::units::Cycle::get(), "Sum of integer core issue-to-completion cycles"),
+      ADD_STAT(inFlightAtDump, statistics::units::Count::get(), "Outstanding integer divider cores at each stats dump")
+{
+}
+
+void
+InstructionQueue::IntDivStats::account()
+{
+    const uint64_t now = iq.cpu->curCycle();
+    const auto covered = [this, now](uint64_t end) {
+        return end > lastCycle ? std::min(end, now) - lastCycle : 0;
+    };
+    admissionCycles += covered(iq.intDivNextIssue);
+    inFlightCycles += covered(iq.intDivActiveUntil);
+    lastCycle = now;
+}
+
+void
+InstructionQueue::IntDivStats::preDumpStats()
+{
+    account();
+    inFlightAtDump = iq.intDivIssuedAt.size();
+    statistics::Group::preDumpStats();
+}
+
+void
+InstructionQueue::IntDivStats::resetStats()
+{
+    statistics::Group::resetStats();
+    lastCycle = iq.cpu->curCycle();
 }
 
 InstructionQueue::~InstructionQueue()
@@ -513,7 +568,7 @@ InstructionQueue::resetState()
         squashedSeqNum[tid] = 0;
     }
 
-    for (int i = 0; i < Num_OpClasses; ++i) {
+    for (int i = 0; i < NumReadyQueues; ++i) {
         while (!readyInsts[i].empty())
             readyInsts[i].pop();
         queueOnList[i] = false;
@@ -557,6 +612,8 @@ InstructionQueue::isDrained() const
                    wbOutstanding == 0;
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         drained = drained && memDepUnit[tid].isDrained();
+    for (auto *iq : iqs)
+        drained = drained && !iq->fuPool()->admissionPending(cpu->curCycle());
 
     return drained;
 }
@@ -626,6 +683,44 @@ InstructionQueue::isFull(const DynInstPtr &inst)
     return numFreeEntries(inst) == 0;
 }
 
+bool
+InstructionQueue::canInsertGroup(const FrontendInstGroup &group)
+{
+    // Singleton admission retains the ordinary per-instruction check.
+    if (group.size == 1)
+        return !isFull(group.members[0]);
+
+    std::vector<unsigned> reserved(iqs.size(), 0);
+    for (unsigned member = 0; member < group.size; ++member) {
+        const auto &inst = group.members[member];
+        bool capable = false;
+        for (auto iq : iqs)
+            capable |= iq->fuPool()->isCapable(inst->opClass());
+
+        size_t selected = iqs.size();
+        unsigned best_load = 0;
+        for (size_t i = 0; i < iqs.size(); ++i) {
+            auto iq = iqs[i];
+            if (capable && !iq->fuPool()->isCapable(inst->opClass()))
+                continue;
+            unsigned free = capable ? iq->numFreeEntries(inst) :
+                iq->numFreeEntries(inst->threadNumber);
+            if (free <= reserved[i])
+                continue;
+            unsigned load = iq->numEntries() - free + reserved[i];
+            if (selected == iqs.size() || load < best_load) {
+                selected = i;
+                best_load = load;
+            }
+            break;
+        }
+        if (selected == iqs.size())
+            return false;
+        ++reserved[selected];
+    }
+    return true;
+}
+
 std::vector<FUPool *>
 InstructionQueue::allFUPools()
 {
@@ -643,7 +738,7 @@ InstructionQueue::hasReadyInsts()
         return true;
     }
 
-    for (int i = 0; i < Num_OpClasses; ++i) {
+    for (int i = 0; i < NumReadyQueues; ++i) {
         if (!readyInsts[i].empty()) {
             return true;
         }
@@ -695,7 +790,7 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
     // register(s).
     addToProducers(new_inst);
 
-    if (new_inst->isMemRef()) {
+    if (new_inst->hasMemoryRequest()) {
         memDepUnit[new_inst->threadNumber].insert(new_inst);
     } else {
         addIfReady(new_inst);
@@ -737,7 +832,7 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
 
     // If it's a memory instruction, add it to the memory dependency
     // unit.
-    if (new_inst->isMemRef()) {
+    if (new_inst->hasMemoryRequest()) {
         memDepUnit[new_inst->threadNumber].insertNonSpec(new_inst);
     }
 
@@ -768,8 +863,16 @@ InstructionQueue::getInstToExecute()
     return inst;
 }
 
+unsigned
+InstructionQueue::readyQueue(const DynInstPtr &inst) const
+{
+    if (const auto *entry = inst->timingEntry())
+        return Num_OpClasses + unsigned(entry->form) - 1;
+    return inst->opClass();
+}
+
 void
-InstructionQueue::addToOrderList(OpClass op_class)
+InstructionQueue::addToOrderList(unsigned op_class)
 {
     assert(!readyInsts[op_class].empty());
 
@@ -803,7 +906,7 @@ InstructionQueue::moveToYoungerInst(ListOrderIt list_order_it)
     // than the new instruction.  If so, then add in a new iterator right here.
     // If not, then move along.
     ListOrderEntry queue_entry;
-    OpClass op_class = (*list_order_it).queueType;
+    unsigned op_class = (*list_order_it).queueType;
     ListOrderIt next_it = list_order_it;
 
     ++next_it;
@@ -823,6 +926,18 @@ void
 InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                                       int fu_idx)
 {
+    if (inst->opClass() == X86IntDiv32Op ||
+        inst->opClass() == X86IntDiv64Op) {
+        intDivStats.account();
+        const auto it = intDivIssuedAt.find(inst->seqNum);
+        assert(it != intDivIssuedAt.end());
+        ++intDivStats.fuCompleted;
+        intDivStats.issueToCompletionCycles +=
+            uint64_t(cpu->curCycle()) - it->second;
+        if (inst->isSquashed())
+            ++intDivStats.squashedAtCompletion;
+        intDivIssuedAt.erase(it);
+    }
     DPRINTF(IQ, "Processing FU completion [sn:%llu]\n", inst->seqNum);
     assert(!cpu->switchedOut());
     // The CPU could have been sleeping until this op completed (*extremely*
@@ -876,11 +991,12 @@ InstructionQueue::scheduleReadyInsts()
     ListOrderIt order_end_it = listOrder.end();
 
     while (total_issued < totalWidth && order_it != order_end_it) {
-        OpClass op_class = (*order_it).queueType;
+        unsigned queue_idx = (*order_it).queueType;
+        OpClass op_class = readyInsts[queue_idx].top()->opClass();
 
-        assert(!readyInsts[op_class].empty());
+        assert(!readyInsts[queue_idx].empty());
 
-        DynInstPtr issuing_inst = readyInsts[op_class].top();
+        DynInstPtr issuing_inst = readyInsts[queue_idx].top();
 
         if (issuing_inst->isFloating()) {
             iqIOStats.fpInstQueueReads++;
@@ -893,13 +1009,13 @@ InstructionQueue::scheduleReadyInsts()
         assert(issuing_inst->seqNum == (*order_it).oldestInst);
 
         if (issuing_inst->isSquashed()) {
-            readyInsts[op_class].pop();
+            readyInsts[queue_idx].pop();
 
-            if (!readyInsts[op_class].empty()) {
+            if (!readyInsts[queue_idx].empty()) {
                 moveToYoungerInst(order_it);
             } else {
-                readyIt[op_class] = listOrder.end();
-                queueOnList[op_class] = false;
+                readyIt[queue_idx] = listOrder.end();
+                queueOnList[queue_idx] = false;
             }
 
             listOrder.erase(order_it++);
@@ -916,7 +1032,22 @@ InstructionQueue::scheduleReadyInsts()
         IQUnit *iq = issuing_inst->iq;
         assert(iq);
         auto fu_pool = iq->fuPool();
-        if (op_class != No_OpClass) {
+        const auto *timing = issuing_inst->timingEntry();
+        if (timing) {
+            idx = fu_pool->getUnit(*timing, op_class, cpu->curCycle());
+            op_latency = timing->latency;
+        } else if (op_class != No_OpClass) {
+            const bool integer_divide =
+                op_class == X86IntDiv32Op || op_class == X86IntDiv64Op;
+            if (integer_divide &&
+                uint64_t(cpu->curCycle()) < intDivNextIssue) {
+                if (op_class == X86IntDiv32Op)
+                    ++intDivStats.admissionRejected32;
+                else
+                    ++intDivStats.admissionRejected64;
+                ++order_it;
+                continue;
+            }
             idx = fu_pool->getUnit(op_class);
             if (issuing_inst->isFloating()) {
                 iqIOStats.fpAluAccesses++;
@@ -927,6 +1058,16 @@ InstructionQueue::scheduleReadyInsts()
             }
             if (idx > FUPool::NoFreeFU) {
                 op_latency = fu_pool->getOpLatency(op_class);
+                if (op_class == X86IntDiv32Op)
+                    op_latency = Cycles(intDiv32QuotientLatency - 1);
+                else if (op_class == X86IntDiv64Op)
+                    op_latency = Cycles(intDiv64QuotientLatency - 1);
+                else if (op_class == X86IntDivRem32Op)
+                    op_latency = Cycles(intDiv32RemainderLatency -
+                                        intDiv32QuotientLatency);
+                else if (op_class == X86IntDivRem64Op)
+                    op_latency = Cycles(intDiv64RemainderLatency -
+                                        intDiv64QuotientLatency);
             }
         }
 
@@ -934,6 +1075,23 @@ InstructionQueue::scheduleReadyInsts()
         // valid FU, then schedule for execution.
         if (idx > FUPool::NoFreeFU || idx == FUPool::NoNeedFU ||
             idx == FUPool::NoCapableFU) {
+            if (op_class == X86IntDiv32Op ||
+                op_class == X86IntDiv64Op) {
+                const unsigned interval = op_class == X86IntDiv32Op ?
+                    intDiv32IssueInterval : intDiv64IssueInterval;
+                panic_if(idx < 0 || op_latency < Cycles(2) || interval == 0,
+                         "Integer integer divide requires a FU, latency >= 2 and interval >= 1");
+                intDivStats.account();
+                const uint64_t now = cpu->curCycle();
+                intDivNextIssue = now + interval;
+                intDivActiveUntil = std::max(
+                    intDivActiveUntil, now + uint64_t(op_latency) - 1);
+                intDivIssuedAt.emplace(issuing_inst->seqNum, now);
+                if (op_class == X86IntDiv32Op)
+                    ++intDivStats.issued32;
+                else
+                    ++intDivStats.issued64;
+            }
             if (op_latency == Cycles(1)) {
                 i2e_info->size++;
                 instsToExecute.push_back(issuing_inst);
@@ -953,7 +1111,7 @@ InstructionQueue::scheduleReadyInsts()
                   issuing_inst->setNoCapableFU();
             } else {
                 assert(idx != FUPool::NoCapableFU);
-                bool pipelined = fu_pool->isPipelined(op_class);
+                bool pipelined = timing || fu_pool->isPipelined(op_class);
                 // Generate completion event for the FU
                 ++wbOutstanding;
                 auto execution =
@@ -977,26 +1135,22 @@ InstructionQueue::scheduleReadyInsts()
                     tid, issuing_inst->pcState(),
                     issuing_inst->seqNum);
 
-            readyInsts[op_class].pop();
+            readyInsts[queue_idx].pop();
 
-            if (!readyInsts[op_class].empty()) {
+            if (!readyInsts[queue_idx].empty()) {
                 moveToYoungerInst(order_it);
             } else {
-                readyIt[op_class] = listOrder.end();
-                queueOnList[op_class] = false;
+                readyIt[queue_idx] = listOrder.end();
+                queueOnList[queue_idx] = false;
             }
 
             issuing_inst->setIssued();
             ++total_issued;
 
-#if TRACING_ON
-            issuing_inst->issueTick = curTick() - issuing_inst->fetchTick;
-#endif
-
             if (issuing_inst->firstIssue == -1)
                 issuing_inst->firstIssue = curTick();
 
-            if (!issuing_inst->isMemRef()) {
+            if (!issuing_inst->hasMemoryRequest()) {
                 // Memory instructions can not be freed from the IQ until they
                 // complete.
                 issuing_inst->clearInIQ();
@@ -1044,7 +1198,7 @@ InstructionQueue::scheduleNonSpec(const InstSeqNum &inst)
 
     (*inst_it).second->setCanIssue();
 
-    if (!(*inst_it).second->isMemRef()) {
+    if (!(*inst_it).second->hasMemoryRequest()) {
         addIfReady((*inst_it).second);
     } else {
         memDepUnit[tid].nonSpecInstReady((*inst_it).second);
@@ -1094,7 +1248,7 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
     // instruction if it is a memory instruction.  Also complete the memory
     // instruction at this point since we know it executed without issues.
     ThreadID tid = completed_inst->threadNumber;
-    if (completed_inst->isMemRef()) {
+    if (completed_inst->hasMemoryRequest()) {
         memDepUnit[tid].completeInst(completed_inst);
 
         DPRINTF(IQ, "Completing mem instruction PC: %s [sn:%llu]\n",
@@ -1173,9 +1327,9 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
 void
 InstructionQueue::addReadyMemInst(const DynInstPtr &ready_inst)
 {
-    OpClass op_class = ready_inst->opClass();
+    unsigned op_class = readyQueue(ready_inst);
 
-    assert(op_class < Num_OpClasses);
+    assert(op_class < NumReadyQueues);
 
     readyInsts[op_class].push(ready_inst);
 
@@ -1211,6 +1365,18 @@ void
 InstructionQueue::replayMemInst(const DynInstPtr &replay_inst)
 {
     memDepUnit[replay_inst->threadNumber].replay();
+}
+
+void
+InstructionQueue::replayStoreData(const DynInstPtr &store_inst)
+{
+    memDepUnit[store_inst->threadNumber].replay(store_inst->seqNum);
+}
+
+void
+InstructionQueue::replayStoreWriteback(const DynInstPtr &store_inst)
+{
+    memDepUnit[store_inst->threadNumber].replay(store_inst->seqNum, true);
 }
 
 void
@@ -1339,7 +1505,7 @@ InstructionQueue::doSquash(ThreadID tid)
         }
 
         if (!squashed_inst->isIssued() ||
-            (squashed_inst->isMemRef() &&
+            (squashed_inst->hasMemoryRequest() &&
              !squashed_inst->memOpDone())) {
 
             DPRINTF(IQ, "[tid:%i] Instruction [sn:%llu] PC %s squashed.\n",
@@ -1396,7 +1562,8 @@ InstructionQueue::doSquash(ThreadID tid)
                     // blocked cache are alreayd removed from
                     // nonSpecInsts, and have not faulted
                     assert(squashed_inst->getFault() != NoFault ||
-                           squashed_inst->isMemRef());
+                           squashed_inst->hasMemoryRequest() ||
+                           squashed_inst->isAtCommit());
                 } else {
 
                     (*ns_inst_it).second = NULL;
@@ -1540,7 +1707,7 @@ InstructionQueue::addIfReady(const DynInstPtr &inst)
     if (inst->readyToIssue()) {
 
         //Add the instruction to the proper ready list.
-        if (inst->isMemRef()) {
+        if (inst->hasMemoryRequest()) {
 
             DPRINTF(IQ, "Checking if memory instruction can issue.\n");
 
@@ -1551,9 +1718,9 @@ InstructionQueue::addIfReady(const DynInstPtr &inst)
             return;
         }
 
-        OpClass op_class = inst->opClass();
+        unsigned op_class = readyQueue(inst);
 
-        assert(op_class < Num_OpClasses);
+        assert(op_class < NumReadyQueues);
 
         DPRINTF(IQ, "Instruction is ready to issue, putting it onto "
                 "the ready list, PC %s opclass:%i [sn:%llu].\n",
@@ -1576,7 +1743,7 @@ InstructionQueue::addIfReady(const DynInstPtr &inst)
 void
 InstructionQueue::dumpLists()
 {
-    for (int i = 0; i < Num_OpClasses; ++i) {
+    for (int i = 0; i < NumReadyQueues; ++i) {
         cprintf("Ready list %i size: %i\n", i, readyInsts[i].size());
 
         cprintf("\n");
@@ -1629,7 +1796,7 @@ InstructionQueue::dumpInsts()
                 if (!(*inst_list_it)->isIssued()) {
                     ++valid_num;
                     cprintf("Count:%i\n", valid_num);
-                } else if ((*inst_list_it)->isMemRef() &&
+                } else if ((*inst_list_it)->hasMemoryRequest() &&
                            !(*inst_list_it)->memOpDone()) {
                     // Loads that have not been marked as executed
                     // still count towards the total instructions.
@@ -1646,7 +1813,7 @@ InstructionQueue::dumpInsts()
                     (*inst_list_it)->isIssued(),
                     (*inst_list_it)->isSquashed());
 
-            if ((*inst_list_it)->isMemRef()) {
+            if ((*inst_list_it)->hasMemoryRequest()) {
                 cprintf("MemOpDone:%i\n", (*inst_list_it)->memOpDone());
             }
 
@@ -1671,7 +1838,7 @@ InstructionQueue::dumpInsts()
             if (!(*inst_list_it)->isIssued()) {
                 ++valid_num;
                 cprintf("Count:%i\n", valid_num);
-            } else if ((*inst_list_it)->isMemRef() &&
+            } else if ((*inst_list_it)->hasMemoryRequest() &&
                        !(*inst_list_it)->memOpDone()) {
                 // Loads that have not been marked as executed
                 // still count towards the total instructions.
@@ -1688,7 +1855,7 @@ InstructionQueue::dumpInsts()
                 (*inst_list_it)->isIssued(),
                 (*inst_list_it)->isSquashed());
 
-        if ((*inst_list_it)->isMemRef()) {
+        if ((*inst_list_it)->hasMemoryRequest()) {
             cprintf("MemOpDone:%i\n", (*inst_list_it)->memOpDone());
         }
 

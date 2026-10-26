@@ -45,11 +45,13 @@
 #include <list>
 #include <map>
 #include <queue>
+#include <unordered_map>
 #include <vector>
 
 #include "base/statistics.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
+#include "cpu/instruction_form.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dep_graph.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
@@ -60,6 +62,7 @@
 #include "cpu/timebuf.hh"
 #include "enums/SMTQueuePolicy.hh"
 #include "sim/eventq.hh"
+#include "sim/probe/probe.hh"
 
 namespace gem5
 {
@@ -78,6 +81,7 @@ namespace o3
 class FUPool;
 class CPU;
 class IEW;
+struct FrontendInstGroup;
 
 class IQUnit : public SimObject
 {
@@ -263,9 +267,13 @@ class InstructionQueue
      * instruction type (OpClass)
      */
     bool isFull(const DynInstPtr &inst);
+    /** Reserve-capacity check using the same IQ routing as real insertion. */
+    bool canInsertGroup(const FrontendInstGroup &group);
 
     /** Returns a vector of FU pools */
     std::vector<FUPool *> allFUPools();
+
+    /** Register scheduler-to-FU events for optional calibration listeners. */
 
     /** Returns if there are any ready instructions in the IQ. */
     bool hasReadyInsts();
@@ -342,6 +350,8 @@ class InstructionQueue
 
     /** Replays a memory instruction. It must be rescheduled first. */
     void replayMemInst(const DynInstPtr &replay_inst);
+    void replayStoreData(const DynInstPtr &store_inst);
+    void replayStoreWriteback(const DynInstPtr &store_inst);
 
     /**
      * Defers a memory instruction when its DTB translation incurs a hw
@@ -450,7 +460,10 @@ class InstructionQueue
     /** List of ready instructions, per op class.  They are separated by op
      *  class to allow for easy mapping to FUs.
      */
-    ReadyInstQueue readyInsts[Num_OpClasses];
+    static constexpr unsigned NumReadyQueues = Num_OpClasses +
+        unsigned(InstructionForm::Count) - 1;
+    unsigned readyQueue(const DynInstPtr &inst) const;
+    ReadyInstQueue readyInsts[NumReadyQueues];
 
     /** List of non-speculative instructions that will be scheduled
      *  once the IQ gets a signal from commit.  While it's redundant to
@@ -466,7 +479,7 @@ class InstructionQueue
     /** Entry for the list age ordering by op class. */
     struct ListOrderEntry
     {
-        OpClass queueType;
+        unsigned queueType;
         InstSeqNum oldestInst;
     };
 
@@ -482,15 +495,15 @@ class InstructionQueue
     typedef typename std::list<ListOrderEntry>::iterator ListOrderIt;
 
     /** Tracks if each ready queue is on the age order list. */
-    bool queueOnList[Num_OpClasses];
+    bool queueOnList[NumReadyQueues];
 
     /** Iterators of each ready queue.  Points to their spot in the age order
      *  list.
      */
-    ListOrderIt readyIt[Num_OpClasses];
+    ListOrderIt readyIt[NumReadyQueues];
 
     /** Add an op class to the age order list. */
-    void addToOrderList(OpClass op_class);
+    void addToOrderList(unsigned queue_idx);
 
     /**
      * Called when the oldest instruction has been removed from a ready queue;
@@ -633,6 +646,32 @@ class InstructionQueue
         statistics::Scalar fpAluAccesses;
         statistics::Scalar vecAluAccesses;
     } iqIOStats;
+
+  private:
+    // Integer-divider service is owned by O3, independently of ISA stages.
+    const unsigned intDiv32QuotientLatency, intDiv64QuotientLatency;
+    const unsigned intDiv32RemainderLatency, intDiv64RemainderLatency;
+    const unsigned intDiv32IssueInterval;
+    const unsigned intDiv64IssueInterval;
+    uint64_t intDivNextIssue = 0;
+    uint64_t intDivActiveUntil = 0;
+    std::unordered_map<InstSeqNum, uint64_t> intDivIssuedAt;
+
+    struct IntDivStats : public statistics::Group
+    {
+        InstructionQueue &iq;
+        uint64_t lastCycle = 0;
+        IntDivStats(CPU *cpu, InstructionQueue &owner);
+        void account();
+        void preDumpStats() override;
+        void resetStats() override;
+        statistics::Scalar issued32, issued64, fuCompleted;
+        statistics::Scalar squashedAtCompletion;
+        statistics::Scalar admissionRejected32, admissionRejected64;
+        statistics::Scalar admissionCycles, inFlightCycles;
+        statistics::Scalar issueToCompletionCycles, inFlightAtDump;
+    } intDivStats;
+
 };
 
 } // namespace o3

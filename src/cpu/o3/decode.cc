@@ -45,6 +45,8 @@
 #include "base/trace.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/limits.hh"
 #include "debug/Activity.hh"
 #include "debug/Decode.hh"
@@ -97,7 +99,8 @@ Decode::Decode(CPU *_cpu, const BaseO3CPUParams &params)
              decodeWidth, static_cast<int>(MaxWidth));
 
     // @todo: Make into a parameter
-    skidBufferMax = (fetchToDecodeDelay + 1) *  params.decodeWidth;
+    skidBufferMax = (fetchToDecodeDelay + 1) * params.decodeWidth *
+        ((params.frontendStoreGroups || params.frontendLoadAluGroups) ? 2 : 1);
     for (int tid = 0; tid < MaxThreads; tid++) {
         stalls[tid] = {false};
         decodeStatus[tid] = Idle;
@@ -168,6 +171,12 @@ Decode::DecodeStats::DecodeStats(CPU *cpu)
                "predicted as a control"),
       ADD_STAT(decodedInsts, statistics::units::Count::get(),
                "Number of instructions handled by decode"),
+      ADD_STAT(frontendGroups, statistics::units::Count::get(),
+               "Non-squashed frontend groups transferred by decode"),
+      ADD_STAT(frontendStoreGroups, statistics::units::Count::get(),
+               "Real STA/STD pairs transferred by decode"),
+      ADD_STAT(frontendLoadAluGroups, statistics::units::Count::get(),
+               "Real load/ALU pairs transferred by decode"),
       ADD_STAT(squashedInsts, statistics::units::Count::get(),
                "Number of squashed instructions handled by decode")
 {
@@ -361,11 +370,11 @@ Decode::squash(const DynInstPtr &inst, bool control_miss, ThreadID tid)
     // Clear the instruction list and skid buffer in case they have any
     // insts in them.
     while (!insts[tid].empty()) {
-        insts[tid].pop();
+        insts[tid].pop_front();
     }
 
     while (!skidBuffer[tid].empty()) {
-        skidBuffer[tid].pop();
+        skidBuffer[tid].pop_front();
     }
 
     // Squash instructions up until this one
@@ -409,11 +418,11 @@ Decode::squash(ThreadID tid)
     // Clear the instruction list and skid buffer in case they have any
     // insts in them.
     while (!insts[tid].empty()) {
-        insts[tid].pop();
+        insts[tid].pop_front();
     }
 
     while (!skidBuffer[tid].empty()) {
-        skidBuffer[tid].pop();
+        skidBuffer[tid].pop_front();
     }
 
     return squash_count;
@@ -427,11 +436,11 @@ Decode::skidInsert(ThreadID tid)
     while (!insts[tid].empty()) {
         inst = insts[tid].front();
 
-        insts[tid].pop();
+        insts[tid].pop_front();
 
         assert(tid == inst->threadNumber);
 
-        skidBuffer[tid].push(inst);
+        skidBuffer[tid].push_back(inst);
 
         DPRINTF(Decode, "Inserting [tid:%d][sn:%lli] PC: %s into decode "
                 "skidBuffer %i\n", inst->threadNumber, inst->seqNum,
@@ -492,7 +501,7 @@ Decode::sortInsts()
 {
     int insts_from_fetch = fromFetch->size;
     for (int i = 0; i < insts_from_fetch; ++i) {
-        insts[fromFetch->insts[i]->threadNumber].push(fromFetch->insts[i]);
+        insts[fromFetch->insts[i]->threadNumber].push_back(fromFetch->insts[i]);
     }
 }
 
@@ -573,6 +582,7 @@ Decode::tick()
     bool status_change = false;
 
     toRenameIndex = 0;
+    toRenameGroups = 0;
 
     sortInsts();
 
@@ -661,94 +671,106 @@ Decode::decodeInsts(ThreadID tid)
         ++stats.status[Running];
     }
 
-    std::queue<DynInstPtr>
+    std::deque<DynInstPtr>
         &insts_to_decode = decodeStatus[tid] == Unblocking ?
         skidBuffer[tid] : insts[tid];
 
     DPRINTF(Decode, "[tid:%i] Sending instruction to rename.\n",tid);
 
-    while (insts_available > 0 && toRenameIndex < decodeWidth) {
+    while (insts_available > 0 && toRenameGroups < decodeWidth) {
         assert(!insts_to_decode.empty());
+        FrontendInstGroup group(insts_to_decode);
+        assert(toRenameIndex + group.size <= MaxWidth);
+        ++toRenameGroups;
+        if (!group.members[0]->isSquashed()) {
+            ++stats.frontendGroups;
+            if (group.members[0]->frontendGroupKind == DynInst::FrontendGroupKind::Store)
+                ++stats.frontendStoreGroups;
+            if (group.members[0]->frontendGroupKind == DynInst::FrontendGroupKind::LoadAlu)
+                ++stats.frontendLoadAluGroups;
+        }
+        for (unsigned member = 0; member < group.size; ++member) {
+            DynInstPtr inst = std::move(insts_to_decode.front());
+            insts_to_decode.pop_front();
 
-        DynInstPtr inst = std::move(insts_to_decode.front());
+            DPRINTF(Decode, "[tid:%i] Processing instruction [sn:%lli] with "
+                    "PC %s\n", tid, inst->seqNum, inst->pcState());
 
-        insts_to_decode.pop();
+            if (inst->isSquashed()) {
+                DPRINTF(Decode, "[tid:%i] Instruction %i with PC %s is "
+                        "squashed, skipping.\n",
+                        tid, inst->seqNum, inst->pcState());
 
-        DPRINTF(Decode, "[tid:%i] Processing instruction [sn:%lli] with "
-                "PC %s\n", tid, inst->seqNum, inst->pcState());
+                ++stats.squashedInsts;
 
-        if (inst->isSquashed()) {
-            DPRINTF(Decode, "[tid:%i] Instruction %i with PC %s is "
-                    "squashed, skipping.\n",
-                    tid, inst->seqNum, inst->pcState());
+                --insts_available;
 
-            ++stats.squashedInsts;
+                continue;
+            }
 
+            // Also check if instructions have no source registers.  Mark
+            // them as ready to issue at any time.  Not sure if this check
+            // should exist here or at a later stage; however it doesn't matter
+            // too much for function correctness.
+            if (inst->numSrcRegs() == 0) {
+                inst->setCanIssue();
+            }
+
+            // This current instruction is valid, so add it into the decode
+            // queue.  The next instruction may not be valid, so check to
+            // see if branches were predicted correctly.
+            toRename->insts[toRenameIndex] = inst;
+
+            ++(toRename->size);
+            ++toRenameIndex;
+            ++stats.decodedInsts;
             --insts_available;
 
-            continue;
-        }
+            inst->decodeTick = curTick() - inst->fetchTick;
 
-        // Also check if instructions have no source registers.  Mark
-        // them as ready to issue at any time.  Not sure if this check
-        // should exist here or at a later stage; however it doesn't matter
-        // too much for function correctness.
-        if (inst->numSrcRegs() == 0) {
-            inst->setCanIssue();
-        }
+            // Ensure that if it was predicted as a branch, it really is a
+            // branch.
+            if (inst->readPredTaken() && !inst->isControl()) {
+                panic("Instruction predicted as a branch!");
 
-        // This current instruction is valid, so add it into the decode
-        // queue.  The next instruction may not be valid, so check to
-        // see if branches were predicted correctly.
-        toRename->insts[toRenameIndex] = inst;
-
-        ++(toRename->size);
-        ++toRenameIndex;
-        ++stats.decodedInsts;
-        --insts_available;
-
-        inst->decodeTick = curTick() - inst->fetchTick;
-
-        // Ensure that if it was predicted as a branch, it really is a
-        // branch.
-        if (inst->readPredTaken() && !inst->isControl()) {
-            panic("Instruction predicted as a branch!");
-
-            ++stats.controlMispred;
-
-            // Might want to set some sort of boolean and just do
-            // a check at the end
-            squash(inst, true, inst->threadNumber);
-
-            break;
-        }
-
-        // Go ahead and compute any PC-relative branches.
-        // This includes direct unconditional control and
-        // direct conditional control that is predicted taken.
-        if (inst->isDirectCtrl() &&
-           (inst->isUncondCtrl() || inst->readPredTaken()))
-        {
-            ++stats.branchResolved;
-
-            std::unique_ptr<PCStateBase> target = inst->branchTarget();
-            if (*target != inst->readPredTarg()) {
-                ++stats.branchMispred;
+                ++stats.controlMispred;
 
                 // Might want to set some sort of boolean and just do
                 // a check at the end
-                squash(inst, false, inst->threadNumber);
+                squash(inst, true, inst->threadNumber);
 
-                DPRINTF(Decode,
-                        "[tid:%i] [sn:%llu] "
-                        "Updating predictions: Wrong predicted target: %s \
-                        PredPC: %s\n",
-                        tid, inst->seqNum, inst->readPredTarg(), *target);
-                //The micro pc after an instruction level branch should be 0
-                inst->setPredTarg(*target);
                 break;
             }
-        }
+
+            // Go ahead and compute any PC-relative branches.
+            // This includes direct unconditional control and
+            // direct conditional control that is predicted taken.
+            if (inst->isDirectCtrl() &&
+               (inst->isUncondCtrl() || inst->readPredTaken()))
+            {
+                ++stats.branchResolved;
+
+                std::unique_ptr<PCStateBase> target = inst->branchTarget();
+                if (*target != inst->readPredTarg()) {
+                    ++stats.branchMispred;
+
+                    // Might want to set some sort of boolean and just do
+                    // a check at the end
+                    squash(inst, false, inst->threadNumber);
+
+                    DPRINTF(Decode,
+                            "[tid:%i] [sn:%llu] "
+                            "Updating predictions: Wrong predicted target: %s \
+                            PredPC: %s\n",
+                            tid, inst->seqNum, inst->readPredTarg(), *target);
+                    //The micro pc after an instruction level branch should be 0
+                    inst->setPredTarg(*target);
+                    break;
+                }
+            }
+        } // complete transfer group
+        if (decodeStatus[tid] == Squashing)
+            break;
     }
 
     // If we didn't process all instructions, then we will need to block

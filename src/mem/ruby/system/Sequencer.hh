@@ -42,6 +42,8 @@
 #define __MEM_RUBY_SYSTEM_SEQUENCER_HH__
 
 #include <iostream>
+#include <deque>
+#include <deque>
 #include <list>
 #include <unordered_map>
 
@@ -87,6 +89,7 @@ class Sequencer : public RubyPort
   public:
     typedef RubySequencerParams Params;
     Sequencer(const Params &);
+    void preDumpStats() override;
     ~Sequencer();
 
     /**
@@ -277,6 +280,36 @@ class Sequencer : public RubyPort
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
     int m_store_prepare_outstanding;
+
+    // Pending real ST packets share the existing request-table budget. Only
+    // the head enters the protocol; its data callback releases the next head
+    // before the previous CPU response has returned.
+    bool m_ordered_stores;
+    unsigned m_ordered_store_width;
+    std::deque<PacketPtr> orderedStorePackets;
+    PacketPtr activeOrderedStore = nullptr;
+    bool orderedStore(const SequencerRequest &request) const;
+    void issueNextOrderedStore();
+    struct StoreOrderStats : public statistics::Group
+    {
+        StoreOrderStats(statistics::Group *parent);
+        statistics::Scalar admitted, issued, applied, coalesced, outstandingAtDump;
+    } storeOrderStats;
+
+    // Bounded observer state, ordinary cacheable LD requests only. No events
+    // are scheduled by this observer and no request identities are retained.
+    struct ReadStats : public statistics::Group
+    {
+        ReadStats(statistics::Group *parent);
+        statistics::Scalar readAdmitted, readAliased, readIssued, readCompleted, readCoalesced;
+        statistics::Scalar readLatencyCycles, readOutstandingCycleSum, readActiveCycles;
+        statistics::Scalar readOutstandingAtDump;
+    } readStats;
+    uint64_t observedReads = 0;
+    Cycles observedAt = Cycles(0);
+    static bool observedRead(PacketPtr pkt);
+    void updateReadArea();
+
     bool m_deadlock_check_scheduled;
 
     int m_coreId;

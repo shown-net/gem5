@@ -45,6 +45,7 @@
 
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/frontend_inst_group.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/reg_class.hh"
 #include "debug/Activity.hh"
@@ -85,6 +86,7 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
       decodeToRenameDelay(params.decodeToRenameDelay),
       commitToRenameDelay(params.commitToRenameDelay),
       renameWidth(params.renameWidth),
+      robFrontendGroups(params.robFrontendGroups),
       numThreads(params.numThreads),
       stats(_cpu)
 {
@@ -94,11 +96,16 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
              renameWidth, static_cast<int>(MaxWidth));
 
     // @todo: Make into a parameter.
-    skidBufferMax = (decodeToRenameDelay + 1) * params.decodeWidth;
+    skidBufferMax = (decodeToRenameDelay + 1) * params.decodeWidth *
+        ((params.frontendStoreGroups || params.frontendLoadAluGroups) ? 2 : 1);
+    fatal_if((params.frontendStoreGroups || params.frontendLoadAluGroups) &&
+             2 * renameWidth > MaxWidth,
+             "Rename transport must fit every real frontend group member");
     for (uint32_t tid = 0; tid < MaxThreads; tid++) {
         renameStatus[tid] = Idle;
         renameMap[tid] = nullptr;
         instsInProgress[tid] = 0;
+        robEntriesInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
         freeEntries[tid] = {0, 0, 0, 0};
@@ -121,6 +128,12 @@ Rename::RenameStats::RenameStats(statistics::Group *parent)
                "Number of cycles spent in each rename state"),
       ADD_STAT(renamedInsts, statistics::units::Count::get(),
                "Number of instructions processed by rename"),
+      ADD_STAT(frontendGroups, statistics::units::Count::get(),
+               "Non-squashed frontend groups renamed in full"),
+      ADD_STAT(frontendStoreGroups, statistics::units::Count::get(),
+               "Real STA/STD pairs renamed in full"),
+      ADD_STAT(frontendLoadAluGroups, statistics::units::Count::get(),
+               "Real load/ALU pairs renamed in full"),
       ADD_STAT(squashedInsts, statistics::units::Count::get(),
                "Number of squashed instructions processed by rename"),
       ADD_STAT(ROBFullEvents, statistics::units::Count::get(),
@@ -133,6 +146,8 @@ Rename::RenameStats::RenameStats(statistics::Group *parent)
                "Number of times rename has blocked due to SQ full"),
       ADD_STAT(fullRegistersEvents, statistics::units::Count::get(),
                "Number of times there has been no free registers"),
+      ADD_STAT(fullRegistersByClass, statistics::units::Count::get(),
+               "Failed register admission by actual destination class; classes can overlap"),
       ADD_STAT(renamedOperands, statistics::units::Count::get(),
                "Number of destination operands rename has renamed"),
       ADD_STAT(lookups, statistics::units::Count::get(),
@@ -177,6 +192,12 @@ Rename::RenameStats::RenameStats(statistics::Group *parent)
     LQFullEvents.prereq(LQFullEvents);
     SQFullEvents.prereq(SQFullEvents);
     fullRegistersEvents.prereq(fullRegistersEvents);
+    fullRegistersByClass.init(CCRegClass + 1);
+    const char *class_names[] = {IntRegClassName, FloatRegClassName,
+        VecRegClassName, VecElemClassName, VecPredRegClassName,
+        MatRegClassName, CCRegClassName};
+    for (unsigned type = 0; type <= CCRegClass; ++type)
+        fullRegistersByClass.subname(type, class_names[type]);
 
     renamedOperands.prereq(renamedOperands);
     lookups.prereq(lookups);
@@ -259,6 +280,7 @@ Rename::clearStates(ThreadID tid)
     serializeInst[tid] = NULL;
 
     instsInProgress[tid] = 0;
+    robEntriesInProgress[tid] = 0;
     loadsInProgress[tid] = 0;
     storesInProgress[tid] = 0;
 
@@ -305,6 +327,7 @@ Rename::resetStage()
         serializeInst[tid] = NULL;
 
         instsInProgress[tid] = 0;
+        robEntriesInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
 
@@ -343,6 +366,7 @@ Rename::isDrained() const
 {
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         if (instsInProgress[tid] != 0 ||
+            robEntriesInProgress[tid] != 0 ||
             !historyBuffer[tid].empty() ||
             !skidBuffer[tid].empty() ||
             !insts[tid].empty() ||
@@ -366,6 +390,8 @@ Rename::drainSanityCheck() const
         assert(insts[tid].empty());
         assert(skidBuffer[tid].empty());
         assert(instsInProgress[tid] == 0);
+        panic_if(robEntriesInProgress[tid] != 0,
+                 "Rename retained ROB reservations after drain");
     }
 }
 
@@ -432,6 +458,7 @@ Rename::tick()
     bool status_change = false;
 
     toIEWIndex = 0;
+    toIEWGroups = 0;
 
     sortInsts();
 
@@ -467,11 +494,15 @@ Rename::tick()
     // @todo: make into updateProgress function
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         instsInProgress[tid] -= fromIEW->iewInfo[tid].dispatched;
+        robEntriesInProgress[tid] -=
+            fromIEW->iewInfo[tid].dispatchedROBEntries;
         loadsInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToLQ;
         storesInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToSQ;
         assert(loadsInProgress[tid] >= 0);
         assert(storesInProgress[tid] >= 0);
         assert(instsInProgress[tid] >=0);
+        panic_if(robEntriesInProgress[tid] < 0,
+                 "Rename ROB reservation accounting underflow");
     }
 
 }
@@ -581,19 +612,6 @@ Rename::renameInsts(ThreadID tid)
         incrFullStat(source);
 
         return;
-    } else if (min_free_entries < insts_available) {
-        DPRINTF(Rename,
-                "[tid:%i] "
-                "Will have to block this cycle. "
-                "%i insts available, "
-                "but only %i insts can be renamed due to ROB/IQ/LSQ limits.\n",
-                tid, insts_available, min_free_entries);
-
-        insts_available = min_free_entries;
-
-        blockThisCycle = true;
-
-        incrFullStat(source);
     }
 
     InstQueue &insts_to_rename = renameStatus[tid] == Unblocking ?
@@ -621,155 +639,194 @@ Rename::renameInsts(ThreadID tid)
     }
 
     int renamed_insts = 0;
+    int renamed_rob_entries = 0;
 
-    while (insts_available > 0 &&  toIEWIndex < renameWidth) {
+    while (insts_available > 0 && toIEWGroups < renameWidth) {
         DPRINTF(Rename, "[tid:%i] Sending instructions to IEW.\n", tid);
 
         assert(!insts_to_rename.empty());
-
-        DynInstPtr inst = insts_to_rename.front();
-
-        //For all kind of instructions, check ROB and IQ first For load
-        //instruction, check LQ size and take into account the inflight loads
-        //For store instruction, check SQ size and take into account the
-        //inflight stores
-
-        if (inst->isLoad()) {
-            if (calcFreeLQEntries(tid) <= 0) {
-                DPRINTF(Rename, "[tid:%i] Cannot rename due to no free LQ\n",
-                        tid);
-                source = LQ;
-                incrFullStat(source);
-                break;
-            }
+        FrontendInstGroup group(insts_to_rename);
+        unsigned rob_needed = robFrontendGroups ? 1 : group.size;
+        // IQ contains each real uop. ROB resource entries can hold a complete
+        // group, retaining both members until the final member retires.
+        if (int(rob_needed) > free_rob_entries - renamed_rob_entries ||
+            int(group.size) > free_iq_entries - renamed_insts) {
+            source = int(rob_needed) >
+                free_rob_entries - renamed_rob_entries ? ROB : IQ;
+            incrFullStat(source);
+            blockThisCycle = true;
+            break;
         }
-
-        if (inst->isStore() || inst->isAtomic()) {
-            if (calcFreeSQEntries(tid) <= 0) {
-                DPRINTF(Rename, "[tid:%i] Cannot rename due to no free SQ\n",
-                        tid);
-                source = SQ;
-                incrFullStat(source);
-                break;
-            }
+        assert(toIEWIndex + group.size <= MaxWidth);
+        if (!group.members[0]->isSquashed() && group.size > 1 &&
+            !renameMap[tid]->canRename(group.members.data(), group.size)) {
+            blockThisCycle = true;
+            ++stats.fullRegistersEvents;
+            recordRegisterShortage(group.members.data(), group.size, tid);
+            break;
         }
+        bool stop_group = false;
+        for (unsigned member = 0; member < group.size; ++member) {
+            DynInstPtr inst = insts_to_rename.front();
 
-        insts_to_rename.pop_front();
+            //For all kind of instructions, check ROB and IQ first For load
+            //instruction, check LQ size and take into account the inflight loads
+            //For store instruction, check SQ size and take into account the
+            //inflight stores
 
-        if (renameStatus[tid] == Unblocking) {
+            if (inst->isLoad()) {
+                if (calcFreeLQEntries(tid) <= 0) {
+                    DPRINTF(Rename, "[tid:%i] Cannot rename due to no free LQ\n",
+                            tid);
+                    source = LQ;
+                    incrFullStat(source);
+                    stop_group = true;
+                    break;
+                }
+            }
+
+            if (inst->isStore() || inst->isAtomic()) {
+                if (calcFreeSQEntries(tid) <= 0) {
+                    DPRINTF(Rename, "[tid:%i] Cannot rename due to no free SQ\n",
+                            tid);
+                    source = SQ;
+                    incrFullStat(source);
+                    stop_group = true;
+                    break;
+                }
+            }
+
+            insts_to_rename.pop_front();
+
+            if (renameStatus[tid] == Unblocking) {
+                DPRINTF(Rename,
+                        "[tid:%i] "
+                        "Removing [sn:%llu] PC:%s from rename skidBuffer\n",
+                        tid, inst->seqNum, inst->pcState());
+            }
+
+            if (inst->isSquashed()) {
+                DPRINTF(Rename,
+                        "[tid:%i] "
+                        "instruction %i with PC %s is squashed, skipping.\n",
+                        tid, inst->seqNum, inst->pcState());
+
+                ++stats.squashedInsts;
+
+                // Decrement how many instructions are available.
+                --insts_available;
+
+                continue;
+            }
+
             DPRINTF(Rename,
                     "[tid:%i] "
-                    "Removing [sn:%llu] PC:%s from rename skidBuffer\n",
-                    tid, inst->seqNum, inst->pcState());
-        }
-
-        if (inst->isSquashed()) {
-            DPRINTF(Rename,
-                    "[tid:%i] "
-                    "instruction %i with PC %s is squashed, skipping.\n",
+                    "Processing instruction [sn:%llu] with PC %s.\n",
                     tid, inst->seqNum, inst->pcState());
 
-            ++stats.squashedInsts;
+            // Check here to make sure there are enough destination registers
+            // to rename to.  Otherwise block.
+            if (!renameMap[tid]->canRename(inst)) {
+                DPRINTF(Rename,
+                        "Blocking due to "
+                        " lack of free physical registers to rename to.\n");
+                blockThisCycle = true;
+                insts_to_rename.push_front(inst);
+                ++stats.fullRegistersEvents;
+                recordRegisterShortage(&inst, 1, tid);
+                stop_group = true;
+                break;
+            }
+
+            // If we detect a WaW conflict for MiscRegs, we tag
+            // the instruction as SerializeBefore to avoid the conflict
+            if (!inst->isSerializeAfter() && inst->numDestRegs(MiscRegClass)) {
+                handleMiscRegWaW(inst, tid);
+            }
+
+            // Handle serializeAfter/serializeBefore instructions.
+            // serializeAfter marks the next instruction as serializeBefore.
+            // serializeBefore makes the instruction wait in rename until the ROB
+            // is empty.
+
+            // In this model, IPR accesses are serialize before
+            // instructions, and store conditionals are serialize after
+            // instructions.  This is mainly due to lack of support for
+            // out-of-order operations of either of those classes of
+            // instructions.
+
+            if (inst->isSerializeBefore() && !inst->isSerializeHandled()) {
+                DPRINTF(Rename, "Serialize before instruction encountered.\n");
+
+                if (!inst->isTempSerializeBefore()) {
+                    stats.serializing++;
+                    inst->setSerializeHandled();
+                } else {
+                    stats.tempSerializing++;
+                }
+
+                // Change status over to SerializeStall so that other stages know
+                // what this is blocked on.
+                renameStatus[tid] = SerializeStall;
+
+                serializeInst[tid] = inst;
+
+                blockThisCycle = true;
+                stop_group = true;
+                break;
+            } else if ((inst->isStoreConditional() || inst->isSerializeAfter()) &&
+                       !inst->isSerializeHandled()) {
+                DPRINTF(Rename, "Serialize after instruction encountered.\n");
+
+                stats.serializing++;
+
+                inst->setSerializeHandled();
+
+                serializeAfter(insts_to_rename, tid);
+            }
+
+            renameSrcRegs(inst, inst->threadNumber);
+
+            renameDestRegs(inst, inst->threadNumber);
+
+            if (inst->isAtomic() || inst->isStore()) {
+                storesInProgress[tid]++;
+            } else if (inst->isLoad()) {
+                loadsInProgress[tid]++;
+            }
+
+            ++renamed_insts;
+            // Notify potential listeners that source and destination registers for
+            // this instruction have been renamed.
+            ppRename->notify(inst);
+
+            inst->renameEndTick = curTick() - inst->fetchTick;
+
+            // Put instruction in rename queue.
+            toIEW->insts[toIEWIndex] = inst;
+            ++(toIEW->size);
+
+            // Increment which instruction we're on.
+            ++toIEWIndex;
 
             // Decrement how many instructions are available.
             --insts_available;
-
-            continue;
-        }
-
-        DPRINTF(Rename,
-                "[tid:%i] "
-                "Processing instruction [sn:%llu] with PC %s.\n",
-                tid, inst->seqNum, inst->pcState());
-
-        // Check here to make sure there are enough destination registers
-        // to rename to.  Otherwise block.
-        if (!renameMap[tid]->canRename(inst)) {
-            DPRINTF(Rename,
-                    "Blocking due to "
-                    " lack of free physical registers to rename to.\n");
-            blockThisCycle = true;
-            insts_to_rename.push_front(inst);
-            ++stats.fullRegistersEvents;
-
+        } // every real member has its own rename and allocation
+        if (stop_group)
             break;
+        ++toIEWGroups;
+        if (!group.members[0]->isSquashed()) {
+            renamed_rob_entries += rob_needed;
+            ++stats.frontendGroups;
+            if (group.members[0]->frontendGroupKind == DynInst::FrontendGroupKind::Store)
+                ++stats.frontendStoreGroups;
+            if (group.members[0]->frontendGroupKind == DynInst::FrontendGroupKind::LoadAlu)
+                ++stats.frontendLoadAluGroups;
         }
-
-        // If we detect a WaW conflict for MiscRegs, we tag
-        // the instruction as SerializeBefore to avoid the conflict
-        if (!inst->isSerializeAfter() && inst->numDestRegs(MiscRegClass)) {
-            handleMiscRegWaW(inst, tid);
-        }
-
-        // Handle serializeAfter/serializeBefore instructions.
-        // serializeAfter marks the next instruction as serializeBefore.
-        // serializeBefore makes the instruction wait in rename until the ROB
-        // is empty.
-
-        // In this model, IPR accesses are serialize before
-        // instructions, and store conditionals are serialize after
-        // instructions.  This is mainly due to lack of support for
-        // out-of-order operations of either of those classes of
-        // instructions.
-        if (inst->isSerializeBefore() && !inst->isSerializeHandled()) {
-            DPRINTF(Rename, "Serialize before instruction encountered.\n");
-
-            if (!inst->isTempSerializeBefore()) {
-                stats.serializing++;
-                inst->setSerializeHandled();
-            } else {
-                stats.tempSerializing++;
-            }
-
-            // Change status over to SerializeStall so that other stages know
-            // what this is blocked on.
-            renameStatus[tid] = SerializeStall;
-
-            serializeInst[tid] = inst;
-
-            blockThisCycle = true;
-
-            break;
-        } else if ((inst->isStoreConditional() || inst->isSerializeAfter()) &&
-                   !inst->isSerializeHandled()) {
-            DPRINTF(Rename, "Serialize after instruction encountered.\n");
-
-            stats.serializing++;
-
-            inst->setSerializeHandled();
-
-            serializeAfter(insts_to_rename, tid);
-        }
-
-        renameSrcRegs(inst, inst->threadNumber);
-
-        renameDestRegs(inst, inst->threadNumber);
-
-        if (inst->isAtomic() || inst->isStore()) {
-            storesInProgress[tid]++;
-        } else if (inst->isLoad()) {
-            loadsInProgress[tid]++;
-        }
-
-        ++renamed_insts;
-        // Notify potential listeners that source and destination registers for
-        // this instruction have been renamed.
-        ppRename->notify(inst);
-
-        inst->renameEndTick = curTick() - inst->fetchTick;
-
-        // Put instruction in rename queue.
-        toIEW->insts[toIEWIndex] = inst;
-        ++(toIEW->size);
-
-        // Increment which instruction we're on.
-        ++toIEWIndex;
-
-        // Decrement how many instructions are available.
-        --insts_available;
     }
 
     instsInProgress[tid] += renamed_insts;
+    robEntriesInProgress[tid] += renamed_rob_entries;
     stats.renamedInsts += renamed_insts;
 
     // If we wrote to the time buffer, record this.
@@ -1206,11 +1263,25 @@ int
 Rename::calcFreeROBEntries(ThreadID tid)
 {
     int num_free = freeEntries[tid].robEntries -
-                  (instsInProgress[tid] - fromIEW->iewInfo[tid].dispatched);
+        (robEntriesInProgress[tid] -
+         fromIEW->iewInfo[tid].dispatchedROBEntries);
 
     //DPRINTF(Rename,"[tid:%i] %i rob free\n",tid,num_free);
 
     return num_free;
+}
+
+void
+Rename::recordRegisterShortage(const DynInstPtr *members, unsigned count,
+                              ThreadID tid)
+{
+    for (unsigned type = 0; type <= CCRegClass; ++type) {
+        unsigned required = 0;
+        for (unsigned member = 0; member < count; ++member)
+            required += members[member]->numDestRegs(RegClassType(type));
+        if (required > renameMap[tid]->numFreeEntries(RegClassType(type)))
+            ++stats.fullRegistersByClass[type];
+    }
 }
 
 int

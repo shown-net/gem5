@@ -294,6 +294,8 @@ class UnifiedRenameMap
      * Return whether there are enough registers to serve the request.
      */
     bool canRename(DynInstPtr inst) const;
+    /** Check all actual group destinations before renaming any member. */
+    bool canRename(const DynInstPtr *insts, unsigned count) const;
 };
 
 } // namespace o3

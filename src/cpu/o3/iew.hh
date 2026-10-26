@@ -41,7 +41,7 @@
 #ifndef __CPU_O3_IEW_HH__
 #define __CPU_O3_IEW_HH__
 
-#include <queue>
+#include <deque>
 #include <set>
 
 #include "base/statistics.hh"
@@ -179,6 +179,8 @@ class IEW
 
     /** Re-executes all rescheduled memory instructions. */
     void replayMemInst(const DynInstPtr &inst);
+    void replayStoreData(const DynInstPtr &store_inst);
+    void replayStoreWriteback(const DynInstPtr &store_inst);
 
     /** Moves memory instruction onto the list of cache blocked instructions */
     void blockMemInst(const DynInstPtr &inst);
@@ -334,10 +336,10 @@ class IEW
     TimeBuffer<IEWStruct>::wire toCommit;
 
     /** Queue of all instructions coming from rename this cycle. */
-    std::queue<DynInstPtr> insts[MaxThreads];
+    std::deque<DynInstPtr> insts[MaxThreads];
 
     /** Skid buffer between rename and IEW. */
-    std::queue<DynInstPtr> skidBuffer[MaxThreads];
+    std::deque<DynInstPtr> skidBuffer[MaxThreads];
 
     /** Scoreboard pointer. */
     Scoreboard* scoreboard;
@@ -392,6 +394,7 @@ class IEW
 
     /** Width of dispatch, in instructions. */
     unsigned dispatchWidth;
+    const bool robFrontendGroups;
 
     /** Width of issue, in instructions. */
     unsigned issueWidth;
@@ -430,6 +433,9 @@ class IEW
         statistics::Vector execStatus;
         /** Stat for total number of instructions dispatched. */
         statistics::Scalar dispatchedInsts;
+        statistics::Scalar frontendGroups;
+        statistics::Scalar frontendStoreGroups;
+        statistics::Scalar frontendLoadAluGroups;
         /** Stat for total number of squashed instructions dispatch skips. */
         statistics::Scalar dispSquashedInsts;
         /** Stat for total number of dispatched load instructions. */

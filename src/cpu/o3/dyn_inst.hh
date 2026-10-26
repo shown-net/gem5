@@ -72,8 +72,18 @@ class Packet;
 namespace o3
 {
 
+class CPU;
+class IQUnit;
+class LSQUnit;
+class LSQRequest;
+class ThreadState;
+class LSQEntry;
+class SQEntry;
+class InstructionTiming;
+
 class DynInst : public ExecContext, public RefCounted
 {
+    const InstructionTiming *instructionTiming = nullptr;
   private:
     DynInst(const StaticInstPtr &staticInst, const StaticInstPtr &macroop,
             InstSeqNum seq_num, CPU *cpu);
@@ -320,6 +330,17 @@ class DynInst : public ExecContext, public RefCounted
     /** The thread this instruction is from. */
     ThreadID threadNumber = 0;
 
+    /** Actual frontend transfer group; execution and retirement stay per uop. */
+    InstSeqNum frontendGroupHead = 0;
+    enum class FrontendGroupKind { Single, Store, LoadAlu };
+    FrontendGroupKind frontendGroupKind = FrontendGroupKind::Single;
+    unsigned frontendGroupSize = 1;
+    unsigned frontendGroupIndex = 0;
+    /** Logical store whose data must arrive before this load can replay. */
+    InstSeqNum waitStoreDataSeqNum = 0;
+    /** Partial forwarding must wait for this store's cache publication. */
+    InstSeqNum waitStoreWritebackSeqNum = 0;
+
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
 
@@ -364,7 +385,7 @@ class DynInst : public ExecContext, public RefCounted
      * Saved memory request (needed when the DTB address translation is
      * delayed due to a hw page table walk).
      */
-    LSQ::LSQRequest *savedRequest;
+    LSQRequest *savedRequest;
 
     /////////////////////// Checker //////////////////////
     // Need a copy of main request pointer to verify on writes.
@@ -402,6 +423,10 @@ class DynInst : public ExecContext, public RefCounted
             const std::vector<bool> &byte_enable) override;
 
     Fault initiateMemMgmtCmd(Request::Flags flags) override;
+
+    Fault initiateStoreAddress(Addr addr, unsigned size,
+                               Request::Flags flags) override;
+    Fault writeStoreData(uint8_t *data, unsigned size) override;
 
     Fault writeMem(uint8_t *data, unsigned size, Addr addr,
                    Request::Flags flags, uint64_t *res,
@@ -573,9 +598,17 @@ class DynInst : public ExecContext, public RefCounted
     //  Instruction types.  Forward checks to StaticInst object.
     //
     bool isNop()          const { return staticInst->isNop(); }
+    bool isZeroIdiom()    const { return staticInst->isZeroIdiom(); }
     bool isMemRef()       const { return staticInst->isMemRef(); }
+    bool hasMemoryRequest() const
+    {
+        return staticInst->isLoad() || staticInst->isStore() ||
+               staticInst->isAtomic();
+    }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
+    bool isStoreAddress() const { return staticInst->isStoreAddress(); }
+    bool isStoreData()    const { return staticInst->isStoreData(); }
     bool isAtomic()       const { return staticInst->isAtomic(); }
     bool isStoreConditional() const
     { return staticInst->isStoreConditional(); }
@@ -702,6 +735,7 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Returns the opclass of this instruction. */
     OpClass opClass() const { return staticInst->opClass(); }
+    const InstructionTiming *timingEntry() const { return instructionTiming; }
 
     /** Returns the branch target address. */
     std::unique_ptr<PCStateBase>
@@ -1059,6 +1093,9 @@ class DynInst : public ExecContext, public RefCounted
 
     /* Values used by LoadToUse stat */
     Tick firstIssue = -1;
+    bool ordinaryLoadTiming = false;
+    Tick loadDataReady = -1;
+    Tick loadWriteback = -1;
     Tick lastWakeDependents = -1;
 
     /** Reads a misc. register, including any side-effects the read

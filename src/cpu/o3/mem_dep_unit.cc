@@ -384,13 +384,21 @@ MemDepUnit::reschedule(const DynInstPtr &inst)
 }
 
 void
-MemDepUnit::replay()
+MemDepUnit::replay(InstSeqNum store_seq, bool writeback)
 {
-    DynInstPtr temp_inst;
-
-    // For now this replay function replays all waiting memory ops.
-    while (!instsToReplay.empty()) {
-        temp_inst = instsToReplay.front();
+    auto it = instsToReplay.begin();
+    while (it != instsToReplay.end()) {
+        DynInstPtr temp_inst = *it;
+        const bool ready = writeback ?
+            temp_inst->waitStoreWritebackSeqNum == store_seq :
+            temp_inst->waitStoreDataSeqNum == store_seq &&
+                temp_inst->waitStoreWritebackSeqNum == 0;
+        if (!ready) {
+            ++it;
+            continue;
+        }
+        temp_inst->waitStoreDataSeqNum = 0;
+        temp_inst->waitStoreWritebackSeqNum = 0;
 
         MemDepEntryPtr inst_entry = findInHash(temp_inst);
 
@@ -399,7 +407,7 @@ MemDepUnit::replay()
 
         moveToReady(inst_entry);
 
-        instsToReplay.pop_front();
+        it = instsToReplay.erase(it);
     }
 }
 
