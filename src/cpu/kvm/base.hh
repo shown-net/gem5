@@ -40,6 +40,7 @@
 
 #include <pthread.h>
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <queue>
@@ -135,7 +136,15 @@ class BaseKvmCPU : public BaseCPU
      * Send a signal to the thread owning this vCPU to get it to exit
      * from KVM. Ignored if the vCPU is not executing.
      */
-    void kick() const { pthread_kill(vcpuThread, KVM_KICK_SIGNAL); }
+    void kick() const
+    {
+        // A restored device may wake this CPU before its event-queue
+        // thread has run restartEqThread(). No KVM entry is possible yet,
+        // so there is nothing to interrupt; wakeup() still activates the
+        // guest context and the pending interrupt is delivered on entry.
+        if (vcpuThreadReady.load(std::memory_order_acquire))
+            pthread_kill(vcpuThread, KVM_KICK_SIGNAL);
+    }
 
     /**
      * A cached copy of a thread's state in the form of a SimpleThread
@@ -660,7 +669,10 @@ class BaseKvmCPU : public BaseCPU
     long vcpuID;
 
     /** ID of the vCPU thread */
-    pthread_t vcpuThread;
+    pthread_t vcpuThread{};
+
+    /** Published only after this event-queue thread can accept kicks. */
+    std::atomic<bool> vcpuThreadReady{false};
 
   private:
     /**

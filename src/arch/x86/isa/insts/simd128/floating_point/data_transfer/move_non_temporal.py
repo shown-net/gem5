@@ -39,14 +39,14 @@ microcode = """
 # ordering constraints
 # We are ignoring the non-temporal hint.
 def macroop MOVNTPS_M_XMM {
-    warn_once "MOVNTPS: Ignoring non-temporal hint, modeling as cacheable!"
+    # NT stores retain the cacheable fallback and real address/store faults.
+    # A MicroDebug warning is a per-execution O3 trap, not a harmless log.
     cda seg, sib, "DISPLACEMENT + 8", dataSize=8
     stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
     stfp xmml, seg, sib, disp, dataSize=8
 };
 
 def macroop MOVNTPS_P_XMM {
-    warn_once "MOVNTPS_P: Ignoring non-temporal hint, modeling as cacheable!"
     rdip t7
     cda seg, riprel, "DISPLACEMENT + 8", dataSize=8
     stfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
@@ -57,14 +57,12 @@ def macroop MOVNTPS_P_XMM {
 # ordering constraints
 # We are ignoring the non-temporal hint.
 def macroop MOVNTPD_M_XMM {
-    warn_once "MOVNTPD: Ignoring non-temporal hint, modeling as cacheable!"
     cda seg, sib, "DISPLACEMENT + 8", dataSize=8
     stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
     stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
 };
 
 def macroop MOVNTPD_P_XMM {
-    warn_once "MOVNTPD_P: Ignoring non-temporal hint, modeling as cacheable!"
     rdip t7
     cda seg, riprel, "DISPLACEMENT + 8", dataSize=8
     stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8

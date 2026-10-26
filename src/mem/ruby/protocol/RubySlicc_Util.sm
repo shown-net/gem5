@@ -62,3 +62,15 @@ structure(BoolVec, external="yes") {
 }
 int countBoolVec(BoolVec bVec);
 RequestorID getRequestorID(RequestPtr req);
+void taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
+                                    int level, int outcome);
+void taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num);
+void taotraceRubyMemoryFetchByIdentity(bool valid, int context_id,
+                                       Addr seq_num);
+
+// Independent native transaction observation; no committed trace identity gate.
+void perfCacheNativeLookup(Addr, NodeID, PrefetchBit, int, int);
+void perfCacheNativeLookupFromRequestor(Addr, MachineID, PrefetchBit, int, int);
+void perfCacheNativeWriteback(NodeID, bool);
+void llcFillAuditComplete(Addr, int, MachineID, bool, int, Addr);
+void llcFillAuditEvict(Addr);

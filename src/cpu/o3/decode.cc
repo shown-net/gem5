@@ -310,6 +310,13 @@ Decode::unblock(ThreadID tid)
 void
 Decode::squash(const DynInstPtr &inst, bool control_miss, ThreadID tid)
 {
+    // Preserve the original predictor miss before the direct-target repair
+    // overwrites predPC. Without this sticky fact a later
+    // DynInst::mispredicted() call at retirement incorrectly reports false.
+    if (inst->isControl()) {
+        inst->setBranchPredMispredicted();
+    }
+
     DPRINTF(Decode, "[tid:%i] [sn:%llu] Squashing due to incorrect branch "
             "prediction detected at decode.\n", tid, inst->seqNum);
 

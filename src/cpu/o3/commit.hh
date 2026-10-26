@@ -49,6 +49,7 @@
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/iew.hh"
+#include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/rename_map.hh"
 #include "cpu/o3/rob.hh"
@@ -123,10 +124,13 @@ class Commit
     CommitPolicy commitPolicy;
 
     /** Probe Points. */
+    ProbePointArg<DynInstPtr> *ppPreCommit;
     ProbePointArg<DynInstPtr> *ppCommit;
     ProbePointArg<DynInstPtr> *ppCommitStall;
     /** To probe when an instruction is squashed */
     ProbePointArg<DynInstPtr> *ppSquash;
+    /** To probe an accepted interrupt or architectural fault entry. */
+    ProbePointArg<KernelEntryEvent> *ppKernelEntry;
 
     /** Mark the thread as processing a trap. */
     void processTrapEvent(ThreadID tid);

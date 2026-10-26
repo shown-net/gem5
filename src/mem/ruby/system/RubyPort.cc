@@ -46,6 +46,7 @@
 #include "debug/RubyPort.hh"
 #include "mem/ruby/slicc_interface/AbstractController.hh"
 #include "mem/simple_mem.hh"
+#include "mem/taotrace_response.hh"
 #include "sim/full_system.hh"
 #include "sim/system.hh"
 
@@ -259,11 +260,16 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
     // core while still processing the prefetch by passing a copy of the
     // request through
     PacketPtr pf = nullptr;
-    if (pkt->cmd.isSWPrefetch()) {
-        RequestPtr req = std::make_shared<Request>(pkt->req->getPaddr(),
-                                                   pkt->req->getSize(),
-                                                   pkt->req->getFlags(),
-                                                   pkt->req->requestorId());
+    if (pkt->cmd.isSWPrefetch() && !pkt->req->isStorePrepare()) {
+        auto native_response =
+            pkt->req->getExtension<TaoTraceRubyResponseExtension>();
+        if (!native_response) {
+            native_response =
+                std::make_shared<TaoTraceRubyResponseExtension>();
+            pkt->req->setExtension(native_response);
+        }
+        RequestPtr req = std::make_shared<Request>(*pkt->req);
+        req->setExtension(native_response);
         pf = pkt;
         pkt = new Packet(req, pf->cmd);
         pkt->allocate();
@@ -307,26 +313,51 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
     // Submit the ruby request
     RequestStatus requestStatus = owner.makeRequest(pkt);
 
+    if (requestStatus == RequestStatus_PrefetchSkipped) {
+        assert(pf != nullptr);
+        SenderState *ss =
+            safe_cast<SenderState *>(pkt->popSenderState());
+        delete ss;
+        delete pkt;
+        pf->makeResponse();
+        schedTimingResp(pf, curTick());
+        return true;
+    }
+
     // If the request successfully issued then we should return true.
     // Otherwise, we need to tell the port to retry at a later point
     // and return false.
     if (requestStatus == RequestStatus_Issued) {
+        if (pkt->req->isStorePrepare()) {
+            SenderState *ss =
+                safe_cast<SenderState *>(pkt->popSenderState());
+            delete ss;
+            delete pkt->popSenderState();
+            delete pkt;
+            pkt = nullptr;
+        }
         // For software prefetches, only schedule early return if it was
         // actually issued/aliased by the sequencer
-        if (pkt->cmd.isSWPrefetch()) {
-            assert(pf != nullptr);
+        if (pf != nullptr) {
             pf->makeResponse();
             schedTimingResp(pf, curTick());
         }
 
-        DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
-                pkt->getAddr());
+        if (pkt != nullptr) {
+            DPRINTF(RubyPort, "Request %s 0x%x issued\n", pkt->cmdString(),
+                    pkt->getAddr());
+        }
         return true;
     }
 
     // pop off sender state as this request failed to issue
     SenderState *ss = safe_cast<SenderState *>(pkt->popSenderState());
     delete ss;
+
+    if (pf != nullptr) {
+        delete pkt;
+        pkt = pf;
+    }
 
     if (pkt->cmd != MemCmd::MemSyncReq) {
         DPRINTF(RubyPort,
