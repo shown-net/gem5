@@ -103,7 +103,7 @@ def template MicroLoadExecute {{
         %(ea_code)s;
         DPRINTF(X86, "%s : %s: The address is %#x\n", instMnem, mnemonic, EA);
 
-        fault = readMemAtomic(xc, traceData, EA, Mem, dataSize, memFlags);
+        fault = readMemAtomic(xc, traceData, EA, Mem, %(memDataSize)s, memFlags);
 
         if (fault == NoFault) {
             %(code)s;
@@ -148,7 +148,7 @@ def template MicroLoadCompleteAcc {{
         %(op_decl)s;
         %(op_rd)s;
 
-        getMem(pkt, Mem, dataSize, traceData);
+        getMem(pkt, Mem, %(memDataSize)s, traceData);
 
         %(code)s;
 
@@ -221,6 +221,36 @@ def template MicroStoreCompleteAcc {{
         %(op_rd)s;
         %(complete_code)s;
         %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+def template MicroStoreAddressExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        Fault fault = NoFault;
+        Addr EA;
+        %(op_decl)s;
+        %(op_rd)s;
+        %(ea_code)s;
+        if (fault == NoFault)
+            fault = xc->initiateStoreAddress(EA, dataSize, memFlags);
+        return fault;
+    }
+
+    Fault
+    %(class_name)s::initiateAcc(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        return execute(xc, traceData);
+    }
+
+    Fault
+    %(class_name)s::completeAcc(PacketPtr pkt, ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
         return NoFault;
     }
 }};
@@ -454,7 +484,7 @@ let {{
 
     def defineMicroLoadOp(mnemonic, code, bigCode='',
                           mem_flags="0", big=True, nonSpec=False,
-                          is_float=False):
+                          is_float=False, ea_code=None, mem_size="dataSize"):
         global header_output
         global decoder_output
         global exec_output
@@ -467,16 +497,17 @@ let {{
         else:
             base = 'X86ISA::LdStOp'
 
+        load_ea = calculateEA if ea_code is None else ea_code
         # Build up the all register version of this micro op
         iops = [InstObjParams(name, Name, base,
                               { "code": code,
-                                "ea_code": calculateEA,
-                                "memDataSize": "dataSize" })]
+                                "ea_code": load_ea,
+                                "memDataSize": mem_size })]
         if big:
             iops += [InstObjParams(name, Name + "Big", base,
                                    { "code": bigCode,
-                                     "ea_code": calculateEA,
-                                     "memDataSize": "dataSize" })]
+                                     "ea_code": load_ea,
+                                     "memDataSize": mem_size })]
         for iop in iops:
             header_output += MicroLdStOpDeclare.subst(iop)
             exec_output += MicroLoadExecute.subst(iop)
@@ -502,9 +533,29 @@ let {{
 
     defineMicroLoadOp('Ld', 'Data = merge(Data, data, Mem, dataSize);',
                             'Data = Mem & mask(dataSize * 8);')
+    rip_load_ea = (
+        'EA = SegBase + bits(xc->pcState().as<PCState>().npc() + disp, '
+        'addressSize * 8 - 1, 0);')
+    defineMicroLoadOp('Ldrip', 'Data = merge(Data, data, Mem, dataSize);',
+                     'Data = Mem & mask(dataSize * 8);', ea_code=rip_load_ea)
+    for suffix, size, signed in (('sxb', 1, True), ('sxw', 2, True),
+                                 ('sxd', 4, True), ('zxb', 1, False),
+                                 ('zxw', 2, False)):
+        value = ('sext<%d>(Mem)' % (size * 8) if signed else
+                 'Mem & mask(%d)' % (size * 8))
+        # These forms only decode for 32/64-bit destinations, so the
+        # load overwrites the entire GPR without reading its old value.
+        code = 'Data = (%s) & mask(machInst.opSize * 8);' % value
+        defineMicroLoadOp('Ld' + suffix, code, big=False, mem_size=str(size))
+        defineMicroLoadOp('Ld' + suffix + 'rip', code, big=False,
+                         ea_code=rip_load_ea, mem_size=str(size))
+
     defineMicroLoadOp('Ldst', 'Data = merge(Data, data, Mem, dataSize);',
                               'Data = Mem & mask(dataSize * 8);',
                       'Request::READ_MODIFY_WRITE')
+    defineMicroLoadOp('Ldstrip', 'Data = merge(Data, data, Mem, dataSize);',
+                                 'Data = Mem & mask(dataSize * 8);',
+                      'Request::READ_MODIFY_WRITE', ea_code=rip_load_ea)
     defineMicroLoadOp('Ldstl', 'Data = merge(Data, data, Mem, dataSize);',
                                'Data = Mem & mask(dataSize * 8);',
                       'Request::READ_MODIFY_WRITE | Request::LOCKED_RMW',
@@ -592,7 +643,8 @@ let {{
                            nonSpec=True)
 
     def defineMicroStoreOp(mnemonic, code, completeCode="", mem_flags="0",
-                           is_float=False, has_data=True):
+                           is_float=False, has_data=True, store_address=False,
+                           ea_code=calculateEA):
         global header_output
         global decoder_output
         global exec_output
@@ -611,12 +663,17 @@ let {{
         iop = InstObjParams(name, Name, base,
                             { "code": code,
                               "complete_code": completeCode,
-                              "ea_code": calculateEA,
-                              "memDataSize": "dataSize" })
+                              "ea_code": ea_code,
+                              "memDataSize": "dataSize" },
+                            ['IsStore', 'X86StoreAddressOp'] if store_address
+                            else [])
         header_output += MicroLdStOpDeclare.subst(iop)
-        exec_output += MicroStoreExecute.subst(iop)
-        exec_output += MicroStoreInitiateAcc.subst(iop)
-        exec_output += MicroStoreCompleteAcc.subst(iop)
+        if store_address:
+            exec_output += MicroStoreAddressExecute.subst(iop)
+        else:
+            exec_output += MicroStoreExecute.subst(iop)
+            exec_output += MicroStoreInitiateAcc.subst(iop)
+            exec_output += MicroStoreCompleteAcc.subst(iop)
 
 
         if has_data:
@@ -642,6 +699,9 @@ let {{
         microopClasses[name] = StoreOp
 
     defineMicroStoreOp('St', 'Mem = PData;')
+    defineMicroStoreOp('Sta', '', has_data=False, store_address=True)
+    defineMicroStoreOp('Starip', '', has_data=False, store_address=True,
+                       ea_code=rip_load_ea)
     defineMicroStoreOp('Stis', 'Mem = PData;')
     defineMicroStoreOp('Stul', 'Mem = PData;', mem_flags="Request::LOCKED_RMW")
 

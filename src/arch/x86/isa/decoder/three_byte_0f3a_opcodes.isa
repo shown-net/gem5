@@ -29,7 +29,24 @@
 // Decode the three byte opcodes with the 0f3a prefix.
 //
 format WarnUnimpl {
-    'X86ISA::ThreeByte0F3AOpcode': decode LEGACY_OP {
+    'X86ISA::ThreeByte0F3AOpcode': decode OPCODE_OP {
+    0xF0: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+    'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+    default: decode VEX_L {
+        0: decode LEGACY_LOCK {
+            0: decode LEGACY_REPNE {
+    1: Inst::RORX(Gdp, Edp, Ib);
+    default: Inst::UD2();
+}
+            default: Inst::UD2();
+        }
+        default: Inst::UD2();
+    }
+}
+        default: Inst::UD2();
+    }
+    default: decode LEGACY_OP {
         1: decode OPCODE_OP {
             0x08: roundps_Vdq_Wdq_Ib();
             0x09: roundpd_Vdq_Wdq_Ib();
@@ -95,4 +112,5 @@ format WarnUnimpl {
             default: Inst::UD2();
         }
     }
+}
 }

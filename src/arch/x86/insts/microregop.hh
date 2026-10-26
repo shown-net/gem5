@@ -66,6 +66,20 @@ class RegOpBase : public X86MicroopBase
             bool subtract=false)const ;
 
   public:
+    Fault initiateAcc(ExecContext *xc,
+                      trace::InstRecord *trace_data) const override
+    {
+        assert(isStoreData());
+        return execute(xc, trace_data);
+    }
+
+    Fault completeAcc(PacketPtr pkt, ExecContext *xc,
+                      trace::InstRecord *trace_data) const override
+    {
+        assert(isStoreData());
+        return NoFault;
+    }
+
     const uint8_t dataSize;
     const RegIndex foldOBit;
 };

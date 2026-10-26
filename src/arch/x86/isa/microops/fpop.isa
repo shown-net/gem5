@@ -137,7 +137,7 @@ let {{
                           [op.cxx_class() for op in operand_types]) + ">"
 
             # Get everything ready for the substitution
-            iop_tag = InstObjParams(name, Name + "TopTag" + suffix, base,
+            iop_tag = X86InstObjParams(name, Name + "TopTag" + suffix, base,
                     {"code" : code,
                      "flag_code" : flag_code,
                      "cond_check" : cond_check,
@@ -145,7 +145,7 @@ let {{
                      "tag_code" : "FTW = genX87Tags(FTW, TOP, spm);",
                      "top_code" : "TOP = (TOP + spm + 8) % 8;",
                      "op_class" : op_class})
-            iop_top = InstObjParams(name, Name + "Top" + suffix, base,
+            iop_top = X86InstObjParams(name, Name + "Top" + suffix, base,
                     {"code" : code,
                      "flag_code" : flag_code,
                      "cond_check" : cond_check,
@@ -153,7 +153,7 @@ let {{
                      "tag_code" : ";",
                      "top_code" : "TOP = (TOP + spm + 8) % 8;",
                      "op_class" : op_class})
-            iop = InstObjParams(name, Name + suffix, base,
+            iop = X86InstObjParams(name, Name + suffix, base,
                     {"code" : code,
                      "flag_code" : flag_code,
                      "cond_check" : cond_check,

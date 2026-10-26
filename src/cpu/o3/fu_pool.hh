@@ -48,6 +48,8 @@
 #include <vector>
 
 #include "cpu/op_class.hh"
+#include "cpu/o3/instruction_timing.hh"
+#include "base/statistics.hh"
 #include "params/FUPool.hh"
 #include "sim/sim_object.hh"
 
@@ -131,6 +133,25 @@ class FUPool : public SimObject
     /** Functional units. */
     std::vector<FuncUnit *> funcUnits;
 
+    struct TimingBinding {
+        const InstructionTiming *entry = nullptr;
+        std::vector<int> ports;
+        unsigned cursor = 0;
+        int unit = -1;
+    };
+    std::array<TimingBinding, unsigned(InstructionForm::Count)> timingBindings;
+    std::vector<Cycles> nextAccept;
+
+    // Model allocation events, including speculative/replayed operations.
+    // Rows are pool-local FU instances, not hardware execution ports.
+    struct AllocationStats : public statistics::Group
+    {
+        AllocationStats(statistics::Group *parent);
+        statistics::Vector2d allocatedByUnit;
+        statistics::Vector timingIssued;
+        statistics::Vector serviceRejected;
+    } allocationStats;
+
   public:
     typedef FUPoolParams Params;
     /** Constructs a FU pool. */
@@ -176,6 +197,15 @@ class FUPool : public SimObject
      * otherwise.
      */
     int getUnit(OpClass capability);
+    const InstructionTiming *timing(InstructionForm form) const
+    { return timingBindings[unsigned(form)].entry; }
+    int getUnit(const InstructionTiming &entry, OpClass capability, Cycles now);
+    bool admissionPending(Cycles now) const
+    {
+        for (auto next : nextAccept)
+            if (now < next) return true;
+        return false;
+    }
 
     /** Frees a FU at the end of this cycle. */
     void freeUnitNextCycle(int fu_idx);

@@ -43,6 +43,13 @@ def macroop POP_R {
     mov reg, reg, t1
 };
 
+def macroop POP_R_FULL {
+    .adjust_env oszIn64Override
+
+    ld reg, ss, [1, t0, rsp], addressSize=ssz
+    popsp reg, dsz, dataSize=ssz
+};
+
 def macroop POP_M {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
@@ -77,7 +84,8 @@ def macroop PUSH_R {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
 
-    st reg, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedata reg
     subi rsp, rsp, dsz, dataSize=ssz
 };
 
@@ -85,8 +93,8 @@ def macroop PUSH_I {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
 
-    limm t1, imm
-    st t1, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedatawide imm
     subi rsp, rsp, dsz, dataSize=ssz
 };
 
@@ -95,7 +103,8 @@ def macroop PUSH_M {
     .adjust_env oszIn64Override
 
     ld t1, seg, sib, disp
-    st t1, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedata t1
     subi rsp, rsp, dsz, dataSize=ssz
 };
 
@@ -103,9 +112,9 @@ def macroop PUSH_P {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
 
-    rdip t7
-    ld t1, seg, riprel, disp
-    st t1, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    ldrip t1, seg, riprel, disp
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedata t1
     subi rsp, rsp, dsz, dataSize=ssz
 };
 
@@ -149,10 +158,9 @@ def macroop LEAVE {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
 
-    mov t1, t1, rbp
+    mov t1, t1, rbp, dataSize=ssz
     ld rbp, ss, [1, t0, t1], addressSize=ssz
-    mov rsp, rsp, t1, dataSize=ssz
-    addi rsp, rsp, dsz, dataSize=ssz
+    addi rsp, t1, dsz, dataSize=ssz
 };
 
 def macroop ENTER_I_I {
@@ -164,7 +172,7 @@ def macroop ENTER_I_I {
     limm t1, imm, dataSize=8
     zexti t2, t1, 15, dataSize=8
     srli t1, t1, 16, dataSize=8
-    zexti t1, t1, 5, dataSize=8
+    zexti t1, t1, 4, dataSize=8
     # t1 is now the masked nesting level, and t2 is the amount of storage.
 
     # Push rbp.

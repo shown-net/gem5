@@ -49,17 +49,17 @@ def macroop ADD_M_I
 {
     limm t2, imm
     ldst t1, seg, sib, disp
-    add t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    addi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
+    storedata t1
 };
 
 def macroop ADD_P_I
 {
-    rdip t7
-    limm t2, imm
-    ldst t1, seg, riprel, disp
-    add t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    addi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
+    storedata t1
 };
 
 def macroop ADD_LOCKED_M_I
@@ -74,8 +74,6 @@ def macroop ADD_LOCKED_M_I
 
 def macroop ADD_LOCKED_P_I
 {
-    rdip t7
-    limm t2, imm
     mfence
     ldstl t1, seg, riprel, disp
     add t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
@@ -86,16 +84,17 @@ def macroop ADD_LOCKED_P_I
 def macroop ADD_M_R
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     add t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop ADD_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     add t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop ADD_LOCKED_M_R
@@ -109,7 +108,6 @@ def macroop ADD_LOCKED_M_R
 
 def macroop ADD_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     add t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -125,8 +123,7 @@ def macroop ADD_R_M
 
 def macroop ADD_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     add reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -149,8 +146,7 @@ def macroop SUB_R_M
 
 def macroop SUB_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     sub reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -158,17 +154,17 @@ def macroop SUB_M_I
 {
     limm t2, imm
     ldst t1, seg, sib, disp
-    sub t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    subi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
+    storedata t1
 };
 
 def macroop SUB_P_I
 {
-    rdip t7
-    limm t2, imm
-    ldst t1, seg, riprel, disp
-    sub t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    subi t1, t1, imm, flags=(OF,SF,ZF,AF,PF,CF)
+    storedata t1
 };
 
 def macroop SUB_LOCKED_M_I
@@ -183,8 +179,6 @@ def macroop SUB_LOCKED_M_I
 
 def macroop SUB_LOCKED_P_I
 {
-    rdip t7
-    limm t2, imm
     mfence
     ldstl t1, seg, riprel, disp
     sub t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
@@ -195,16 +189,17 @@ def macroop SUB_LOCKED_P_I
 def macroop SUB_M_R
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     sub t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop SUB_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     sub t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop SUB_LOCKED_M_R
@@ -218,7 +213,6 @@ def macroop SUB_LOCKED_M_R
 
 def macroop SUB_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sub t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -241,17 +235,19 @@ def macroop ADC_M_I
 {
     limm t2, imm
     ldst t1, seg, sib, disp
-    adc t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    adcimmdatai t1, imm
+    adcimmresultflagsi t1, imm
+    storedata t2
 };
 
 def macroop ADC_P_I
 {
-    rdip t7
-    limm t2, imm
-    ldst t1, seg, riprel, disp
-    adc t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    adcimmdatai t1, imm
+    adcimmresultflagsi t1, imm
+    storedata t2
 };
 
 def macroop ADC_LOCKED_M_I
@@ -266,8 +262,6 @@ def macroop ADC_LOCKED_M_I
 
 def macroop ADC_LOCKED_P_I
 {
-    rdip t7
-    limm t2, imm
     mfence
     ldstl t1, seg, riprel, disp
     adc t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
@@ -278,16 +272,21 @@ def macroop ADC_LOCKED_P_I
 def macroop ADC_M_R
 {
     ldst t1, seg, sib, disp
-    adc t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    carryinput
+    adcdata t1, reg
+    adcresultflags t1, reg
+    storedata t2
 };
 
 def macroop ADC_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    adc t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    carryinput
+    adcdata t1, reg
+    adcresultflags t1, reg
+    storedata t2
 };
 
 def macroop ADC_LOCKED_M_R
@@ -301,7 +300,6 @@ def macroop ADC_LOCKED_M_R
 
 def macroop ADC_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     adc t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -317,8 +315,7 @@ def macroop ADC_R_M
 
 def macroop ADC_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     adc reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -341,8 +338,7 @@ def macroop SBB_R_M
 
 def macroop SBB_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    ldrip t1, seg, riprel, disp
     sbb reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
 
@@ -350,17 +346,19 @@ def macroop SBB_M_I
 {
     limm t2, imm
     ldst t1, seg, sib, disp
-    sbb t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    sbbimmdatai t1, imm
+    sbbimmresultflagsi t1, imm
+    storedata t2
 };
 
 def macroop SBB_P_I
 {
-    rdip t7
-    limm t2, imm
-    ldst t1, seg, riprel, disp
-    sbb t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    sbbimmdatai t1, imm
+    sbbimmresultflagsi t1, imm
+    storedata t2
 };
 
 def macroop SBB_LOCKED_M_I
@@ -375,8 +373,6 @@ def macroop SBB_LOCKED_M_I
 
 def macroop SBB_LOCKED_P_I
 {
-    rdip t7
-    limm t2, imm
     mfence
     ldstl t1, seg, riprel, disp
     sbb t1, t1, t2, flags=(OF,SF,ZF,AF,PF,CF)
@@ -387,16 +383,21 @@ def macroop SBB_LOCKED_P_I
 def macroop SBB_M_R
 {
     ldst t1, seg, sib, disp
-    sbb t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    carryinput
+    sbbdata t1, reg
+    sbbresultflags t1, reg
+    storedata t2
 };
 
 def macroop SBB_P_R
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
-    sbb t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
-    st t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    carryinput
+    sbbdata t1, reg
+    sbbresultflags t1, reg
+    storedata t2
 };
 
 def macroop SBB_LOCKED_M_R
@@ -410,7 +411,6 @@ def macroop SBB_LOCKED_M_R
 
 def macroop SBB_LOCKED_P_R
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sbb t1, t1, reg, flags=(OF,SF,ZF,AF,PF,CF)
@@ -426,16 +426,17 @@ def macroop NEG_R
 def macroop NEG_M
 {
     ldst t1, seg, sib, disp
+    sta seg, sib, disp
     sub t1, t0, t1, flags=(CF,OF,SF,ZF,AF,PF)
-    st t1, seg, sib, disp
+    storedata t1
 };
 
 def macroop NEG_P
 {
-    rdip t7
-    ldst t1, seg, riprel, disp
+    ldstrip t1, seg, riprel, disp
+    starip seg, riprel, disp
     sub t1, t0, t1, flags=(CF,OF,SF,ZF,AF,PF)
-    st t1, seg, riprel, disp
+    storedata t1
 };
 
 def macroop NEG_LOCKED_M
@@ -449,11 +450,31 @@ def macroop NEG_LOCKED_M
 
 def macroop NEG_LOCKED_P
 {
-    rdip t7
     mfence
     ldstl t1, seg, riprel, disp
     sub t1, t0, t1, flags=(CF,OF,SF,ZF,AF,PF)
     stul t1, seg, riprel, disp
     mfence
 };
+"""
+
+microcode += """
+def macroop SUB_R_R_ZERO {
+    subzeroalu reg, flags=(OF,SF,ZF,PF,CF,AF)
+};
+"""
+
+for name, operation in (("ADCX", "adcxvalue"), ("ADOX", "adoxvalue")):
+    microcode += f"""
+def macroop {name}_R_R {{
+    {operation} reg, reg, regm
+}};
+def macroop {name}_R_M {{
+    ld t1, seg, sib, disp
+    {operation} reg, reg, t1
+}};
+def macroop {name}_R_P {{
+    ldrip t1, seg, riprel, disp
+    {operation} reg, reg, t1
+}};
 """

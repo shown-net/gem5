@@ -161,7 +161,7 @@ let {{
     for suffix, cond, flags in \
             ("Flags", cond_code, ["IsDirectControl", "IsCondControl"]), \
             ("", "true", []):
-        iop = InstObjParams("br", "Br" + suffix,
+        iop = X86InstObjParams("br", "Br" + suffix,
                 "X86ISA::InstOperands<X86ISA::MicroCondBase, X86ISA::UpcOp>",
                 {"code": "nuIP = target;", "else_code": "nuIP = nuIP;",
                  "cond_test": cond},
@@ -169,7 +169,7 @@ let {{
         exec_output += SeqOpExecute.subst(iop)
         header_output += BrDeclare.subst(iop)
 
-        iop = InstObjParams("eret", "Eret" + suffix,
+        iop = X86InstObjParams("eret", "Eret" + suffix,
                 "X86ISA::InstOperands<X86ISA::MicroCondBase>",
                 {"code": "", "else_code": "", "cond_test": cond}, flags)
         exec_output += SeqOpExecute.subst(iop)

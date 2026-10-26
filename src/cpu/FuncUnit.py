@@ -131,6 +131,22 @@ class OpClass(Enum):
         "SimdBf16MultAcc",
         "Bf16Cvt",
         "System",
+        # Append calibration classes to preserve v25 FST/FU numbering.
+        "X86IntDiv32",
+        "X86IntDiv64",
+        "X86IntDivRem32",
+        "X86IntDivRem64",
+        "X86StoreAddress",
+        "X86StoreData",
+        "X86IntShift",
+        "X86IntDoubleShift",
+        "X86ByteSwap32",
+        "X86Crc32",
+        "X86IntBoolean",
+        "X86IntBitExtract",
+        "X86IntBitManip",
+        "X86IntMulResult64",
+        "X86IntCarry",
     ]
 
 
@@ -155,3 +171,4 @@ class FUDesc(SimObject):
 
     count = Param.Int("number of these FU's available")
     opList = VectorParam.OpDesc("operation classes for this FU type")
+    timingPort = Param.String("", "Port name for a single FU instance")

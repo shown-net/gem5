@@ -38,29 +38,26 @@ def macroop LOOP_I {
     .control_direct
 
     # Make the default data size of pops 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
-    rdip t1
+    .adjust_env oszNearControl
     subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    wripi t1, imm, flags=(nCEZF,)
+    relbranch imm, flags=(nCEZF,)
 };
 
 def macroop LOOPNE_I {
     .control_direct
 
     # Make the default data size of pops 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
-    rdip t1
+    .adjust_env oszNearControl
     subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    wripi t1, imm, flags=(CSTRnZnEZF,)
+    relbranch imm, flags=(CSTRnZnEZF,)
 };
 
 def macroop LOOPE_I {
     .control_direct
 
     # Make the default data size of pops 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
-    rdip t1
+    .adjust_env oszNearControl
     subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    wripi t1, imm, flags=(CSTRZnEZF,)
+    relbranch imm, flags=(CSTRZnEZF,)
 };
 """
