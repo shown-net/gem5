@@ -556,6 +556,7 @@ LSQUnit::insertStoreData(const DynInstPtr &inst)
                  address->pcState().instAddr() != inst->pcState().instAddr(),
                  "STD does not belong to the unmatched STA macro instruction");
         it->dataInstruction() = inst;
+        inst->storeAddressInst = address;
         inst->sqIdx = address->sqIdx;
         inst->sqIt = address->sqIt;
         return;

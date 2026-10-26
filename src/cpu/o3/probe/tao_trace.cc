@@ -5619,6 +5619,36 @@ encodeRegClassValueMicro(int cls_value)
     }
 }
 
+// Keep the existing v25 FST reader/FU contract. The address execution member
+// remains an ALU record; its paired data member carries the logical store.
+inline int
+fstOpClass(OpClass op)
+{
+    switch (op) {
+      case X86IntDiv32Op:
+      case X86IntDiv64Op:
+        return int(IntDivOp);
+      case X86IntMulResult64Op:
+        return int(IntMultOp);
+      case X86StoreDataOp:
+        return int(MemWriteOp);
+      case X86StoreAddressOp:
+      case X86IntDivRem32Op:
+      case X86IntDivRem64Op:
+      case X86IntShiftOp:
+      case X86IntDoubleShiftOp:
+      case X86ByteSwap32Op:
+      case X86Crc32Op:
+      case X86IntBooleanOp:
+      case X86IntBitExtractOp:
+      case X86IntBitManipOp:
+      case X86IntCarryOp:
+        return int(IntAluOp);
+      default:
+        return int(op);
+    }
+}
+
 inline bool
 isTrackableRegClassMicro(int cls_value)
 {
@@ -5664,6 +5694,21 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
 
     auto si = inst->staticInst;
     if (!si) return;
+    const DynInstPtr memory_inst = si->isStoreData()
+        ? inst->storeAddressInst : inst;
+    panic_if(si->isStoreData() && !memory_inst,
+             "FST STD has no paired store address");
+    const bool fst_load = si->isLoad();
+    const bool fst_store = si->isStoreData() ||
+        (si->isStore() && !si->isStoreAddress());
+    if (si->isStoreData()) {
+        vaddr = memory_inst->effAddr;
+        paddr = memory_inst->physEffAddr;
+        size = memory_inst->effSize;
+    } else if (si->isStoreAddress()) {
+        vaddr = paddr = 0;
+        size = 0;
+    }
     const uint8_t instruction_cpl = instructionCpl(inst);
     const bool functional_user = instruction_cpl == 3;
     const uint8_t encoded_cpl =
@@ -5683,6 +5728,8 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     }
 
     uint64_t micro_seq = ++micro_seq_per_thread_[thread_id];
+    if (si->isStoreAddress())
+        inst->fstStoreAddressMicroSeq = micro_seq;
 
     // 收集 src/dst regs（仅 trackable class）
     std::vector<std::pair<uint8_t, uint32_t>> srcs, dsts;
@@ -5737,6 +5784,10 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             prods.emplace_back(dist, kv.first);
         }
     }
+    if (si->isStoreData() && memory_inst->fstStoreAddressMicroSeq &&
+        memory_inst->fstStoreAddressMicroSeq < micro_seq) {
+        prods.emplace_back(micro_seq - memory_inst->fstStoreAddressMicroSeq, 0);
+    }
     std::sort(prods.begin(), prods.end());
     // Multiple architectural source registers can share one producing UOP.
     // Preserve every distinct dynamic RAW edge, without a fan-in limit.
@@ -5771,7 +5822,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     //   方便下游用 paddr-key 与 mem_events / Ruby evict 流做 join。
     uint64_t cacheline_paddr = (paddr & ~uint64_t(63));
     const bool is_memory_instruction =
-        si->isLoad() || si->isStore() || si->isAtomic();
+        fst_load || fst_store || si->isAtomic();
     const bool pte_address_space_matches =
         is_memory_instruction && pteAddressSpaceMatches(inst);
     const auto initial_pte = pte_address_space_matches
@@ -5853,8 +5904,8 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             measurement_pte_present ? 1u : 0u,
             measurement_boundary_inflight_fault ? 1u : 0u,
             cacheline, cacheline_paddr, unsigned(size),
-            si->isLoad() ? 1 : 0,
-            si->isStore() ? 1 : 0,
+            fst_load ? 1 : 0,
+            fst_store ? 1 : 0,
             si->isAtomic() ? 1 : 0,
             si->isControl() ? 1 : 0,
             si->isCondCtrl() ? 1 : 0,
@@ -5867,9 +5918,9 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
             si->isFloating() ? 1 : 0,
             si->isVector() ? 1 : 0,
             si->isSerializing() ? 1 : 0,
-            int(si->opClass()), unsigned(encoded_cpl),
+            fstOpClass(si->opClass()), unsigned(encoded_cpl),
             is_microop, is_last_microop,
-            unsigned(srcs.size()), unsigned(tracked_destination_count),
+            unsigned(srcs.size() + si->isStoreData()), unsigned(tracked_destination_count),
             p_dists[0], p_dists[1], p_dists[2], p_dists[3],
             unsigned(p_classes[0]), unsigned(p_classes[1]),
             unsigned(p_classes[2]), unsigned(p_classes[3]),
@@ -5943,8 +5994,8 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         auto set_flag = [&rec](FstFlag f, bool v) {
             if (v) rec.flags = uint16_t(rec.flags | f);
         };
-        set_flag(kFstLoad, si->isLoad());
-        set_flag(kFstStore, si->isStore());
+        set_flag(kFstLoad, fst_load);
+        set_flag(kFstStore, fst_store);
         set_flag(kFstAtomic, si->isAtomic());
         set_flag(kFstBranch, is_branch);
         set_flag(kFstConditional, si->isCondCtrl());
@@ -5957,7 +6008,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         set_flag(kFstMicroOp, is_microop != 0);
         set_flag(kFstLastMicroOp, is_last_microop != 0);
         set_flag(kFstSerialize, si->isSerializing());
-        const int op_class = int(si->opClass());
+        const int op_class = fstOpClass(si->opClass());
         if (encoded_cpl != 3 && op_class > INT16_MAX - 2) {
             throw std::runtime_error(
                 "TaoTrace kernel OpClass exceeds FST privilege width");
@@ -5967,7 +6018,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         if (encoded_cpl != 3) {
             fst_feature_flags_ |= kFstFeaturePrivilege;
         }
-        rec.n_src = uint8_t(std::min<size_t>(srcs.size(), 255));
+        rec.n_src = uint8_t(std::min<size_t>(srcs.size() + si->isStoreData(), 255));
         rec.n_dst = uint8_t(tracked_destination_count);
         for (int k = 0; k < 4; ++k) {
             rec.producer_dists[k] = p_dists[k];
@@ -6031,10 +6082,10 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         // memReqFlags are the functional request flags captured by LSQ
         // translation. NO_ACCESS retains address translation/faults and the SQ
         // entry but uses a local accessor, never a Ruby data write.
-        llc_fill_audit::observer().member(getCoreId(inst),getTraceThreadId(inst),inst->seqNum,
+        llc_fill_audit::observer().member(getCoreId(memory_inst),getTraceThreadId(memory_inst),memory_inst->seqNum,
             fst_record_count_,rec.pc,rec.address,rec.size,rec.flags,
             !functional_warmup_||functional_measurement_started_,uint64_t(curTick()));
-        noteFstMemoryRequest(&rec, (inst->memReqFlags & Request::NO_ACCESS) != 0,
+        noteFstMemoryRequest(&rec, (memory_inst->memReqFlags & Request::NO_ACCESS) != 0,
                              uint32_t(micro_pc), inst->isDataPrefetch(),
                              perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
         if (prods.size() > 4) {

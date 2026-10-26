@@ -330,6 +330,9 @@ class DynInst : public ExecContext, public RefCounted
     /** The thread this instruction is from. */
     ThreadID threadNumber = 0;
 
+    /** STA retained by its STD for functional trace request/dependency pairing. */
+    DynInstPtr storeAddressInst;
+    uint64_t fstStoreAddressMicroSeq = 0;
     /** Actual frontend transfer group; execution and retirement stay per uop. */
     InstSeqNum frontendGroupHead = 0;
     enum class FrontendGroupKind { Single, Store, LoadAlu };
