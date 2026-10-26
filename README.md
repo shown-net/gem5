@@ -1,29 +1,37 @@
 # gem5 v25: FastSim and calibration
 
-The active branches retain the official v25.1.0.1 ancestry. The
-FastSim mainline is based on c8222cc67a399bfc01e8658dd14b30d5bfd634f9. FastSim
+The active branches are based on the official v25.1.0.1 commit
+c8222cc67a399bfc01e8658dd14b30d5bfd634f9. Daily repositories use shallow
+history, stopping at the official release commits while retaining their real
+commit IDs. FastSim
 production changes are synchronized from
 `/home/data00/yinhaolang/FastSim/gem5-fs`; that source directory remains under
 its author's management.
 
 | Branch | Content | Worktree |
 | --- | --- | --- |
-| `fastsim-main` | Current FastSim producer and its native observations | Updated through a temporary checkout in the local worktree |
-| `calibration-deploy` | FastSim plus calibrated ISA/FU, frontend and memory mechanisms | `/home/data00/zhonghaocheng/simulation-framework/gem5` |
+| `fastsim-main` | Current FastSim producer and its native observations | No permanent worktree; update through a temporary checkout |
+| `calibration-deploy` | FastSim plus calibrated ISA/FU, frontend and memory mechanisms | `/home/data00/xuhaoen/repos/simulators/gem5-deploy` |
 | `calibration-dev` | Deployment plus local KVM/TASK and Marker measurement support | `/home/data00/xuhaoen/repos/simulators/gem5-cpu` |
-| `archive` | Previous histories and original reference index | `/home/data00/xuhaoen/repos/simulators/gem5-archive` |
+| `archive` | Previous histories and original reference index | Remote only; excluded from daily fetches |
 
-The public Git metadata is owned by the local worktree. Linked worktrees share
-branches and objects, while HEAD, index and source files remain per-worktree.
-`archive/ARCHIVE.md` means the file on the archive branch, where the default
-source view is the previous calibration-v26 tree. Old local development
-histories remain in archive; official v25 ancestors are shared with the
-active source branches.
+The two local worktrees share Git metadata owned by `gem5-cpu`. HEAD, index
+and source files remain per-worktree. The consumer repository at
+`/home/data00/zhonghaocheng/simulation-framework/gem5` owns an independent
+`.git`, checks out `calibration-deploy`, and fetches only that branch from
+origin. Update it with `git pull --ff-only` after publishing deployment changes.
+
+The local repository fetches only the three active origin branches and two
+fixed official references: `upstream/stable-v25` at c8222cc67a and
+`upstream/stable-v26` at fed0e07e93. It does not track floating `stable` or fetch
+archive and the full tag set. Complete old histories and the branch/tag index
+are available in [archive/ARCHIVE.md](https://github.com/shown-net/gem5/blob/archive/ARCHIVE.md).
+Use a separate temporary history checkout for cross-version history analysis.
 
 FastSim updates flow into deployment, then development. Promote selected
 calibration changes from development; a whole development merge would carry
-local measurement support into deployment. The upstream remote tracks the
-official reference independently of the active branch history.
+local measurement support into deployment. Official references remain separate
+from the calibration source branches.
 
 FastSim's original native counters, FST and request/retirement contracts are
 retained. Unconsumed calibration diagnostics and their bookkeeping have been
@@ -45,6 +53,11 @@ CPU Marker API selects the independent calibration module when `marker_pc`
 is nonzero; the FastSim producer remains the default path when it is zero.
 The development build uses C++20 to match the canonical protobuf/Abseil
 installation; the pure producer and deployment builds retain v25's C++17.
+
+The CPU project's frozen observation baseline remains an independent shallow
+repository under `gem5-cpu/build/baseline`, pinned by `configs/software.yaml`.
+If absent, `compile_gem5.sh --baseline` fetches that exact commit from origin;
+it does not import archive history into the daily repository.
 
 The reconstruction is checked by compilation, native parameter smoke checks,
 reference reachability and source/interface inspection. Those checks do not
