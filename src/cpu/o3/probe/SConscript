@@ -38,9 +38,24 @@
 Import('*')
 
 if env['CONF']['BUILD_ISA']:
+    # TAOGEN_SHARED_INC: 让 tao_trace 可以 include 共享头
+    # (uarch_profile.hh / lru_banked.hh)。install.sh 会设置 TAOGEN_SHARED；
+    # 默认布局为 <workspace>/taogen/shared，避免依赖旧 single_core_mvp 目录。
+    import os
+    env.Append(CPPPATH=[os.environ.get('TAOGEN_SHARED',
+                                       Dir('#../taogen/shared').abspath)])
+
+    SimObject('BranchEvents.py', sim_objects=['BranchEvents'])
+    Source('branch_events.cc')
+    DebugFlag('BranchEvents')
+
     SimObject('SimpleTrace.py', sim_objects=['SimpleTrace'])
     Source('simple_trace.cc')
     DebugFlag('SimpleTrace')
+
+    SimObject('TaoTrace.py', sim_objects=['TaoTrace'])
+    Source('tao_trace.cc')
+    DebugFlag('TaoTrace')
 
     if env['CONF']['HAVE_PROTOBUF']:
         SimObject(

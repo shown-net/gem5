@@ -35,12 +35,12 @@
 
 microcode = """
 def macroop MOVNTQ_M_MMX {
-    warn_once "MOVNTQ: Ignoring non-temporal hint, modeling as cacheable!"
+    # The NT hint remains cacheable. Do not introduce a MicroDebug fault
+    # for this approximation: O3 would drain and flush on every store.
     stfp mmx, seg, sib, "DISPLACEMENT", dataSize=8
 };
 
 def macroop MOVNTQ_P_MMX {
-    warn_once "MOVNTQ_P: Ignoring non-temporal hint, modeling as cacheable!"
     rdip t7
     stfp mmx, seg, riprel, "DISPLACEMENT", dataSize=8
 };

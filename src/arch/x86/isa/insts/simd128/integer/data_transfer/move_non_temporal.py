@@ -35,14 +35,14 @@
 
 microcode = """
 def macroop MOVNTDQ_M_XMM {
-    warn_once "MOVNTDQ: Ignoring non-temporal hint, modeling as cacheable!"
+    # The NT hint remains cacheable. Preserve cda/store faults, but do not
+    # turn the unsupported hint into an O3 trap and pipeline flush.
     cda seg, sib, "DISPLACEMENT + 8", dataSize=8
     stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
     stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
 };
 
 def macroop MOVNTDQ_P_XMM {
-    warn_once "MOVNTDQ_P: Ignoring non-temporal hint, modeling as cacheable!"
     rdip t7
     cda seg, riprel, "DISPLACEMENT + 8", dataSize=8
     stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8

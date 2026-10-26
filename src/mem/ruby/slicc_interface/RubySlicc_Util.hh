@@ -52,18 +52,101 @@
 #include "debug/RubyProtocol.hh"
 #include "debug/RubySlicc.hh"
 #include "mem/packet.hh"
+#include "mem/taotrace_response.hh"
+#include "mem/perf_cache_native.hh"
+#include "mem/llc_fill_audit.hh"
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/common/BoolVec.hh"
+#include "mem/ruby/common/MachineID.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/common/TypeDefines.hh"
 #include "mem/ruby/common/WriteMask.hh"
 #include "mem/ruby/protocol/RubyRequestType.hh"
+#include "mem/ruby/protocol/PrefetchBit.hh"
 
 namespace gem5
 {
 
 namespace ruby
 {
+
+// Actual LLC response/eviction only; no functional trace labels are read.
+inline void llcFillAuditComplete(Addr address,int role,MachineID origin,
+                                 bool valid,int context,Addr sequence) {
+    llc_fill_audit::observer().fill(address,role,
+        origin.type==MachineType_L1Cache ? origin.num : -1,
+        valid,context,sequence,uint64_t(curTick()));
+}
+inline void llcFillAuditEvict(Addr address) {
+    llc_fill_audit::observer().evict(address,uint64_t(curTick()));
+}
+
+// Physical controller facts, independent of TraceValid and retirement joins.
+inline void
+perfCacheNativeLookup(Addr transaction, int origin, PrefetchBit prefetch,
+                      int level, int outcome)
+{
+    auto &observer = perf_cache_native::observer();
+    if (transaction) {
+        observer.lookup(transaction,unsigned(level),
+            perf_cache_native::Outcome(outcome),uint64_t(curTick()),origin);
+    } else {
+        auto kind=perf_cache_native::Kind::Unknown;
+        if(prefetch==PrefetchBit_Yes) kind=perf_cache_native::Kind::HardwarePrefetch;
+        else if(prefetch==PrefetchBit_L1_HW) kind=perf_cache_native::Kind::HardwarePrefetchL1;
+        else if(prefetch==PrefetchBit_L2_HW) kind=perf_cache_native::Kind::HardwarePrefetchL2;
+        observer.unidentifiedLookup(origin, kind, unsigned(level),
+            perf_cache_native::Outcome(outcome),uint64_t(curTick()));
+    }
+}
+inline void
+perfCacheNativeLookupFromRequestor(Addr transaction, MachineID origin,
+                                   PrefetchBit prefetch, int level, int outcome)
+{
+    // MESI_Three_Level private L2 controllers are MachineType_L1Cache.
+    // Other origins remain unqualified rather than being assigned to a core.
+    if (origin.type != MachineType_L1Cache) {
+        perf_cache_native::observer().unassignedOrigin();
+        return;
+    }
+    perfCacheNativeLookup(transaction,origin.num,prefetch,level,outcome);
+}
+inline void
+perfCacheNativeWriteback(int origin, bool dirty)
+{
+    perf_cache_native::observer().writeback(origin,dirty,uint64_t(curTick()));
+}
+
+inline void
+taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
+                               int level, int outcome)
+{
+    if (!valid || context_id < 0 ||
+        level < 0 || level >= int(TaoTraceNativeHierarchyFacts::Levels) ||
+        outcome < int(TaoTraceNativeCacheOutcome::Hit) ||
+        outcome > int(TaoTraceNativeCacheOutcome::RemoteSupply)) {
+        return;
+    }
+    TaoTraceNativeAccessRegistry::noteHierarchy(
+        uint32_t(context_id), uint64_t(seq_num), unsigned(level),
+        TaoTraceNativeCacheOutcome(outcome));
+}
+
+inline void
+taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num)
+{
+    if (!valid || context_id < 0) return;
+    TaoTraceNativeAccessRegistry::noteUniqueFill(
+        uint32_t(context_id), uint64_t(seq_num));
+}
+
+inline void
+taotraceRubyMemoryFetchByIdentity(bool valid, int context_id, Addr seq_num)
+{
+    if (!valid || context_id < 0) return;
+    TaoTraceNativeAccessRegistry::noteRubyMemoryFetch(
+        uint32_t(context_id), uint64_t(seq_num));
+}
 
 inline Cycles zero_time() { return Cycles(0); }
 

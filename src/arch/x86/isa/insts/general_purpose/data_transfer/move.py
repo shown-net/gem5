@@ -331,12 +331,12 @@ processDescriptor:
 };
 
 def macroop MOVNTI_M_R {
-    warn_once "MOVNTI: Ignoring non-temporal hint, modeling as cacheable!"
+    # The NT hint remains cacheable. A MicroDebug warning would trap and
+    # flush O3 on every store; retain only the architectural memory members.
     st reg, seg, sib, disp
 };
 
 def macroop MOVNTI_P_R {
-    warn_once "MOVNTI_P: Ignoring non-temporal hint, modeling as cacheable!"
     rdip t7
     st reg, seg, riprel, disp
 };

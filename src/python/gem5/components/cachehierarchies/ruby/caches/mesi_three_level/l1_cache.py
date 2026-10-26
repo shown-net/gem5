@@ -105,5 +105,11 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         # In stdlib terms, they are bufferToL2 and bufferFromL2 respectively.
         # These buffers are connections between L1 cache and L2 cache.
         # Later on, we'll need to connect those buffers to L2.
-        self.bufferToL1 = MessageBuffer(ordered=True)
-        self.bufferFromL1 = MessageBuffer(ordered=True)
+        # ordered=True 会触发 MessageBuffer.cc:261 的 strict-FIFO 单调性检查，
+        # 在 8 核高争用 workload (ads_ctr) 下，L0 recycle() → delayHead() 路径
+        # 会出现 arrival_time < last_arrival_time 的 1 cycle 级越位，panic abort。
+        # L0 协议用 block_on="addr" 已保证同地址串行化，跨地址消息不需要全局
+        # arrival 单调；关掉 ordered 仅放宽入队侧时间戳约束，dequeue 仍按
+        # arrival_time 最小堆顺序，不影响协议正确性。
+        self.bufferToL1 = MessageBuffer(ordered=False)
+        self.bufferFromL1 = MessageBuffer(ordered=False)

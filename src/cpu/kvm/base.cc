@@ -136,6 +136,8 @@ BaseKvmCPU::init()
 void
 BaseKvmCPU::startup()
 {
+    vcpuThreadReady.store(false, std::memory_order_release);
+
     const BaseKvmCPUParams &p =
         dynamic_cast<const BaseKvmCPUParams &>(params());
 
@@ -276,6 +278,10 @@ BaseKvmCPU::restartEqThread()
                                          p.hostFactor,
                                          p.hostFreq));
     }
+
+    // Publish the pthread identity only after signal handling and timers
+    // have been initialized on the thread that owns this event queue.
+    vcpuThreadReady.store(true, std::memory_order_release);
 }
 
 BaseKvmCPU::StatGroup::StatGroup(statistics::Group *parent)
@@ -398,6 +404,10 @@ BaseKvmCPU::drain()
 void
 BaseKvmCPU::drainResume()
 {
+    // Worker threads may have been recreated while simulation was stopped.
+    // Do not signal the previous thread before restartEqThread() runs.
+    vcpuThreadReady.store(false, std::memory_order_release);
+
     assert(!tickEvent.scheduled());
 
     // We might have been switched out. In that case, we don't need to
@@ -428,6 +438,8 @@ BaseKvmCPU::drainResume()
 void
 BaseKvmCPU::notifyFork()
 {
+    vcpuThreadReady.store(false, std::memory_order_release);
+
     // We should have drained prior to forking, which means that the
     // tick event shouldn't be scheduled and the CPU is idle.
     assert(!tickEvent.scheduled());
@@ -453,6 +465,8 @@ BaseKvmCPU::notifyFork()
 void
 BaseKvmCPU::switchOut()
 {
+    vcpuThreadReady.store(false, std::memory_order_release);
+
     DPRINTF(Kvm, "switchOut\n");
 
     BaseCPU::switchOut();
