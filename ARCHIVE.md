@@ -3,6 +3,23 @@
 This branch retains the old commit graphs independently of the new v25 branches.
 The checked-out source is the former calibration-v26 tree. Use the index below to inspect other snapshots.
 
+## Calibration restart from v25 plus FST, 2026-10-27
+
+The pre-restart development history is a parent of this archive update; it also
+contains the previous deployment tip. These are historical implementations,
+including TASK isolation, custom uop counters, ISA/FU calibration, frontend
+groups and memory-service changes. The new active calibration branches start
+from `74c1e6350bb91f581eb7fedfe9a5a154fc5f1ab0`, retain serial TSO as the
+initial execution path, and do not inherit those calibrated mechanisms.
+
+| Previous active reference | Commit |
+| --- | --- |
+| `pre-component-v25-20261027/calibration-dev` | `c43cd526e9a054c577557bd68a03bf313de1c9d5` |
+| `pre-component-v25-20261027/calibration-deploy` | `e3b82f678b98aab63e6211693f1df1e399956517` |
+
+Inspect a snapshot with `git show <commit>:<path>` from a history checkout.
+The archive's checked-out v26 source remains unchanged.
+
 | Original reference | Object | Commit |
 | --- | --- | --- |
 | `refs/heads/calibration` | `2ca9e9404479c55aadb3545ac706cfc5b6ec1932` | `2ca9e9404479c55aadb3545ac706cfc5b6ec1932` |
