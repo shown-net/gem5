@@ -61,7 +61,8 @@ def macroop TEST_M_I
 def macroop TEST_P_I
 {
     ldrip t1, seg, riprel, disp
-    andi t0, t1, imm, flags=(OF, SF, ZF, PF, CF, AF)
+    limm t2, imm
+    and t0, t1, t2, flags=(OF, SF, ZF, PF, CF, AF)
 };
 
 def macroop TEST_R_I

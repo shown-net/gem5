@@ -230,6 +230,7 @@ class VectorDistInfo : public Info
 class Vector2dInfo : public Info
 {
   public:
+    const VCounter *taskValues = nullptr;
     /** Names and descriptions of subfields. */
     std::vector<std::string> subnames;
     std::vector<std::string> subdescs;
@@ -243,6 +244,7 @@ class Vector2dInfo : public Info
 
     void enable();
 
+    virtual const VCounter &rawValue() const = 0;
     virtual Result total() const = 0;
 };
 

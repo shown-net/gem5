@@ -854,9 +854,12 @@ TimingSimpleCPU::completeIfetch(PacketPtr pkt)
             thread->htmTransactionStarts);
     }
 
-    if (curStaticInst && curStaticInst->isMemRef()) {
+    if (curStaticInst &&
+        (curStaticInst->isMemRef() || curStaticInst->isStoreData())) {
         // load or store: just send to dcache
-        Fault fault = curStaticInst->initiateAcc(&t_info, traceData);
+        Fault fault = curStaticInst->isStoreData()
+            ? curStaticInst->execute(&t_info, traceData)
+            : curStaticInst->initiateAcc(&t_info, traceData);
 
         // If we're not running now the instruction will complete in a dcache
         // response callback or the instruction faulted and has started an
@@ -1052,6 +1055,10 @@ TimingSimpleCPU::completeDataAccess(PacketPtr pkt)
         } else {
             panic("HTM - unhandled rc %s", htmFailureToStr(htm_rc));
         }
+    } else if (curStaticInst->isStoreData()) {
+        // STD has already copied its bytes into the timing write request.
+        // Its response completes the operation without register writeback.
+        fault = NoFault;
     } else {
         fault = curStaticInst->completeAcc(pkt, t_info,
                                      traceData);

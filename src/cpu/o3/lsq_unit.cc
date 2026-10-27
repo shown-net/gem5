@@ -2208,11 +2208,8 @@ LSQUnit::write(LSQRequest *request, uint8_t *data, ssize_t store_idx)
     storeQueue[store_idx].setRequest(request);
     unsigned size = request->_size;
     storeQueue[store_idx].size() = size;
-    if (storeQueue[store_idx].instruction()->isStoreAddress() &&
-        !storeQueue[store_idx].addressReady() &&
-        !storeQueue[store_idx].dataReady())
-    storeQueue[store_idx].addressReady() = true;
     if (storeQueue[store_idx].instruction()->isStoreAddress()) {
+        storeQueue[store_idx].addressReady() = true;
         panic_if(storeQueue[store_idx].dataReady() &&
                  storeQueue[store_idx].dataBytes() != size,
                  "STA/STD access sizes disagree");

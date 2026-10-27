@@ -67,9 +67,9 @@ def macroop INC_LOCKED_M
 def macroop INC_LOCKED_P
 {
     mfence
-    ldstl t1, seg, riprel, disp
+    ldstlrip t1, seg, riprel, disp
     addi t1, t1, 1, flags=(OF, SF, ZF, AF, PF)
-    stul t1, seg, riprel, disp
+    stulrip t1, seg, riprel, disp
     mfence
 };
 
@@ -106,9 +106,9 @@ def macroop DEC_LOCKED_M
 def macroop DEC_LOCKED_P
 {
     mfence
-    ldstl t1, seg, riprel, disp
+    ldstlrip t1, seg, riprel, disp
     subi t1, t1, 1, flags=(OF, SF, ZF, AF, PF)
-    stul t1, seg, riprel, disp
+    stulrip t1, seg, riprel, disp
     mfence
 };
 """

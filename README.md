@@ -47,17 +47,19 @@ the current tree's `taogen/shared`. Build resources come from the CPU project's
 host configuration.
 
 Development uses the CPU repository's `compile_gem5.sh`, producing
-`build/X86/gem5.fast` and the common libm5. Its `--source-root PATH` input
+`build/X86/gem5.fast` and the common libm5. `--opt` builds the same development
+source as `build/X86/gem5.opt`, retaining assertions and execution tracing for
+functional diagnosis. Measurements use the configured fast binary.
+Its `--source-root PATH` input
 supports checking a staged development tree before deployment. The existing
 CPU Marker API selects the independent calibration module when `marker_pc`
 is nonzero; the FastSim producer remains the default path when it is zero.
 The development build uses C++20 to match the canonical protobuf/Abseil
 installation; the pure producer and deployment builds retain v25's C++17.
 
-The CPU project's frozen observation baseline remains an independent shallow
-repository under `gem5-cpu/build/baseline`, pinned by `configs/software.yaml`.
-If absent, `compile_gem5.sh --baseline` fetches that exact commit from origin;
-it does not import archive history into the daily repository.
+The CPU project runs explicitly selected calibration variants from the current
+development binary and compares them with native measurements of the same
+frozen program windows.
 
 The reconstruction is checked by compilation, native parameter smoke checks,
 reference reachability and source/interface inspection. Those checks do not

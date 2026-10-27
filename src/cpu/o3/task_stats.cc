@@ -57,8 +57,15 @@ TaskStatsObserver::bind(statistics::Group &group, const char *name,
         entry.previous = entry.raw();
         entry.total.assign(entry.previous.size(), 0);
         v->taskValues = &entry.total;
+    } else if (auto *v = dynamic_cast<statistics::Vector2dInfo *>(info)) {
+        vectors.push_back({[v]() -> const statistics::VCounter & {
+            return v->rawValue(); }, {}, {}});
+        auto &entry = vectors.back();
+        entry.previous = entry.raw();
+        entry.total.assign(entry.previous.size(), 0);
+        v->taskValues = &entry.total;
     } else {
-        panic("TASK observation only binds Scalar or Vector statistics");
+        panic("TASK observation cannot bind statistic %s", name);
     }
 }
 void

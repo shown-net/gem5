@@ -55,8 +55,9 @@ def macroop CMP_M_I
 
 def macroop CMP_P_I
 {
+    limm t2, imm
     ldrip t1, seg, riprel, disp
-    subi t0, t1, imm, flags=(OF, SF, ZF, AF, PF, CF)
+    sub t0, t1, t2, flags=(OF, SF, ZF, AF, PF, CF)
 };
 
 def macroop CMP_M_R

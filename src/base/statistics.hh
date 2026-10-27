@@ -200,10 +200,32 @@ class VectorDistInfoProxy : public InfoProxy<Stat, VectorDistInfo>
 template <class Stat>
 class Vector2dInfoProxy : public InfoProxy<Stat, Vector2dInfo>
 {
+  protected:
+    mutable VCounter rawValues;
+
   public:
     Vector2dInfoProxy(Stat &stat) : InfoProxy<Stat, Vector2dInfo>(stat) {}
 
-    Result total() const { return this->s.total(); }
+    const VCounter &rawValue() const override
+    {
+        this->s.value(rawValues);
+        return rawValues;
+    }
+
+    Result total() const override
+    {
+        if (!this->taskValues) return this->s.total();
+        Result sum = 0;
+        for (auto value : *this->taskValues) sum += value;
+        return sum;
+    }
+
+    bool zero() const override
+    {
+        if (!this->taskValues) return this->s.zero();
+        for (auto value : *this->taskValues) if (value != 0) return false;
+        return true;
+    }
 };
 
 class InfoAccess
@@ -1264,9 +1286,16 @@ class Vector2dBase : public DataWrapVec2d<Derived, Vector2dInfoProxy>
         for (off_type i = 0; i < size; ++i)
             data(i)->prepare(info->getStorageParams());
 
-        info->cvec.resize(size);
-        for (off_type i = 0; i < size; ++i)
-            info->cvec[i] = data(i)->value();
+        if (info->taskValues) info->cvec = *info->taskValues;
+        else value(info->cvec);
+    }
+
+    void
+    value(VCounter &values) const
+    {
+        values.resize(size());
+        for (off_type i = 0; i < size(); ++i)
+            values[i] = data(i)->value();
     }
 
     /**
