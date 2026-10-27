@@ -333,6 +333,30 @@ def macroop LLDT_P
     panic "LLDT in non-64 bit mode doesn't support RIP addressing."
 };
 
+def macroop RDFSBASE_R
+{
+    .adjust_env clampOsz
+    fsgsrdbase reg, fs
+};
+
+def macroop RDGSBASE_R
+{
+    .adjust_env clampOsz
+    fsgsrdbase reg, gs
+};
+
+def macroop WRFSBASE_R
+{
+    .adjust_env clampOsz
+    fsgswrbase fs, reg
+};
+
+def macroop WRGSBASE_R
+{
+    .adjust_env clampOsz
+    fsgswrbase gs, reg
+};
+
 def macroop SWAPGS
 {
     rdval t1, kernel_gs_base, dataSize=8
