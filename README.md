@@ -1,65 +1,64 @@
-# gem5 v25: FastSim and calibration
+# gem5 v25: FastSim and component calibration
 
-The active branches are based on the official v25.1.0.1 commit
-c8222cc67a399bfc01e8658dd14b30d5bfd634f9. Daily repositories use shallow
-history, stopping at the official release commits while retaining their real
-commit IDs. FastSim
-production changes are synchronized from
-`/home/data00/yinhaolang/FastSim/gem5-fs`; that source directory remains under
-its author's management.
+The common mechanism starting point is
+`74c1e6350bb91f581eb7fedfe9a5a154fc5f1ab0`: the FastSim producer on official
+v25.1.0.1 `c8222cc67a399bfc01e8658dd14b30d5bfd634f9`. It already contains
+buffer TSO / Store Prepare code; new CPU experiments explicitly select serial.
+The FastSim source remains managed by its author at
+`/home/data00/yinhaolang/FastSim/gem5-fs`; this restart does not modify it.
 
-| Branch | Content | Worktree |
+| Branch | Current responsibility | Worktree |
 | --- | --- | --- |
-| `fastsim-main` | Current FastSim producer and its native observations | No permanent worktree; update through a temporary checkout |
-| `calibration-deploy` | FastSim plus calibrated ISA/FU, frontend and memory mechanisms | `/home/data00/xuhaoen/repos/simulators/gem5-deploy` |
-| `calibration-dev` | Deployment plus local KVM/TASK and Marker measurement support | `/home/data00/xuhaoen/repos/simulators/gem5-cpu` |
-| `archive` | Previous histories and original reference index | Remote only; excluded from daily fetches |
+| `fastsim-main` | Existing producer, FST contract and native observations | Temporary checkout for updates |
+| `calibration-deploy` | Common base plus independent FSGSBASE functional support; future accepted calibration mechanisms | `/home/data00/xuhaoen/repos/simulators/gem5-deploy` |
+| `calibration-dev` | Deployment plus KVM drain, HANDOFF, single-event-queue transition, Marker snapshots and optional PC/branch traces | `/home/data00/xuhaoen/repos/simulators/gem5-cpu` |
+| `archive` | Superseded histories and their reference index | Remote only, excluded from daily fetches |
 
-The two local worktrees share Git metadata owned by `gem5-cpu`. HEAD, index
-and source files remain per-worktree. The consumer repository at
-`/home/data00/zhonghaocheng/simulation-framework/gem5` owns an independent
-`.git`, checks out `calibration-deploy`, and fetches only that branch from
-origin. Update it with `git pull --ff-only` after publishing deployment changes.
+TASK isolation, native-stat return-value replacement, custom allocation / issue /
+retirement counters and the previous ISA/FU, frontend-group and memory-service
+calibration implementations remain in
+[archive/ARCHIVE.md](https://github.com/shown-net/gem5/blob/archive/ARCHIVE.md).
+The index records old development `c43cd526` and deployment `e3b82f67` tips.
+New component timing remains unvalidated.
 
-The local repository fetches only the three active origin branches and two
-fixed official references: `upstream/stable-v25` at c8222cc67a and
-`upstream/stable-v26` at fed0e07e93. It does not track floating `stable` or fetch
-archive and the full tag set. Complete old histories and the branch/tag index
-are available in [archive/ARCHIVE.md](https://github.com/shown-net/gem5/blob/archive/ARCHIVE.md).
-Use a separate temporary history checkout for cross-version history analysis.
+The local worktrees share Git metadata. The independent deployment consumer at
+`/home/data00/zhonghaocheng/simulation-framework/gem5` tracks only
+`calibration-deploy`; after the one-time history migration, update it with
+`git pull --ff-only`.
 
-FastSim updates flow into deployment, then development. Promote selected
-calibration changes from development; a whole development merge would carry
-local measurement support into deployment. Official references remain separate
-from the calibration source branches.
+Daily fetches retain the three active origin branches and two fixed official
+references: `upstream/stable-v25` at c8222cc67a and `upstream/stable-v26` at
+fed0e07e93. Archive and the full tag set are excluded. Use a separate history
+checkout for old graphs; the fixed official references remain source controls.
 
-FastSim's original native counters, FST and request/retirement contracts are
-retained. Unconsumed calibration diagnostics and their bookkeeping have been
-removed; admission, dependency, ordering, cancellation and drain state remain
-part of the actual models.
+FastSim updates enter deployment, then development. Promote calibration changes
+individually from development; merging all development would also publish local
+measurement support.
 
-## Builds
+## Builds and observation
 
-FastSim and deployment use `build/X86_MESI_Three_Level/gem5.opt` with the v25
-build configuration. Load the workspace environment, use GCC 11 and the
-existing Python 3.11/protobuf v25 configuration, and set `TAOGEN_SHARED` to
-the current tree's `taogen/shared`. Build resources come from the CPU project's
-host configuration.
+FastSim and deployment retain the v25 C++17 build recipe:
+`build/X86_MESI_Three_Level/gem5.opt`, GCC 11, Python 3.11 and system protobuf.
+Set `TAOGEN_SHARED` to the checked-out tree's `taogen/shared`. Build resources
+come from the CPU project's `configs/host.yaml`.
 
-Development uses the CPU repository's `compile_gem5.sh`, producing
-`build/X86/gem5.fast` and the common libm5. Its `--source-root PATH` input
-supports checking a staged development tree before deployment. The existing
-CPU Marker API selects the independent calibration module when `marker_pc`
-is nonzero; the FastSim producer remains the default path when it is zero.
+Development uses the CPU project's `compile_gem5.sh`, producing
+`build/X86/gem5.fast` and libm5; `--opt` preserves assertions and tracing.
+`--source-root PATH` validates a staged development tree. Development uses
+C++20 for the canonical protobuf/Abseil installation.
 
-The CPU project's frozen observation baseline remains an independent shallow
-repository under `gem5-cpu/build/baseline`, pinned by `configs/software.yaml`.
-If absent, `compile_gem5.sh --baseline` fetches that exact commit from origin;
-it does not import archive history into the daily repository.
+The existing `TaoTrace` Marker API delegates to `CalibrationMarker` when
+`marker_pc` is nonzero and retains the producer path when it is zero.
+START and END save cumulative native statistics at retirement. CPU analysis
+uses END minus START over the workload O3 core, with no TASK settlement or CPL
+filtering. Hardware PMU keeps its measured-thread TASK scope; reports show the
+difference. Optional observations do not define calibrated execution mechanisms.
 
-The reconstruction is checked by compilation, native parameter smoke checks,
-reference reachability and source/interface inspection. Those checks do not
-establish timing accuracy, whole-workload behavior or SPR equivalence.
+The CPU public model uses native `X86O3CPU` and
+`MESIThreeLevelCacheHierarchy`. Its documented SPR resource initial values and
+fixed experiment geometry are distinct from validated component timing.
+Compilation and minimal functional runs establish interface and execution
+availability, not performance accuracy or SPR equivalence.
 
 ---
 
