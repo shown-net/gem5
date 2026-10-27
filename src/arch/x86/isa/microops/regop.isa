@@ -1449,6 +1449,20 @@ let {{
             SegBaseDest = PSrcReg1;
         '''
 
+    class Fsgswrbase(WrSegOp):
+        code = '''
+            CR4 cr4 = CR4Op;
+            const RegVal value = PSrcReg1 & mask(dataSize * 8);
+            const bool canonical = bits(uint64_t(cr4), 12)
+                ? value == szext<57>(value) : value == szext<48>(value);
+            if (!cr4.fsgsbase)
+                fault = std::make_shared<InvalidOpcode>();
+            else if (!canonical)
+                fault = std::make_shared<GeneralProtection>(0);
+            else
+                SegBaseDest = value;
+        '''
+
     class Wrlimit(WrSegOp):
         code = '''
             SegLimitDest = PSrcReg1;
@@ -1471,6 +1485,15 @@ let {{
     class Rdbase(RdSegOp):
         code = 'DestReg = merge(DestReg, dest, SegBaseSrc1, dataSize);'
         big_code = 'DestReg = SegBaseSrc1 & mask(dataSize * 8);'
+
+    class Fsgsrdbase(RdSegOp):
+        code = '''
+            CR4 cr4 = CR4Op;
+            if (!cr4.fsgsbase)
+                fault = std::make_shared<InvalidOpcode>();
+            else
+                DestReg = SegBaseSrc1 & mask(dataSize * 8);
+        '''
 
     class Rdlimit(RdSegOp):
         code = 'DestReg = merge(DestReg, dest, SegLimitSrc1, dataSize);'
