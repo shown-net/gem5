@@ -320,6 +320,15 @@ class DynInst : public ExecContext, public RefCounted
     /** The thread this instruction is from. */
     ThreadID threadNumber = 0;
 
+    // Optional Marker observations; none drive the pipeline.
+    bool fetchedFromUser = false;
+    uint64_t fetchedAddressSpaceId = 0;
+    std::unique_ptr<PCStateBase> originalBranchPredPC;
+    bool branchDirectionPredictionValid = false;
+    bool originalBranchDirectionPrediction = false;
+    bool branchBtbHit = false;
+    bool branchCommitSquash = false;
+
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
 

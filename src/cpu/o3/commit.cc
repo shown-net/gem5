@@ -865,6 +865,8 @@ Commit::commit()
                      toIEW->commitInfo[tid].branchTaken = true;
                 }
                 ++stats.branchMispredicts;
+                if (cpu->markerBranchObservation)
+                    toIEW->commitInfo[tid].mispredictInst->branchCommitSquash = true;
             }
 
             set(toIEW->commitInfo[tid].pc, fromIEW->pc[tid]);

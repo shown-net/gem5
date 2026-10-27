@@ -55,6 +55,7 @@ if env['CONF']['BUILD_ISA']:
 
     SimObject('TaoTrace.py', sim_objects=['TaoTrace'])
     Source('tao_trace.cc')
+    Source('calibration_marker.cc')
     DebugFlag('TaoTrace')
 
     if env['CONF']['HAVE_PROTOBUF']:
