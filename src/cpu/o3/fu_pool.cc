@@ -39,10 +39,14 @@
  */
 
 #include "cpu/o3/fu_pool.hh"
+#include <algorithm>
+#include <limits>
 
 #include <sstream>
 
 #include "cpu/func_unit.hh"
+#include "cpu/o3/cpu.hh"
+#include "cpu/o3/dyn_inst.hh"
 
 namespace gem5
 {
@@ -82,6 +86,81 @@ FUPool::~FUPool()
 
 
 // Constructor
+void
+FUPool::bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
+                              IntExecutionResource *alu, IntExecutionResource *shift,
+                              IntExecutionResource *slow, IntExecutionResource *bm,
+                              const std::vector<IntegerALU *> &alus)
+{
+    fatal_if(ports && (!results || (!alu && alus.empty())),
+             "Integer execution requires ports, ALUs and result forwarding");
+    fatal_if(alu && !alus.empty(), "ALU family and individual ALUs duplicate resources");
+    fatal_if(executionPorts && executionPorts != ports,
+             "One FU coordinator cannot belong to different cores");
+    executionPorts = ports;
+    forwarding = results;
+    integerResources = {nullptr, alu, shift, slow, bm};
+    individualALUs = !alus.empty();
+    integerALUs.fill(nullptr);
+    for (auto unit : alus) {
+        auto port = unit->connection();
+        fatal_if(!ports || ports->get(port->number) != port || integerALUs[port->number],
+                 "ALU must connect to one unique shared execution port");
+        integerALUs[port->number] = unit;
+    }
+}
+
+bool
+FUPool::usesIntegerResources(const DynInstPtr &inst) const
+{
+    const auto family = inst->staticInst->intExecution().family;
+    return executionPorts && family != IntExecutionFamily::None &&
+        (integerResources.at(unsigned(family)) ||
+         (family == IntExecutionFamily::ALU && individualALUs));
+}
+
+bool
+FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
+                     std::function<void()> available, std::function<void()> complete)
+{
+    const auto &info = inst->staticInst->intExecution();
+    const auto resourceAt = [this, &info](unsigned port) -> IntExecutionResource * {
+        return info.family == IntExecutionFamily::ALU && individualALUs
+            ? integerALUs[port] : integerResources.at(unsigned(info.family));
+    };
+    uint16_t eligible = 0;
+    Tick next_path = std::numeric_limits<Tick>::max();
+    for (unsigned port = 0; port < 12; ++port) {
+        if (!(info.ports & (1 << port)))
+            continue;
+        auto resource = resourceAt(port);
+        if (!resource)
+            continue;
+        const Tick ready = forwarding->availableAt(inst, port);
+        if (ready <= curTick() && resource->accepts(info.family, port, curTick()))
+            eligible |= 1 << port;
+        else if (ready > curTick())
+            next_path = std::min(next_path, ready);
+    }
+    const int port = executionPorts->probe(info.family, info.ports, curTick(), eligible);
+    if (port < 0) {
+        if (next_path != std::numeric_limits<Tick>::max())
+            forwarding->defer(inst, next_path);
+        return false;
+    }
+    forwarding->clearWait(inst);
+    executionPorts->commit(info.family, info.ports, port, curTick());
+    resourceAt(port)->admit(cpu, forwarding, inst, port, available, complete);
+    return true;
+}
+
+void
+FUPool::takeOverFrom()
+{
+    if (forwarding)
+        forwarding->reset();
+}
+
 FUPool::FUPool(const Params &p)
     : SimObject(p)
 {
@@ -246,6 +325,14 @@ FUPool::dump()
 bool
 FUPool::isDrained() const
 {
+    for (auto unit : integerALUs)
+        if (unit && !unit->empty())
+            return false;
+    for (auto resource : integerResources)
+        if (resource && !resource->empty())
+            return false;
+    if (forwarding && !forwarding->empty())
+        return false;
     bool is_drained = true;
     for (int i = 0; i < numFU; i++)
         is_drained = is_drained && !unitBusy[i];

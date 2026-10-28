@@ -48,6 +48,7 @@
 #include <vector>
 
 #include "cpu/op_class.hh"
+#include "cpu/o3/int_execution.hh"
 #include "params/FUPool.hh"
 #include "sim/sim_object.hh"
 
@@ -75,6 +76,11 @@ namespace o3
 class FUPool : public SimObject
 {
   private:
+    ExecutionPorts *executionPorts = nullptr;
+    ResultForwarding *forwarding = nullptr;
+    std::array<IntExecutionResource *, 5> integerResources{};
+    std::array<IntegerALU *, 12> integerALUs{};
+    bool individualALUs = false;
     /** Maximum op execution latencies, per op class. */
     std::array<Cycles, Num_OpClasses> maxOpLatencies;
     /** Whether op is pipelined or not. */
@@ -135,6 +141,13 @@ class FUPool : public SimObject
     typedef FUPoolParams Params;
     /** Constructs a FU pool. */
     FUPool(const Params &p);
+    void bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
+                              IntExecutionResource *alu, IntExecutionResource *shift,
+                              IntExecutionResource *slow, IntExecutionResource *bm,
+                              const std::vector<IntegerALU *> &alus);
+    bool usesIntegerResources(const DynInstPtr &inst) const;
+    bool issueInteger(CPU *cpu, const DynInstPtr &inst,
+                      std::function<void()> available, std::function<void()> complete);
     ~FUPool();
 
     /**
@@ -203,7 +216,7 @@ class FUPool : public SimObject
     bool isDrained() const;
 
     /** Takes over from another CPU's thread. */
-    void takeOverFrom() {};
+    void takeOverFrom();
 };
 
 } // namespace o3

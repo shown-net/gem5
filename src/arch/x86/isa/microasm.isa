@@ -126,6 +126,11 @@ let {{
         "ssz" : "env.stackSize"
     }
     assembler.symbols.update(symbols)
+    assembler.symbols["vreg"] = gpRegIdx("machInst.vex.v")
+    assembler.symbols["bmiOsz"] = '''
+        env.dataSize = machInst.mode.submode == SixtyFourBitMode &&
+            machInst.rex.w ? 8 : 4;
+    '''
 
     assembler.symbols["ldsz"] = \
         "((env.dataSize == 8) ? 3 : (env.dataSize == 4) ? 2 : 1)"

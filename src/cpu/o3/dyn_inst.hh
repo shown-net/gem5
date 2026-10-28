@@ -47,6 +47,7 @@
 #include <deque>
 #include <list>
 #include <string>
+#include <vector>
 
 #include "base/refcnt.hh"
 #include "base/trace.hh"
@@ -57,6 +58,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/int_execution.hh"
 #include "cpu/o3/lsq_unit.hh"
 #include "cpu/op_class.hh"
 #include "cpu/reg_class.hh"
@@ -113,6 +115,33 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Executes the instruction.*/
     Fault execute();
+    void bindSourceResults();
+    void prepareResultValues(unsigned port, Tick nominal_at);
+    void evaluateResultValues(Tick available_at);
+    void writeResultValues();
+    bool hasResultValue(RegIndex index) const
+    { return index < resultValues.size() && resultValues[index].isValid(); }
+    RegVal resultValue(RegIndex index) const
+    { return resultValues.at(index).asRegVal(); }
+    Tick resultAvailableAt() const { return resultAvailableTick; }
+    Tick resultNominalAt() const { return resultNominalTick; }
+    unsigned resultProducerPort() const { return resultPort; }
+    const auto &sourceResults() const { return sourceResultValues; }
+    bool wasEvaluatedByResource() const { return resourceEvaluated; }
+    bool wereResultsWoken() const { return resourceResultsWoken; }
+    void setResultsWoken() { resourceResultsWoken = true; }
+
+  private:
+    std::vector<InstResult> resultValues;
+    std::vector<ResultForwarding::Reference> sourceResultValues;
+    bool captureResultValues = false;
+    bool resourceEvaluated = false;
+    bool resourceResultsWoken = false;
+    Tick resultAvailableTick = 0;
+    Tick resultNominalTick = 0;
+    unsigned resultPort = 0;
+
+  public:
 
     /** Initiates the access.  Only valid for memory operations. */
     Fault initiateAcc();
@@ -1203,6 +1232,13 @@ class DynInst : public ExecContext, public RefCounted
         const PhysRegIdPtr reg = renamedSrcIdx(idx);
         if (reg->is(InvalidRegClass))
             return 0;
+        if (idx < sourceResultValues.size() && sourceResultValues[idx].producer) {
+            const auto &ref = sourceResultValues[idx];
+            panic_if(!ref.producer->hasResultValue(ref.destination) ||
+                     ref.producer->resultAvailableAt() > curTick(),
+                     "Consumer read a result before its value was available");
+            return ref.producer->resultValue(ref.destination);
+        }
         return cpu->getReg(reg, threadNumber);
     }
 
@@ -1230,7 +1266,10 @@ class DynInst : public ExecContext, public RefCounted
         const PhysRegIdPtr reg = renamedDestIdx(idx);
         if (reg->is(InvalidRegClass))
             return;
-        cpu->setReg(reg, val, threadNumber);
+        if (captureResultValues)
+            resultValues.at(idx) = InstResult(reg->regClass(), val);
+        else
+            cpu->setReg(reg, val, threadNumber);
         setResult(reg->regClass(), val);
     }
 

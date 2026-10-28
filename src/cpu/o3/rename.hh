@@ -376,6 +376,7 @@ class Rename
      * and ROB, but are not yet included in their occupancy counts.
      */
     int instsInProgress[MaxThreads];
+    int zeroInstsInProgress[MaxThreads];
 
     /** Count of Load instructions in progress that have been sent off to the
      * IQ and ROB, but are not yet included in their occupancy counts.

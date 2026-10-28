@@ -143,6 +143,15 @@ let {{
         def serializeAfter(self):
             self.serialize_after = True
 
+        def directImmediate(self):
+            self.direct_immediate = True
+
+        def lowResultMultiply(self):
+            self.low_result_multiply = True
+
+        def splitShift(self):
+            self.split_shift = True
+
         def function_call(self):
             self.function_call = True
         def function_return(self):
@@ -160,6 +169,9 @@ let {{
                 "adjust_disp" : self.adjustDisp,
                 "serialize_before" : self.serializeBefore,
                 "serialize_after" : self.serializeAfter,
+                "direct_imm" : self.directImmediate,
+                "low_result_mul" : self.lowResultMultiply,
+                "split_shift" : self.splitShift,
                 "function_call" : self.function_call,
                 "function_return" : self.function_return,
                 "control_direct" : self.control_direct,
@@ -180,6 +192,9 @@ let {{
             '''
             self.serialize_before = False
             self.serialize_after = False
+            self.direct_immediate = False
+            self.low_result_multiply = False
+            self.split_shift = False
             self.function_call = False
             self.function_return = False
             self.control_direct = False
@@ -243,6 +258,67 @@ let {{
                     "microops[%d] = %s;\n" % \
                     (micropc, op.getAllocator(flags))
                 micropc += 1
+            if self.direct_immediate:
+                # Keep narrow register merge work on its existing path.
+                # Wide register/immediate ALU work consumes the decoded
+                # immediate directly, without an independently issued limm.
+                import copy
+                if numMicroops != 2 or self.microops[0].mnemonic != 'limm':
+                    raise ValueError('direct_imm requires limm + ALU')
+                op = copy.copy(self.microops[1])
+                op.ops = list(op.ops)
+                op.ops[2] = 'adjustedImm'
+                op.mnemonic += 'i'
+                direct = op.getAllocator(
+                    ['IsMicroop', 'IsFirstMicroop', 'IsLastMicroop'])
+                allocMicroops = ('if (env.dataSize >= 4) {\n'
+                    'microops[0] = %s;\n} else {\n%s}\n' %
+                    (direct, allocMicroops))
+                numMicroops = '(_env.dataSize >= 4 ? 1 : 2)'
+            if self.low_result_multiply:
+                # Collapse only the selected wide low-result forms. Keep
+                # narrow merges and the full-product forms unchanged.
+                multiply_index = next(i for i, op in enumerate(self.microops)
+                                      if op.mnemonic == 'mul1s')
+                multiply = self.microops[multiply_index]
+                dest = self.microops[multiply_index + 1].ops[0]
+                prefix = [op for op in self.microops[:multiply_index]
+                          if op.mnemonic != 'limm']
+                immediate = any(op.mnemonic == 'limm'
+                                for op in self.microops[:multiply_index])
+                op = microopClasses['muls'](dest, multiply.ops[0],
+                    'adjustedImm' if immediate else multiply.ops[1],
+                    flags=multiply.flags, dataSize=multiply.dataSize)
+                op.mnemonic = 'mulsi' if immediate else 'muls'
+                wide = ''
+                for i, load in enumerate(prefix):
+                    flags = ['IsMicroop', 'IsDelayedCommit']
+                    if i == 0:
+                        flags.append('IsFirstMicroop')
+                    wide += 'microops[%d] = %s;\n' % (i, load.getAllocator(flags))
+                flags = ['IsMicroop', 'IsLastMicroop']
+                if not prefix:
+                    flags.append('IsFirstMicroop')
+                wide += 'microops[%d] = %s;\n' % (len(prefix), op.getAllocator(flags))
+                allocMicroops = ('if (env.dataSize >= 4) {\n%s} else {\n%s}\n' %
+                                (wide, allocMicroops))
+                numMicroops = '(_env.dataSize >= 4 ? %d : %d)' % (
+                    len(prefix) + 1, numMicroops)
+            if self.split_shift:
+                original = self.microops[0]
+                flags = microopClasses[original.mnemonic + 'flags'](
+                    original.ops[1], original.ops[2], flags=original.flags,
+                    dataSize=original.dataSize)
+                flags.mnemonic = original.mnemonic + 'flags'
+                value = microopClasses[original.mnemonic + 'value'](
+                    *original.ops, dataSize=original.dataSize)
+                value.mnemonic = original.mnemonic + 'value'
+                wide = 'microops[0] = %s;\nmicroops[1] = %s;\n' % (
+                    flags.getAllocator(['IsMicroop', 'IsFirstMicroop', 'IsDelayedCommit']),
+                    value.getAllocator(['IsMicroop', 'IsLastMicroop']))
+                allocMicroops = 'if (env.dataSize >= 4) {\n%s} else {\n%s}\n' % (
+                    wide, allocMicroops)
+                numMicroops = '(_env.dataSize >= 4 ? 2 : 1)'
             if env.useStackSize:
                 useStackSize = "true"
             else:

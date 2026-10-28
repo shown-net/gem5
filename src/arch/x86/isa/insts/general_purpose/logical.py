@@ -126,6 +126,7 @@ def macroop OR_R_P
 
 def macroop OR_R_I
 {
+    .direct_imm
     limm t1, imm
     or reg, reg, t1, flags=(OF,SF,ZF,PF,CF,AF)
 };
@@ -137,6 +138,7 @@ def macroop XOR_R_R
 
 def macroop XOR_R_I
 {
+    .direct_imm
     limm t1, imm
     xor reg, reg, t1, flags=(OF,SF,ZF,PF,CF,AF)
 };
@@ -246,6 +248,7 @@ def macroop AND_R_P
 
 def macroop AND_R_I
 {
+    .direct_imm
     limm t1, imm
     and reg, reg, t1, flags=(OF,SF,ZF,PF,CF,AF)
 };

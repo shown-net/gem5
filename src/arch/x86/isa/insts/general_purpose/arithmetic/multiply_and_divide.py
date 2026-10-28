@@ -149,6 +149,7 @@ def macroop IMUL_P
 
 def macroop IMUL_R_R
 {
+    .low_result_mul
     mul1s reg, regm, flags=(OF,CF)
     mulel reg
     muleh t0
@@ -156,6 +157,7 @@ def macroop IMUL_R_R
 
 def macroop IMUL_R_M
 {
+    .low_result_mul
     ld t1, seg, sib, disp
     mul1s reg, t1, flags=(CF,OF)
     mulel reg
@@ -177,6 +179,7 @@ def macroop IMUL_R_P
 
 def macroop IMUL_R_R_I
 {
+    .low_result_mul
     limm t1, imm
     mul1s regm, t1, flags=(OF,CF)
     mulel reg
@@ -185,6 +188,7 @@ def macroop IMUL_R_R_I
 
 def macroop IMUL_R_M_I
 {
+    .low_result_mul
     limm t1, imm
     ld t2, seg, sib, disp
     mul1s t2, t1, flags=(OF,CF)

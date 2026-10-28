@@ -44,6 +44,11 @@ Import('*')
 
 if env['CONF']['BUILD_ISA']:
     SimObject('FUPool.py', sim_objects=['FUPool'])
+    SimObject('ZeroIdiom.py', sim_objects=['ZeroIdiom'])
+    Source('zero_idiom.cc')
+    SimObject('IntExecution.py', sim_objects=[
+        'ExecutionPort', 'ExecutionPorts', 'IntExecutionResource', 'IntegerALU',
+        'ResultPathRule', 'ResultForwarding'])
     SimObject('FuncUnitConfig.py', sim_objects=[])
     SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
         enums=['TSOStore'])
@@ -62,6 +67,7 @@ if env['CONF']['BUILD_ISA']:
     Source('fu_pool.cc')
     Source('iew.cc')
     Source('inst_queue.cc')
+    Source('int_execution.cc')
     Source('lsq.cc')
     Source('lsq_unit.cc')
     Source('mem_dep_unit.cc')

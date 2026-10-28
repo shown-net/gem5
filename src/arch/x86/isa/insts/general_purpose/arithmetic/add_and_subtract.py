@@ -41,6 +41,7 @@ def macroop ADD_R_R
 
 def macroop ADD_R_I
 {
+    .direct_imm
     limm t1, imm
     add reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
@@ -137,6 +138,7 @@ def macroop SUB_R_R
 
 def macroop SUB_R_I
 {
+    .direct_imm
     limm t1, imm
     sub reg, reg, t1, flags=(OF,SF,ZF,AF,PF,CF)
 };
@@ -456,4 +458,20 @@ def macroop NEG_LOCKED_P
     stul t1, seg, riprel, disp
     mfence
 };
+"""
+
+for name, operation in (("ADCX", "adcxvalue"), ("ADOX", "adoxvalue")):
+    microcode += f"""
+def macroop {name}_R_R {{
+    {operation} reg, reg, regm
+}};
+def macroop {name}_R_M {{
+    ld t1, seg, sib, disp
+    {operation} reg, reg, t1
+}};
+def macroop {name}_R_P {{
+    rdip t7
+    ld t1, seg, riprel, disp
+    {operation} reg, reg, t1
+}};
 """

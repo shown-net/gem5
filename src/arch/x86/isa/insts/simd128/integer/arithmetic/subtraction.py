@@ -35,8 +35,7 @@
 
 microcode = """
 def macroop PSUBB_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=1, ext=0
-    msubi xmmh, xmmh, xmmhm, size=1, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=1
 };
 
 def macroop PSUBB_XMM_M {
@@ -55,8 +54,7 @@ def macroop PSUBB_XMM_P {
 };
 
 def macroop PSUBW_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=2, ext=0
-    msubi xmmh, xmmh, xmmhm, size=2, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=2
 };
 
 def macroop PSUBW_XMM_M {
@@ -75,8 +73,7 @@ def macroop PSUBW_XMM_P {
 };
 
 def macroop PSUBD_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=4, ext=0
-    msubi xmmh, xmmh, xmmhm, size=4, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=4
 };
 
 def macroop PSUBD_XMM_M {
@@ -95,8 +92,7 @@ def macroop PSUBD_XMM_P {
 };
 
 def macroop PSUBQ_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=8, ext=0
-    msubi xmmh, xmmh, xmmhm, size=8, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop PSUBQ_XMM_M {

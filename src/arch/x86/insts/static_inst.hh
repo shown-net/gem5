@@ -39,6 +39,7 @@
 #define __ARCH_X86_INSTS_STATICINST_HH__
 
 #include "arch/x86/pcstate.hh"
+#include "arch/x86/regs/ccr.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/types.hh"
 #include "base/trace.hh"
@@ -100,6 +101,28 @@ struct SegRegIndex
 class X86StaticInst : public StaticInst
 {
   public:
+    RegVal zeroIdiomResult(RegIndex destination) const override
+    {
+        const auto &reg = destRegIdx(destination);
+        return reg.is(CCRegClass) && reg.index() == cc_reg::_ZapsIdx ?
+            0x44 /* PF | ZF; the other arithmetic flags are clear. */ : 0;
+    }
+
+    IntResultRole intResultRole(RegIndex destination) const override
+    {
+        const auto &reg = destRegIdx(destination);
+        if (reg.is(IntRegClass))
+            return IntResultRole::GPR;
+        if (reg.is(CCRegClass)) {
+            if (reg.index() == cc_reg::_CfIdx)
+                return IntResultRole::CF;
+            if (reg.index() == cc_reg::_OfIdx)
+                return IntResultRole::OF;
+            return IntResultRole::Flags;
+        }
+        return IntResultRole::Other;
+    }
+
     static void printMnemonic(std::ostream &os, const char *mnemonic);
     static void printMnemonic(std::ostream &os, const char *instMnemonic,
             const char *mnemonic);

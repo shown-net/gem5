@@ -462,6 +462,8 @@ IEW::squash(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched++;
+        if (skidBuffer[tid].front()->staticInst->isZeroIdiom())
+            toRename->iewInfo[tid].zeroDispatched++;
 
         skidBuffer[tid].pop();
     }
@@ -806,6 +808,8 @@ IEW::emptyRenameInsts(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched++;
+        if (insts[tid].front()->staticInst->isZeroIdiom())
+            toRename->iewInfo[tid].zeroDispatched++;
 
         insts[tid].pop();
     }
@@ -934,12 +938,14 @@ IEW::dispatchInsts(ThreadID tid)
             }
 
             toRename->iewInfo[tid].dispatched++;
+            if (inst->staticInst->isZeroIdiom())
+                toRename->iewInfo[tid].zeroDispatched++;
 
             continue;
         }
 
         // Check for full conditions.
-        if (instQueue.isFull(inst)) {
+        if (!inst->staticInst->isZeroIdiom() && instQueue.isFull(inst)) {
             DPRINTF(IEW, "[tid:%i] Issue: IQ has become full.\n", tid);
 
             // Call function to start blocking.
@@ -1047,6 +1053,13 @@ IEW::dispatchInsts(ThreadID tid)
             inst->setCanCommit();
             instQueue.insertBarrier(inst);
             add_to_iq = false;
+        } else if (inst->staticInst->isZeroIdiom()) {
+            inst->setIssued();
+            inst->setExecuted();
+            inst->setCanCommit();
+            if (inst->getFault() == NoFault)
+                instQueue.recordCompletedProducer(inst);
+            add_to_iq = false;
         } else if (inst->isNop()) {
             DPRINTF(IEW, "[tid:%i] Issue: Nop instruction encountered, "
                     "skipping.\n", tid);
@@ -1089,6 +1102,8 @@ IEW::dispatchInsts(ThreadID tid)
         insts_to_dispatch.pop();
 
         toRename->iewInfo[tid].dispatched++;
+        if (inst->staticInst->isZeroIdiom())
+            toRename->iewInfo[tid].zeroDispatched++;
 
         ++iewStats.dispatchedInsts;
 
@@ -1262,7 +1277,7 @@ IEW::executeInsts()
             // Such case can happen when it faulted during ITLB translation.
             // If we execute the instruction (even if it's a nop) the fault
             // will be replaced and we will lose it.
-            if (inst->getFault() == NoFault) {
+            if (inst->getFault() == NoFault && !inst->wasEvaluatedByResource()) {
                 inst->execute();
                 if (!inst->readPredicate())
                     inst->forwardOldRegs();
@@ -1405,7 +1420,7 @@ IEW::writebackInsts()
         // when it's ready to execute the strictly ordered load.
         if (!inst->isSquashed() && inst->isExecuted() &&
                 inst->getFault() == NoFault) {
-            int dependents = instQueue.wakeDependents(inst);
+            int dependents = inst->wereResultsWoken() ? 0 : instQueue.wakeDependents(inst);
 
             for (int i = 0; i < inst->numDestRegs(); i++) {
                 // Mark register as ready if not pinned

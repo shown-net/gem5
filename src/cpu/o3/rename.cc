@@ -50,6 +50,7 @@
 #include "debug/Activity.hh"
 #include "debug/Rename.hh"
 #include "params/BaseO3CPU.hh"
+#include "cpu/o3/zero_idiom.hh"
 
 namespace gem5
 {
@@ -99,6 +100,7 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
         renameStatus[tid] = Idle;
         renameMap[tid] = nullptr;
         instsInProgress[tid] = 0;
+        zeroInstsInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
         freeEntries[tid] = {0, 0, 0, 0};
@@ -259,6 +261,7 @@ Rename::clearStates(ThreadID tid)
     serializeInst[tid] = NULL;
 
     instsInProgress[tid] = 0;
+    zeroInstsInProgress[tid] = 0;
     loadsInProgress[tid] = 0;
     storesInProgress[tid] = 0;
 
@@ -305,6 +308,7 @@ Rename::resetStage()
         serializeInst[tid] = NULL;
 
         instsInProgress[tid] = 0;
+        zeroInstsInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
 
@@ -467,11 +471,13 @@ Rename::tick()
     // @todo: make into updateProgress function
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         instsInProgress[tid] -= fromIEW->iewInfo[tid].dispatched;
+        zeroInstsInProgress[tid] -= fromIEW->iewInfo[tid].zeroDispatched;
         loadsInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToLQ;
         storesInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToSQ;
         assert(loadsInProgress[tid] >= 0);
         assert(storesInProgress[tid] >= 0);
         assert(instsInProgress[tid] >=0);
+        assert(zeroInstsInProgress[tid] >= 0);
     }
 
 }
@@ -561,10 +567,7 @@ Rename::renameInsts(ThreadID tid)
 
     FullSource source = ROB;
 
-    if (free_iq_entries < min_free_entries) {
-        min_free_entries = free_iq_entries;
-        source = IQ;
-    }
+    // ROB limits every operation; IQ is checked for each requesting operation.
 
     // Check if there's any space left.
     if (min_free_entries <= 0) {
@@ -628,6 +631,12 @@ Rename::renameInsts(ThreadID tid)
         assert(!insts_to_rename.empty());
 
         DynInstPtr inst = insts_to_rename.front();
+        if (!inst->isSquashed() && !inst->staticInst->isZeroIdiom() &&
+            free_iq_entries <= 0) {
+            blockThisCycle = true;
+            incrFullStat(IQ);
+            break;
+        }
 
         //For all kind of instructions, check ROB and IQ first For load
         //instruction, check LQ size and take into account the inflight loads
@@ -744,6 +753,18 @@ Rename::renameInsts(ThreadID tid)
         renameSrcRegs(inst, inst->threadNumber);
 
         renameDestRegs(inst, inst->threadNumber);
+        if (inst->staticInst->isZeroIdiom()) {
+            ++zeroInstsInProgress[tid];
+            if (inst->getFault() == NoFault) {
+                cpu->zeroIdiom->admit(inst);
+                if (cpu->resultForwarding)
+                    cpu->resultForwarding->track(inst, false);
+                for (RegIndex i = 0; i < inst->numDestRegs(); ++i)
+                    scoreboard->setReg(inst->renamedDestIdx(i));
+            }
+        } else {
+            --free_iq_entries;
+        }
 
         if (inst->isAtomic() || inst->isStore()) {
             storesInProgress[tid]++;
@@ -942,6 +963,7 @@ Rename::doSquash(const InstSeqNum &squashed_seq_num, ThreadID tid)
     while (!historyBuffer[tid].empty() &&
            hb_it->instSeqNum > squashed_seq_num) {
         assert(hb_it != historyBuffer[tid].end());
+        if (cpu->zeroIdiom) cpu->zeroIdiom->cancel(hb_it->instSeqNum);
 
         DPRINTF(Rename, "[tid:%i] Removing history entry with sequence "
                 "number %i (archReg: %d, newPhysReg: %d, prevPhysReg: %d).\n",
@@ -990,6 +1012,7 @@ Rename::doSquash(const InstSeqNum &squashed_seq_num, ThreadID tid)
 void
 Rename::removeFromHistory(InstSeqNum inst_seq_num, ThreadID tid)
 {
+    if (cpu->zeroIdiom) cpu->zeroIdiom->retire(tid, inst_seq_num);
     DPRINTF(Rename, "[tid:%i] Removing a committed instruction from the "
             "history buffer %u (size=%i), until [sn:%llu].\n",
             tid, tid, historyBuffer[tid].size(), inst_seq_num);
@@ -1217,7 +1240,8 @@ int
 Rename::calcFreeIQEntries(ThreadID tid)
 {
     int num_free = freeEntries[tid].iqEntries -
-                  (instsInProgress[tid] - fromIEW->iewInfo[tid].dispatched);
+        (instsInProgress[tid] - zeroInstsInProgress[tid] -
+         fromIEW->iewInfo[tid].dispatched + fromIEW->iewInfo[tid].zeroDispatched);
 
     //DPRINTF(Rename,"[tid:%i] %i iq free\n",tid,num_free);
 

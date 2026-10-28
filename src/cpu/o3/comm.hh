@@ -156,6 +156,7 @@ struct TimeStruct
         unsigned ldstqCount = 0;
 
         unsigned dispatched = 0;
+        unsigned zeroDispatched = 0;
         bool usedIQ = false;
         bool usedLSQ = false;
     };

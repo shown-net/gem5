@@ -344,6 +344,50 @@ DynInst::setSquashed()
     setPinnedRegsSquashDone();
 }
 
+void
+DynInst::bindSourceResults()
+{
+    if (!cpu->resultForwarding)
+        return;
+    sourceResultValues.resize(numSrcRegs());
+    for (RegIndex i = 0; i < numSrcRegs(); ++i)
+        sourceResultValues[i] = cpu->resultForwarding->source(renamedSrcIdx(i));
+}
+
+void
+DynInst::prepareResultValues(unsigned port, Tick nominal_at)
+{
+    resultValues.resize(numDestRegs());
+    resultPort = port;
+    resultNominalTick = nominal_at;
+}
+
+void
+DynInst::evaluateResultValues(Tick available_at)
+{
+    panic_if(resourceEvaluated, "Integer operation evaluated twice");
+    captureResultValues = true;
+    execute();
+    if (!readPredicate())
+        forwardOldRegs();
+    captureResultValues = false;
+    resourceEvaluated = true;
+    resultAvailableTick = available_at;
+    // All input values have been consumed. Downstream work uses our results,
+    // not this chain of producer references; retaining it delays reclamation
+    // and makes a long recurrence unwind recursively at the window boundary.
+    sourceResultValues.clear();
+}
+
+void
+DynInst::writeResultValues()
+{
+    for (RegIndex i = 0; i < resultValues.size(); ++i) {
+        if (resultValues[i].isValid())
+            cpu->setReg(renamedDestIdx(i), resultValues[i].asRegVal(), threadNumber);
+    }
+}
+
 Fault
 DynInst::execute()
 {

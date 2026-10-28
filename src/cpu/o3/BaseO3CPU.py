@@ -44,6 +44,8 @@ from m5.objects.BaseCPU import BaseCPU
 # from m5.objects.O3Checker import O3Checker
 from m5.objects.BranchPredictor import *
 from m5.objects.FUPool import *
+from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, ResultForwarding
+from m5.objects.ZeroIdiom import ZeroIdiom
 from m5.objects.IndexingPolicies import *
 from m5.objects.IQUnit import *
 from m5.objects.ReplacementPolicies import *
@@ -61,6 +63,14 @@ class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/dyn_inst.hh"
+    executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
+    resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
+    zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+    intALU = Param.IntExecutionResource(NULL, "ALU execution family")
+    intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
+    intSHFT = Param.IntExecutionResource(NULL, "Shift/carry execution family")
+    intSlow = Param.IntExecutionResource(NULL, "Slow integer execution family")
+    intBM = Param.IntExecutionResource(NULL, "Bit-manipulation execution family")
 
     @classmethod
     def memory_mode(cls):

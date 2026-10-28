@@ -79,6 +79,7 @@ namespace gem5
 template <class>
 class Checker;
 class ThreadContext;
+class ResultForwarding;
 
 class Checkpoint;
 class Process;
@@ -87,6 +88,7 @@ namespace o3
 {
 
 class ThreadContext;
+class ZeroIdiom;
 
 /**
  * O3CPU class, has each of the stages (fetch through commit)
@@ -97,6 +99,8 @@ class CPU : public BaseCPU
 {
   public:
     bool markerObservation = false;
+    ResultForwarding *resultForwarding = nullptr;
+    ZeroIdiom *zeroIdiom = nullptr;
     bool markerBranchObservation = false;
     typedef std::list<DynInstPtr>::iterator ListIt;
 

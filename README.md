@@ -44,8 +44,9 @@ come from the CPU project's `configs/host.yaml`.
 
 Development uses the CPU project's `compile_gem5.sh`, producing
 `build/X86/gem5.fast` and libm5; `--opt` preserves assertions and tracing.
-`--source-root PATH` validates a staged development tree. Development uses
-C++20 for the canonical protobuf/Abseil installation.
+Only the public development and deployment trees own simulator builds;
+experiments do not keep source copies or frozen gem5 binaries. Development
+uses C++20 for the canonical protobuf/Abseil installation.
 
 The existing `TaoTrace` Marker API delegates to `CalibrationMarker` when
 `marker_pc` is nonzero and retains the producer path when it is zero.
@@ -57,6 +58,11 @@ difference. Optional observations do not define calibrated execution mechanisms.
 The CPU public model uses native `X86O3CPU` and
 `MESIThreeLevelCacheHierarchy`. Its documented SPR resource initial values and
 fixed experiment geometry are distinct from validated component timing.
+Development `X86O3CPU` now defaults to twelve shared execution ports, five
+individual integer ALUs, and the implemented integer result paths. The common
+CPU-project model applies the same SPR resource cfg to development and
+deployment; the selected source owns the execution structure without task
+mechanism switches.
 Compilation and minimal functional runs establish interface and execution
 availability, not performance accuracy or SPR equivalence.
 

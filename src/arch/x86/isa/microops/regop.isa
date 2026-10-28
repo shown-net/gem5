@@ -47,6 +47,11 @@ def template MicroRegOpExecute {{
         Fault fault = NoFault;
 
         DPRINTF(X86, "The data size is %d\n", dataSize);
+        if (isZeroIdiom()) {
+            for (RegIndex i = 0; i < numDestRegs(); ++i)
+                xc->setRegOperand(this, i, zeroIdiomResult(i));
+            return NoFault;
+        }
         %(op_decl)s;
         %(op_rd)s;
 
@@ -84,6 +89,8 @@ def template MicroRegOpDeclare {{
             %(set_reg_idx_arr)s;
             %(constructor)s;
             %(cond_control_flag_init)s;
+            %(int_execution)s;
+            %(zero_idiom)s;
 
             // In some cases, we need to invalidate some source registers
             // to eliminate unnecessary input dependencies (e.g., for a
@@ -229,7 +236,7 @@ let {{
                         matcher.sub(src2_name, cond_control_flag_init),
                         matcher.sub(src2_name, invalidate_srcs),
                         op_class, operand_types)
-                imm_name = '(int8_t)imm8' if match.group("prefix") else 'imm8'
+                imm_name = '(int64_t)imm64' if match.group("prefix") else 'imm64'
                 self.buildCppClasses(name + "i", Name, suffix + "Imm",
                         matcher.sub(imm_name, code),
                         matcher.sub(imm_name, big_code),
@@ -240,6 +247,10 @@ let {{
                         matcher.sub(imm_name, invalidate_srcs),
                         op_class, imm_operand_types)
                 return
+
+            if Imm64Op in operand_types and Name in ('Sll', 'Srl', 'Sra'):
+                flag_code = flag_code.replace('ShiftcfBit', 'ImmShiftcfBit')
+                flag_code = flag_code.replace('ShiftofBit', 'ImmShiftofBit')
 
             # If there's something optional to do with flags, generate
             # a version without it and fix up this version to use it.
@@ -252,6 +263,41 @@ let {{
 
             cxx_classes = list([op.cxx_class() for op in operand_types])
             base = "X86ISA::RegOpT<" + ', '.join(cxx_classes) + '>'
+            operation = name[:-1] if name.endswith('i') else name
+            families = {
+                'add': ('ALU', 0x863, 1), 'sub': ('ALU', 0x863, 1),
+                'and': ('ALU', 0x863, 1), 'or': ('ALU', 0x863, 1),
+                'xor': ('ALU', 0x863, 1),
+                'adc': ('SHFT', 0x41, 1), 'sbb': ('SHFT', 0x41, 1),
+                'sll': ('SHFT', 0x41, 1), 'srl': ('SHFT', 0x41, 1),
+                'sra': ('SHFT', 0x41, 1),
+                'sllvalue': ('SHFT', 0x41, 1), 'srlvalue': ('SHFT', 0x41, 1),
+                'sravalue': ('SHFT', 0x41, 1), 'sllflags': ('SHFT', 0x41, 1),
+                'srlflags': ('SHFT', 0x41, 1), 'sraflags': ('SHFT', 0x41, 1),
+                'adcxvalue': ('SHFT', 0x41, 1), 'adoxvalue': ('SHFT', 0x41, 1),
+                'muls': ('SlowInt', 0x2, 3),
+                'andnvalue': ('BM', 0x822, 1), 'blsivalue': ('BM', 0x822, 1),
+                'blsmskvalue': ('BM', 0x822, 1), 'blsrvalue': ('BM', 0x822, 1),
+            }
+            execution = ''
+            if operation in families:
+                family, ports, latency = families[operation]
+                execution = ('if (dataSize >= 4) intExecutionInfo = '
+                    '{IntExecutionFamily::%s, %d, %d}' % (family, ports, latency))
+
+            zero_idiom = ''
+            if operation in ('xor', 'sub') and FoldedSrc2Op in operand_types:
+                kind = 'GprXor' if operation == 'xor' else 'GprSub'
+                macro = 'XOR_R_R' if operation == 'xor' else 'SUB_R_R'
+                zero_idiom = '''
+                    if (!mach_inst.vex.present &&
+                        (dataSize == 4 || dataSize == 8) && src1 == src2 &&
+                        std::string(inst_mnem) == "%s") {
+                        zeroIdiomInfo = ZeroIdiomKind::%s;
+                        _numSrcRegs = 0;
+                        intExecutionInfo = {};
+                    }
+                ''' % (macro, kind)
 
             if re.search('imm8', allCode) and re.search('NRIP', allCode):
                 templates = branchTemplates
@@ -266,6 +312,8 @@ let {{
                      "else_code" : else_code,
                      "cond_control_flag_init" : cond_control_flag_init,
                      "invalidate_srcs": invalidate_srcs,
+                     "int_execution": execution,
+                     "zero_idiom": zero_idiom,
                      "op_class" : op_class})]
             if big_code != "":
                 iops += [InstObjParams(name, Name + suffix + "Big", base,
@@ -275,6 +323,8 @@ let {{
                           "else_code" : else_code,
                           "cond_control_flag_init" : cond_control_flag_init,
                           "invalidate_srcs": invalidate_srcs,
+                          "int_execution": execution,
+                          "zero_idiom": zero_idiom,
                           "op_class" : op_class})]
 
             # Generate the actual code (finally!)
@@ -403,7 +453,7 @@ let {{
                 return allocator
 
     class BasicRegOp(RegOp):
-        operand_types = (FoldedDestOp, FoldedSrc1Op, Op2)
+        operand_types = (FoldedDestOp, FoldedSrc1Op, RegOp2)
         abstract = True
 
         def __init__(self, dest, src1, src2, flags=None,
@@ -422,18 +472,18 @@ let {{
             PredccFlagBits = newFlags & CcFlagMask;
 
             //If a logic microop wants to set these, it wants to set them to 0.
-            PredcfofBits = PredcfofBits & ~((CFBit | OFBit | AFBit) & ext);
+            { const uint64_t flagsValue = (PredcfBit | PredofBit) & ~((CFBit | OFBit | AFBit) & ext); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
             PredecfBit = PredecfBit & ~(ECFBit & ext);
         '''
 
     class FlagRegOp(BasicRegOp):
         abstract = True
         flag_code = '''
-            uint64_t newFlags = genFlags(PredccFlagBits | PredcfofBits |
+            uint64_t newFlags = genFlags(PredccFlagBits | (PredcfBit | PredofBit) |
                                     PreddfBit | PredecfBit | PredezfBit,
                                     ext, result, PSrcReg1, op2);
 
-            PredcfofBits = newFlags & CfofMask;
+            { const uint64_t flagsValue = newFlags & CfofMask; PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
             PredecfBit = newFlags & ECFBit;
             PredezfBit = newFlags & EZFBit;
             PreddfBit = newFlags & DFBit;
@@ -443,11 +493,11 @@ let {{
     class SubRegOp(BasicRegOp):
         abstract = True
         flag_code = '''
-            uint64_t newFlags = genFlags(PredccFlagBits | PredcfofBits |
+            uint64_t newFlags = genFlags(PredccFlagBits | (PredcfBit | PredofBit) |
                                          PreddfBit | PredecfBit | PredezfBit,
                                          ext, result, PSrcReg1, ~op2, true);
 
-            PredcfofBits = newFlags & CfofMask;
+            { const uint64_t flagsValue = newFlags & CfofMask; PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
             PredecfBit = newFlags & ECFBit;
             PredezfBit = newFlags & EZFBit;
             PreddfBit = newFlags & DFBit;
@@ -456,7 +506,7 @@ let {{
 
     class CondRegOp(RegOp):
         abstract = True
-        cond_check = "checkCondition(ccFlagBits | cfofBits | dfBit | ecfBit | \
+        cond_check = "checkCondition(ccFlagBits | (cfBit | ofBit) | dfBit | ecfBit | \
                                      ezfBit, ext)"
         cond_control_flag_init = "flags[IsCondControl] = flags[IsControl];"
 
@@ -469,7 +519,7 @@ let {{
             super().__init__(dest, src1, dataSize=dataSize)
 
     class WrRegOp(RegOp):
-        operand_types = (FoldedSrc1Op, Op2)
+        operand_types = (FoldedSrc1Op, RegOp2)
 
         abstract = True
         def __init__(self, src1, src2, flags=None, dataSize="env.dataSize"):
@@ -491,27 +541,85 @@ let {{
 
     class Adc(FlagRegOp):
         code = '''
-            CCFlagBits flags = cfofBits;
+            CCFlagBits flags = cfBit;
             result = PSrcReg1 + op2 + flags.cf;
             DestReg = merge(DestReg, dest, result, dataSize);
             '''
         big_code = '''
-            CCFlagBits flags = cfofBits;
+            CCFlagBits flags = cfBit;
             DestReg = result =
                 (PSrcReg1 + op2 + flags.cf) & mask(dataSize * 8);
             '''
 
     class Sbb(SubRegOp):
         code = '''
-            CCFlagBits flags = cfofBits;
+            CCFlagBits flags = cfBit;
             result = PSrcReg1 - op2 - flags.cf;
             DestReg = merge(DestReg, dest, result, dataSize);
             '''
         big_code = '''
-            CCFlagBits flags = cfofBits;
+            CCFlagBits flags = cfBit;
             DestReg = result =
                 (PSrcReg1 - op2 - flags.cf) & mask(dataSize * 8);
             '''
+
+    class Adcxvalue(BasicRegOp):
+        code = '''
+            const unsigned width = dataSize * 8;
+            const unsigned __int128 sum =
+                static_cast<unsigned __int128>(PSrcReg1 & mask(width)) +
+                (op2 & mask(width)) + ((cfBit & CFBit) ? 1 : 0);
+            DestReg = uint64_t(sum) & mask(width);
+            cfBit = (sum >> width) ? CFBit : 0;
+        '''
+        big_code = code
+
+    class Adoxvalue(BasicRegOp):
+        code = Adcxvalue.code.replace('CFBit', 'OFBit').replace('cfBit', 'ofBit')
+        big_code = code
+
+    class Andnvalue(BasicRegOp):
+        code = '''
+            result = (~PSrcReg1 & op2) & mask(dataSize * 8);
+            DestReg = result;
+            cfBit = 0;
+            ofBit = 0;
+            ccFlagBits = genFlags(0, SFBit | ZFBit, result, PSrcReg1, op2);
+        '''
+        big_code = code
+
+    class Blsivalue(RdRegOp):
+        code = '''
+            const uint64_t source = PSrcReg1 & mask(dataSize * 8);
+            result = source & -source;
+            DestReg = result;
+            cfBit = source ? CFBit : 0;
+            ofBit = 0;
+            ccFlagBits = genFlags(0, SFBit | ZFBit, result, source, 0);
+        '''
+        big_code = code
+
+    class Blsmskvalue(Blsivalue):
+        code = '''
+            const uint64_t source = PSrcReg1 & mask(dataSize * 8);
+            result = (source ^ (source - 1)) & mask(dataSize * 8);
+            DestReg = result;
+            cfBit = source ? 0 : CFBit;
+            ofBit = 0;
+            ccFlagBits = genFlags(0, SFBit, result, source, 0);
+        '''
+        big_code = code
+
+    class Blsrvalue(Blsivalue):
+        code = '''
+            const uint64_t source = PSrcReg1 & mask(dataSize * 8);
+            result = source & (source - 1);
+            DestReg = result;
+            cfBit = source ? 0 : CFBit;
+            ofBit = 0;
+            ccFlagBits = genFlags(0, SFBit | ZFBit, result, source, 0);
+        '''
+        big_code = code
 
     class And(LogicRegOp):
         code = '''
@@ -560,12 +668,37 @@ let {{
         flag_code = '''
             if ((-ProdHi & mask(dataSize * 8)) !=
                     bits(ProdLow, dataSize * 8 - 1)) {
-                PredcfofBits = PredcfofBits | (ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (PredcfBit | PredofBit) | (ext & (CFBit | OFBit)); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit | (ext & ECFBit);
             } else {
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (PredcfBit | PredofBit) & ~(ext & (CFBit | OFBit)); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
             }
+        '''
+
+    class Muls(BasicRegOp):
+        op_class = 'IntMultOp'
+        product_code = '''
+            int64_t hi, low;
+            switch (dataSize) {
+              case 8:
+                std::tie(hi, low) = mulSigned<int64_t>(PSrcReg1, op2);
+                break;
+              case 4:
+                std::tie(hi, low) = mulSigned<int32_t>(PSrcReg1, op2);
+                break;
+              default:
+                panic("Unsupported low-result IMUL size %d.", dataSize);
+            }
+        '''
+        code = product_code + 'DestReg = uint64_t(low) & mask(dataSize * 8);'
+        big_code = code
+        flag_code = '''
+            const unsigned width = dataSize * 8;
+            const bool overflow = (uint64_t(hi) & mask(width)) !=
+                (bits(uint64_t(low), width - 1) ? mask(width) : 0);
+            cfBit = overflow ? CFBit : 0;
+            ofBit = overflow ? OFBit : 0;
         '''
 
     class Mul1u(WrRegOp):
@@ -594,10 +727,10 @@ let {{
             '''
         flag_code = '''
             if (ProdHi) {
-                PredcfofBits = PredcfofBits | (ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (PredcfBit | PredofBit) | (ext & (CFBit | OFBit)); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit | (ext & ECFBit);
             } else {
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (PredcfBit | PredofBit) & ~(ext & (CFBit | OFBit)); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
             }
         '''
@@ -756,7 +889,7 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 int CFBits = 0;
@@ -768,14 +901,14 @@ let {{
 
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) && CFBits) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) &&
                         (CFBits ^ bits(DestReg, dataSize * 8 - 1))) {
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 }
 
                 //Use the regular mechanisms to calculate the other flags.
@@ -809,20 +942,20 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) &&
                         shiftAmt <= dataSize * 8 &&
                         bits(SrcReg1, shiftAmt - 1)) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && bits(SrcReg1, dataSize * 8 - 1))
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
 
                 //Use the regular mechanisms to calculate the other flags.
                 uint64_t newFlags = genFlags(PredccFlagBits | PreddfBit |
@@ -858,7 +991,7 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 //If some combination of the CF bits need to be set, set them.
@@ -866,7 +999,7 @@ let {{
                     (shiftAmt <= dataSize * 8) ? shiftAmt : (dataSize * 8);
                 if ((ext & (CFBit | ECFBit)) &&
                         bits(SrcReg1, effectiveShift - 1)) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
@@ -880,6 +1013,16 @@ let {{
                 PredccFlagBits = newFlags & CcFlagMask;
             }
         '''
+
+    for direction, operation in (('Sll', Sll), ('Srl', Srl), ('Sra', Sra)):
+        # Flags work precedes the data destination in rename order. Both
+        # therefore read the original GPR/CL versions, without a temporary
+        # data result or a serial value-to-flags dependency.
+        globals()[direction + 'value'] = type(direction + 'value', (BasicRegOp,), {
+            'code': operation.code, 'big_code': operation.big_code})
+        globals()[direction + 'flags'] = type(direction + 'flags', (WrRegOp,), {
+            'code': operation.big_code.replace('DestReg =', 'const uint64_t shifted ='),
+            'flag_code': operation.flag_code.replace('DestReg', 'shifted')})
 
     class Ror(BasicRegOp):
         code = '''
@@ -898,7 +1041,7 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 //Find the most and second most significant bits of the result.
@@ -906,13 +1049,13 @@ let {{
                 int smsb = bits(DestReg, dataSize * 8 - 2);
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) && msb) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && (msb ^ smsb))
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
 
                 //Use the regular mechanisms to calculate the other flags.
                 uint64_t newFlags = genFlags(PredccFlagBits | PreddfBit |
@@ -931,7 +1074,7 @@ let {{
                 (op2 & ((dataSize == 8) ? mask(6) : mask(5)));
             uint8_t realShiftAmt = shiftAmt % (dataSize * 8 + 1);
             if (realShiftAmt) {
-                CCFlagBits flags = cfofBits;
+                CCFlagBits flags = cfBit;
                 uint64_t top = flags.cf << (dataSize * 8 - realShiftAmt);
                 if (realShiftAmt > 1)
                     top |= PSrcReg1 << (dataSize * 8 - realShiftAmt + 1);
@@ -945,22 +1088,22 @@ let {{
         flag_code = '''
             // If the shift amount is zero, no flags should be modified.
             if (shiftAmt) {
-                int origCFBit = (cfofBits & CFBit) ? 1 : 0;
+                int origCFBit = ((cfBit & CFBit)) ? 1 : 0;
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && (origCFBit ^
                                       bits(SrcReg1, dataSize * 8 - 1))) {
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 }
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) &&
                         (realShiftAmt == 0) ? origCFBit :
                         bits(SrcReg1, realShiftAmt - 1)) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
@@ -993,7 +1136,7 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 //The CF bits, if set, would be set to the lsb of the result.
@@ -1001,13 +1144,13 @@ let {{
                 int msb = bits(DestReg, dataSize * 8 - 1);
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) && lsb) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && (msb ^ lsb))
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
 
                 //Use the regular mechanisms to calculate the other flags.
                 uint64_t newFlags = genFlags(PredccFlagBits | PreddfBit |
@@ -1026,7 +1169,7 @@ let {{
                 (op2 & ((dataSize == 8) ? mask(6) : mask(5)));
             uint8_t realShiftAmt = shiftAmt % (dataSize * 8 + 1);
             if (realShiftAmt) {
-                CCFlagBits flags = cfofBits;
+                CCFlagBits flags = cfBit;
                 uint64_t top = PSrcReg1 << realShiftAmt;
                 uint64_t bottom = flags.cf << (realShiftAmt - 1);
                 if(realShiftAmt > 1) {
@@ -1040,10 +1183,10 @@ let {{
         flag_code = '''
             // If the shift amount is zero, no flags should be modified.
             if (shiftAmt) {
-                int origCFBit = (cfofBits & CFBit) ? 1 : 0;
+                int origCFBit = ((cfBit & CFBit)) ? 1 : 0;
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
 
                 int msb = bits(DestReg, dataSize * 8 - 1);
@@ -1051,13 +1194,13 @@ let {{
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) &&
                         (realShiftAmt == 0) ? origCFBit : CFBits) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && (msb ^ CFBits))
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
 
                 //Use the regular mechanisms to calculate the other flags.
                 uint64_t newFlags = genFlags(PredccFlagBits | PreddfBit |
@@ -1094,7 +1237,7 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
                 int CFBits = 0;
 
@@ -1110,14 +1253,14 @@ let {{
 
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) && CFBits) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && (bits(SrcReg1, dataBits - 1) ^
                                       bits(result, dataBits - 1)))
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
 
                 //Use the regular mechanisms to calculate the other flags.
                 uint64_t newFlags = genFlags(PredccFlagBits | PreddfBit |
@@ -1160,7 +1303,7 @@ let {{
             if (shiftAmt) {
                 //Zero out any flags we might modify. This way we only have to
                 //worry about setting them.
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit | OFBit));
+                { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) & ~(ext & (CFBit | OFBit)); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
                 int CFBits = 0;
 
@@ -1176,14 +1319,14 @@ let {{
 
                 //If some combination of the CF bits need to be set, set them.
                 if ((ext & (CFBit | ECFBit)) && CFBits) {
-                    PredcfofBits = PredcfofBits | (ext & CFBit);
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | (ext & CFBit); ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
                     PredecfBit = PredecfBit | (ext & ECFBit);
                 }
 
                 //Figure out what the OF bit should be.
                 if ((ext & OFBit) && (bits(SrcReg1, dataBits - 1) ^
                                       bits(result, dataBits - 1)))
-                    PredcfofBits = PredcfofBits | OFBit;
+                    { const uint64_t flagsValue = (ShiftcfBit | ShiftofBit) | OFBit; ShiftcfBit = flagsValue & CFBit; ShiftofBit = flagsValue & OFBit; }
 
                 //Use the regular mechanisms to calculate the other flags.
                 uint64_t newFlags = genFlags(PredccFlagBits | PreddfBit |
@@ -1206,7 +1349,7 @@ let {{
     class Wruflags(WrRegOp):
         code = '''
             uint64_t newFlags = PSrcReg1 ^ op2;
-            cfofBits = newFlags & CfofMask;
+            { const uint64_t flagsValue = newFlags & CfofMask; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             ecfBit = newFlags & ECFBit;
             ezfBit = newFlags & EZFBit;
             dfBit = newFlags & DFBit;
@@ -1220,7 +1363,7 @@ let {{
             // Get only the user flags
             ccFlagBits = new_flags & CcFlagMask;
             dfBit = new_flags & DFBit;
-            cfofBits = new_flags & CfofMask;
+            { const uint64_t flagsValue = new_flags & CfofMask; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             ecfBit = 0;
             ezfBit = 0;
 
@@ -1236,24 +1379,24 @@ let {{
         code = 'DestReg = NRIP - CSBase;'
 
     class Ruflags(RdRegOp):
-        code = 'DestReg = ccFlagBits | cfofBits | dfBit | ecfBit | ezfBit;'
+        code = 'DestReg = ccFlagBits | (cfBit | ofBit) | dfBit | ecfBit | ezfBit;'
 
     class Rflags(RdRegOp):
         code = '''
-            DestReg = ccFlagBits | cfofBits | dfBit |
+            DestReg = ccFlagBits | (cfBit | ofBit) | dfBit |
                       ecfBit | ezfBit | nccFlagBits | (1 << 1);
             '''
 
     class Ruflag(RegOp):
         code = '''
-            int flag = bits(ccFlagBits | cfofBits | dfBit |
+            int flag = bits(ccFlagBits | (cfBit | ofBit) | dfBit |
                             ecfBit | ezfBit, imm8);
             DestReg = merge(DestReg, dest, flag, dataSize);
             ezfBit = (flag == 0) ? EZFBit : 0;
             '''
 
         big_code = '''
-            int flag = bits(ccFlagBits | cfofBits | dfBit |
+            int flag = bits(ccFlagBits | (cfBit | ofBit) | dfBit |
                             ecfBit | ezfBit, imm8);
             DestReg = flag & mask(dataSize * 8);
             ezfBit = (flag == 0) ? EZFBit : 0;
@@ -1267,7 +1410,7 @@ let {{
     class Rflag(RegOp):
         code = '''
             RegVal flagMask = 0x3F7FDD5;
-            RegVal flags = (nccFlagBits | ccFlagBits | cfofBits | dfBit |
+            RegVal flags = (nccFlagBits | ccFlagBits | (cfBit | ofBit) | dfBit |
                              ecfBit | ezfBit) & flagMask;
 
             int flag = bits(flags, imm8);
@@ -1277,7 +1420,7 @@ let {{
 
         big_code = '''
             RegVal flagMask = 0x3F7FDD5;
-            RegVal flags = (nccFlagBits | ccFlagBits | cfofBits | dfBit |
+            RegVal flags = (nccFlagBits | ccFlagBits | (cfBit | ofBit) | dfBit |
                              ecfBit | ezfBit) & flagMask;
 
             int flag = bits(flags, imm8);
@@ -1313,12 +1456,12 @@ let {{
         flag_code = '''
             if (!sign_bit) {
                 PredccFlagBits = PredccFlagBits & ~(ext & (ZFBit));
-                PredcfofBits = PredcfofBits & ~(ext & (CFBit));
+                { const uint64_t flagsValue = (PredcfBit | PredofBit) & ~(ext & (CFBit)); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit & ~(ext & ECFBit);
                 PredezfBit = PredezfBit & ~(ext & EZFBit);
             } else {
                 PredccFlagBits = PredccFlagBits | (ext & (ZFBit));
-                PredcfofBits = PredcfofBits | (ext & (CFBit));
+                { const uint64_t flagsValue = (PredcfBit | PredofBit) | (ext & (CFBit)); PredcfBit = flagsValue & CFBit; PredofBit = flagsValue & OFBit; }
                 PredecfBit = PredecfBit | (ext & ECFBit);
                 PredezfBit = PredezfBit | (ext & EZFBit);
             }
@@ -1682,7 +1825,7 @@ let {{
         '''
 
     class Wrdl(BasicRegOp):
-        operand_types = (SegDestOp, FoldedSrc1Op, Op2)
+        operand_types = (SegDestOp, FoldedSrc1Op, RegOp2)
         code = '''
             SegDescriptor desc = SrcReg1;
             SegSelector selector = SrcReg2;
@@ -1767,6 +1910,6 @@ let {{
             if (findZero(dataSize * 8, SrcReg1)) {
                 ccFlagBits = ccFlagBits | X86ISA::ZFBit;
             }
-            cfofBits = cfofBits & ~(X86ISA::OFBit | X86ISA::CFBit);
+            { const uint64_t flagsValue = (cfBit | ofBit) & ~(X86ISA::OFBit | X86ISA::CFBit); cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
         '''
 }};

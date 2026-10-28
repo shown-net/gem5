@@ -76,6 +76,7 @@ def macroop SAL_1_P
 
 def macroop SAL_R_R
 {
+    .split_shift
     sll reg, reg, regm, flags=(CF,OF,SF,ZF,PF)
 };
 
@@ -182,6 +183,7 @@ def macroop SHR_1_P
 
 def macroop SHR_R_R
 {
+    .split_shift
     srl reg, reg, regm, flags=(CF,OF,SF,ZF,PF)
 };
 
@@ -288,6 +290,7 @@ def macroop SAR_1_P
 
 def macroop SAR_R_R
 {
+    .split_shift
     sra reg, reg, regm, flags=(CF,OF,SF,ZF,PF)
 };
 

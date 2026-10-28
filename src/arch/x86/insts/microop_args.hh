@@ -78,6 +78,28 @@ struct Src1Op
     {}
 };
 
+struct DestHiOp
+{
+    const RegIndex destHi;
+    const size_t size;
+    RegIndex opIndex() const { return destHi; }
+    DestHiOp(RegIndex index, size_t bytes) : destHi(index), size(bytes) {}
+    template <class InstType>
+    DestHiOp(RegIndex index, InstType *inst) :
+        destHi(index), size(inst->getDestSize()) {}
+};
+
+struct Src4Op
+{
+    const RegIndex src4;
+    const size_t size;
+    RegIndex opIndex() const { return src4; }
+    Src4Op(RegIndex index, size_t bytes) : src4(index), size(bytes) {}
+    template <class InstType>
+    Src4Op(RegIndex index, InstType *inst) :
+        src4(index), size(inst->getSrcSize()) {}
+};
+
 struct Src2Op
 {
     const RegIndex src2;
@@ -270,6 +292,7 @@ using CrDestOp = CrOp<DestOp>;
 using SegDestOp = SegOp<DestOp>;
 using MiscDestOp = MiscOp<DestOp>;
 using FloatDestOp = FloatOp<DestOp>;
+using FloatDestHiOp = FloatOp<DestHiOp>;
 using IntDestOp = IntOp<DestOp>;
 
 using FoldedSrc1Op = FoldedOp<Src1Op>;
@@ -285,6 +308,7 @@ using FloatSrc2Op = FloatOp<Src2Op>;
 using IntSrc2Op = IntOp<Src2Op>;
 
 using FloatSrc3Op = FloatOp<Src3Op>;
+using FloatSrc4Op = FloatOp<Src4Op>;
 
 using FoldedDataOp = FoldedOp<DataOp>;
 using FloatDataOp = FloatOp<DataOp>;

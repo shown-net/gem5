@@ -87,7 +87,7 @@ def template MicroDebugFlagsConstructor {{
 let {{
     iop = InstObjParams("", "MicroDebugFlags", "X86ISA::MicroDebug",
             {"code": "",
-             "cond_test": "checkCondition(ccFlagBits | cfofBits | \
+             "cond_test": "checkCondition(ccFlagBits | (cfBit | ofBit) | \
                                               dfBit | ecfBit | ezfBit, cc)"})
 
     header_output = MicroDebugFlagsDeclare.subst(iop)

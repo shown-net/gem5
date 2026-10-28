@@ -309,6 +309,8 @@ class InstructionQueue
         addToProducers(inst);
     }
 
+    void recordCompletedProducer(const DynInstPtr &inst);
+
     /** Process FU completion event. */
     void processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                              int fu_idx);

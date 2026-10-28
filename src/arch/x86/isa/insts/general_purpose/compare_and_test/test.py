@@ -69,6 +69,7 @@ def macroop TEST_P_I
 
 def macroop TEST_R_I
 {
+    .direct_imm
     limm t1, imm
     and t0, reg, t1, flags=(OF, SF, ZF, PF, CF, AF)
 };

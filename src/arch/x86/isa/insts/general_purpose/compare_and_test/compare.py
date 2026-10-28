@@ -82,6 +82,7 @@ def macroop CMP_R_R
 
 def macroop CMP_R_I
 {
+    .direct_imm
     limm t1, imm
     sub t0, reg, t1, flags=(OF, SF, ZF, AF, PF, CF)
 };

@@ -256,6 +256,11 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     }
 
     resetState();
+    if (params.resultForwarding)
+        params.resultForwarding->bindCPU(cpu);
+    for (auto iq : iqs)
+        iq->fuPool()->bindIntegerResources(params.executionPorts, params.resultForwarding,
+            params.intALU, params.intSHFT, params.intSlow, params.intBM, params.intALUs);
 }
 
 InstructionQueue::~InstructionQueue()
@@ -557,6 +562,8 @@ InstructionQueue::isDrained() const
                    wbOutstanding == 0;
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         drained = drained && memDepUnit[tid].isDrained();
+    for (auto iq : iqs)
+        drained = drained && iq->fuPool()->isDrained();
 
     return drained;
 }
@@ -872,6 +879,7 @@ InstructionQueue::scheduleReadyInsts()
     // This will avoid trying to schedule a certain op class if there are no
     // FUs that handle it.
     int total_issued = 0;
+    std::vector<DynInstPtr> resource_deferred;
     ListOrderIt order_it = listOrder.begin();
     ListOrderIt order_end_it = listOrder.end();
 
@@ -916,7 +924,28 @@ InstructionQueue::scheduleReadyInsts()
         IQUnit *iq = issuing_inst->iq;
         assert(iq);
         auto fu_pool = iq->fuPool();
-        if (op_class != No_OpClass) {
+        const bool managed = fu_pool->usesIntegerResources(issuing_inst);
+        bool path_blocked = false;
+        if (!managed && cpu->resultForwarding) {
+            const Tick ready = cpu->resultForwarding->availableAt(issuing_inst, 12);
+            path_blocked = ready > curTick();
+            if (path_blocked && ready != std::numeric_limits<Tick>::max())
+                cpu->resultForwarding->defer(issuing_inst, ready);
+            else if (!path_blocked)
+                cpu->resultForwarding->clearWait(issuing_inst);
+        }
+        if (managed) {
+            if (fu_pool->issueInteger(cpu, issuing_inst,
+                [this, issuing_inst] { wakeDependents(issuing_inst); },
+                [this, issuing_inst] { processFUCompletion(issuing_inst, nullptr, -1); })) {
+                ++wbOutstanding;
+                idx = FUPool::NoNeedFU;
+            } else {
+                idx = FUPool::NoFreeFU;
+            }
+            iqIOStats.intAluAccesses++;
+        }
+        if (op_class != No_OpClass && !managed && !path_blocked) {
             idx = fu_pool->getUnit(op_class);
             if (issuing_inst->isFloating()) {
                 iqIOStats.fpAluAccesses++;
@@ -930,11 +959,16 @@ InstructionQueue::scheduleReadyInsts()
             }
         }
 
+        if (path_blocked)
+            idx = FUPool::NoFreeFU;
+
         // If we have an instruction that doesn't require a FU, or a
         // valid FU, then schedule for execution.
         if (idx > FUPool::NoFreeFU || idx == FUPool::NoNeedFU ||
             idx == FUPool::NoCapableFU) {
-            if (op_latency == Cycles(1)) {
+            if (managed) {
+                // The execution family owns evaluation and completion.
+            } else if (op_latency == Cycles(1)) {
                 i2e_info->size++;
                 instsToExecute.push_back(issuing_inst);
 
@@ -1010,10 +1044,24 @@ InstructionQueue::scheduleReadyInsts()
             assert(idx == FUPool::NoFreeFU);
             iqStats.statFuBusy[op_class]++;
             iqStats.fuBusy[tid]++;
-            ++order_it;
+            if (managed) {
+                resource_deferred.push_back(issuing_inst);
+                readyInsts[op_class].pop();
+                if (!readyInsts[op_class].empty())
+                    moveToYoungerInst(order_it);
+                else {
+                    readyIt[op_class] = listOrder.end();
+                    queueOnList[op_class] = false;
+                }
+                listOrder.erase(order_it++);
+            } else {
+                ++order_it;
+            }
         }
     }
 
+    for (const auto &inst : resource_deferred)
+        addIfReady(inst);
     iqStats.numIssuedDist.sample(total_issued);
     iqStats.instsIssued+= total_issued;
 
@@ -1140,21 +1188,18 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
 
         //Go through the dependency chain, marking the registers as
         //ready within the waiting instructions.
-        DynInstPtr dep_inst = dependGraph.pop(dest_reg->flatIndex());
+        RegIndex src_index = 0;
+        DynInstPtr dep_inst = dependGraph.pop(dest_reg->flatIndex(), src_index);
 
         while (dep_inst) {
             DPRINTF(IQ, "Waking up a dependent instruction, [sn:%llu] "
                     "PC %s.\n", dep_inst->seqNum, dep_inst->pcState());
 
-            // Might want to give more information to the instruction
-            // so that it knows which of its source registers is
-            // ready.  However that would mean that the dependency
-            // graph entries would need to hold the src_reg_idx.
-            dep_inst->markSrcRegReady();
+            dep_inst->markSrcRegReady(src_index);
 
             addIfReady(dep_inst);
 
-            dep_inst = dependGraph.pop(dest_reg->flatIndex());
+            dep_inst = dependGraph.pop(dest_reg->flatIndex(), src_index);
 
             ++dependents;
         }
@@ -1337,6 +1382,8 @@ InstructionQueue::doSquash(ThreadID tid)
             --squash_it;
             continue;
         }
+        if (cpu->resultForwarding && !squashed_inst->isIssued())
+            cpu->resultForwarding->release(squashed_inst);
 
         if (!squashed_inst->isIssued() ||
             (squashed_inst->isMemRef() &&
@@ -1377,7 +1424,7 @@ InstructionQueue::doSquash(ThreadID tid)
                     if (!squashed_inst->readySrcIdx(src_reg_idx) &&
                         !src_reg->isAlwaysReady()) {
                         dependGraph.remove(src_reg->flatIndex(),
-                                           squashed_inst);
+                                           squashed_inst, src_reg_idx);
                     }
 
                     ++iqStats.squashedOperandsExamined;
@@ -1438,6 +1485,8 @@ InstructionQueue::doSquash(ThreadID tid)
             assert(dependGraph.empty(dest_reg->flatIndex()));
             dependGraph.clearInst(dest_reg->flatIndex());
         }
+        if (cpu->resultForwarding)
+            cpu->resultForwarding->cancel(squashed_inst);
         instList[tid].erase(squash_it--);
         ++iqStats.squashedInstsExamined;
     }
@@ -1453,6 +1502,7 @@ InstructionQueue::PqCompare::operator()(
 bool
 InstructionQueue::addToDependents(const DynInstPtr &new_inst)
 {
+    new_inst->bindSourceResults();
     // Loop through the instruction's source registers, adding
     // them to the dependency list if they are not ready.
     int8_t total_src_regs = new_inst->numSrcRegs();
@@ -1478,7 +1528,7 @@ InstructionQueue::addToDependents(const DynInstPtr &new_inst)
                         new_inst->pcState(), src_reg->index(),
                         src_reg->className());
 
-                dependGraph.insert(src_reg->flatIndex(), new_inst);
+                dependGraph.insert(src_reg->flatIndex(), new_inst, src_reg_idx);
 
                 // Change the return value to indicate that something
                 // was added to the dependency graph.
@@ -1500,6 +1550,9 @@ InstructionQueue::addToDependents(const DynInstPtr &new_inst)
 void
 InstructionQueue::addToProducers(const DynInstPtr &new_inst)
 {
+    if (cpu->resultForwarding)
+        cpu->resultForwarding->track(new_inst,
+            new_inst->iq->fuPool()->usesIntegerResources(new_inst));
     // Nothing really needs to be marked when an instruction becomes
     // the producer of a register's value, but for convenience a ptr
     // to the producing instruction will be placed in the head node of
@@ -1529,6 +1582,19 @@ InstructionQueue::addToProducers(const DynInstPtr &new_inst)
 
         // Mark the scoreboard to say it's not yet ready.
         regScoreboard[dest_reg->flatIndex()] = false;
+    }
+}
+
+void
+InstructionQueue::recordCompletedProducer(const DynInstPtr &inst)
+{
+    for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
+        auto reg = inst->renamedDestIdx(i);
+        if (reg->isAlwaysReady()) continue;
+        panic_if(!dependGraph.empty(reg->flatIndex()),
+                 "Completed rename result reused a live destination");
+        dependGraph.setInst(reg->flatIndex(), nullptr);
+        regScoreboard[reg->flatIndex()] = true;
     }
 }
 

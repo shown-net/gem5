@@ -31,6 +31,13 @@ from m5.objects.BaseTimingSimpleCPU import BaseTimingSimpleCPU
 from m5.objects.FuncUnit import *
 from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
+from m5.objects.ZeroIdiom import ZeroIdiom
+from m5.objects.IntExecution import (
+    ExecutionPorts,
+    IntegerALU,
+    IntExecutionResource,
+    ResultForwarding,
+)
 from m5.objects.X86Decoder import X86Decoder
 from m5.objects.X86ISA import X86ISA
 from m5.objects.X86LocalApic import X86LocalApic
@@ -57,13 +64,17 @@ class X86TimingSimpleCPU(BaseTimingSimpleCPU, X86CPU):
     mmu = X86MMU()
 
 
-class X86IntMultDiv(IntMultDiv):
+class X86IntMult(IntMultDiv):
+    opList = [OpDesc(opClass="IntMult", opLat=3)]
+    count = 1
+
+
+class X86IntDiv(IntMultDiv):
     # DIV and IDIV instructions in x86 are implemented using a loop which
     # issues division microops.  The latency of these microops should really be
     # one (or a small number) cycle each since each of these computes one bit
     # of the quotient.
     opList = [
-        OpDesc(opClass="IntMult", opLat=3),
         OpDesc(opClass="IntDiv", opLat=1, pipelined=False),
     ]
 
@@ -73,7 +84,8 @@ class X86IntMultDiv(IntMultDiv):
 class DefaultX86FUPool(FUPool):
     FUList = [
         IntALU(),
-        X86IntMultDiv(),
+        X86IntMult(),
+        X86IntDiv(),
         FP_ALU(),
         FP_MultDiv(),
         ReadPort(),
@@ -88,6 +100,20 @@ class DefaultX86FUPool(FUPool):
 class X86O3CPU(BaseO3CPU, X86CPU):
     mmu = X86MMU()
     needsTSO = True
+
+    # Development measurements always use the implemented integer structure.
+    # SimObject cloning preserves shared port references within each core.
+    executionPorts = ExecutionPorts()
+    intALUs = [
+        IntegerALU(port=port)
+        for port in executionPorts.ports
+        if int(port.number) in (0, 1, 5, 6, 11)
+    ]
+    resultForwarding = ResultForwarding()
+    zeroIdiom = ZeroIdiom()
+    intSHFT = IntExecutionResource(family=2)
+    intSlow = IntExecutionResource(family=3)
+    intBM = IntExecutionResource(family=4)
 
     # For x86, each CC reg is used to hold only a subset of the
     # flags, so we need 4-5 times the number of CC regs as

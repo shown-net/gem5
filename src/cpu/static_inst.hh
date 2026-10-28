@@ -53,6 +53,8 @@
 #include "base/logging.hh"
 #include "base/refcnt.hh"
 #include "cpu/op_class.hh"
+#include "cpu/int_execution_info.hh"
+#include "cpu/zero_idiom_info.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "enums/StaticInstFlags.hh"
@@ -87,7 +89,18 @@ class InstRecord;
  */
 class StaticInst : public RefCounted, public StaticInstFlags
 {
+  protected:
+    IntExecutionInfo intExecutionInfo;
+    ZeroIdiomKind zeroIdiomInfo = ZeroIdiomKind::None;
+
   public:
+    const IntExecutionInfo &intExecution() const { return intExecutionInfo; }
+    void clearIntExecution() { intExecutionInfo = {}; }
+    ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
+    bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
+    virtual RegVal zeroIdiomResult(RegIndex destination) const { return 0; }
+    virtual IntResultRole intResultRole(RegIndex destination) const
+    { return IntResultRole::Other; }
     using RegIdArrayPtr = RegId (StaticInst:: *)[];
 
   private:

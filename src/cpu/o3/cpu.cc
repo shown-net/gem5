@@ -47,6 +47,7 @@
 #include "cpu/checker/cpu.hh"
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/zero_idiom.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/simple_thread.hh"
@@ -117,6 +118,8 @@ CPU::CPU(const BaseO3CPUParams &params)
 {
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
+    resultForwarding = params.resultForwarding;
+    zeroIdiom = params.zeroIdiom;
 
     fatal_if(!FullSystem && params.numThreads < params.workload.size(),
             "More workload items (%d) than threads (%d) on CPU %s.",
@@ -818,6 +821,7 @@ bool
 CPU::isCpuDrained() const
 {
     bool drained(true);
+    if (zeroIdiom && !zeroIdiom->empty()) drained = false;
 
     if (!instList.empty() || !removeList.empty()) {
         DPRINTF(Drain, "Main CPU structures not drained.\n");
