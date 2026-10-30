@@ -68,6 +68,37 @@ namespace gem5
 
 namespace X86ISA {
 
+Walker::ItlbStats::ItlbStats(Walker *parent)
+    : statistics::Group(parent, "ITLB_MISSES"), owner(parent),
+      ADD_STAT(WALK_COMPLETED_4K, statistics::units::Count::get(),
+               "Successful instruction walks with a known 4 KiB leaf"),
+      ADD_STAT(WALK_COMPLETED, statistics::units::Count::get(),
+               "Instruction walks completed including walk faults and completed speculation"),
+      ADD_STAT(WALK_ACTIVE, statistics::units::Cycle::get(),
+               "Cycles with a modeled instruction walk in service"),
+      ADD_STAT(WALK_PENDING, statistics::units::Cycle::get(),
+               "Per-cycle in-service instruction walks, excluding queued requests")
+{}
+
+void
+Walker::ItlbStats::preDumpStats()
+{
+    owner->accountInstructionWalk();
+    statistics::Group::preDumpStats();
+}
+
+void
+Walker::accountInstructionWalk()
+{
+    if (!instructionWalkActive)
+        return;
+    const uint64_t cycle = uint64_t(curCycle());
+    const uint64_t elapsed = cycle - instructionWalkLastCycle;
+    itlbStats.WALK_ACTIVE += elapsed;
+    itlbStats.WALK_PENDING += elapsed; // This walker services one request.
+    instructionWalkLastCycle = cycle;
+}
+
 Fault
 Walker::start(ThreadContext * _tc, BaseMMU::Translation *_translation,
               const RequestPtr &_req, BaseMMU::Mode _mode)
@@ -116,6 +147,10 @@ Walker::recvTimingResp(PacketPtr pkt)
     bool walkComplete = senderWalk->recvPacket(pkt);
     delete senderState;
     if (walkComplete) {
+        if (senderWalk->mode == BaseMMU::Execute && senderWalk->wasStarted()) {
+            accountInstructionWalk();
+            instructionWalkActive = false;
+        }
         std::list<WalkerState *>::iterator iter;
         for (iter = currStates.begin(); iter != currStates.end(); iter++) {
             WalkerState * walkerState = *(iter);
@@ -232,6 +267,11 @@ Walker::WalkerState::startWalk()
     Fault fault = NoFault;
     assert(!started);
     started = true;
+    if (timing && mode == BaseMMU::Execute) {
+        assert(!walker->instructionWalkActive);
+        walker->instructionWalkActive = true;
+        walker->instructionWalkLastCycle = uint64_t(walker->curCycle());
+    }
     setupWalk(req->getVaddr());
     if (timing) {
         nextState = state;
@@ -304,6 +344,8 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     bool doTLBInsert = false;
     bool doEndWalk = false;
     bool badNX = pte.nx && mode == BaseMMU::Execute && enableNX;
+    if (dataSize == 8 && enableNX)
+        entry.noExec = entry.noExec || pte.nx;
     switch(state) {
       case LongPML4:
         DPRINTF(PageTableWalker, "Got long mode PML4 entry %#016x.\n", pte);
@@ -317,7 +359,6 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             fault = pageFault(pte.p);
             break;
         }
-        entry.noExec = pte.nx;
         nextState = LongPDP;
         break;
       case LongPDP:
@@ -600,6 +641,7 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     nextState = Ready;
     entry.vaddr = vaddr;
+    entry.noExec = false;
 
     Request::Flags flags = Request::PHYSICAL;
 
@@ -651,7 +693,11 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
     if (inflight == 0 && read == NULL && writes.size() == 0) {
         state = Ready;
         nextState = Waiting;
+        if (mode == BaseMMU::Execute)
+            ++walker->itlbStats.WALK_COMPLETED;
         if (timingFault == NoFault) {
+            if (mode == BaseMMU::Execute && entry.logBytes == 12)
+                ++walker->itlbStats.WALK_COMPLETED_4K;
             /*
              * Finish the translation. Now that we know the right entry is
              * in the TLB, this should work with no memory accesses.

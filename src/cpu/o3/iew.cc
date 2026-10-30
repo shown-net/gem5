@@ -462,8 +462,8 @@ IEW::squash(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched++;
-        if (skidBuffer[tid].front()->staticInst->isZeroIdiom())
-            toRename->iewInfo[tid].zeroDispatched++;
+        if (skidBuffer[tid].front()->bypassesIQ())
+            toRename->iewInfo[tid].noIQDispatched++;
 
         skidBuffer[tid].pop();
     }
@@ -808,8 +808,8 @@ IEW::emptyRenameInsts(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched++;
-        if (insts[tid].front()->staticInst->isZeroIdiom())
-            toRename->iewInfo[tid].zeroDispatched++;
+        if (insts[tid].front()->bypassesIQ())
+            toRename->iewInfo[tid].noIQDispatched++;
 
         insts[tid].pop();
     }
@@ -938,14 +938,14 @@ IEW::dispatchInsts(ThreadID tid)
             }
 
             toRename->iewInfo[tid].dispatched++;
-            if (inst->staticInst->isZeroIdiom())
-                toRename->iewInfo[tid].zeroDispatched++;
+            if (inst->bypassesIQ())
+                toRename->iewInfo[tid].noIQDispatched++;
 
             continue;
         }
 
         // Check for full conditions.
-        if (!inst->staticInst->isZeroIdiom() && instQueue.isFull(inst)) {
+        if (!inst->bypassesIQ() && instQueue.isFull(inst)) {
             DPRINTF(IEW, "[tid:%i] Issue: IQ has become full.\n", tid);
 
             // Call function to start blocking.
@@ -1102,8 +1102,8 @@ IEW::dispatchInsts(ThreadID tid)
         insts_to_dispatch.pop();
 
         toRename->iewInfo[tid].dispatched++;
-        if (inst->staticInst->isZeroIdiom())
-            toRename->iewInfo[tid].zeroDispatched++;
+        if (inst->bypassesIQ())
+            toRename->iewInfo[tid].noIQDispatched++;
 
         ++iewStats.dispatchedInsts;
 

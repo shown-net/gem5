@@ -284,6 +284,13 @@ let {{
                 family, ports, latency = families[operation]
                 execution = ('if (dataSize >= 4) intExecutionInfo = '
                     '{IntExecutionFamily::%s, %d, %d}' % (family, ports, latency))
+            if Name == 'Jmprel':
+                # SPR near-relative JMP is one p6 operation; ordinary Jcc
+                # is one p0/p6 operation. Resolution retains a one-cycle
+                # model initial value, separate from dependency latency.
+                ports = 0x40 if cond_check == 'true' else 0x41
+                execution = ('intExecutionInfo = '
+                    '{IntExecutionFamily::Branch, %d, 1}' % ports)
 
             zero_idiom = ''
             if operation in ('xor', 'sub') and FoldedSrc2Op in operand_types:
@@ -1345,6 +1352,14 @@ let {{
     class Wrip(WrRegOp, CondRegOp):
         code = 'NRIP = ((SrcReg1 + sop2) & mask(dataSize * 8)) + CSBase;'
         else_code = "NRIP = NRIP;"
+
+    class Jmprel(CondRegOp):
+        operand_types = (Imm64Op,)
+        code = '''
+            NRIP = (((NRIP - CSBase) + (int64_t)imm64) &
+                    mask(dataSize * 8)) + CSBase;
+        '''
+        else_code = 'NRIP = NRIP;'
 
     class Wruflags(WrRegOp):
         code = '''

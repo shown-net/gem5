@@ -48,6 +48,7 @@
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/zero_idiom.hh"
+#include "arch/x86/mmu.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/simple_thread.hh"
@@ -120,6 +121,16 @@ CPU::CPU(const BaseO3CPUParams &params)
             "SMT is not supported in O3 in full system mode currently.");
     resultForwarding = params.resultForwarding;
     zeroIdiom = params.zeroIdiom;
+    frontend = params.frontend;
+    if (frontend) {
+        fatal_if(params.decoupledFrontEnd,
+                 "Component frontend does not use a second FTQ supply loop");
+        frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
+        auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
+        fatal_if(!x86_mmu, "Component frontend requires native x86 Execute translation");
+        x86_mmu->onInstructionCodeInvalidation(
+            [this] { fetch.invalidateTranslations(); });
+    }
 
     fatal_if(!FullSystem && params.numThreads < params.workload.size(),
             "More workload items (%d) than threads (%d) on CPU %s.",
@@ -172,6 +183,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     decode.setFetchQueue(&fetchQueue);
     commit.setFetchQueue(&fetchQueue);
     decode.setDecodeQueue(&decodeQueue);
+    fetch.setRenameQueue(&decodeQueue);
     rename.setDecodeQueue(&decodeQueue);
     rename.setRenameQueue(&renameQueue);
     iew.setRenameQueue(&renameQueue);
@@ -384,7 +396,8 @@ CPU::tick()
 
     fetch.tick();
 
-    decode.tick();
+    if (!frontend)
+        decode.tick();
 
     rename.tick();
 

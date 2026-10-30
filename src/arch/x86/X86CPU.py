@@ -32,6 +32,7 @@ from m5.objects.FuncUnit import *
 from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
 from m5.objects.ZeroIdiom import ZeroIdiom
+from m5.objects.Frontend import FrontendCoordinator
 from m5.objects.IntExecution import (
     ExecutionPorts,
     IntegerALU,
@@ -111,9 +112,11 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     ]
     resultForwarding = ResultForwarding()
     zeroIdiom = ZeroIdiom()
+    frontend = FrontendCoordinator()
     intSHFT = IntExecutionResource(family=2)
     intSlow = IntExecutionResource(family=3)
     intBM = IntExecutionResource(family=4)
+    intBranch = IntExecutionResource(family=5)
 
     # For x86, each CC reg is used to hold only a subset of the
     # flags, so we need 4-5 times the number of CC regs as

@@ -57,6 +57,9 @@ class X86TLB(BaseTLB):
     cxx_header = "arch/x86/tlb.hh"
 
     size = Param.Unsigned(64, "TLB size")
+    itlb_4k_ways = Param.Unsigned(0, "4K instruction TLB ways; zero uses fully associative replacement")
+    spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
+    next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
     system = Param.System(Parent.any, "system object")
     walker = Param.X86PagetableWalker(
         X86PagetableWalker(), "page table walker"

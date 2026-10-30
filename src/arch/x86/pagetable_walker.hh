@@ -178,6 +178,21 @@ namespace X86ISA
         // The number of outstanding walks that can be squashed per cycle.
         unsigned numSquashable;
 
+        struct ItlbStats : public statistics::Group
+        {
+            explicit ItlbStats(Walker *parent);
+            Walker *owner;
+            statistics::Scalar WALK_COMPLETED_4K;
+            statistics::Scalar WALK_COMPLETED;
+            statistics::Scalar WALK_ACTIVE;
+            statistics::Scalar WALK_PENDING;
+            void preDumpStats() override;
+        } itlbStats;
+
+        bool instructionWalkActive = false;
+        uint64_t instructionWalkLastCycle = 0;
+        void accountInstructionWalk();
+
         // Wrapper for checking for squashes before starting a translation.
         void startWalkWrapper();
 
@@ -204,7 +219,7 @@ namespace X86ISA
             ClockedObject(params), port(name() + ".port", this),
             funcState(this, NULL, NULL, true), tlb(NULL), sys(params.system),
             requestorId(sys->getRequestorId(this)),
-            numSquashable(params.num_squash_per_cycle),
+            numSquashable(params.num_squash_per_cycle), itlbStats(this),
             startWalkWrapperEvent([this]{ startWalkWrapper(); }, name())
         {
         }

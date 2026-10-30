@@ -90,6 +90,7 @@ void
 FUPool::bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
                               IntExecutionResource *alu, IntExecutionResource *shift,
                               IntExecutionResource *slow, IntExecutionResource *bm,
+                              IntExecutionResource *branch,
                               const std::vector<IntegerALU *> &alus)
 {
     fatal_if(ports && (!results || (!alu && alus.empty())),
@@ -99,7 +100,7 @@ FUPool::bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
              "One FU coordinator cannot belong to different cores");
     executionPorts = ports;
     forwarding = results;
-    integerResources = {nullptr, alu, shift, slow, bm};
+    integerResources = {nullptr, alu, shift, slow, bm, branch};
     individualALUs = !alus.empty();
     integerALUs.fill(nullptr);
     for (auto unit : alus) {

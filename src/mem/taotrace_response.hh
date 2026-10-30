@@ -633,6 +633,7 @@ class TaoTraceFrontendRegistry
         RetryDiscard,
         Response,
         SquashedResponse,
+        DsbValidation,
         Count
     };
 

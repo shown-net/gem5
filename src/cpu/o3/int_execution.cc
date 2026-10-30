@@ -22,6 +22,7 @@ parseFamily(const std::string &name)
     if (name == "SHFT") return IntExecutionFamily::SHFT;
     if (name == "SlowInt") return IntExecutionFamily::SlowInt;
     if (name == "BM") return IntExecutionFamily::BM;
+    if (name == "Branch") return IntExecutionFamily::Branch;
     fatal("Unknown result-path execution family: %s", name);
 }
 
@@ -90,11 +91,19 @@ ExecutionPort::accept(Tick now)
 
 ExecutionPorts::Stats::Stats(statistics::Group *parent)
     : statistics::Group(parent),
-      ADD_STAT(accepted, statistics::units::Count::get(), "Accepted work by port")
+      ADD_STAT(accepted, statistics::units::Count::get(), "Accepted work by port"),
+      ADD_STAT(acceptedByFamily, statistics::units::Count::get(),
+               "Shared grants by execution family and port")
 {
     accepted.init(12);
+    acceptedByFamily.init(6, 12);
+    const char *families[] = {"none", "alu", "shft", "slow", "bm", "branch"};
+    for (unsigned i = 0; i < 6; ++i) acceptedByFamily.subname(i, families[i]);
     for (unsigned i = 0; i < 12; ++i)
+    {
         accepted.subname(i, "p" + std::to_string(i));
+        acceptedByFamily.ysubname(i, "p" + std::to_string(i));
+    }
 }
 
 ExecutionPorts::ExecutionPorts(const ExecutionPortsParams &p)
@@ -132,6 +141,7 @@ ExecutionPorts::commit(IntExecutionFamily family, uint16_t candidates,
     ports[port]->accept(now);
     cursors[(unsigned(family) << 12) | candidates] = (port + 1) % 12;
     stats.accepted[port]++;
+    stats.acceptedByFamily[unsigned(family)][port]++;
 }
 
 ResultForwarding::Stats::Stats(statistics::Group *parent)
@@ -392,7 +402,7 @@ IntExecutionResource::IntExecutionResource(const IntExecutionResourceParams &p)
       issueInterval(p.issueInterval), completionDelay(p.completionDelay),
       prfDelay(p.prfDelay), stats(this)
 {
-    fatal_if(p.family < 1 || p.family > 4 || issueInterval < Cycles(1),
+    fatal_if(p.family < 1 || p.family > 5 || issueInterval < Cycles(1),
              "Invalid integer execution family or issue interval");
 }
 

@@ -352,6 +352,7 @@ class DynInst : public ExecContext, public RefCounted
     // Optional Marker observations; none drive the pipeline.
     bool fetchedFromUser = false;
     uint64_t fetchedAddressSpaceId = 0;
+    bool pendingFrontendAcceptance = false;
     std::unique_ptr<PCStateBase> originalBranchPredPC;
     bool branchDirectionPredictionValid = false;
     bool originalBranchDirectionPrediction = false;
@@ -611,6 +612,7 @@ class DynInst : public ExecContext, public RefCounted
     //  Instruction types.  Forward checks to StaticInst object.
     //
     bool isNop()          const { return staticInst->isNop(); }
+    bool bypassesIQ() const { return isNop() || staticInst->isZeroIdiom(); }
     bool isMemRef()       const { return staticInst->isMemRef(); }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }

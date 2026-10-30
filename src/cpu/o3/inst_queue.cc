@@ -260,7 +260,8 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
         params.resultForwarding->bindCPU(cpu);
     for (auto iq : iqs)
         iq->fuPool()->bindIntegerResources(params.executionPorts, params.resultForwarding,
-            params.intALU, params.intSHFT, params.intSlow, params.intBM, params.intALUs);
+            params.intALU, params.intSHFT, params.intSlow, params.intBM,
+            params.intBranch, params.intALUs);
 }
 
 InstructionQueue::~InstructionQueue()

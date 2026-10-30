@@ -23,7 +23,7 @@ class IntExecutionResource(SimObject):
     type = "IntExecutionResource"
     cxx_class = "gem5::o3::IntExecutionResource"
     cxx_header = "cpu/o3/int_execution.hh"
-    family = Param.Unsigned("1=ALU, 2=SHFT, 3=SlowInt, 4=BM")
+    family = Param.Unsigned("1=ALU, 2=SHFT, 3=SlowInt, 4=BM, 5=Branch")
     issueInterval = Param.Cycles(1, "Service acceptance interval per connected port")
     completionDelay = Param.Cycles(0, "Result formation to operation completion")
     prfDelay = Param.Cycles(0, "Result formation to PRF writeback")

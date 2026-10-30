@@ -66,11 +66,13 @@ class BaseO3CPU(BaseCPU):
     executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
     resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
     zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+    frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
     intALU = Param.IntExecutionResource(NULL, "ALU execution family")
     intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
     intSHFT = Param.IntExecutionResource(NULL, "Shift/carry execution family")
     intSlow = Param.IntExecutionResource(NULL, "Slow integer execution family")
     intBM = Param.IntExecutionResource(NULL, "Bit-manipulation execution family")
+    intBranch = Param.IntExecutionResource(NULL, "Branch resolution execution family")
 
     @classmethod
     def memory_mode(cls):

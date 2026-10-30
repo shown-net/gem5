@@ -801,6 +801,12 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     sequencer.readCallback(address, cache_entry.DataBlk, true);
   }
 
+  action(hx_ifetch_stale, "hxs", desc="Return stale code without reusable template permission") {
+    assert(is_valid(cache_entry));
+    Icache.setMRU(cache_entry);
+    sequencer.readCallbackStale(address, cache_entry.DataBlk);
+  }
+
   action(hh_store_hit, "\h", desc="Notify sequencer that store completed (cache hit)") {
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
@@ -1290,7 +1296,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition(Inst_IS, Data_Stale, I) {
     u_writeInstToCache;
-    hx_ifetch_hit;
+    hx_ifetch_stale;
     s_deallocateTBE;
     ff_deallocateCacheBlock;
     o_popIncomingResponseQueue;

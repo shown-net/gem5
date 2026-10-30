@@ -52,8 +52,10 @@ The existing `TaoTrace` Marker API delegates to `CalibrationMarker` when
 `marker_pc` is nonzero and retains the producer path when it is zero.
 START and END save cumulative native statistics at retirement. CPU analysis
 uses END minus START over the workload O3 core, with no TASK settlement or CPL
-filtering. Hardware PMU keeps its measured-thread TASK scope; reports show the
-difference. Optional observations do not define calibrated execution mechanisms.
+filtering. Hardware PMU uses the scope recorded in each measurement artifact;
+the CPU project's current counter path measures one logical CPU at core-level
+U+K scope. See its [observation contract](../../calibration/cpu_microarchitecture/docs/observations/native-observations.md).
+Optional observations do not define calibrated execution mechanisms.
 
 The CPU public model uses native `X86O3CPU` and
 `MESIThreeLevelCacheHierarchy`. Its documented SPR resource initial values and
@@ -65,6 +67,33 @@ deployment; the selected source owns the execution structure without task
 mechanism switches.
 Compilation and minimal functional runs establish interface and execution
 availability, not performance accuracy or SPR equivalence.
+
+Near-relative JMP and the sixteen ordinary Jcc conditions now use one direct
+PC-relative operation by default. Branch resolution uses the shared execution
+ports (p6 for JMP, p0/p6 for Jcc), with a one-cycle initial resolution service.
+The Intel JMP dependency-latency entry of zero does not set frontend waiting
+or branch recovery to zero. CALL/RET, far transfers and JRCXZ retain their
+existing expansions.
+
+Development X86 now also creates a frontend coordinator with byte service,
+MITE, DSB templates and IDQ SimObjects. IDQ creates DynInsts at its output and
+shares the Rename width; pending acceptance retains IDQ capacity. The legacy
+Decode supply loop is idle on this path. Native instruction semantics, ROM control flow,
+Execute translation and Ruby code-validity notifications remain in use.
+Resource counts are gem5 operation proxies; initial raw counters and unresolved
+timing differences are documented in the [frontend experiment](../../calibration/cpu_microarchitecture/docs/calibration/spr-frontend/README.md).
+
+Source service uses a bounded stream of records with explicit ready cycles;
+delivery joins ready fragments up to its output budget and waits for credits
+for the ready group. Template fills remain tied to delivery completion and
+the code-validity epoch. NOPs and zero idioms reserve no IQ entry at Rename or
+IEW. Frontend statistics record source widths, actual Rename acceptance,
+backend eligibility and missing allocation slots; execution-port grants can
+be separated by family. Native byte-request wait counts include cache hits
+and are not aliases for Intel instruction-cache-miss stall events.
+An Execute translation that completes synchronously can renew the DSB code
+lease and continue service in the same cycle; native asynchronous translation
+and cache requests retain their wait state and identity checks.
 
 ---
 

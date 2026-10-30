@@ -60,6 +60,7 @@
 #include "cpu/o3/decode.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/fetch.hh"
+#include "cpu/o3/frontend.hh"
 #include "cpu/o3/free_list.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/iew.hh"
@@ -89,6 +90,7 @@ namespace o3
 
 class ThreadContext;
 class ZeroIdiom;
+class FrontendCoordinator;
 
 /**
  * O3CPU class, has each of the stages (fetch through commit)
@@ -101,6 +103,7 @@ class CPU : public BaseCPU
     bool markerObservation = false;
     ResultForwarding *resultForwarding = nullptr;
     ZeroIdiom *zeroIdiom = nullptr;
+    FrontendCoordinator *frontend = nullptr;
     bool markerBranchObservation = false;
     typedef std::list<DynInstPtr>::iterator ListIt;
 

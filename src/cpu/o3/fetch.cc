@@ -62,6 +62,7 @@
 #include "debug/Fetch.hh"
 #include "debug/O3CPU.hh"
 #include "mem/packet.hh"
+#include "mem/inst_code.hh"
 #include "mem/taotrace_response.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/byteswap.hh"
@@ -117,6 +118,7 @@ Fetch::IcachePort::IcachePort(Fetch *_fetch, CPU *_cpu) :
 Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
     : fetchPolicy(params.smtFetchPolicy),
       cpu(_cpu),
+      frontend(params.frontend),
       bac(nullptr),
       ftq(nullptr),
       decoupledFrontEnd(params.decoupledFrontEnd),
@@ -178,7 +180,8 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
         decoder[tid] = params.decoder[tid];
         // Create space to buffer the cache line data,
         // which may not hold the entire cache line.
-        fetchBuffer[tid] = new uint8_t[fetchBufferSize];
+        if (!frontend)
+            fetchBuffer[tid] = new uint8_t[fetchBufferSize];
     }
 
     // Get the size of an instruction.
@@ -296,6 +299,10 @@ Fetch::startupStage()
 void
 Fetch::clearStates(ThreadID tid)
 {
+    if (frontend) {
+        frontend->reset();
+        expansionTemplate.reset();
+    }
     fetchStatus[tid] = Running;
     set(pc[tid], cpu->pcState(tid));
     fetchOffset[tid] = 0;
@@ -322,6 +329,10 @@ Fetch::clearStates(ThreadID tid)
 void
 Fetch::resetStage()
 {
+    if (frontend) {
+        frontend->reset();
+        expansionTemplate.reset();
+    }
     numInst = 0;
     interruptPending = false;
     cacheBlocked = false;
@@ -374,7 +385,16 @@ Fetch::processCacheCompletion(PacketPtr pkt)
         return;
     }
 
-    memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
+    if (frontend) {
+        const auto validity = pkt->req->getExtension<InstructionCodeValidity>();
+        frontend->instructionBytes->complete(pkt->req->getVaddr(),
+            pkt->req->getPaddr(), pkt->getConstPtr<uint8_t>(), fetchBufferSize,
+            uint64_t(cpu->curCycle()), !pkt->req->isUncacheable() &&
+            !(validity && validity->stale) &&
+            requestEpoch[tid] == frontend->dsb->epoch());
+    } else {
+        memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
+    }
     fetchBufferValid[tid] = true;
 
     // Wake up the CPU (if it went to sleep and was waiting on
@@ -430,6 +450,7 @@ Fetch::drainSanityCheck() const
 bool
 Fetch::isDrained() const
 {
+    if (frontend && !frontend->empty()) return false;
     /* Make sure that threads are either idle of that the commit stage
      * has signaled that draining has completed by setting the drain
      * stall flag. This effectively forces the pipeline to be disabled
@@ -578,6 +599,7 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
     mem_req->taskId(cpu->taskId());
 
     memReq[tid] = mem_req;
+    if (frontend) requestEpoch[tid] = frontend->dsb->epoch();
 
     // Initiate translation of the icache block
     fetchStatus[tid] = ItlbWait;
@@ -613,8 +635,46 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
     }
 
 
+    if (frontend && requestEpoch[tid] != frontend->dsb->epoch()) {
+        memReq[tid] = nullptr;
+        fetchStatus[tid] = Running;
+        TaoTraceFrontendRegistry::noteTerminal(mem_req,
+            TaoTraceFrontendRegistry::Terminal::TranslationSquash,
+            uint64_t(curTick()));
+        _status = updateFetchStatus();
+        return;
+    }
+
     // If translation was successful, attempt to read the icache block.
     if (fault == NoFault) {
+        if (frontend) {
+            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr());
+            // A validated DSB hit consumes no native I-cache request.
+            const auto identity = frontend->identity(pc[tid]->instAddr());
+            const auto *value = frontend->dsb->candidate(identity,
+                uint64_t(cpu->curCycle()));
+            std::vector<Addr> blocks;
+            if (value && frontend->physicalBlocks(identity.address,
+                    value->bytes, blocks)) {
+                fetchStatus[tid] = Running;
+                memReq[tid] = nullptr;
+                TaoTraceFrontendRegistry::noteTerminal(mem_req,
+                    TaoTraceFrontendRegistry::Terminal::DsbValidation,
+                    uint64_t(curTick()));
+                _status = updateFetchStatus();
+                return;
+            }
+            if (value) {
+                // The next cycle requests the remaining cross-block Execute check.
+                fetchStatus[tid] = Running;
+                memReq[tid] = nullptr;
+                TaoTraceFrontendRegistry::noteTerminal(mem_req,
+                    TaoTraceFrontendRegistry::Terminal::DsbValidation,
+                    uint64_t(curTick()));
+                _status = updateFetchStatus();
+                return;
+            }
+        }
         // Check that we're not going off into random memory
         // If we have, just wait around for commit to squash something and put
         // us on the right track
@@ -663,8 +723,12 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         }
     } else {
         // Don't send an instruction to decode if we can't handle it.
-        if (!(numInst < fetchWidth) ||
-                !(fetchQueue[tid].size() < fetchQueueSize)) {
+        // A synchronous fault must not overtake older records still in
+        // fetchFrontend's local batch. Retry after that batch is submitted.
+        if (frontend ? (frontendBatchPending ||
+                        !frontend->canAccept(FrontendSource::Mite)) :
+                (!(numInst < fetchWidth) ||
+                 !(fetchQueue[tid].size() < fetchQueueSize))) {
             assert(!finishTranslationEvent.scheduled());
             finishTranslationEvent.setFault(fault);
             finishTranslationEvent.setReq(mem_req);
@@ -688,12 +752,22 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
 
         DPRINTF(Fetch, "[tid:%i] Translation faulted, building noop.\n", tid);
         // We will use a nop in order to carry the fault.
-        DynInstPtr instruction = buildInst(tid, nopStaticInstPtr, nullptr,
-                fetch_pc, fetch_pc, false);
-        instruction->setNotAnInst();
-
-        instruction->setPredTarg(fetch_pc);
-        instruction->fault = fault;
+        if (frontend) {
+            auto record = std::make_unique<FrontendRecord>(cpu, tid,
+                nopStaticInstPtr, nullptr, fetch_pc, FrontendSource::Mite, false);
+            record->notAnInstruction = true;
+            record->fault = fault;
+            std::vector<FrontendRecordPtr> records;
+            records.push_back(std::move(record));
+            frontend->submit(FrontendSource::Mite, std::move(records), 0, {},
+                uint64_t(cpu->curCycle()));
+        } else {
+            DynInstPtr instruction = buildInst(tid, nopStaticInstPtr, nullptr,
+                    fetch_pc, fetch_pc, false);
+            instruction->setNotAnInst();
+            instruction->setPredTarg(fetch_pc);
+            instruction->fault = fault;
+        }
         wroteToTimeBuffer = true;
 
         DPRINTF(Activity, "Activity this cycle.\n");
@@ -716,6 +790,8 @@ Fetch::squashFromDecode(const PCStateBase &new_pc, const DynInstPtr squashInst,
 
     doSquash(new_pc, squashInst, tid);
 
+    if (frontend) frontend->redirect(seq_num);
+
     // Tell the CPU to remove any instructions that are in flight between
     // fetch and decode.
     cpu->removeInstsUntil(seq_num, tid);
@@ -728,6 +804,8 @@ Fetch::squashFromCommit(const PCStateBase &new_pc, const InstSeqNum seq_num,
     DPRINTF(Fetch, "[tid:%i] Squash from commit.\n", tid);
 
     doSquash(new_pc, squashInst, tid);
+
+    if (frontend) frontend->redirect(seq_num);
 
     // Tell the CPU to remove any instructions that are not in the ROB.
     cpu->removeInstsNotInROB(tid);
@@ -751,6 +829,9 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     else
         macroop[tid] = NULL;
     decoder[tid]->reset();
+    expansionTemplate.reset();
+    expansionSource = FrontendSource::Mite;
+    decodeCanReuse = true;
 
     // Clear the icache miss if it's outstanding.
     if (fetchStatus[tid] == IcacheWaitResponse) {
@@ -820,6 +901,10 @@ Fetch::checkStall(ThreadID tid) const
 Fetch::FetchStatus
 Fetch::updateFetchStatus()
 {
+    if (frontend && !frontend->empty()) {
+        if (_status == Inactive) cpu->activateStage(CPU::FetchIdx);
+        return Active;
+    }
     //Check Running
     for (ThreadID tid : *activeThreads) {
         if (fetchStatus[tid] == Running ||
@@ -881,16 +966,26 @@ Fetch::tick()
         }
     }
 
+    if (frontend) {
+        frontend->instructionBytes->waiting(fetchStatus[0] == ItlbWait,
+            fetchStatus[0] == IcacheWaitResponse, fetchStatus[0] == IcacheWaitRetry);
+        frontend->advance(uint64_t(cpu->curCycle()), stalls[0].decode,
+            [this](FrontendRecordPtr record) {
+                return emitFrontendRecord(std::move(record));
+            });
+    }
+
     for (threadFetched = 0; threadFetched < numFetchingThreads;
          threadFetched++) {
         // Fetch each of the actively fetching threads.
-        fetch(status_change);
+        if (frontend) fetchFrontend(status_change);
+        else fetch(status_change);
     }
 
     // Record number of instructions fetched this cycle for distribution.
     fetchStats.nisnDist.sample(numInst);
 
-    if (status_change) {
+    if (status_change || frontend) {
         // Change the fetch stage status if there was a status change.
         _status = updateFetchStatus();
     }
@@ -904,6 +999,7 @@ Fetch::tick()
 
     // Send instructions enqueued into the fetch queue to decode.
     // Limit rate by fetchWidth.  Stall if decode is stalled.
+    if (!frontend) {
     unsigned insts_to_decode = 0;
     unsigned available_insts = 0;
 
@@ -939,6 +1035,8 @@ Fetch::tick()
             tid_itr = activeThreads->begin();
     }
 
+    }
+
     // If there was activity this cycle, inform the CPU of it.
     if (wroteToTimeBuffer) {
         DPRINTF(Activity, "Activity this cycle.\n");
@@ -960,6 +1058,10 @@ Fetch::tick()
 bool
 Fetch::checkSignalsAndUpdate(ThreadID tid)
 {
+    if (frontend) {
+        if (fromRename->renameBlock[tid]) stalls[tid].decode = true;
+        if (fromRename->renameUnblock[tid]) stalls[tid].decode = false;
+    }
     // Update the per thread stall statuses.
     if (fromDecode->decodeBlock[tid]) {
         stalls[tid].decode = true;

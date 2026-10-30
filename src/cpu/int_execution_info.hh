@@ -7,7 +7,7 @@
 namespace gem5
 {
 
-enum class IntExecutionFamily : uint8_t { None, ALU, SHFT, SlowInt, BM };
+enum class IntExecutionFamily : uint8_t { None, ALU, SHFT, SlowInt, BM, Branch };
 enum class IntResultRole : uint8_t { Any, GPR, CF, OF, Flags, Other };
 
 struct IntExecutionInfo

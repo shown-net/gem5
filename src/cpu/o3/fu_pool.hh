@@ -78,7 +78,7 @@ class FUPool : public SimObject
   private:
     ExecutionPorts *executionPorts = nullptr;
     ResultForwarding *forwarding = nullptr;
-    std::array<IntExecutionResource *, 5> integerResources{};
+    std::array<IntExecutionResource *, 6> integerResources{};
     std::array<IntegerALU *, 12> integerALUs{};
     bool individualALUs = false;
     /** Maximum op execution latencies, per op class. */
@@ -144,6 +144,7 @@ class FUPool : public SimObject
     void bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
                               IntExecutionResource *alu, IntExecutionResource *shift,
                               IntExecutionResource *slow, IntExecutionResource *bm,
+                              IntExecutionResource *branch,
                               const std::vector<IntegerALU *> &alus);
     bool usesIntegerResources(const DynInstPtr &inst) const;
     bool issueInteger(CPU *cpu, const DynInstPtr &inst,

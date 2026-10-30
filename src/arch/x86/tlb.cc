@@ -48,6 +48,7 @@
 #include "arch/x86/regs/msr.hh"
 #include "arch/x86/x86_traits.hh"
 #include "base/trace.hh"
+#include "cpu/base.hh"
 #include "cpu/thread_context.hh"
 #include "debug/TLB.hh"
 #include "mem/packet_access.hh"
@@ -64,10 +65,18 @@ namespace X86ISA {
 
 TLB::TLB(const Params &p)
     : BaseTLB(p), configAddress(0), size(p.size),
+      itlb4kWays(p.itlb_4k_ways), sprSharedDomains(p.spr_shared_domains),
+      nextLevelHitLatency(p.next_level_hit_latency),
       tlb(size), lruSeq(0), m5opRange(p.system->m5opRange()), stats(this)
 {
     if (!size)
         fatal("TLBs must have a non-zero size.\n");
+    fatal_if(itlb4kWays && (size % itlb4kWays),
+             "ITLB size must be divisible by its number of ways");
+    fatal_if(sprSharedDomains && size != 2048,
+             "SPR shared TLB proxy requires 2048 entries");
+    if (nextLevel() && type() == TypeTLB::instruction)
+        itlbMissStats = std::make_unique<ItlbMissStats>(this);
 
     for (int x = 0; x < size; x++) {
         tlb[x].trieHandle = NULL;
@@ -77,6 +86,12 @@ TLB::TLB(const Params &p)
     walker = p.walker;
     walker->setTLB(this);
 }
+
+TLB::ItlbMissStats::ItlbMissStats(statistics::Group *parent)
+    : statistics::Group(parent, "ITLB_MISSES"),
+      ADD_STAT(STLB_HIT, statistics::units::Count::get(),
+               "Instruction TLB misses satisfied by the modeled shared TLB")
+{}
 
 void
 TLB::evictLRU()
@@ -97,7 +112,7 @@ TLB::evictLRU()
 }
 
 TlbEntry *
-TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid)
+TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel)
 {
     //Adding pcid to the page address so
     //that multiple processes using the same
@@ -112,6 +127,50 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid)
         return newEntry;
     }
 
+    if (sprSharedDomains) {
+        // Two support domains. A: 4K/2M/4M, B: 4K/1G.
+        // 4K placement uses VPN[7] for the domain and VPN[6:0] for
+        // the set; large-page indexing is an uncalibrated proxy.
+        auto location = [](Addr addr, unsigned log_bytes) {
+            const Addr page = addr >> log_bytes;
+            const unsigned domain = log_bytes == 12 ? ((page >> 7) & 1) :
+                                    log_bytes == 30 ? 1 : 0;
+            return std::make_pair(domain, unsigned(page & 127));
+        };
+        auto target = location(vpn, entry.logBytes);
+        unsigned used = 0;
+        TlbEntry *victim = nullptr;
+        for (auto &candidate : tlb) {
+            if (candidate.trieHandle &&
+                location(candidate.vaddr, candidate.logBytes) == target) {
+                ++used;
+                if (!victim || candidate.lruSeq < victim->lruSeq)
+                    victim = &candidate;
+            }
+        }
+        if (used >= 8) {
+            trie.remove(victim->trieHandle);
+            victim->trieHandle = nullptr;
+            freeList.push_back(victim);
+        }
+    } else if (itlb4kWays && entry.logBytes == 12) {
+        const auto set = (vpn >> 12) % (size / itlb4kWays);
+        unsigned used = 0;
+        TlbEntry *victim = nullptr;
+        for (auto &candidate : tlb) {
+            if (candidate.trieHandle && candidate.logBytes == 12 &&
+                (candidate.vaddr >> 12) % (size / itlb4kWays) == set) {
+                ++used;
+                if (!victim || candidate.lruSeq < victim->lruSeq)
+                    victim = &candidate;
+            }
+        }
+        if (used >= itlb4kWays) {
+            trie.remove(victim->trieHandle);
+            victim->trieHandle = nullptr;
+            freeList.push_back(victim);
+        }
+    }
     if (freeList.empty())
         evictLRU();
 
@@ -129,6 +188,8 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid)
         newEntry->trieHandle =
         trie.insert(vpn, TlbEntryTrie::MaxBits, newEntry);
     }
+    if (fillNextLevel && nextLevel())
+        static_cast<TLB *>(nextLevel())->insert(entry.vaddr, entry, pcid);
     return newEntry;
 }
 
@@ -144,6 +205,9 @@ TLB::lookup(Addr va, bool update_lru)
 void
 TLB::flushAll()
 {
+    ++invalidationGeneration;
+    if (codeInvalidation) codeInvalidation();
+    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushAll();
     DPRINTF(TLB, "Invalidating all entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle) {
@@ -163,6 +227,9 @@ TLB::setConfigAddress(uint32_t addr)
 void
 TLB::flushNonGlobal()
 {
+    ++invalidationGeneration;
+    if (codeInvalidation) codeInvalidation();
+    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushNonGlobal();
     DPRINTF(TLB, "Invalidating all non global entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle && !tlb[i].global) {
@@ -176,6 +243,9 @@ TLB::flushNonGlobal()
 void
 TLB::demapPage(Addr va, uint64_t asn)
 {
+    ++invalidationGeneration;
+    if (codeInvalidation) codeInvalidation();
+    if (nextLevel()) static_cast<TLB *>(nextLevel())->demapPage(va, asn);
     TlbEntry *entry = trie.lookup(va);
     if (entry) {
         trie.remove(entry->trieHandle);
@@ -450,7 +520,51 @@ TLB::translate(const RequestPtr &req,
                         panic("Invalid mode\n");
                         break;
                 }
-                if (FullSystem) {
+                if (FullSystem && nextLevel()) {
+                    auto *shared = static_cast<TLB *>(nextLevel());
+                    if (auto *hit = shared->lookup(pageAlignedVaddr)) {
+                        if (mode == BaseMMU::Execute && itlbMissStats)
+                            ++itlbMissStats->STLB_HIT;
+                        if (timing && translation && nextLevelHitLatency > Cycles(0)) {
+                            auto *cpu = tc->getCpuPtr();
+                            const TlbEntry saved = *hit;
+                            const auto localGeneration = invalidationGeneration;
+                            const auto sharedGeneration = shared->invalidationGeneration;
+                            const auto savedCr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+                            const auto savedCr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+                            const auto savedEfer = tc->readMiscRegNoEffect(misc_reg::Efer);
+                            cpu->schedule(new EventFunctionWrapper(
+                                [this, shared, req, tc, translation, mode, saved,
+                                 pcid, localGeneration, sharedGeneration,
+                                 savedCr3, savedCr4, savedEfer] {
+                                    if (translation->squashed()) {
+                                        if (mode == BaseMMU::Execute)
+                                            ++stats.stlbSquashes;
+                                        translation->finish(std::make_shared<UnimpFault>(
+                                            "Squashed Inst"), req, tc, mode);
+                                    } else {
+                                        if (localGeneration == invalidationGeneration &&
+                                            sharedGeneration == shared->invalidationGeneration &&
+                                            savedCr3 == tc->readMiscRegNoEffect(misc_reg::Cr3) &&
+                                            savedCr4 == tc->readMiscRegNoEffect(misc_reg::Cr4) &&
+                                            savedEfer == tc->readMiscRegNoEffect(misc_reg::Efer)) {
+                                            insert(saved.vaddr, saved, pcid, false);
+                                            if (mode == BaseMMU::Execute)
+                                                ++stats.stlbResponses;
+                                        } else if (mode == BaseMMU::Execute) {
+                                            ++stats.stlbRestarts;
+                                        }
+                                        translateTiming(req, tc, translation, mode);
+                                    }
+                                }, name() + ".stlbResponse", true),
+                                cpu->clockEdge(nextLevelHitLatency));
+                            delayedResponse = true;
+                            return NoFault;
+                        }
+                        entry = insert(hit->vaddr, *hit, pcid, false);
+                    }
+                }
+                if (!entry && FullSystem) {
                     Fault fault = walker->start(tc, translation, req, mode);
                     if (timing || fault != NoFault) {
                         // This gets ignored in atomic mode.
@@ -459,7 +573,7 @@ TLB::translate(const RequestPtr &req,
                     }
                     entry = lookup(pageAlignedVaddr);
                     assert(entry);
-                } else {
+                } else if (!entry) {
                     Process *p = tc->getProcessPtr();
                     const EmulationPageTable::Entry *pte =
                         p->pTable->lookup(vaddr);
@@ -485,9 +599,12 @@ TLB::translate(const RequestPtr &req,
             // Do paging protection checks.
             bool inUser = m5Reg.cpl == 3 && !(flags & CPL0FlagBit);
             CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+            Efer efer = tc->readMiscRegNoEffect(misc_reg::Efer);
             bool badWrite = (!entry->writable && (inUser || cr0.wp));
             if ((inUser && !entry->user) ||
-                (mode == BaseMMU::Write && badWrite)) {
+                (mode == BaseMMU::Write && badWrite) ||
+                (nextLevel() && mode == BaseMMU::Execute &&
+                 efer.nxe && entry->noExec)) {
                 // The page must have been present to get into the TLB in
                 // the first place. We'll assume the reserved bits are
                 // fine even though we're not checking them.
@@ -608,7 +725,13 @@ TLB::TlbStats::TlbStats(statistics::Group *parent)
       ADD_STAT(wrMisses, statistics::units::Count::get(),
                "TLB misses on write requests"),
       ADD_STAT(exMisses, statistics::units::Count::get(),
-               "TLB misses on execute (instr) requests")
+               "TLB misses on execute (instr) requests"),
+      ADD_STAT(stlbResponses, statistics::units::Count::get(),
+               "Delayed instruction STLB responses delivered to the first-level TLB"),
+      ADD_STAT(stlbSquashes, statistics::units::Count::get(),
+               "Delayed instruction STLB responses cancelled after squash"),
+      ADD_STAT(stlbRestarts, statistics::units::Count::get(),
+               "Delayed instruction STLB responses restarted after invalidation or context change")
 {
 }
 

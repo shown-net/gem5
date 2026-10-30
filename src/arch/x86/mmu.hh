@@ -56,6 +56,9 @@ class MMU : public BaseMMU
       : BaseMMU(p)
     {}
 
+    void onInstructionCodeInvalidation(std::function<void()> callback)
+    { static_cast<TLB *>(itb)->onCodeInvalidation(std::move(callback)); }
+
     void
     flushNonGlobal()
     {

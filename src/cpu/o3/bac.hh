@@ -43,6 +43,7 @@
 #include "base/statistics.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/frontend_record.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/branch_type.hh"
@@ -286,6 +287,10 @@ class BAC
      */
     bool updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                   FetchTargetPtr &ft);
+
+    /** Coupled prediction needs instruction identity, never a DynInst. */
+    FrontendPrediction predictInstruction(const StaticInstPtr &instruction,
+        InstSeqNum sequence, ThreadID tid, PCStateBase &next_pc);
 
   private:
     /** Pre-decode update -----------------------------------------

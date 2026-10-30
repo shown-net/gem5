@@ -83,7 +83,7 @@ std::string Rename::RenameStats::statusDefinitions[ThreadStatusMax] = {
 Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
     : cpu(_cpu),
       iewToRenameDelay(params.iewToRenameDelay),
-      decodeToRenameDelay(params.decodeToRenameDelay),
+      decodeToRenameDelay(params.frontend ? Cycles(0) : params.decodeToRenameDelay),
       commitToRenameDelay(params.commitToRenameDelay),
       renameWidth(params.renameWidth),
       numThreads(params.numThreads),
@@ -96,11 +96,13 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
 
     // @todo: Make into a parameter.
     skidBufferMax = (decodeToRenameDelay + 1) * params.decodeWidth;
+    if (params.frontend)
+        skidBufferMax = params.frontend->idq->capacityValue();
     for (uint32_t tid = 0; tid < MaxThreads; tid++) {
         renameStatus[tid] = Idle;
         renameMap[tid] = nullptr;
         instsInProgress[tid] = 0;
-        zeroInstsInProgress[tid] = 0;
+        noIQInstsInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
         freeEntries[tid] = {0, 0, 0, 0};
@@ -261,7 +263,7 @@ Rename::clearStates(ThreadID tid)
     serializeInst[tid] = NULL;
 
     instsInProgress[tid] = 0;
-    zeroInstsInProgress[tid] = 0;
+    noIQInstsInProgress[tid] = 0;
     loadsInProgress[tid] = 0;
     storesInProgress[tid] = 0;
 
@@ -308,7 +310,7 @@ Rename::resetStage()
         serializeInst[tid] = NULL;
 
         instsInProgress[tid] = 0;
-        zeroInstsInProgress[tid] = 0;
+        noIQInstsInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
 
@@ -376,6 +378,8 @@ Rename::drainSanityCheck() const
 void
 Rename::squash(const InstSeqNum &squash_seq_num, ThreadID tid)
 {
+    if (cpu->frontend)
+        cpu->frontend->cancelAfter(squash_seq_num);
     DPRINTF(Rename, "[tid:%i] [squash sn:%llu] Squashing instructions.\n",
         tid,squash_seq_num);
 
@@ -445,7 +449,32 @@ Rename::tick()
 
         status_change = checkSignalsAndUpdate(tid) || status_change;
 
+        unsigned frontend_blocked = 0;
+        const int first_output = toIEWIndex;
+        if (cpu->frontend) {
+            if (stalls[tid].iew || renameStatus[tid] == Blocked)
+                frontend_blocked |= FrontendCoordinator::RenameSignal;
+            if (renameStatus[tid] == Squashing ||
+                fromCommit->commitInfo[tid].squash || fromCommit->commitInfo[tid].robSquashing)
+                frontend_blocked |= FrontendCoordinator::Recovery;
+            if (renameStatus[tid] == SerializeStall)
+                frontend_blocked |= FrontendCoordinator::Serialize;
+            if (calcFreeROBEntries(tid) < int(renameWidth))
+                frontend_blocked |= FrontendCoordinator::FullROB;
+            if (calcFreeIQEntries(tid) < int(renameWidth))
+                frontend_blocked |= FrontendCoordinator::FullIQ;
+            if (calcFreeLQEntries(tid) <= 0 && calcFreeSQEntries(tid) <= 0)
+                frontend_blocked |= FrontendCoordinator::FullLSQ;
+            if (renameMap[tid]->minFreeEntries() < renameWidth)
+                frontend_blocked |= FrontendCoordinator::FullPRF;
+        }
         rename(status_change, tid);
+        if (cpu->frontend) {
+            if (blockThisCycle) frontend_blocked |= FrontendCoordinator::RenameSignal;
+            if (renameStatus[tid] == SerializeStall)
+                frontend_blocked |= FrontendCoordinator::Serialize;
+            cpu->frontend->allocation(toIEWIndex - first_output, frontend_blocked);
+        }
     }
 
     if (status_change) {
@@ -471,13 +500,13 @@ Rename::tick()
     // @todo: make into updateProgress function
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         instsInProgress[tid] -= fromIEW->iewInfo[tid].dispatched;
-        zeroInstsInProgress[tid] -= fromIEW->iewInfo[tid].zeroDispatched;
+        noIQInstsInProgress[tid] -= fromIEW->iewInfo[tid].noIQDispatched;
         loadsInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToLQ;
         storesInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToSQ;
         assert(loadsInProgress[tid] >= 0);
         assert(storesInProgress[tid] >= 0);
         assert(instsInProgress[tid] >=0);
-        assert(zeroInstsInProgress[tid] >= 0);
+        assert(noIQInstsInProgress[tid] >= 0);
     }
 
 }
@@ -631,7 +660,7 @@ Rename::renameInsts(ThreadID tid)
         assert(!insts_to_rename.empty());
 
         DynInstPtr inst = insts_to_rename.front();
-        if (!inst->isSquashed() && !inst->staticInst->isZeroIdiom() &&
+        if (!inst->isSquashed() && !inst->bypassesIQ() &&
             free_iq_entries <= 0) {
             blockThisCycle = true;
             incrFullStat(IQ);
@@ -753,9 +782,13 @@ Rename::renameInsts(ThreadID tid)
         renameSrcRegs(inst, inst->threadNumber);
 
         renameDestRegs(inst, inst->threadNumber);
-        if (inst->staticInst->isZeroIdiom()) {
-            ++zeroInstsInProgress[tid];
-            if (inst->getFault() == NoFault) {
+        if (inst->pendingFrontendAcceptance) {
+            cpu->frontend->accepted(inst->seqNum);
+            inst->pendingFrontendAcceptance = false;
+        }
+        if (inst->bypassesIQ()) {
+            ++noIQInstsInProgress[tid];
+            if (inst->staticInst->isZeroIdiom() && inst->getFault() == NoFault) {
                 cpu->zeroIdiom->admit(inst);
                 if (cpu->resultForwarding)
                     cpu->resultForwarding->track(inst, false);
@@ -1240,8 +1273,8 @@ int
 Rename::calcFreeIQEntries(ThreadID tid)
 {
     int num_free = freeEntries[tid].iqEntries -
-        (instsInProgress[tid] - zeroInstsInProgress[tid] -
-         fromIEW->iewInfo[tid].dispatched + fromIEW->iewInfo[tid].zeroDispatched);
+        (instsInProgress[tid] - noIQInstsInProgress[tid] -
+         fromIEW->iewInfo[tid].dispatched + fromIEW->iewInfo[tid].noIQDispatched);
 
     //DPRINTF(Rename,"[tid:%i] %i iq free\n",tid,num_free);
 

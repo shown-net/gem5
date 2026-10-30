@@ -63,6 +63,7 @@ class ExecutionPorts : public SimObject
     struct Stats : statistics::Group
     {
         statistics::Vector accepted;
+        statistics::Vector2d acceptedByFamily;
         Stats(statistics::Group *parent);
     } stats;
 

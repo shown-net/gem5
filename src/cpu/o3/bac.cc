@@ -909,6 +909,18 @@ bool
 BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
               FetchTargetPtr &ft)
 {
+    if (!decoupledFrontEnd) {
+        const auto prediction = predictInstruction(inst->staticInst,
+            inst->seqNum, inst->threadNumber, fetch_pc);
+        inst->setPredTarg(fetch_pc);
+        inst->setPredTaken(prediction.taken);
+        inst->branchDirectionPredictionValid = prediction.directionValid;
+        inst->originalBranchDirectionPrediction = prediction.originalDirection;
+        inst->branchBtbHit = prediction.btbHit;
+        if (inst->isControl() && cpu->markerBranchObservation)
+            set(inst->originalBranchPredPC, fetch_pc);
+        return prediction.taken;
+    }
     // This function will update the fetch PC to the next instruction.
     // If the current instruction is a branch it will make
     // the branch prediction.
@@ -918,29 +930,8 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
     if (inst->isControl()) {
         // The instruction is a control instruction.
 
-        if (decoupledFrontEnd) {
-            // With a decoupled front-end the branch prediction was done
-            // while creating the fetch target. Now update the prediction
-            // with the information from the predecoding.
-            predict_taken = updatePreDecode(tid, inst->seqNum,
-                                            inst->staticInst, fetch_pc, ft,
-                                            inst);
-        } else {
-            // With a coupled front-end we need to make the branch prediction
-            // here.
-            if (!cpu->markerBranchObservation) {
-                predict_taken = bpu->predict(inst->staticInst, inst->seqNum,
-                                            fetch_pc, tid);
-            } else {
-                BPredUnit::PredictorHistory *hist = nullptr;
-                predict_taken = bpu->predict(inst->staticInst, inst->seqNum,
-                                            fetch_pc, tid, hist);
-                bpu->insertPredictorHistory(tid, hist);
-                inst->branchDirectionPredictionValid = hist->condPredValid;
-                inst->originalBranchDirectionPrediction = hist->condPred;
-                inst->branchBtbHit = hist->btbHit;
-            }
-        }
+        predict_taken = updatePreDecode(tid, inst->seqNum,
+            inst->staticInst, fetch_pc, ft, inst);
 
         DPRINTF(BAC,
                 "[tid:%i] [sn:%llu] Branch at PC %#x "
@@ -986,6 +977,33 @@ BAC::updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
     }
 
     return predict_taken;
+}
+
+FrontendPrediction
+BAC::predictInstruction(const StaticInstPtr &instruction,
+        InstSeqNum sequence, ThreadID tid, PCStateBase &next_pc)
+{
+    fatal_if(decoupledFrontEnd,
+             "Record-based frontend requires coupled branch prediction");
+    FrontendPrediction result;
+    if (!instruction->isControl()) {
+        instruction->advancePC(next_pc);
+        return result;
+    }
+    if (cpu->markerBranchObservation) {
+        BPredUnit::PredictorHistory *history = nullptr;
+        result.taken = bpu->predict(instruction, sequence, next_pc, tid, history);
+        bpu->insertPredictorHistory(tid, history);
+        result.directionValid = history->condPredValid;
+        result.originalDirection = history->condPred;
+        result.btbHit = history->btbHit;
+    } else {
+        result.taken = bpu->predict(instruction, sequence, next_pc, tid);
+    }
+    ++stats.branches;
+    if (result.taken)
+        ++stats.predTakenBranches;
+    return result;
 }
 
 BAC::BACStats::BACStats(o3::CPU *cpu, BAC *bac)

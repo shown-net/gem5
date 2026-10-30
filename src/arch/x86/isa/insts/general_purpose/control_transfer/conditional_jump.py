@@ -40,9 +40,7 @@ def macroop JZ_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CZF,)
+    jmprel imm, flags=(CZF,)
 };
 
 def macroop JNZ_I
@@ -51,9 +49,7 @@ def macroop JNZ_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCZF,)
+    jmprel imm, flags=(nCZF,)
 };
 
 def macroop JB_I
@@ -62,9 +58,7 @@ def macroop JB_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CCF,)
+    jmprel imm, flags=(CCF,)
 };
 
 def macroop JNB_I
@@ -73,9 +67,7 @@ def macroop JNB_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCCF,)
+    jmprel imm, flags=(nCCF,)
 };
 
 def macroop JBE_I
@@ -84,9 +76,7 @@ def macroop JBE_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CCvZF,)
+    jmprel imm, flags=(CCvZF,)
 };
 
 def macroop JNBE_I
@@ -95,9 +85,7 @@ def macroop JNBE_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCCvZF,)
+    jmprel imm, flags=(nCCvZF,)
 };
 
 def macroop JS_I
@@ -106,9 +94,7 @@ def macroop JS_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CSF,)
+    jmprel imm, flags=(CSF,)
 };
 
 def macroop JNS_I
@@ -117,9 +103,7 @@ def macroop JNS_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCSF,)
+    jmprel imm, flags=(nCSF,)
 };
 
 def macroop JP_I
@@ -128,9 +112,7 @@ def macroop JP_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CPF,)
+    jmprel imm, flags=(CPF,)
 };
 
 def macroop JNP_I
@@ -139,9 +121,7 @@ def macroop JNP_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCPF,)
+    jmprel imm, flags=(nCPF,)
 };
 
 def macroop JL_I
@@ -150,9 +130,7 @@ def macroop JL_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CSxOF,)
+    jmprel imm, flags=(CSxOF,)
 };
 
 def macroop JNL_I
@@ -161,9 +139,7 @@ def macroop JNL_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCSxOF,)
+    jmprel imm, flags=(nCSxOF,)
 };
 
 def macroop JLE_I
@@ -172,9 +148,7 @@ def macroop JLE_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(CSxOvZF,)
+    jmprel imm, flags=(CSxOvZF,)
 };
 
 def macroop JNLE_I
@@ -183,9 +157,7 @@ def macroop JNLE_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCSxOvZF,)
+    jmprel imm, flags=(nCSxOvZF,)
 };
 
 def macroop JO_I
@@ -194,9 +166,7 @@ def macroop JO_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(COF,)
+    jmprel imm, flags=(COF,)
 };
 
 def macroop JNO_I
@@ -205,9 +175,7 @@ def macroop JNO_I
     .adjust_env oszIn64Override
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2, flags=(nCOF,)
+    jmprel imm, flags=(nCOF,)
 };
 
 def macroop JRCXZ_I
