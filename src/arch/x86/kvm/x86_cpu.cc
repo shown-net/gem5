@@ -1257,6 +1257,21 @@ X86KvmCPU::deliverInterrupts()
         // interrupt before restarting the thread. The simulated CPUs
         // use the same kind of hack using a microcode routine.
         thread->suspend();
+        // A SIPI can already be pending when INIT is delivered. Its wakeup
+        // then happened while this CPU was active, before the suspend above.
+        // Recheck after this tick on the APIC queue; a later SIPI still wakes
+        // the suspended CPU via the ordinary interrupt path. Deferring the
+        // wakeup also avoids scheduling the current KVM tick twice.
+        schedule(new EventFunctionWrapper([this] {
+            bool pending;
+            {
+                EventQueue::ScopedMigration migrate(interrupts[0]->eventQueue());
+                auto *lapic = dynamic_cast<X86ISA::Interrupts *>(interrupts[0]);
+                pending = lapic->hasPendingUnmaskable();
+            }
+            if (pending)
+                wakeup(0);
+        }, name() + ".recheckInitInterrupts", true), clockEdge(Cycles(1)));
     } else if (dynamic_cast<StartupInterrupt *>(fault.get())) {
         DPRINTF(KvmInt, "STARTUP interrupt\n");
         fault.get()->invoke(tc);

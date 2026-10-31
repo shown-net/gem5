@@ -1572,8 +1572,15 @@ let {{
                   case 4:
                     {
                         CR4 cr4 = newVal;
+                        CpuidResult features{};
+                        auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                        const bool fsgsbase = isa->cpuid->doCpuid(
+                            xc->tcBase(), ExtendedFeatures, 0, features) &&
+                            (features.rbx & 1);
+                        const RegVal allowed = mask(11) |
+                            (fsgsbase ? (RegVal(1) << 16) : 0);
                         // PAE can't be disabled in long mode.
-                        if (bits(newVal, 63, 11) ||
+                        if ((newVal & ~allowed) ||
                                 (machInst.mode.mode == LongMode && !cr4.pae))
                             fault = std::make_shared<GeneralProtection>(0);
                     }

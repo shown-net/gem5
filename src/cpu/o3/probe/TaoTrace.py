@@ -22,6 +22,7 @@ class TaoTrace(ProbeListenerObject):
                    PyBindMethod("resumeMarkerHandoff")]
 
     marker_pc = Param.Addr(0, "CPU calibration Marker PC; zero selects FastSim producer")
+    marker_pc_trace_file = Param.String("", "Committed PC protobuf stream")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "

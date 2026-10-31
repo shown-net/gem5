@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include "base/statistics.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/probes/marker_pc_trace.hh"
 #include "params/TaoTrace.hh"
 #include "sim/probe/probe.hh"
 #include "sim/probe/probe_listener_object.hh"
@@ -31,6 +32,8 @@ class CalibrationMarker
     bool marker_capture_started_ = false;
     Addr marker_pc_;
     CPU *marker_cpu_;
+    std::string marker_pc_trace_file_;
+    std::unique_ptr<MarkerPcTrace> marker_pc_trace_;
     uint64_t marker_ordinal_ = 0, marker_begin_ = 1, marker_end_ = 2;
     uint64_t marker_address_space_ = 0;
     enum class MarkerMeasurementPhase { Warming, Measuring, Complete };

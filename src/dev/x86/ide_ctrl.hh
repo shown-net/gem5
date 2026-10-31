@@ -52,6 +52,9 @@ class X86IdeController : public IdeController
 
     void postInterrupt(bool is_primary) override;
     void clearInterrupt(bool is_primary) override;
+
+    void serialize(CheckpointOut &cp) const override;
+    void unserialize(CheckpointIn &cp) override;
 };
 
 } // namespace gem5

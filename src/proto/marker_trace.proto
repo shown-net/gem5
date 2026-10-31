@@ -1,0 +1,41 @@
+syntax = "proto2";
+
+package ProtoMessage;
+
+message MarkerTraceHeader {
+  optional uint32 version = 1 [default = 1];
+  optional string trace_kind = 2;
+  optional uint64 tick_freq = 3;
+  optional uint32 batch_size = 4;
+}
+
+message MarkerPcBatch {
+  repeated uint64 pc = 1 [packed = true];
+  repeated uint64 commit_tick = 2 [packed = true];
+  repeated sint64 fetch_tick = 3 [packed = true];
+  repeated sint32 dispatch_from_fetch = 4 [packed = true];
+  repeated sint32 issue_from_fetch = 5 [packed = true];
+  repeated sint32 complete_from_fetch = 6 [packed = true];
+  optional uint32 row_count = 100;
+}
+
+message MarkerBranchBatch {
+  repeated uint64 branch_index = 1 [packed = true];
+  repeated uint64 macro_index = 2 [packed = true];
+  repeated uint64 seq_num = 3 [packed = true];
+  repeated uint32 thread_id = 4 [packed = true];
+  repeated uint64 pc = 5 [packed = true];
+  repeated uint64 commit_tick = 6 [packed = true];
+  repeated bool actual_taken = 7 [packed = true];
+  repeated bool direction_valid = 8 [packed = true];
+  repeated bool original_direction = 9 [packed = true];
+  repeated bool pred_taken = 10 [packed = true];
+  repeated uint64 pred_next_pc = 11 [packed = true];
+  repeated uint64 actual_next_pc = 12 [packed = true];
+  repeated bool direction_mispred = 13 [packed = true];
+  repeated bool next_pc_mispred = 14 [packed = true];
+  repeated bool redirect = 15 [packed = true];
+  repeated bool commit_squash = 16 [packed = true];
+  repeated bool btb_hit = 17 [packed = true];
+  optional uint32 row_count = 100;
+}

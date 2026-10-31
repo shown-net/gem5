@@ -25,6 +25,7 @@ CalibrationMarker::CalibrationMarker(TaoTrace &owner, const TaoTraceParams &para
     fatal_if(!marker_pc_ || !marker_cpu_, "Marker requires O3 manager and boundary PC");
     marker_cpu_->markerObservation = true;
     marker_instances_.insert(this);
+    marker_pc_trace_file_ = params.marker_pc_trace_file;
 }
 CalibrationMarker::~CalibrationMarker()
 {
@@ -42,6 +43,8 @@ CalibrationMarker::startMarkerCapture(const std::string &directory)
 {
     fatal_if(marker_capture_started_, "Marker capture already started");
     marker_capture_started_ = true;
+    if (!marker_pc_trace_file_.empty())
+        marker_pc_trace_ = std::make_unique<MarkerPcTrace>(directory + "/" + marker_pc_trace_file_);
 
 }
 void
@@ -121,6 +124,16 @@ CalibrationMarker::observeMarkerCommit(const DynInstPtr &inst)
          owner->marker_address_space_ != inst->fetchedAddressSpaceId))
         return;
     const Addr pc = inst->pcState().instAddr();
+    // Fetch-time CPL can lag an x86 exception entry. Linux user PCs occupy
+    // the lower canonical half, with the legacy vsyscall page as an exception.
+    const bool linuxUserPc = !(pc >> 63) ||
+        (pc >= 0xffffffffff600000ULL && pc < 0xffffffffff601000ULL);
+    if (owner->marker_measurement_phase_ == MarkerMeasurementPhase::Measuring &&
+        owner->marker_pc_trace_ && linuxUserPc) {
+        const int64_t fetch_tick = inst->fetchTick == Tick(-1) ? -1 : int64_t(inst->fetchTick);
+        owner->marker_pc_trace_->append(pc, curTick(), fetch_tick,
+            inst->dispatchTick, inst->issueTick, inst->completeTick);
+    }
     if (pc != marker_pc_) return;
     owner->marker_address_space_ = inst->fetchedAddressSpaceId;
     ++owner->marker_ordinal_;
@@ -129,8 +142,10 @@ CalibrationMarker::observeMarkerCommit(const DynInstPtr &inst)
     if (!begin && !end) return;
     owner->marker_measurement_phase_ = begin ?
         MarkerMeasurementPhase::Measuring : MarkerMeasurementPhase::Complete;
+    if (end && owner->marker_pc_trace_) owner->marker_pc_trace_->finalizeTrace();
     // Snapshot at retirement without draining or changing pipeline state.
     statistics::dump();
+    if (begin && owner->marker_pc_trace_) owner->marker_pc_trace_->initializeTrace();
     if (end) exitSimulationLoopNow(8, {{"kind", "end"}});
 }
 } }
