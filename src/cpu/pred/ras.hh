@@ -194,9 +194,11 @@ class ReturnAddrStack : public SimObject
         std::unique_ptr<PCStateBase> ras_entry;
         /** The RAS index (top of stack pointer) of the instruction */
         unsigned tos = 0;
+        unsigned usedEntries = 0;
+        std::vector<std::unique_ptr<PCStateBase>> entries;
     };
 
-    void makeRASHistory(void* &ras_history);
+    void makeRASHistory(ThreadID tid, void* &ras_history);
 
     /** The RAS itself. */
     std::vector<AddrStack> addrStacks;
@@ -211,6 +213,7 @@ class ReturnAddrStack : public SimObject
         ReturnAddrStackStats(statistics::Group *parent);
         statistics::Scalar pushes;
         statistics::Scalar pops;
+        statistics::Scalar emptyPops;
         statistics::Scalar squashes;
         statistics::Scalar used;
         statistics::Scalar correct;

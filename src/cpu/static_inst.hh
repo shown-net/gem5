@@ -179,6 +179,16 @@ class StaticInst : public RefCounted, public StaticInstFlags
     bool isCondCtrl()     const { return flags[IsCondControl]; }
     bool isUncondCtrl()   const { return flags[IsUncondControl]; }
 
+    /** ISA-specific classification for return-stack and near-target use. */
+    virtual bool isRasCall() const { return isCall(); }
+    virtual bool isRasReturn() const { return isReturn(); }
+    virtual bool isArchitecturalBranch() const { return isControl(); }
+    virtual bool isArchitecturalConditionalBranch() const { return isCondCtrl(); }
+    virtual bool isNearIndirectBranch() const
+    {
+        return isIndirectCtrl() && !isReturn();
+    }
+
     bool isSerializing()  const { return flags[IsSerializing] ||
                                       flags[IsSerializeBefore] ||
                                       flags[IsSerializeAfter]; }

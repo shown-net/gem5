@@ -358,6 +358,8 @@ class DynInst : public ExecContext, public RefCounted
     bool originalBranchDirectionPrediction = false;
     bool branchBtbHit = false;
     bool branchCommitSquash = false;
+    /** Execution-stage final-address mismatch; frontend repairs are separate. */
+    bool executionBranchMispredicted = false;
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -606,6 +608,14 @@ class DynInst : public ExecContext, public RefCounted
         std::unique_ptr<PCStateBase> next_pc(pc->clone());
         staticInst->advancePC(*next_pc);
         return *next_pc != *predPC;
+    }
+
+    bool
+    mispredictedArchitecturalAddress() const
+    {
+        std::unique_ptr<PCStateBase> next_pc(pc->clone());
+        staticInst->advancePC(*next_pc);
+        return next_pc->instAddr() != predPC->instAddr();
     }
 
     //

@@ -108,7 +108,13 @@ class FetchTarget
     /** If the exit branch is predicted taken */
     bool taken;
 
+    /** Earliest O3 cycle at which this path can be consumed. */
+    uint64_t readyCycle = 0;
+
   public:
+    void setReadyCycle(uint64_t cycle) { readyCycle = cycle; }
+    bool ready(uint64_t cycle) const { return cycle >= readyCycle; }
+
     /** Anchor point to attach a branch predictor history.
      * Will carry information while FT is waiting in th FTQ. */
     branch_prediction::BPredUnit::PredictorHistory *bpuHistory;
@@ -347,6 +353,7 @@ class FTQ
         statistics::Scalar locks;
 
         statistics::Distribution occupancy;
+        statistics::Vector insertOccupancy;
     } stats;
 };
 

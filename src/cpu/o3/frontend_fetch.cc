@@ -58,11 +58,21 @@ Fetch::fetchFrontend(bool &status_change)
     }
     if (fetchStatus[tid] != Running) return;
 
+    if (decoupledFrontEnd && !ftqReady(tid, status_change)) {
+        fetchStats.status[FtqWait]++;
+        return;
+    }
+
     auto *dec = dynamic_cast<X86ISA::Decoder *>(decoder[tid]);
     assert(dec);
     frontend->context(cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3),
                       dec->frontendContext());
     PCStateBase &at = *pc[tid];
+    FetchTargetPtr curFT = decoupledFrontEnd ? ftq->readHead(tid) : nullptr;
+    if (curFT && !curFT->inRange(at.instAddr())) {
+        bacResteer(at, tid);
+        return;
+    }
     Addr offset = fetchOffset[tid];
     StaticInstPtr current_macro = macroop[tid];
     bool in_rom = isRomMicroPC(at.microPC());
@@ -99,11 +109,24 @@ Fetch::fetchFrontend(bool &status_change)
     const unsigned instruction_limit = source == FrontendSource::Dsb ?
         frontend->dsb->maxInstructions() : frontend->mite->maxInstructions();
     unsigned accepted_instructions = 0;
+    unsigned consumed_targets = 0;
+    unsigned consumed_taken = 0;
     bool stop = false;
     std::vector<FrontendRecordPtr> records;
     std::vector<FrontendTemplate> fills;
 
     while (records.size() < limit && !stop) {
+        if (decoupledFrontEnd && !curFT) {
+            if (consumed_targets >= maxFTPerCycle ||
+                consumed_taken >= maxTakenPredPerCycle ||
+                !ftq->isHeadReady(tid))
+                break;
+            curFT = ftq->readHead(tid);
+            if (!curFT->inRange(at.instAddr())) {
+                bacResteer(at, tid);
+                break;
+            }
+        }
         StaticInstPtr op;
         if (!current_macro && !in_rom) {
             if (accepted_instructions >= instruction_limit) break;
@@ -161,8 +184,13 @@ Fetch::fetchFrontend(bool &status_change)
 
         auto record = std::make_unique<FrontendRecord>(cpu, tid, op, current_macro,
             at, in_rom ? FrontendSource::Rom : source, true);
-        record->prediction = bac->predictInstruction(op, record->sequence, tid,
-                                                     *record->predictedPC);
+        record->prediction = decoupledFrontEnd ?
+            bac->predictFrontendInstruction(op, record->sequence, tid,
+                                             *record->predictedPC, curFT) :
+            bac->predictInstruction(op, record->sequence, tid,
+                                    *record->predictedPC);
+        const bool target_exit = curFT && curFT->isExitInst(at.instAddr()) &&
+            (!op->isMicroop() || op->isLastMicroop());
         stop = at.branching() || record->prediction.taken;
         if (op->isControl()) ++cpu->fetchStats[tid]->numBranches;
         if (stop) ++fetchStats.predictedBranches;
@@ -173,6 +201,16 @@ Fetch::fetchFrontend(bool &status_change)
             expansionTemplate->operations.push_back(op);
         if (in_rom) expansionTemplate.reset();
         set(at, *record->predictedPC);
+        if (curFT && (target_exit || !curFT->inRange(at.instAddr()) ||
+                      !ftq->isReady(tid))) {
+            ++consumed_targets;
+            if (record->prediction.taken) ++consumed_taken;
+            if (!ftq->popHead(tid)) {
+                bacResteer(at, tid);
+                stop = true;
+            }
+            curFT = nullptr;
+        }
         records.push_back(std::move(record));
         frontendBatchPending = true;
         if (finished) {

@@ -72,6 +72,12 @@ class BranchTargetBuffer : public ClockedObject
      */
     virtual bool valid(ThreadID tid, Addr instPC) = 0;
 
+    /** Time from lookup start to the selected target's availability. */
+    virtual Cycles lookupLatency(ThreadID tid, Addr instPC) const
+    {
+        return Cycles(0);
+    }
+
     /** Looks up an address in the BTB to get the target of the branch.
      *  @param inst_PC The address of the branch to look up.
      *  @param type Optional type of the branch to look up.

@@ -292,6 +292,11 @@ class BAC
     FrontendPrediction predictInstruction(const StaticInstPtr &instruction,
         InstSeqNum sequence, ThreadID tid, PCStateBase &next_pc);
 
+    /** Consume the FTQ prediction without materializing a DynInst. */
+    FrontendPrediction predictFrontendInstruction(
+        const StaticInstPtr &instruction, InstSeqNum sequence, ThreadID tid,
+        PCStateBase &next_pc, const FetchTargetPtr &ft);
+
   private:
     /** Pre-decode update -----------------------------------------
      * After predecoding instruction in the fetch stage all instructions
@@ -326,7 +331,8 @@ class BAC
     bool updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
                          const StaticInstPtr &inst, PCStateBase &pc,
                          const FetchTargetPtr &ft,
-                         const DynInstPtr &dyn_inst);
+                         const DynInstPtr &dyn_inst,
+                         FrontendPrediction *prediction = nullptr);
 
   private:
     /** Squashes BAC for a specific thread and resets the PC. */
@@ -365,6 +371,9 @@ class BAC
 
     /** The decoupled PC which runs ahead of fetch */
     std::unique_ptr<PCStateBase> bacPC[MaxThreads];
+
+    /** A dependent path cannot begin before the previous target is ready. */
+    uint64_t nextPredictCycle[MaxThreads] = {};
 
     /** Variable that tracks if BAC has written to the time buffer this
      * cycle. Used to tell CPU if there is activity this cycle.

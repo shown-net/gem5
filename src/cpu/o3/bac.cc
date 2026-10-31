@@ -40,6 +40,7 @@
 #include <algorithm>
 
 #include "arch/generic/pcstate.hh"
+#include "arch/x86/pcstate.hh"
 #include "base/trace.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -92,7 +93,8 @@ BAC::BAC(CPU *_cpu, const BaseO3CPUParams &params)
       maxTakenPredPerCycle(params.maxTakenPredPerCycle),
       stats(_cpu, this)
 {
-    fatal_if(decoupledFrontEnd && (fetchTargetWidth < params.fetchBufferSize),
+    fatal_if(decoupledFrontEnd && !params.frontend &&
+             (fetchTargetWidth < params.fetchBufferSize),
              "Fetch target width should be larger than fetch buffer size!");
     fatal_if(decoupledFrontEnd && (numThreads > 1),
              "More than 1 thread has not been tested with the decoupled "
@@ -148,6 +150,7 @@ void
 BAC::clearStates(ThreadID tid)
 {
     bacStatus[tid] = Running;
+    nextPredictCycle[tid] = 0;
     set(bacPC[tid], cpu->pcState(tid));
 
     stalls[tid].fetch = false;
@@ -494,6 +497,7 @@ BAC::squash(const PCStateBase &new_pc, ThreadID tid)
 
     // Set the new PC
     set(bacPC[tid], new_pc);
+    nextPredictCycle[tid] = 0;
 
     // Then squash all fetch targets
     ftq->squash(tid);
@@ -584,6 +588,9 @@ BAC::predict(ThreadID tid, const StaticInstPtr &inst, const FetchTargetPtr &ft,
 void
 BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 {
+    if (uint64_t(cpu->curCycle()) < nextPredictCycle[tid])
+        return;
+    bpu->setUserMode(tid, cpu->inUserMode(tid));
     /**
      * This function implements the head of the decoupled frontend.
      * Instead of waiting for the pre-decoding the current instruction, as
@@ -637,7 +644,7 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         // stream or the maximum search width per cycle was reached.
         // In the first case make the branch prediction and in the later
         // advance the PC to start the search at the following address.
-        while (true) {
+        while ((search_addr - start_addr) < fetchTargetWidth) {
 
             // Check if the current search address can be found in the BTB
             // indicating the end of the branch.
@@ -648,15 +655,14 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
                 break;
             }
 
-            // If its not a branch check if the maximum search width is
-            // reached. If yes stop searching.
-            if ((search_addr - start_addr) >= fetchTargetWidth) {
-                break;
-            }
-
             // Continue searching.
             search_addr += minInstSize;
         }
+
+        // The target range is inclusive, so its last byte is one minimum
+        // instruction unit before the next target's start.
+        if (!branch_found)
+            search_addr -= minInstSize;
 
         // Update the current PC to point to the last instruction
         // in the fetch target
@@ -672,6 +678,18 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
             // look it up from the BTB.
             staticInst = bpu->BTBGetInst(tid, cur_pc.instAddr());
             assert(staticInst);
+
+            // A search address is not a decoded x86 PC: set() clears the
+            // instruction length and next PC. Restore both from the BTB's
+            // decoded branch before predicting, in particular for CALL's
+            // return address and not-taken fallthrough.
+            if (auto *xpc = dynamic_cast<X86ISA::PCState *>(&cur_pc)) {
+                fatal_if(!staticInst->size(),
+                         "BTB branch at %#x has no decoded x86 length", search_addr);
+                xpc->size(staticInst->size());
+                xpc->npc(search_addr + staticInst->size());
+                set(*next_pc, cur_pc);
+            }
 
             // Now make the actual prediction. Note the BPU will advance
             // the PC to the next instruction.
@@ -692,7 +710,9 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 
         if (!predict_taken) {
             // Not predicted taken. Start the next FT at the next address.
-            next_pc->set(cur_pc.instAddr() + minInstSize);
+            next_pc->set(cur_pc.instAddr() +
+                (branch_found && staticInst->size() ?
+                    staticInst->size() : minInstSize));
         }
 
         // x86 has some complex instruction like string copy where the branch
@@ -729,6 +749,10 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         // - or the maximum fetch bandwidth is reached.
         curFT->finalize(cur_pc, branch_found, predict_taken, *next_pc);
 
+        const uint64_t ready = uint64_t(cpu->curCycle()) +
+            (curFT->bpuHistory ? uint64_t(curFT->bpuHistory->btbLatency) : 0);
+        curFT->setReadyCycle(ready);
+
         ftq->insert(tid, curFT);
         wroteToTimeBuffer = true;
 
@@ -742,6 +766,11 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 
         // Finally set the BPU PC to the next FT in the next cycle
         set(cur_pc, *next_pc);
+
+        if (ready > uint64_t(cpu->curCycle())) {
+            nextPredictCycle[tid] = ready;
+            break;
+        }
 
         if (debug::FTQ) {
             ftq->printFTQ(tid);
@@ -763,7 +792,8 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 bool
 BAC::updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
                      const StaticInstPtr &inst, PCStateBase &pc,
-                     const FetchTargetPtr &ft, const DynInstPtr &dyn_inst)
+                     const FetchTargetPtr &ft, const DynInstPtr &dyn_inst,
+                     FrontendPrediction *prediction)
 {
     assert(ft != nullptr);
     // The PC must be in the range of the fetch target.
@@ -897,12 +927,32 @@ BAC::updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
     }
 
     DPRINTF(BAC, "%s done. next PC:%s\n", __func__, pc);
-    if (cpu->markerBranchObservation) {
+    if (prediction) {
+        prediction->directionValid = hist->condPredValid;
+        prediction->originalDirection = hist->condPred;
+        prediction->btbHit = hist->btbHit;
+    }
+    if (dyn_inst && cpu->markerBranchObservation) {
         dyn_inst->branchDirectionPredictionValid = hist->condPredValid;
         dyn_inst->originalBranchDirectionPrediction = hist->condPred;
         dyn_inst->branchBtbHit = hist->btbHit;
     }
     return hist->predTaken;
+}
+
+FrontendPrediction
+BAC::predictFrontendInstruction(const StaticInstPtr &instruction,
+        InstSeqNum sequence, ThreadID tid, PCStateBase &next_pc,
+        const FetchTargetPtr &ft)
+{
+    FrontendPrediction result;
+    if (instruction->isControl()) {
+        result.taken = updatePreDecode(tid, sequence, instruction, next_pc,
+                                      ft, DynInstPtr(), &result);
+    } else {
+        instruction->advancePC(next_pc);
+    }
+    return result;
 }
 
 bool
@@ -983,6 +1033,7 @@ FrontendPrediction
 BAC::predictInstruction(const StaticInstPtr &instruction,
         InstSeqNum sequence, ThreadID tid, PCStateBase &next_pc)
 {
+    bpu->setUserMode(tid, cpu->inUserMode(tid));
     fatal_if(decoupledFrontEnd,
              "Record-based frontend requires coupled branch prediction");
     FrontendPrediction result;

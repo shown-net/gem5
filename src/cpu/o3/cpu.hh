@@ -47,6 +47,7 @@
 #include <iostream>
 #include <list>
 #include <queue>
+#include <array>
 #include <set>
 #include <vector>
 
@@ -623,7 +624,34 @@ class CPU : public BaseCPU
         statistics::Scalar quiesceCycles;
     } cpuStats;
 
+    struct BranchInstStats : public statistics::Group
+    {
+        BranchInstStats(CPU *cpu);
+        statistics::Scalar ALL_BRANCHES, COND, INDIRECT, NEAR_RETURN;
+    } branchInstStats;
+
+    struct BranchMispStats : public statistics::Group
+    {
+        BranchMispStats(CPU *cpu);
+        statistics::Scalar ALL_BRANCHES, COND, INDIRECT, RET;
+    } branchMispStats;
+
+    struct UnhaltedClockStats : public statistics::Group
+    {
+        explicit UnhaltedClockStats(CPU *cpu);
+        void setActive(ThreadID tid, bool active);
+        void account();
+        void preDumpStats() override;
+        void resetStats() override;
+        CPU *owner;
+        std::array<bool, MaxThreads> running{};
+        std::array<uint64_t, MaxThreads> lastCycle{};
+        statistics::Scalar THREAD;
+    } unhaltedClockStats;
+
   public:
+    void recordBranchRetirement(const DynInstPtr &inst);
+
     // hardware transactional memory
     void htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
                             HtmFailureFaultCause cause) override;

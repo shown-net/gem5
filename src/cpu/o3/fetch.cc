@@ -1134,7 +1134,7 @@ Fetch::checkSignalsAndUpdate(ThreadID tid)
 
     // Check if the FTQ in has filled up and we can witch to running
     // otherwise continue waiting to fill up.
-    if (fetchStatus[tid] == FtqWait && !ftq->isEmpty(tid)) {
+    if (fetchStatus[tid] == FtqWait && ftq->isHeadReady(tid)) {
         DPRINTF(Fetch, "[tid:%i] FTQ is refilled -> running\n", tid);
         fetchStatus[tid] = Running;
         return true;

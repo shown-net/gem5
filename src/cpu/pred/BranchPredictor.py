@@ -115,6 +115,8 @@ class BTBSetAssociative(BTBIndexingPolicy):
     # This is above the index and offset bit
     tag_bits = Param.Unsigned(64, "number of bits in the tag")
 
+    full_address_tag = Param.Bool(False, "Retain all address bits in the tag")
+
     # Number of threads sharing the BTB
     numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
 
@@ -145,6 +147,50 @@ class SimpleBTB(BranchTargetBuffer):
     )
 
 
+class BTBLevel(SimObject):
+    type = "BTBLevel"
+    cxx_class = "gem5::branch_prediction::BTBLevel"
+    cxx_header = "cpu/pred/multi_level_btb.hh"
+
+    tagBits = Param.Unsigned(64, "Size of the BTB tags, in bits")
+    numEntries = Param.Unsigned(4096, "Number of BTB entries")
+    associativity = Param.Unsigned(8, "BTB associativity")
+    latency = Param.Cycles(1, "Time to provide the target")
+    inclusive = Param.Bool(False, "Write new entries to this level")
+    numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
+    replPolicy = Param.BaseReplacementPolicy(LRURP(), "BTB replacement policy")
+    indexingPolicy = Param.BTBIndexingPolicy(
+        BTBSetAssociative(
+            assoc=Parent.associativity, num_entries=Parent.numEntries,
+            set_shift=5, tag_bits=Parent.tagBits, full_address_tag=True,
+            numThreads=Parent.numThreads,
+        ),
+        "BTB indexing policy",
+    )
+
+
+class MultiLevelBTB(BranchTargetBuffer):
+    type = "MultiLevelBTB"
+    cxx_class = "gem5::branch_prediction::MultiLevelBTB"
+    cxx_header = "cpu/pred/multi_level_btb.hh"
+
+    levels = VectorParam.BTBLevel(
+        [
+            BTBLevel(numEntries=128, associativity=4, latency=0, inclusive=True),
+            BTBLevel(numEntries=6144, associativity=6, latency=1, inclusive=True),
+            BTBLevel(numEntries=12288, associativity=12, latency=2, inclusive=False),
+        ],
+        "BTB levels ordered from the uppermost to the lowermost",
+    )
+
+
+class BranchPathHistory(SimObject):
+    type = "BranchPathHistory"
+    cxx_class = "gem5::branch_prediction::BranchPathHistory"
+    cxx_header = "cpu/pred/path_predictors.hh"
+    numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
+
+
 class ConditionalPredictor(SimObject):
     type = "ConditionalPredictor"
     cxx_class = "gem5::branch_prediction::ConditionalPredictor"
@@ -159,6 +205,13 @@ class ConditionalPredictor(SimObject):
         Parent.speculativeHistUpdate,
         "Use speculative update for the conditional predictor",
     )
+
+
+class PathTAGE(ConditionalPredictor):
+    type = "PathTAGE"
+    cxx_class = "gem5::branch_prediction::PathTAGE"
+    cxx_header = "cpu/pred/path_predictors.hh"
+    pathHistory = Param.BranchPathHistory("Shared speculative path history")
 
 
 class IndirectPredictor(SimObject):
@@ -196,6 +249,13 @@ class SimpleIndirectPredictor(IndirectPredictor):
     )
 
 
+class PathIndirectPredictor(IndirectPredictor):
+    type = "PathIndirectPredictor"
+    cxx_class = "gem5::branch_prediction::PathIndirectPredictor"
+    cxx_header = "cpu/pred/path_predictors.hh"
+    pathHistory = Param.BranchPathHistory("Shared speculative path history")
+
+
 class BranchPredictor(SimObject):
     type = "BranchPredictor"
     cxx_class = "gem5::branch_prediction::BPredUnit"
@@ -225,6 +285,10 @@ class BranchPredictor(SimObject):
         "This info is only available from the BTB. "
         "Low-end CPUs predecoding might be used to identify branches. ",
     )
+    useReturnFallback = Param.Bool(
+        True,
+        "Allow near returns without a RAS target to use BTB or indirect targets",
+    )
     updateBTBAtSquash = Param.Bool(
         True,
         "Update the BTB at squash time instead of commit. This can be useful "
@@ -253,6 +317,19 @@ class BranchPredictor(SimObject):
         "instead of direction history from all branches. Widely implemented "
         "in modern server CPUs: https://ieeexplore.ieee.org/document/9246215",
     )
+
+
+class PathHistoryBranchPredictor(BranchPredictor):
+    """Candidate branch predictor with one shared logical path history."""
+    sharedHistory = BranchPathHistory()
+    conditionalBranchPred = PathTAGE(pathHistory=Parent.sharedHistory)
+    indirectBranchPred = PathIndirectPredictor(pathHistory=Parent.sharedHistory)
+    btb = MultiLevelBTB()
+    requiresBTBHit = True
+
+
+class PathHistoryNoReturnFallback(PathHistoryBranchPredictor):
+    useReturnFallback = False
 
 
 class LocalBP(ConditionalPredictor):

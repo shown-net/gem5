@@ -1414,6 +1414,7 @@ Commit::updateComInstStats(const DynInstPtr &inst)
     //  Control Instructions
     //
     cpu->commitStats[tid]->updateComCtrlStats(inst->staticInst);
+    cpu->recordBranchRetirement(inst);
 
     //
     //  Memory references

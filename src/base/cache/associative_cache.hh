@@ -236,6 +236,17 @@ class AssociativeCache : public Named
     virtual Entry*
     findVictim(const KeyType &key)
     {
+        return findVictim(key, [](const Entry &) {});
+    }
+
+    /** Inspect the selected entry before it and its replacement data are
+     * invalidated. The callback is only needed by clients that write victims
+     * into another level.
+     */
+    template <typename BeforeInvalidate>
+    Entry*
+    findVictim(const KeyType &key, BeforeInvalidate before_invalidate)
+    {
         auto candidates = indexingPolicy->getPossibleEntries(key);
 
         auto victim = static_cast<Entry*>(replPolicy->getVictim(candidates));
@@ -246,6 +257,7 @@ class AssociativeCache : public Named
                 "Replacing entry: %s\n", victim->print());
         }
 
+        before_invalidate(*victim);
         invalidate(victim);
 
         return victim;

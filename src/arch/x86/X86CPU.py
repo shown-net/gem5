@@ -43,6 +43,7 @@ from m5.objects.X86Decoder import X86Decoder
 from m5.objects.X86ISA import X86ISA
 from m5.objects.X86LocalApic import X86LocalApic
 from m5.objects.X86MMU import X86MMU
+from m5.objects.X86TLB import X86TLB
 from m5.proxy import Self
 
 
@@ -98,8 +99,19 @@ class DefaultX86FUPool(FUPool):
     ]
 
 
-class X86O3CPU(BaseO3CPU, X86CPU):
+def x86_o3_mmu():
+    """Default O3 instruction translation and shared second-level proxy."""
     mmu = X86MMU()
+    mmu.stlb = X86TLB(size=2048, entry_type="unified", spr_shared_domains=True)
+    mmu.itb.size = 256
+    mmu.itb.itlb_4k_ways = 8
+    mmu.itb.next_level = mmu.stlb
+    mmu.dtb.next_level = mmu.stlb
+    return mmu
+
+
+class X86O3CPU(BaseO3CPU, X86CPU):
+    mmu = x86_o3_mmu()
     needsTSO = True
 
     # Development measurements always use the implemented integer structure.

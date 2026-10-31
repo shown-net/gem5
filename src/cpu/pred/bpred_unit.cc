@@ -58,6 +58,7 @@ namespace branch_prediction
 BPredUnit::BPredUnit(const Params &params)
     : SimObject(params), numThreads(params.numThreads),
       requiresBTBHit(params.requiresBTBHit),
+      useReturnFallback(params.useReturnFallback),
       updateBTBAtSquash(params.updateBTBAtSquash),
       instShiftAmt(params.instShiftAmt), predHist(numThreads), btb(params.btb),
       ras(params.ras), cPred(params.conditionalBranchPred),
@@ -178,12 +179,13 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
      * chance to detect a branch without a BTB hit.
      */
     stats.BTBLookups++;
+    hist->btbLatency = btb->lookupLatency(tid, pc.instAddr());
     const PCStateBase * btb_target = btb->lookup(tid, pc.instAddr(), brType);
     if (btb_target) {
         stats.BTBHits++;
         hist->btbHit = true;
 
-        if (hist->predTaken) {
+        if (hist->predTaken && (useReturnFallback || !inst->isRasReturn())) {
             hist->targetProvider = TargetProvider::BTB;
             set(hist->target, btb_target);
         }
@@ -210,7 +212,7 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
      *    top of the RAS.
      */
     if (ras && branch_detected) {
-        if (inst->isCall()) {
+        if (inst->isRasCall()) {
             // In case of a call build the return address and
             // push it to the RAS.
             auto return_addr = inst->buildRetPC(pc, pc);
@@ -221,7 +223,7 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
                     tid, seqNum, pc, *return_addr);
 
         }
-        else if (inst->isReturn()) {
+        else if (inst->isRasReturn()) {
 
             // If it's a return from a function call, then look up the
             // RETURN address in the RAS.
@@ -253,7 +255,9 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
      * to save space in the indirect predictor itself.
      */
     if (iPred && hist->predTaken && branch_detected &&
-        inst->isIndirectCtrl() && !inst->isReturn()) {
+        (inst->isNearIndirectBranch() ||
+         (useReturnFallback && inst->isRasReturn() &&
+          hist->targetProvider != TargetProvider::RAS))) {
 
         ++stats.indirectLookups;
 
@@ -358,6 +362,8 @@ BPredUnit::commitBranch(ThreadID tid, PredictorHistory* &hist)
 {
 
     stats.committed[tid][hist->type]++;
+    if (hist->type == BranchType::Return)
+        stats.returnTargetProvider[tid][hist->targetProvider]++;
     if (hist->mispredict) {
         stats.mispredicted[tid][hist->type]++;
         // stats for identifying miss-prediction due to BTB or predictor
@@ -542,7 +548,7 @@ BPredUnit::squash(const InstSeqNum &squashed_sn,
             if (actually_taken && (hist->rasHistory == nullptr)) {
 
                 // A return has not poped the RAS.
-                if (hist->type == BranchType::Return) {
+                if (hist->inst->isRasReturn()) {
                     DPRINTF(Branch, "[tid:%i] [squash sn:%llu] "
                         "Incorrectly predicted return [sn:%llu] PC: %#x\n",
                         tid, squashed_sn, hist->seqNum, hist->pc);
@@ -551,7 +557,7 @@ BPredUnit::squash(const InstSeqNum &squashed_sn,
                 }
 
                 // A call has not pushed a return address to the RAS.
-                if (hist->call) {
+                if (hist->inst->isRasCall()) {
                     // In case of a call build the return address and
                     // push it to the RAS.
                     auto return_addr = hist->inst->buildRetPC(
@@ -678,6 +684,8 @@ BPredUnit::BPredUnitStats::BPredUnitStats(BPredUnit *bp)
       ADD_STAT(targetWrong, statistics::units::Count::get(),
               "Number of branches where the target was incorrect or not "
               "available at prediction time."),
+      ADD_STAT(returnTargetProvider, statistics::units::Count::get(),
+              "Initial target provider for committed return prediction records"),
       ADD_STAT(condPredicted, statistics::units::Count::get(),
                "Number of conditional branches predicted"),
       ADD_STAT(condPredictedTaken, statistics::units::Count::get(),
@@ -755,9 +763,12 @@ BPredUnit::BPredUnitStats::BPredUnitStats(BPredUnit *bp)
     targetProvider.ysubnames(enums::TargetProviderStrings);
 
     targetWrong
-        .init(bp->numThreads, enums::Num_BranchType)
+        .init(bp->numThreads, enums::Num_TargetProvider)
         .flags(total | pdf);
-    targetWrong.ysubnames(enums::BranchTypeStrings);
+    targetWrong.ysubnames(enums::TargetProviderStrings);
+    returnTargetProvider.init(bp->numThreads, enums::Num_TargetProvider)
+        .flags(total | pdf);
+    returnTargetProvider.ysubnames(enums::TargetProviderStrings);
 
 }
 

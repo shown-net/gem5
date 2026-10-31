@@ -1309,6 +1309,8 @@ IEW::executeInsts()
             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
 
             if (inst->mispredicted() && !loadNotExecuted) {
+                inst->executionBranchMispredicted =
+                    inst->mispredictedArchitecturalAddress();
                 inst->setBranchPredMispredicted();
                 fetchRedirect[tid] = true;
 
@@ -1618,6 +1620,8 @@ IEW::checkMisprediction(const DynInstPtr& inst)
         toCommit->squashedSeqNum[tid] > inst->seqNum) {
 
         if (inst->mispredicted()) {
+            inst->executionBranchMispredicted =
+                inst->mispredictedArchitecturalAddress();
             inst->setBranchPredMispredicted();
             fetchRedirect[tid] = true;
 

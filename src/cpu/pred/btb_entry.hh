@@ -78,7 +78,7 @@ class BTBSetAssociative : public BTBIndexingPolicy
 
     BTBSetAssociative(const Params &p)
         : BTBIndexingPolicy(p, p.num_entries, p.set_shift),
-          tagMask(mask(p.tag_bits))
+          tagMask(mask(p.tag_bits)), fullAddressTag(p.full_address_tag)
     {
         setNumThreads(p.numThreads);
     }
@@ -124,7 +124,7 @@ class BTBSetAssociative : public BTBIndexingPolicy
     Addr
     extractTag(const Addr addr) const override
     {
-        return (addr >> tagShift) & tagMask;
+        return (fullAddressTag ? addr : (addr >> tagShift)) & tagMask;
     }
 
     Addr regenerateAddr(const KeyType &key,
@@ -136,6 +136,7 @@ class BTBSetAssociative : public BTBIndexingPolicy
 
   private:
     const uint64_t tagMask;
+    const bool fullAddressTag;
     unsigned log2NumThreads;
 };
 
@@ -151,7 +152,8 @@ class BTBEntry : public ReplaceableEntry
 
     /** Default constructor */
     BTBEntry(TagExtractor ext)
-        : inst(nullptr), extractTag(ext), valid(false), tag({MaxAddr, -1})
+        : inst(nullptr), extractTag(ext), valid(false), tag({MaxAddr, -1}),
+          branchPC(0)
     {}
 
     /** Update the target and instruction in the BTB entry.
@@ -184,6 +186,7 @@ class BTBEntry : public ReplaceableEntry
     {
         setValid();
         setTag({extractTag(key.address), key.tid});
+        branchPC = key.address;
     }
 
     /** Copy constructor */
@@ -193,6 +196,7 @@ class BTBEntry : public ReplaceableEntry
         tag        = other.tag;
         inst       = other.inst;
         extractTag = other.extractTag;
+        branchPC   = other.branchPC;
         set(target, other.target);
     }
 
@@ -203,6 +207,7 @@ class BTBEntry : public ReplaceableEntry
         tag        = other.tag;
         inst       = other.inst;
         extractTag = other.extractTag;
+        branchPC   = other.branchPC;
         set(target, other.target);
 
         return *this;
@@ -217,6 +222,7 @@ class BTBEntry : public ReplaceableEntry
      * Get tag associated to this block.
      */
     KeyType getTag() const { return tag; }
+    Addr getBranchPC() const { return branchPC; }
 
     /** Invalidate the block. Its contents are no longer valid. */
     void
@@ -266,6 +272,7 @@ class BTBEntry : public ReplaceableEntry
 
     /** The entry's tag. */
     KeyType tag;
+    Addr branchPC;
 };
 
 } // namespace gem5::branch_prediction

@@ -115,7 +115,10 @@ CPU::CPU(const BaseO3CPUParams &params)
       globalFTSeqNum(1),
       system(params.system),
       lastRunningCycle(curCycle()),
-      cpuStats(this)
+      cpuStats(this),
+      branchInstStats(this),
+      branchMispStats(this),
+      unhaltedClockStats(this)
 {
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
@@ -123,8 +126,6 @@ CPU::CPU(const BaseO3CPUParams &params)
     zeroIdiom = params.zeroIdiom;
     frontend = params.frontend;
     if (frontend) {
-        fatal_if(params.decoupledFrontEnd,
-                 "Component frontend does not use a second FTQ supply loop");
         frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
         auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
         fatal_if(!x86_mmu, "Component frontend requires native x86 Execute translation");
@@ -379,6 +380,86 @@ CPU::CPUStats::CPUStats(CPU *cpu)
         .prereq(quiesceCycles);
 }
 
+CPU::BranchInstStats::BranchInstStats(CPU *cpu)
+    : statistics::Group(cpu, "BR_INST_RETIRED"),
+      ADD_STAT(ALL_BRANCHES, statistics::units::Count::get(),
+               "Retired architectural branch instructions"),
+      ADD_STAT(COND, statistics::units::Count::get(),
+               "Retired conditional branch instructions"),
+      ADD_STAT(INDIRECT, statistics::units::Count::get(),
+               "Retired near indirect branches excluding returns"),
+      ADD_STAT(NEAR_RETURN, statistics::units::Count::get(),
+               "Retired near return instructions")
+{}
+
+CPU::BranchMispStats::BranchMispStats(CPU *cpu)
+    : statistics::Group(cpu, "BR_MISP_RETIRED"),
+      ADD_STAT(ALL_BRANCHES, statistics::units::Count::get(),
+               "Retired branches with an execution-detected wrong address"),
+      ADD_STAT(COND, statistics::units::Count::get(),
+               "Retired conditional branches with a wrong address"),
+      ADD_STAT(INDIRECT, statistics::units::Count::get(),
+               "Retired near indirect branches with a wrong address"),
+      ADD_STAT(RET, statistics::units::Count::get(),
+               "Retired isReturn branches with a wrong address")
+{}
+
+CPU::UnhaltedClockStats::UnhaltedClockStats(CPU *cpu)
+    : statistics::Group(cpu, "CPU_CLK_UNHALTED"), owner(cpu),
+      ADD_STAT(THREAD, statistics::units::Cycle::get(),
+               "Cycles while a logical O3 thread is not halted")
+{}
+
+void
+CPU::UnhaltedClockStats::account()
+{
+    const uint64_t now = uint64_t(owner->curCycle());
+    for (ThreadID tid = 0; tid < owner->numThreads; ++tid) {
+        if (running[tid]) THREAD += now - lastCycle[tid];
+        lastCycle[tid] = now;
+    }
+}
+
+void
+CPU::UnhaltedClockStats::setActive(ThreadID tid, bool active)
+{
+    account();
+    running.at(tid) = active;
+}
+
+void
+CPU::UnhaltedClockStats::preDumpStats()
+{
+    account();
+    statistics::Group::preDumpStats();
+}
+
+void
+CPU::UnhaltedClockStats::resetStats()
+{
+    account();
+    statistics::Group::resetStats();
+}
+
+void
+CPU::recordBranchRetirement(const DynInstPtr &inst)
+{
+    if (inst->notAnInst() ||
+        (inst->isMicroop() && !inst->isLastMicroop()) ||
+        !inst->staticInst->isArchitecturalBranch())
+        return;
+    const auto &op = inst->staticInst;
+    ++branchInstStats.ALL_BRANCHES;
+    if (op->isArchitecturalConditionalBranch()) ++branchInstStats.COND;
+    if (op->isNearIndirectBranch()) ++branchInstStats.INDIRECT;
+    if (op->isRasReturn()) ++branchInstStats.NEAR_RETURN;
+    if (!inst->executionBranchMispredicted) return;
+    ++branchMispStats.ALL_BRANCHES;
+    if (op->isArchitecturalConditionalBranch()) ++branchMispStats.COND;
+    if (op->isNearIndirectBranch()) ++branchMispStats.INDIRECT;
+    if (op->isReturn()) ++branchMispStats.RET;
+}
+
 void
 CPU::tick()
 {
@@ -474,6 +555,7 @@ CPU::startup()
 void
 CPU::activateThread(ThreadID tid)
 {
+    unhaltedClockStats.setActive(tid, true);
     auto active_it = std::find(
             activeThreads.begin(), activeThreads.end(), tid);
 
@@ -490,6 +572,7 @@ CPU::activateThread(ThreadID tid)
 void
 CPU::deactivateThread(ThreadID tid)
 {
+    unhaltedClockStats.setActive(tid, false);
     // hardware transactional memory
     // shouldn't deactivate thread in the middle of a transaction
     assert(!commit.executingHtmTransaction(tid));
@@ -915,6 +998,8 @@ void
 CPU::switchOut()
 {
     DPRINTF(O3CPU, "Switching out\n");
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        unhaltedClockStats.setActive(tid, false);
     BaseCPU::switchOut();
 
     activityRec.reset();

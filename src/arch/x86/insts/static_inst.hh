@@ -101,6 +101,60 @@ struct SegRegIndex
 class X86StaticInst : public StaticInst
 {
   public:
+    bool isArchitecturalBranch() const override
+    {
+        if (!isControl()) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (machInst.opcode.type == TwoByteOpcode)
+            return (opcode >= 0x80 && opcode <= 0x8f) ||
+                opcode == 0x05 || opcode == 0x07 ||
+                opcode == 0x34 || opcode == 0x35;
+        if (machInst.opcode.type != OneByteOpcode) return false;
+        return (opcode >= 0x70 && opcode <= 0x7f) ||
+            (opcode >= 0xe0 && opcode <= 0xe3) ||
+            opcode == 0xe8 || opcode == 0xe9 || opcode == 0xeb ||
+            opcode == 0x9a || opcode == 0xea || opcode == 0xc2 ||
+            opcode == 0xc3 || opcode == 0xca || opcode == 0xcb ||
+            opcode == 0xcf || (opcode == 0xff &&
+                machInst.modRM.reg >= 2 && machInst.modRM.reg <= 5);
+    }
+
+    bool isArchitecturalConditionalBranch() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return isArchitecturalBranch() &&
+            ((machInst.opcode.type == OneByteOpcode &&
+              ((opcode >= 0x70 && opcode <= 0x7f) ||
+               (opcode >= 0xe0 && opcode <= 0xe3))) ||
+             (machInst.opcode.type == TwoByteOpcode &&
+              opcode >= 0x80 && opcode <= 0x8f));
+    }
+
+    bool isRasCall() const override
+    {
+        if (!isCall() || machInst.opcode.type != OneByteOpcode)
+            return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return (opcode == 0xe8 && machInst.immediate != 0) ||
+            (opcode == 0xff && machInst.modRM.reg == 2);
+    }
+
+    bool isRasReturn() const override
+    {
+        if (!isReturn() || machInst.opcode.type != OneByteOpcode)
+            return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return opcode == 0xc2 || opcode == 0xc3;
+    }
+
+    bool isNearIndirectBranch() const override
+    {
+        return isIndirectCtrl() && !isReturn() &&
+            machInst.opcode.type == OneByteOpcode &&
+            uint8_t(machInst.opcode.op) == 0xff &&
+            (machInst.modRM.reg == 2 || machInst.modRM.reg == 4);
+    }
+
     RegVal zeroIdiomResult(RegIndex destination) const override
     {
         const auto &reg = destRegIdx(destination);

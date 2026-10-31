@@ -190,6 +190,7 @@ FTQ::insert(ThreadID tid, FetchTargetPtr fetchTarget)
     ppFTQInsert->notify(fetchTarget);
     stats.inserts++;
     stats.occupancy.sample(ftq[tid].size());
+    stats.insertOccupancy[ftq[tid].size()]++;
 
     DPRINTF(FTQ, "Insert %s in FTQ[T:%i]. size FTQ:%i\n",
             fetchTarget->toString(), tid, ftq[tid].size());
@@ -218,16 +219,14 @@ FTQ::squashSanityCheck(ThreadID tid)
 bool
 FTQ::isHeadReady(ThreadID tid)
 {
-    return (ftqStatus[tid] != Invalid) && (ftq[tid].size() > 0);
+    return (ftqStatus[tid] != Invalid) && !ftq[tid].empty() &&
+        ftq[tid].front()->ready(uint64_t(cpu->curCycle()));
 }
 
 FetchTargetPtr
 FTQ::readHead(ThreadID tid)
 {
-    if (ftqStatus[tid] == Invalid) {
-        return nullptr;
-    }
-    if (ftq[tid].empty()) {
+    if (!isHeadReady(tid)) {
         return nullptr;
     }
 
@@ -285,8 +284,11 @@ FTQ::FTQStats::FTQStats(o3::CPU *cpu, unsigned numFTQEntries)
       ADD_STAT(locks, statistics::units::Count::get(),
                "The number of times the FTQ got locked."),
       ADD_STAT(occupancy, statistics::units::Count::get(),
-               "Distribution of the FTQ occupation.")
+               "Distribution of the FTQ occupation."),
+      ADD_STAT(insertOccupancy, statistics::units::Count::get(),
+               "FTQ depth sampled after successful insertion")
 {
+    insertOccupancy.init(numFTQEntries + 1);
     occupancy
         .init(/* base value */ 0,
               /* last value */ numFTQEntries,
