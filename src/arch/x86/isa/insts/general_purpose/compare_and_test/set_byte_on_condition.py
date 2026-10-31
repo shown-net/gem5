@@ -41,337 +41,277 @@ def macroop SALC_R
 
 def macroop SETZ_R
 {
-    movi reg, reg, 1, flags=(CZF,)
-    movi reg, reg, 0, flags=(nCZF,)
+    setzvalue reg, reg, dataSize=1
 };
 
 def macroop SETZ_M
 {
-    movi t1, t1, 1, flags=(CZF,)
-    movi t1, t1, 0, flags=(nCZF,)
-    st t1, seg, sib, disp
+    setzvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETZ_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CZF,)
-    movi t1, t1, 0, flags=(nCZF,)
-    st t1, seg, riprel, disp
+    setzvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNZ_R
 {
-    movi reg, reg, 1, flags=(nCZF,)
-    movi reg, reg, 0, flags=(CZF,)
+    setnzvalue reg, reg, dataSize=1
 };
 
 def macroop SETNZ_M
 {
-    movi t1, t1, 1, flags=(nCZF,)
-    movi t1, t1, 0, flags=(CZF,)
-    st t1, seg, sib, disp
+    setnzvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNZ_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCZF,)
-    movi t1, t1, 0, flags=(CZF,)
-    st t1, seg, riprel, disp
+    setnzvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETB_R
 {
-    movi reg, reg, 1, flags=(CCF,)
-    movi reg, reg, 0, flags=(nCCF,)
+    setbvalue reg, reg, dataSize=1
 };
 
 def macroop SETB_M
 {
-    movi t1, t1, 1, flags=(CCF,)
-    movi t1, t1, 0, flags=(nCCF,)
-    st t1, seg, sib, disp
+    setbvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETB_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CCF,)
-    movi t1, t1, 0, flags=(nCCF,)
-    st t1, seg, riprel, disp
+    setbvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNB_R
 {
-    movi reg, reg, 1, flags=(nCCF,)
-    movi reg, reg, 0, flags=(CCF,)
+    setnbvalue reg, reg, dataSize=1
 };
 
 def macroop SETNB_M
 {
-    movi t1, t1, 1, flags=(nCCF,)
-    movi t1, t1, 0, flags=(CCF,)
-    st t1, seg, sib, disp
+    setnbvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNB_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCCF,)
-    movi t1, t1, 0, flags=(CCF,)
-    st t1, seg, riprel, disp
+    setnbvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
-def macroop SETBE_R
-{
-    movi reg, reg, 1, flags=(CCvZF,)
-    movi reg, reg, 0, flags=(nCCvZF,)
+def macroop SETBE_R {
+    conditionbe
+    setcondition reg, reg, dataSize=1
 };
 
 def macroop SETBE_M
 {
-    movi t1, t1, 1, flags=(CCvZF,)
-    movi t1, t1, 0, flags=(nCCvZF,)
-    st t1, seg, sib, disp
+    conditionbe
+    setcondition t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETBE_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CCvZF,)
-    movi t1, t1, 0, flags=(nCCvZF,)
-    st t1, seg, riprel, disp
+    conditionbe
+    setcondition t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
-def macroop SETNBE_R
-{
-    movi reg, reg, 1, flags=(nCCvZF,)
-    movi reg, reg, 0, flags=(CCvZF,)
+def macroop SETNBE_R {
+    conditionnbe
+    setcondition reg, reg, dataSize=1
 };
 
 def macroop SETNBE_M
 {
-    movi t1, t1, 1, flags=(nCCvZF,)
-    movi t1, t1, 0, flags=(CCvZF,)
-    st t1, seg, sib, disp
+    conditionnbe
+    setcondition t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNBE_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCCvZF,)
-    movi t1, t1, 0, flags=(CCvZF,)
-    st t1, seg, riprel, disp
+    conditionnbe
+    setcondition t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETS_R
 {
-    movi reg, reg, 1, flags=(CSF,)
-    movi reg, reg, 0, flags=(nCSF,)
+    setsvalue reg, reg, dataSize=1
 };
 
 def macroop SETS_M
 {
-    movi t1, t1, 1, flags=(CSF,)
-    movi t1, t1, 0, flags=(nCSF,)
-    st t1, seg, sib, disp
+    setsvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETS_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CSF,)
-    movi t1, t1, 0, flags=(nCSF,)
-    st t1, seg, riprel, disp
+    setsvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNS_R
 {
-    movi reg, reg, 1, flags=(nCSF,)
-    movi reg, reg, 0, flags=(CSF,)
+    setnsvalue reg, reg, dataSize=1
 };
 
 def macroop SETNS_M
 {
-    movi t1, t1, 1, flags=(nCSF,)
-    movi t1, t1, 0, flags=(CSF,)
-    st t1, seg, sib, disp
+    setnsvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNS_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCSF,)
-    movi t1, t1, 0, flags=(CSF,)
-    st t1, seg, riprel, disp
+    setnsvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETP_R
 {
-    movi reg, reg, 1, flags=(CPF,)
-    movi reg, reg, 0, flags=(nCPF,)
+    setpvalue reg, reg, dataSize=1
 };
 
 def macroop SETP_M
 {
-    movi t1, t1, 1, flags=(CPF,)
-    movi t1, t1, 0, flags=(nCPF,)
-    st t1, seg, sib, disp
+    setpvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETP_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CPF,)
-    movi t1, t1, 0, flags=(nCPF,)
-    st t1, seg, riprel, disp
+    setpvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNP_R
 {
-    movi reg, reg, 1, flags=(nCPF,)
-    movi reg, reg, 0, flags=(CPF,)
+    setnpvalue reg, reg, dataSize=1
 };
 
 def macroop SETNP_M
 {
-    movi t1, t1, 1, flags=(nCPF,)
-    movi t1, t1, 0, flags=(CPF,)
-    st t1, seg, sib, disp
+    setnpvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNP_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCPF,)
-    movi t1, t1, 0, flags=(CPF,)
-    st t1, seg, riprel, disp
+    setnpvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETL_R
 {
-    movi reg, reg, 1, flags=(CSxOF,)
-    movi reg, reg, 0, flags=(nCSxOF,)
+    setlvalue reg, reg, dataSize=1
 };
 
 def macroop SETL_M
 {
-    movi t1, t1, 1, flags=(CSxOF,)
-    movi t1, t1, 0, flags=(nCSxOF,)
-    st t1, seg, sib, disp
+    setlvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETL_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CSxOF,)
-    movi t1, t1, 0, flags=(nCSxOF,)
-    st t1, seg, riprel, disp
+    setlvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNL_R
 {
-    movi reg, reg, 1, flags=(nCSxOF,)
-    movi reg, reg, 0, flags=(CSxOF,)
+    setnlvalue reg, reg, dataSize=1
 };
 
 def macroop SETNL_M
 {
-    movi t1, t1, 1, flags=(nCSxOF,)
-    movi t1, t1, 0, flags=(CSxOF,)
-    st t1, seg, sib, disp
+    setnlvalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNL_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCSxOF,)
-    movi t1, t1, 0, flags=(CSxOF,)
-    st t1, seg, riprel, disp
+    setnlvalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETLE_R
 {
-    movi reg, reg, 1, flags=(CSxOvZF,)
-    movi reg, reg, 0, flags=(nCSxOvZF,)
+    setlevalue reg, reg, dataSize=1
 };
 
 def macroop SETLE_M
 {
-    movi t1, t1, 1, flags=(CSxOvZF,)
-    movi t1, t1, 0, flags=(nCSxOvZF,)
-    st t1, seg, sib, disp
+    setlevalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETLE_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(CSxOvZF,)
-    movi t1, t1, 0, flags=(nCSxOvZF,)
-    st t1, seg, riprel, disp
+    setlevalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNLE_R
 {
-    movi reg, reg, 1, flags=(nCSxOvZF,)
-    movi reg, reg, 0, flags=(CSxOvZF,)
+    setnlevalue reg, reg, dataSize=1
 };
 
 def macroop SETNLE_M
 {
-    movi t1, t1, 1, flags=(nCSxOvZF,)
-    movi t1, t1, 0, flags=(CSxOvZF,)
-    st t1, seg, sib, disp
+    setnlevalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNLE_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCSxOvZF,)
-    movi t1, t1, 0, flags=(CSxOvZF,)
-    st t1, seg, riprel, disp
+    setnlevalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETO_R
 {
-    movi reg, reg, 1, flags=(COF,)
-    movi reg, reg, 0, flags=(nCOF,)
+    setovalue reg, reg, dataSize=1
 };
 
 def macroop SETO_M
 {
-    movi t1, t1, 1, flags=(COF,)
-    movi t1, t1, 0, flags=(nCOF,)
-    st t1, seg, sib, disp
+    setovalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETO_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(COF,)
-    movi t1, t1, 0, flags=(nCOF,)
-    st t1, seg, riprel, disp
+    setovalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 
 def macroop SETNO_R
 {
-    movi reg, reg, 1, flags=(nCOF,)
-    movi reg, reg, 0, flags=(COF,)
+    setnovalue reg, reg, dataSize=1
 };
 
 def macroop SETNO_M
 {
-    movi t1, t1, 1, flags=(nCOF,)
-    movi t1, t1, 0, flags=(COF,)
-    st t1, seg, sib, disp
+    setnovalue t1, t0, dataSize=8
+    st t1, seg, sib, disp, dataSize=1
 };
 
 def macroop SETNO_P
 {
-    rdip t7
-    movi t1, t1, 1, flags=(nCOF,)
-    movi t1, t1, 0, flags=(COF,)
-    st t1, seg, riprel, disp
+    setnovalue t1, t0, dataSize=8
+    strip t1, seg, riprel, disp, dataSize=1
 };
 """

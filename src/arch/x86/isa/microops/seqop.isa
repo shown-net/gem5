@@ -156,7 +156,7 @@ let {{
                 "cc" : self.cond}
     microopClasses["eret"] = Eret
 
-    cond_code = "checkCondition(ccFlagBits | cfofBits | dfBit |" \
+    cond_code = "checkCondition(ccFlagBits | (cfBit | ofBit) | dfBit |" \
                  "ecfBit | ezfBit, cc)"
     for suffix, cond, flags in \
             ("Flags", cond_code, ["IsDirectControl", "IsCondControl"]), \

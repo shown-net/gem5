@@ -28,7 +28,76 @@
 //
 // Decode the three byte opcodes with the 0f38 prefix.
 //
-'X86ISA::ThreeByte0F38Opcode': decode LEGACY_OP {
+'X86ISA::ThreeByte0F38Opcode': decode OPCODE_OP {
+    0xF2: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        0: decode LEGACY_REPNE {
+                            0: decode LEGACY_REP {
+                                0: Inst::ANDN(Gdp, Edp);
+                                default: Inst::UD2();
+                            }
+                            default: Inst::UD2();
+                        }
+                        default: Inst::UD2();
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: Inst::UD2();
+    }
+    0xF3: decode VEX_PRESENT {
+        1: decode MODE_SUBMODE {
+            'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();
+            default: decode VEX_L {
+                0: decode LEGACY_LOCK {
+                    0: decode LEGACY_OP {
+                        0: decode LEGACY_REPNE {
+                            0: decode LEGACY_REP {
+                                0: decode MODRM_REG {
+                                    1: Inst::BLSR(Edp);
+                                    2: Inst::BLSMSK(Edp);
+                                    3: Inst::BLSI(Edp);
+                                    default: Inst::UD2();
+                                }
+                                default: Inst::UD2();
+                            }
+                            default: Inst::UD2();
+                        }
+                        default: Inst::UD2();
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+        }
+        default: Inst::UD2();
+    }
+    0xF6: decode VEX_PRESENT {
+        0: decode LEGACY_LOCK {
+            0: decode LEGACY_REPNE {
+                0: decode LEGACY_OP {
+                    1: decode LEGACY_REP {
+                        0: Inst::ADCX(Gdp, Edp);
+                        default: Inst::UD2();
+                    }
+                    default: decode LEGACY_REP {
+                        1: Inst::ADOX(Gdp, Edp);
+                        default: Inst::UD2();
+                    }
+                }
+                default: Inst::UD2();
+            }
+            default: Inst::UD2();
+        }
+        default: Inst::UD2();
+    }
+    default: decode LEGACY_OP {
     format WarnUnimpl {
         1: decode OPCODE_OP {
             0x00: Inst::PSHUFB(Vo, Wo);
@@ -167,4 +236,5 @@
             }
         }
     }
+}
 }

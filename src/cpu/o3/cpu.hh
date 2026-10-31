@@ -96,6 +96,7 @@ class ThreadContext;
 class CPU : public BaseCPU
 {
   public:
+    bool markerObservation = false;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;

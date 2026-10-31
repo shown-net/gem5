@@ -73,7 +73,7 @@ class X86ISA(BaseISA):
     #     https://sandpile.org/x86/cpuid.htm
     # 0000_0001h
     FamilyModelStepping = VectorParam.UInt32(
-        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00000209],
+        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00800209],
         "type/family/model/stepping and feature flags",
     )
     # 0000_0004h
@@ -83,8 +83,8 @@ class X86ISA(BaseISA):
     )
     # 0000_0007h
     ExtendedFeatures = VectorParam.UInt32(
-        # CPUID.7.0:EBX[0] exposes the implemented FSGSBASE instructions.
-        [0x00000000, 0x01800001, 0x00000000, 0x00000000], "feature flags"
+        # FSGSBASE and validated ADCX/ADOX. The partial BMI1 set stays hidden.
+        [0x00000000, 0x01880001, 0x00000000, 0x00000000], "feature flags"
     )
     # 0000_000Dh - This uses ECX index, so the last entry must be all zeros
     ExtendedState = VectorParam.UInt32(

@@ -35,8 +35,7 @@
 
 microcode = """
 def macroop PXOR_XMM_XMM {
-    mxor xmml, xmml, xmmlm
-    mxor xmmh, xmmh, xmmhm
+    mxmmxor xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop PXOR_XMM_M {

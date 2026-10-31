@@ -38,12 +38,10 @@ microcode = """
 def macroop JMP_I
 {
     # Make the default data size of jumps 64 bits in 64 bit mode
-    .adjust_env oszIn64Override
+    .adjust_env oszNearControl
     .control_direct
 
-    rdip t1
-    limm t2, imm
-    wrip t1, t2
+    jmprel imm
 };
 
 def macroop JMP_R

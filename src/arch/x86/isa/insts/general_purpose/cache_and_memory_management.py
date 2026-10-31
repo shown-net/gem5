@@ -41,8 +41,7 @@ def macroop PREFETCH_M
 
 def macroop PREFETCH_P
 {
-    rdip t7
-    ld t0, seg, riprel, disp, dataSize=1, prefetch=True
+    ldrip t0, seg, riprel, disp, dataSize=1, prefetch=True
 };
 
 def macroop PREFETCH_T0_M
@@ -52,8 +51,7 @@ def macroop PREFETCH_T0_M
 
 def macroop PREFETCH_T0_P
 {
-    rdip t7
-    ld t0, seg, riprel, disp, dataSize=1, prefetch=True
+    ldrip t0, seg, riprel, disp, dataSize=1, prefetch=True
 };
 
 def macroop CLFLUSH_M

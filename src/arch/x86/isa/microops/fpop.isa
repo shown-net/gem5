@@ -287,7 +287,7 @@ let {{
         '''
         big_code = 'FpDestReg_uqw = FpSrcReg1_uqw;'
         else_code = 'FpDestReg_uqw = FpDestReg_uqw;'
-        cond_check = "checkCondition(ccFlagBits | cfofBits | dfBit | \
+        cond_check = "checkCondition(ccFlagBits | (cfBit | ofBit) | dfBit | \
                                      ecfBit | ezfBit, src1)"
         op_class = 'IntAluOp'
 
@@ -434,14 +434,14 @@ let {{
             // Equal          1  0  0
             //           OF = SF = AF = 0
             ccFlagBits = ccFlagBits & ~(SFBit | AFBit | ZFBit | PFBit);
-            cfofBits = cfofBits & ~(OFBit | CFBit);
+            { const uint64_t flagsValue = (cfBit | ofBit) & ~(OFBit | CFBit); cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
 
             if (std::isnan(FpSrcReg1) || std::isnan(FpSrcReg2)) {
                 ccFlagBits = ccFlagBits | (ZFBit | PFBit);
-                cfofBits = cfofBits | CFBit;
+                { const uint64_t flagsValue = (cfBit | ofBit) | CFBit; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             }
             else if(FpSrcReg1 < FpSrcReg2)
-                cfofBits = cfofBits | CFBit;
+                { const uint64_t flagsValue = (cfBit | ofBit) | CFBit; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             else if(FpSrcReg1 == FpSrcReg2)
                 ccFlagBits = ccFlagBits | ZFBit;
         '''

@@ -35,8 +35,7 @@
 
 microcode = """
 def macroop XORPD_XMM_XMM {
-    mxor xmml, xmml, xmmlm
-    mxor xmmh, xmmh, xmmhm
+    mxmmxor xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop XORPD_XMM_M {
@@ -55,8 +54,7 @@ def macroop XORPD_XMM_P {
 };
 
 def macroop XORPS_XMM_XMM {
-    mxor xmml, xmml, xmmlm
-    mxor xmmh, xmmh, xmmhm
+    mxmmxor xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop XORPS_XMM_M {

@@ -40,8 +40,7 @@ microcode = """
 #
 
 def macroop MOV_R_MI {
-    limm t1, imm, dataSize=asz
-    ld reg, seg, [1, t0, t1]
+    ld reg, seg, [0, t0, t0], imm
 };
 
 def macroop MOV_MI_R {
@@ -67,8 +66,7 @@ def macroop MOV_R_M {
 };
 
 def macroop MOV_R_P {
-    rdip t7
-    ld reg, seg, riprel, disp
+    ldrip reg, seg, riprel, disp
 };
 
 def macroop MOV_R_I {
@@ -91,34 +89,27 @@ def macroop MOV_P_I {
 #
 
 def macroop MOVSXD_R_R {
-    sexti reg, regm, 31
+    sexti reg, regm, "env.dataSize == 2 ? 15 : 31"
 };
 
 def macroop MOVSXD_R_M {
-    ld t1, seg, sib, disp, dataSize=4
-    sexti reg, t1, 31
+    ldsxd reg, seg, sib, disp
 };
 
 def macroop MOVSXD_R_P {
-    rdip t7
-    ld t1, seg, riprel, disp, dataSize=4
-    sexti reg, t1, 31
+    ldsxdrip reg, seg, riprel, disp
 };
 
 def macroop MOVSX_B_R_R {
-    mov t1, t1, regm, dataSize=1
-    sexti reg, t1, 7
+    sextbyte reg, byteregm
 };
 
 def macroop MOVSX_B_R_M {
-    ld t1, seg, sib, disp, dataSize=1
-    sexti reg, t1, 7
+    ldsxb reg, seg, sib, disp
 };
 
 def macroop MOVSX_B_R_P {
-    rdip t7
-    ld t1, seg, riprel, disp, dataSize=1
-    sexti reg, t1, 7
+    ldsxbrip reg, seg, riprel, disp
 };
 
 def macroop MOVSX_W_R_R {
@@ -126,14 +117,11 @@ def macroop MOVSX_W_R_R {
 };
 
 def macroop MOVSX_W_R_M {
-    ld reg, seg, sib, disp, dataSize=2
-    sexti reg, reg, 15
+    ldsxw reg, seg, sib, disp
 };
 
 def macroop MOVSX_W_R_P {
-    rdip t7
-    ld reg, seg, riprel, disp, dataSize=2
-    sexti reg, reg, 15
+    ldsxwrip reg, seg, riprel, disp
 };
 
 #
@@ -141,19 +129,15 @@ def macroop MOVSX_W_R_P {
 #
 
 def macroop MOVZX_B_R_R {
-    mov t1, t1, regm, dataSize=1
-    zexti reg, t1, 7
+    zextbyte reg, byteregm
 };
 
 def macroop MOVZX_B_R_M {
-    ld t1, seg, sib, disp, dataSize=1
-    zexti reg, t1, 7
+    ldzxb reg, seg, sib, disp
 };
 
 def macroop MOVZX_B_R_P {
-    rdip t7
-    ld t1, seg, riprel, disp, dataSize=1
-    zexti reg, t1, 7
+    ldzxbrip reg, seg, riprel, disp
 };
 
 def macroop MOVZX_W_R_R {
@@ -161,14 +145,11 @@ def macroop MOVZX_W_R_R {
 };
 
 def macroop MOVZX_W_R_M {
-    ld t1, seg, sib, disp, dataSize=2
-    zexti reg, t1, 15
+    ldzxw reg, seg, sib, disp
 };
 
 def macroop MOVZX_W_R_P {
-    rdip t7
-    ld t1, seg, riprel, disp, dataSize=2
-    zexti reg, t1, 15
+    ldzxwrip reg, seg, riprel, disp
 };
 
 def macroop MOV_C_R {
@@ -262,8 +243,7 @@ processDescriptor:
 };
 
 def macroop MOV_S_P {
-    rdip t7
-    ld t1, seg, riprel, disp, dataSize=2
+    ldrip t1, seg, riprel, disp, dataSize=2
     andi t0, t1, 0xFC, flags=(EZF,), dataSize=2
     br label("processDescriptor"), flags=(CEZF,)
     andi t2, t1, 0xF8, dataSize=8
@@ -313,8 +293,7 @@ processDescriptor:
 };
 
 def macroop MOVSS_S_P {
-    rdip t7
-    ld t1, seg, riprel, disp, dataSize=2
+    ldrip t1, seg, riprel, disp, dataSize=2
     andi t0, t1, 0xFC, flags=(EZF,), dataSize=2
     br label("processDescriptor"), flags=(CEZF,)
     andi t2, t1, 0xF8, dataSize=8
@@ -375,3 +354,65 @@ def macroop MOVD_P_XMM {
 #    class MOVD(Inst):
 #       "GenFault ${new UnimpInstFault}"
 # }};
+
+microcode += """
+def macroop MOV_R_M_PARTIAL {
+    ld t1, seg, sib, disp
+    mov reg, reg, t1
+};
+
+def macroop MOV_R_P_PARTIAL {
+    ldrip t1, seg, riprel, disp
+    mov reg, reg, t1
+};
+
+def macroop MOVSX_B_R_M_16 {
+    ld t1, seg, sib, disp, dataSize=1
+    sexti reg, t1, 7
+};
+
+def macroop MOVSX_B_R_P_16 {
+    ldrip t1, seg, riprel, disp, dataSize=1
+    sexti reg, t1, 7
+};
+
+def macroop MOVSX_W_R_M_16 {
+    ld t1, seg, sib, disp, dataSize=2
+    sexti reg, t1, 15
+};
+
+def macroop MOVSX_W_R_P_16 {
+    ldrip t1, seg, riprel, disp, dataSize=2
+    sexti reg, t1, 15
+};
+
+def macroop MOVZX_B_R_M_16 {
+    ld t1, seg, sib, disp, dataSize=1
+    zexti reg, t1, 7
+};
+
+def macroop MOVZX_B_R_P_16 {
+    ldrip t1, seg, riprel, disp, dataSize=1
+    zexti reg, t1, 7
+};
+
+def macroop MOVZX_W_R_M_16 {
+    ld t1, seg, sib, disp, dataSize=2
+    zexti reg, t1, 15
+};
+
+def macroop MOVZX_W_R_P_16 {
+    ldrip t1, seg, riprel, disp, dataSize=2
+    zexti reg, t1, 15
+};
+
+def macroop MOVSXD_R_M_16 {
+    ld t1, seg, sib, disp, dataSize=2
+    sexti reg, t1, 15
+};
+
+def macroop MOVSXD_R_P_16 {
+    ldrip t1, seg, riprel, disp, dataSize=2
+    sexti reg, t1, 15
+};
+"""

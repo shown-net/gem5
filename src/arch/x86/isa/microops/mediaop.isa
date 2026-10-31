@@ -111,7 +111,8 @@ let {{
             opt_args = []
             if self.op_class:
                 opt_args.append(self.op_class)
-            iop = InstObjParams(name, Name + suffix, base, {"code" : code},
+            iop = InstObjParams(name, Name + suffix, base,
+                                {"code": code},
                                 opt_args)
 
             # Generate the actual code (finally!)
@@ -447,6 +448,33 @@ let {{
                                     picked);
             }
             FpDestReg_uqw = result;
+        '''
+
+    class Mxmmxor(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op,
+                         FloatSrc2Op, FloatSrc3Op, FloatSrc4Op)
+        op_class = 'SimdAluOp'
+        code = '''
+            FpDestReg_uqw = FpSrcReg1_uqw ^ FpSrcReg3_uqw;
+            FpDestHiReg_uqw = FpSrcReg2_uqw ^ FpSrcReg4_uqw;
+        '''
+
+    class Mxmmsub(Mxmmxor):
+        op_class = 'SimdAddOp'
+        code = '''
+            const unsigned width = srcSize * 8;
+            auto subtract = [width](uint64_t left, uint64_t right) {
+                uint64_t result = 0;
+                for (unsigned offset = 0; offset < 64; offset += width) {
+                    const uint64_t value =
+                        (bits(left, offset + width - 1, offset) -
+                         bits(right, offset + width - 1, offset)) & mask(width);
+                    result = insertBits(result, offset + width - 1, offset, value);
+                }
+                return result;
+            };
+            FpDestReg_uqw = subtract(FpSrcReg1_uqw, FpSrcReg3_uqw);
+            FpDestHiReg_uqw = subtract(FpSrcReg2_uqw, FpSrcReg4_uqw);
         '''
 
     class Mxor(Media3Op):
@@ -1543,14 +1571,14 @@ let {{
             // Equal          1  0  0
             //           OF = SF = AF = 0
             ccFlagBits = ccFlagBits & ~(SFBit | AFBit | ZFBit | PFBit);
-            cfofBits   = cfofBits   & ~(OFBit | CFBit);
+            { const uint64_t flagsValue = (cfBit | ofBit)   & ~(OFBit | CFBit); cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
 
             if (std::isnan(arg1) || std::isnan(arg2)) {
                 ccFlagBits = ccFlagBits | (ZFBit | PFBit);
-                cfofBits = cfofBits | CFBit;
+                { const uint64_t flagsValue = (cfBit | ofBit) | CFBit; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             }
             else if(arg1 < arg2)
-                cfofBits = cfofBits | CFBit;
+                { const uint64_t flagsValue = (cfBit | ofBit) | CFBit; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             else if(arg1 == arg2)
                 ccFlagBits = ccFlagBits | ZFBit;
         '''
