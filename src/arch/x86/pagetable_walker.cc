@@ -60,6 +60,7 @@
 #include "cpu/base.hh"
 #include "cpu/thread_context.hh"
 #include "debug/PageTableWalker.hh"
+#include "mem/functional_translation.hh"
 #include "mem/packet_access.hh"
 #include "mem/request.hh"
 
@@ -290,6 +291,8 @@ Fault
 Walker::WalkerState::stepWalk(PacketPtr &write)
 {
     assert(state != Ready && state != Waiting);
+    recordFunctionalTranslationPte(entry.functionalTranslation,
+                                   read->getAddr());
     Fault fault = NoFault;
     write = NULL;
     PageTableEntry pte;
@@ -509,6 +512,10 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
       default:
         panic("Unknown page table walker state %d!\n");
     }
+    if (doTLBInsert) {
+        completeFunctionalTranslationLeaf(entry.functionalTranslation,
+            entry.vaddr, entry.paddr, entry.logBytes, entry.global);
+    }
     if (doEndWalk) {
         if (doTLBInsert)
             if (!functional) {
@@ -600,6 +607,10 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     nextState = Ready;
     entry.vaddr = vaddr;
+
+    const Addr root = efer.lma ? Addr(cr3.longPdtb) << 12 :
+        (cr4.pae ? Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
+    beginFunctionalTranslationWalk(entry.functionalTranslation, root);
 
     Request::Flags flags = Request::PHYSICAL;
 

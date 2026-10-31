@@ -53,6 +53,10 @@ from m5.proxy import *
 from m5.SimObject import *
 
 
+class TSOStore(Enum):
+    vals = ["serial", "buffer"]
+
+
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
@@ -206,6 +210,12 @@ class BaseO3CPU(BaseCPU):
         "Branch Predictor",
     )
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
+    tsoStore = Param.TSOStore(
+        "serial", "Committed-store implementation used by TSO CPUs"
+    )
+    tsoStoreBufferSize = Param.Unsigned(
+        114, "Store-buffer entries used only by the buffer TSO implementation"
+    )
 
     recvRespThrottling = Param.Bool(
         False, "Enable load receive response throttling in the LSQ"

@@ -42,6 +42,7 @@
 #include "cpu/o3/lsq_unit.hh"
 
 #include "arch/generic/debugfaults.hh"
+#include "base/logging.hh"
 #include "base/str.hh"
 #include "cpu/checker/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -216,6 +217,15 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
     depCheckShift = params.LSQDepCheckShift;
     checkLoads = params.LSQCheckLoads;
     needsTSO = params.needsTSO;
+    tsoStore = params.tsoStore;
+    tsoStoreBufferSize = params.tsoStoreBufferSize;
+    fatal_if(tsoStore == enums::TSOStore::buffer && !needsTSO,
+             "buffer TSO store mode requires needsTSO=true");
+    fatal_if(tsoStore == enums::TSOStore::buffer &&
+                 params.SQEntries != tsoStoreBufferSize,
+             "buffer TSO store mode requires SQEntries (%u) to match "
+             "tsoStoreBufferSize (%u)",
+             params.SQEntries, tsoStoreBufferSize);
 
     resetState();
 }
@@ -268,6 +278,10 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(blockedByCache, statistics::units::Count::get(),
                "Number of times an access to memory failed due to the cache "
                "being blocked"),
+      ADD_STAT(storePrepareIssued, statistics::units::Count::get(),
+               "Buffer-mode exclusive permission prefetches issued"),
+      ADD_STAT(storePrepareBlocked, statistics::units::Count::get(),
+               "Buffer-mode permission prefetches rejected for retry"),
       ADD_STAT(loadToUse, statistics::units::Cycle::get(),
                "Distribution of cycle latency between the "
                "first time a load is issued and its completion"),
@@ -832,6 +846,10 @@ LSQUnit::writebackStores()
         // Store didn't write any data so no need to write it back to
         // memory.
         if (storeWBIt->size() == 0) {
+            if (storeWBIt->hasRequest()) {
+                storeWBIt->request()->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::ZeroSize);
+            }
             /* It is important that the preincrement happens at (or before)
              * the call, as the the code of completeStore checks
              * storeWBIt. */
@@ -840,6 +858,10 @@ LSQUnit::writebackStores()
         }
 
         if (storeWBIt->instruction()->isDataPrefetch()) {
+            if (storeWBIt->hasRequest()) {
+                storeWBIt->request()->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::PrefetchSkipped);
+            }
             storeWBIt++;
             continue;
         }
@@ -894,6 +916,8 @@ LSQUnit::writebackStores()
             request->packetSent();
 
             if (!success) {
+                request->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::FailedStoreConditional);
                 request->complete();
                 // Instantly complete this store.
                 DPRINTF(LSQUnit, "Store conditional [sn:%lli] failed.  "
@@ -913,6 +937,8 @@ LSQUnit::writebackStores()
         }
 
         if (request->mainReq()->isLocalAccess()) {
+            request->noteNativeTerminal(
+                TaoTraceNativeTerminalReason::LocalAccess);
             assert(!inst->isStoreConditional());
             assert(!inst->inHtmTransactionalState());
             gem5::ThreadContext *thread = cpu->tcBase(lsqID);
@@ -938,6 +964,76 @@ LSQUnit::writebackStores()
         }
     }
     assert(storesToWB >= 0);
+
+    if (tsoStore == enums::TSOStore::buffer && !isStoreBlocked) {
+        issueStorePrepareRequests();
+    }
+}
+
+void
+LSQUnit::issueStorePrepareRequests()
+{
+    if (lsq->cacheBlocked()) {
+        return;
+    }
+
+    for (auto store_it = storeQueue.begin();
+         store_it != storeQueue.end() && lsq->cachePortAvailable(false);
+         ++store_it) {
+        if (!store_it->valid() || !store_it->canWB()) {
+            break;
+        }
+        if (store_it->size() == 0 || !store_it->hasRequest()) {
+            continue;
+        }
+
+        const DynInstPtr& inst = store_it->instruction();
+        LSQRequest* request = store_it->request();
+        RequestPtr main_req = request->mainReq();
+        if (!inst->isStore() || inst->isStoreConditional() ||
+            inst->isAtomic() || inst->inHtmTransactionalState() ||
+            inst->isDataPrefetch() || request->isSplit() ||
+            main_req->isLLSC() || main_req->isRelease() ||
+            main_req->isLocalAccess() || main_req->isUncacheable() ||
+            main_req->isStrictlyOrdered() ||
+            main_req->isCacheMaintenance()) {
+            break;
+        }
+        if (store_it->committed() || store_it->storePrepareIssued()) {
+            continue;
+        }
+
+        Request::Flags flags =
+            Request::PF_EXCLUSIVE | Request::STORE_PREPARE;
+        if (main_req->isSecure()) {
+            flags.set(Request::SECURE);
+        }
+        RequestPtr prepare_req = std::make_shared<Request>(
+            main_req->getPaddr(), 0, flags, main_req->requestorId());
+        if (main_req->hasPC()) {
+            prepare_req->setPC(main_req->getPC());
+        }
+        if (main_req->hasContextId()) {
+            prepare_req->setContext(main_req->contextId());
+        }
+
+        PacketPtr prepare_pkt = new Packet(prepare_req, MemCmd::SoftPFExReq);
+        prepare_pkt->allocate();
+        prepare_pkt->senderState = new LSQ::StorePrepareSenderState();
+
+        if (!dcachePort->sendTimingReq(prepare_pkt)) {
+            delete prepare_pkt->popSenderState();
+            delete prepare_pkt;
+            lsq->cacheBlocked(true);
+            ++stats.blockedByCache;
+            ++stats.storePrepareBlocked;
+            break;
+        }
+
+        store_it->storePrepareIssued() = true;
+        ++stats.storePrepareIssued;
+        lsq->cachePortBusy(false);
+    }
 }
 
 void
@@ -1390,6 +1486,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
     }
 
     if (request->mainReq()->isLocalAccess()) {
+        request->noteNativeTerminal(
+            TaoTraceNativeTerminalReason::LocalAccess);
         assert(!load_inst->memData);
         load_inst->memData = new uint8_t[MaxDataBytes];
 
@@ -1472,6 +1570,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
             }
 
             if (coverage == AddrRangeCoverage::FullAddrRangeCoverage) {
+                request->noteNativeTerminal(
+                    TaoTraceNativeTerminalReason::StoreForward);
                 // Get shift amount for offset into the store's data.
                 int shift_amt = request->mainReq()->getVaddr() -
                     store_it->instruction()->effAddr;

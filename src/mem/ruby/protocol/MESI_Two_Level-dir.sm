@@ -49,7 +49,10 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
 
     M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
-    IM, AccessPermission:Busy, desc="Intermediate State I>M";
+    // I -> IM only queues a clean memory fetch. Until Memory_Data arrives,
+    // memory remains authoritative even though the timing request is pending.
+    // Functional observers may read it; dirty-writeback and DMA states stay Busy.
+    IM, AccessPermission:Read_Only, desc="Memory is current while a clean fetch is pending";
     MI, AccessPermission:Busy, desc="Intermediate State M>I";
     M_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
     M_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
@@ -318,6 +321,9 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         out_msg.Sender := in_msg.Requestor;
         out_msg.MessageSize := MessageSizeType:Request_Control;
         out_msg.Len := 0;
+        out_msg.TraceValid := in_msg.TraceValid;
+        out_msg.TraceContextId := in_msg.TraceContextId;
+        out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
       }
     }
   }

@@ -49,6 +49,9 @@
 #include "debug/RubySequencer.hh"
 #include "debug/RubyStats.hh"
 #include "mem/packet.hh"
+#include "mem/taotrace_response.hh"
+#include "mem/perf_cache_native.hh"
+#include "mem/llc_fill_audit.hh"
 #include "mem/ruby/profiler/Profiler.hh"
 #include "mem/ruby/protocol/PrefetchBit.hh"
 #include "mem/ruby/protocol/RubyAccessMode.hh"
@@ -67,6 +70,7 @@ Sequencer::Sequencer(const Params &p)
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
+    m_store_prepare_outstanding = 0;
 
     m_ruby_system = p.ruby_system;
 
@@ -303,7 +307,8 @@ void Sequencer::resetStats()
 }
 
 // Insert the request in the request table. Return RequestStatus_Aliased
-// if the entry was already present.
+// if the entry was already present, or RequestStatus_PrefetchSkipped when a
+// redundant software prefetch is intentionally consumed without insertion.
 RequestStatus
 Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
                          RubyRequestType secondary_type)
@@ -364,10 +369,14 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     auto &seq_req_list = m_RequestTable[line_addr];
 
     // For software prefetches, if the same cache line is already requested we
-    // can return aliased and skip emplacing it on the request table, this way
-    // we won't need to handle any response at all
+    // can skip emplacing it on the request table, this way we won't need to
+    // handle any response at all. Close the native lifecycle at this exact
+    // production point instead of reporting a Ruby admission that can never
+    // receive a response.
     if (pkt->cmd.isSWPrefetch() && seq_req_list.size() > 1) {
-        return RequestStatus_Aliased;
+        TaoTraceNativeAccessRegistry::noteTerminal(
+            pkt->req, TaoTraceNativeTerminalReason::PrefetchSkipped);
+        return RequestStatus_PrefetchSkipped;
     }
 
     // Create a default entry
@@ -388,6 +397,14 @@ void
 Sequencer::markRemoved()
 {
     m_outstanding_count--;
+}
+
+void
+Sequencer::storePrepareComplete()
+{
+    assert(m_store_prepare_outstanding > 0);
+    --m_store_prepare_outstanding;
+    testDrainComplete();
 }
 
 void
@@ -709,6 +726,17 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
               "in .sm files!");
 
     PacketPtr pkt = srequest->pkt;
+    if (pkt->req) {
+        // In this Sequencer API externalHit=true denotes a controller miss;
+        // preserve the protocol-native spelling in the sideband so the event
+        // dictionary, not this observer, decides its eventual PMU mapping.
+        TaoTraceNativeAccessRegistry::noteResponse(
+            pkt->req, externalHit, was_coalesced,
+            mach == MachineType_NUM ? -1 : int(mach));
+    }
+    if (was_coalesced)
+        perf_cache_native::observer().merged(m_version,uint64_t(curTick()));
+    perf_cache_native::observer().finish(uint64_t(reinterpret_cast<uintptr_t>(pkt)));
     Addr request_address(pkt->getAddr());
     RubyRequestType type = srequest->m_type;
 
@@ -944,16 +972,25 @@ bool
 Sequencer::empty() const
 {
     return m_RequestTable.empty() &&
-           m_UnaddressedRequestTable.empty();
+           m_UnaddressedRequestTable.empty() &&
+           m_store_prepare_outstanding == 0;
 }
 
 RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
+    if (pkt->req->isStorePrepare()) {
+        ++m_store_prepare_outstanding;
+        m_controller->enqueuePrefetch(
+            makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
+        return RequestStatus_Issued;
+    }
+
     // HTM abort signals must be allowed to reach the Sequencer
     // the same cycle they are issued. They cannot be retried.
     if ((m_outstanding_count >= m_max_outstanding_requests) &&
         !pkt->req->isHTMAbort()) {
+        perf_cache_native::observer().retry(m_version,uint64_t(curTick()));
         return RequestStatus_BufferFull;
     }
 
@@ -1069,14 +1106,30 @@ Sequencer::makeRequest(PacketPtr pkt)
         // Return that this request's cache line address aliases with
         // a prior request that locked the cache line. The request cannot
         // proceed until the cache line is unlocked by a Locked_RMW_Write
+        perf_cache_native::observer().retry(m_version,uint64_t(curTick()));
         return RequestStatus_Aliased;
     }
 
     RequestStatus status = insertRequest(pkt, primary_type, secondary_type);
 
-    // It is OK to receive RequestStatus_Aliased, it can be considered Issued
-    if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
+    // An aliased request was inserted behind an existing request. A skipped
+    // software prefetch was intentionally consumed without entering Ruby.
+    if (status != RequestStatus_Ready &&
+        status != RequestStatus_Aliased &&
+        status != RequestStatus_PrefetchSkipped) {
         return status;
+    }
+    if (status == RequestStatus_PrefetchSkipped) {
+        return status;
+    }
+    // Only requests accepted into the Sequencer request table are native
+    // Ruby line admissions. Buffer-full and locked-line retries return above;
+    // MemSyncReq is an uninserted alias and is outside the retired data-UOP
+    // population.
+    if (pkt->cmd != MemCmd::MemSyncReq) {
+        TaoTraceNativeAccessRegistry::noteAdmission(
+            pkt->req, status == RequestStatus_Aliased);
+    }
     // non-aliased with any existing request in the request table, just issue
     // to the cache
     if (status != RequestStatus_Aliased)
@@ -1173,6 +1226,30 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
     assert(latency > 0);
 
     assert(m_mandatory_q_ptr != NULL);
+    // Count the exact request population that enters the Ruby hierarchy.
+    // RequestStatus_Aliased alone cannot identify this population: a merged
+    // read may share its parent's lookup, while an aliased write can be
+    // reissued here after the parent response.
+    TaoTraceNativeAccessRegistry::noteHierarchyRequest(pkt->req);
+    // MESI_Three_Level binds Sequencer version to the originating physical
+    // CPU. coreId() is the unrelated CorePair tracking ID (default 99).
+    // Independent transaction ID: includes ifetch, speculative/squashed and
+    // software-prefetch packets without a committed DynInst/TraceValid identity.
+    using perf_cache_native::Kind;
+    Kind kind = Kind::Unknown;
+    if (pkt->cmd.isSWPrefetch()) kind = Kind::SoftwarePrefetch;
+    else if (secondary_type == RubyRequestType_IFETCH) kind = Kind::CodeRead;
+    else if (isDataReadRequest(secondary_type)) kind = Kind::DataRead;
+    else if (secondary_type == RubyRequestType_FLUSH) kind = Kind::Unknown;
+    else if (isWriteRequest(secondary_type) || pkt->isAtomicOp()) kind = Kind::Rfo;
+    else if (secondary_type == RubyRequestType_REPLACEMENT) kind = Kind::Writeback;
+    if (llc_fill_audit::observer().enabled()) {
+        msg->m_fillAuditRole = pkt->req->isPTWalk() ? 4
+            : (kind==Kind::CodeRead ? 3 : (kind==Kind::Rfo ? 2
+            : (kind==Kind::DataRead ? 1 : (kind==Kind::SoftwarePrefetch ? 5 : 0))));
+    }
+    msg->m_perfTransactionId = perf_cache_native::observer().issue(
+        m_version, uint64_t(reinterpret_cast<uintptr_t>(pkt)), kind, uint64_t(curTick()));
     m_mandatory_q_ptr->enqueue(msg, clockEdge(), latency,
                                m_ruby_system->getRandomization(),
                                m_ruby_system->getWarmupEnabled());
@@ -1197,6 +1274,7 @@ Sequencer::print(std::ostream& out) const
 {
     out << "[Sequencer: " << m_version
         << ", outstanding requests: " << m_outstanding_count
+        << ", outstanding store prepares: " << m_store_prepare_outstanding
         << ", request table: " << m_RequestTable
         << "]";
 }

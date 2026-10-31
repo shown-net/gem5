@@ -41,6 +41,7 @@
 #include <memory>
 
 #include "arch/x86/faults.hh"
+#include "mem/functional_translation.hh"
 #include "arch/x86/insts/microldstop.hh"
 #include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/pseudo_inst_abi.hh"
@@ -229,16 +230,20 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
             }
         );
 
+        recordFunctionalSpecialTranslation(req, fastsim::fst::TranslationKind::kMsr,
+            tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
         return NoFault;
     } else if (prefix == IntAddrPrefixIO) {
         // TODO If CPL > IOPL or in virtual mode, check the I/O permission
         // bitmap in the TSS.
 
+        auto functionalKind = fastsim::fst::TranslationKind::kIo;
         Addr IOPort = vaddr & ~IntAddrPrefixMask;
         // Make sure the address fits in the expected 16 bit IO address
         // space.
         assert(!(IOPort & ~0xFFFF));
         if (IOPort == 0xCF8 && req->getSize() == 4) {
+            functionalKind = fastsim::fst::TranslationKind::kPciConfig;
             req->setPaddr(req->getVaddr());
             req->setLocalAccessor(
                 [read](ThreadContext *tc, PacketPtr pkt)
@@ -252,6 +257,7 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
             Addr configAddress =
                 tc->readMiscRegNoEffect(misc_reg::PciConfigAddress);
             if (bits(configAddress, 31, 31)) {
+                functionalKind = fastsim::fst::TranslationKind::kPciConfig;
                 req->setPaddr(PhysAddrPrefixPciConfig |
                         mbits(configAddress, 30, 2) |
                         (IOPort & mask(2)));
@@ -262,6 +268,8 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
             req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
             req->setPaddr(PhysAddrPrefixIO | IOPort);
         }
+        recordFunctionalSpecialTranslation(req, functionalKind,
+            tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
         return NoFault;
     } else {
         panic("Access to unrecognized internal address space %#x.\n",
@@ -289,6 +297,8 @@ TLB::finalizePhysical(const RequestPtr &req,
                 return Cycles(1);
             }
         );
+        recordFunctionalSpecialTranslation(req, fastsim::fst::TranslationKind::kM5,
+            tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
     } else if (FullSystem) {
         // Check for an access to the local APIC
         LocalApicBase localApicBase =
@@ -312,6 +322,8 @@ TLB::finalizePhysical(const RequestPtr &req,
             req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
             req->setPaddr(x86LocalAPICAddress(tc->contextId(),
                                               paddr - apicRange.start()));
+            recordFunctionalSpecialTranslation(req, fastsim::fst::TranslationKind::kLocalApic,
+                tc->readMiscRegNoEffect(misc_reg::Cr3) & ~uint64_t(0xfff));
         }
     }
 
@@ -323,6 +335,10 @@ TLB::translate(const RequestPtr &req,
         ThreadContext *tc, BaseMMU::Translation *translation,
         BaseMMU::Mode mode, bool &delayedResponse, bool timing)
 {
+    // Retries and failed translations cannot expose an older Request's facts.
+    req->removeExtension<FunctionalTranslationExtension>();
+    fastsim::fst::TranslationMapping functionalMapping;
+    bool functionalLeaf = false;
     Request::Flags flags = req->getFlags();
     int seg = flags & SegmentFlagMask;
     bool storeCheck = flags & Request::READ_MODIFY_WRITE;
@@ -504,6 +520,19 @@ TLB::translate(const RequestPtr &req,
             Addr paddr = entry->paddr | (vaddr & mask(entry->logBytes));
             DPRINTF(TLB, "Translated %#x -> %#x.\n", vaddr, paddr);
             req->setPaddr(paddr);
+            if (FullSystem) {
+                functionalMapping = entry->functionalTranslation;
+                // A restored entry still proves leaf geometry, but no path.
+                completeFunctionalTranslationLeaf(functionalMapping,
+                    vaddr & ~mask(entry->logBytes), entry->paddr,
+                    entry->logBytes, entry->global);
+                Efer efer = tc->readMiscRegNoEffect(misc_reg::Efer);
+                functionalMapping.address_space_id = efer.lma ?
+                    Addr(cr3.longPdtb) << 12 : (cr4.pae ?
+                    Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
+                functionalMapping.pcid = pcid;
+                functionalLeaf = true;
+            }
             if (entry->uncacheable)
                 req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
         } else {
@@ -519,7 +548,18 @@ TLB::translate(const RequestPtr &req,
         req->setPaddr(vaddr);
     }
 
-    return finalizePhysical(req, tc, mode);
+    if (functionalLeaf) {
+        auto extension = std::make_shared<FunctionalTranslationExtension>();
+        extension->fragment.virtual_address = req->getVaddr();
+        extension->fragment.physical_address = req->getPaddr();
+        extension->fragment.size = req->getSize();
+        extension->fragment.mapping = functionalMapping;
+        req->setExtension(extension);
+    }
+    Fault finalFault = finalizePhysical(req, tc, mode);
+    if (finalFault != NoFault)
+        req->removeExtension<FunctionalTranslationExtension>();
+    return finalFault;
 }
 
 Fault

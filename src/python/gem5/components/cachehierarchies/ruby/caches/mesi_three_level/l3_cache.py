@@ -27,6 +27,7 @@
 import math
 
 from m5.objects import (
+    LRURP,
     MESI_Three_Level_L2Cache_Controller,
     MessageBuffer,
     RubyCache,
@@ -59,6 +60,7 @@ class L3Cache(MESI_Three_Level_L2Cache_Controller):
             size=l3_size,
             assoc=l3_assoc,
             start_index_bit=self.getIndexBit(num_l3Caches, cache_line_size),
+            replacement_policy=LRURP(),
         )
 
         self.transitions_per_cycle = 4

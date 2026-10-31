@@ -47,6 +47,7 @@
 #include "base/trie.hh"
 #include "mem/port_proxy.hh"
 #include "sim/serialize.hh"
+#include "fst_translation_facts.hh"
 
 namespace gem5
 {
@@ -90,6 +91,10 @@ namespace X86ISA
         bool noExec;
         // A sequence number to keep track of LRU.
         uint64_t lruSeq;
+
+        // Actual walk facts, copied on TLB insertion and retained on hits.
+        // Absent after checkpoint restore; never reconstructed by rewalking.
+        fastsim::fst::TranslationMapping functionalTranslation;
 
         TlbEntryTrie::Handle trieHandle;
 

@@ -47,6 +47,7 @@
 #include <deque>
 #include <list>
 #include <string>
+#include <vector>
 
 #include "base/refcnt.hh"
 #include "base/trace.hh"
@@ -63,6 +64,7 @@
 #include "cpu/static_inst.hh"
 #include "cpu/translation.hh"
 #include "debug/HtmCpu.hh"
+#include "fst_translation_facts.hh"
 
 namespace gem5
 {
@@ -176,6 +178,7 @@ class DynInst : public ExecContext, public RefCounted
         NotAnInst,
         TranslationStarted,
         TranslationCompleted,
+        DataTlbMissObserved,
         PossibleLoadViolation,
         HitExternalSnoop,
         EffAddrValid,
@@ -183,6 +186,7 @@ class DynInst : public ExecContext, public RefCounted
         Predicate,
         MemAccPredicate,
         PredTaken,
+        BranchPredMispredicted,
         IsStrictlyOrdered,
         ReqMade,
         MemOpDone,
@@ -339,6 +343,9 @@ class DynInst : public ExecContext, public RefCounted
     /** The effective physical address. */
     Addr physEffAddr = 0;
 
+    /** Successful fragments from this execution's actual translations. */
+    std::vector<fastsim::fst::TranslationFragment> functionalTranslations;
+
     /** The memory request flags (from translation). */
     unsigned memReqFlags = 0;
 
@@ -419,6 +426,15 @@ class DynInst : public ExecContext, public RefCounted
         return instFlags[TranslationCompleted];
     }
     void translationCompleted(bool f) { instFlags[TranslationCompleted] = f; }
+
+    /** True when at least one data-translation fragment required a hardware
+     * page-table walk. Unlike isTranslationDelayed(), this sticky retirement
+     * fact remains available after translation completes. */
+    bool dataTlbMissObserved() const
+    {
+        return instFlags[DataTlbMissObserved];
+    }
+    void dataTlbMissObserved(bool f) { instFlags[DataTlbMissObserved] = f; }
 
     /** True if this address was found to match a previous load and they issued
      * out of order. If that happend, then it's only a problem if an incoming
@@ -528,6 +544,25 @@ class DynInst : public ExecContext, public RefCounted
     setPredTaken(bool predicted_taken)
     {
         instFlags[PredTaken] = predicted_taken;
+    }
+
+    /** Remember that the original fetch prediction caused a redirect.
+     *
+     * Decode may repair a direct target in predPC before this instruction
+     * retires. DynInst::mispredicted() is therefore a current-PC comparison,
+     * not persistent branch-predictor history. This sticky bit preserves the
+     * original BPred miss until retirement.
+     */
+    bool
+    branchPredMispredicted() const
+    {
+        return instFlags[BranchPredMispredicted];
+    }
+
+    void
+    setBranchPredMispredicted()
+    {
+        instFlags[BranchPredMispredicted] = true;
     }
 
     /** Returns whether the instruction mispredicted. */

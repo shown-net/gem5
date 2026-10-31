@@ -56,6 +56,8 @@
 #include "debug/HtmCpu.hh"
 #include "debug/LSQ.hh"
 #include "debug/Writeback.hh"
+#include "mem/functional_translation.hh"
+#include "mem/taotrace_response.hh"
 #include "params/BaseO3CPU.hh"
 
 namespace gem5
@@ -449,6 +451,12 @@ LSQ::recvTimingResp(PacketPtr pkt)
         DPRINTF(LSQ, "Got error packet back for address: %#X\n",
                 pkt->getAddr());
 
+    if (dynamic_cast<StorePrepareSenderState*>(pkt->senderState)) {
+        delete pkt->popSenderState();
+        delete pkt;
+        return true;
+    }
+
     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
     panic_if(!request, "Got packet back with unknown sender state\n");
 
@@ -782,6 +790,8 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
         request = inst->savedRequest;
         assert(request);
     } else {
+        // A new execution attempt must not inherit an earlier translation.
+        inst->functionalTranslations.clear();
         if (htm_cmd || tlbi_cmd) {
             assert(addr == 0x0lu);
             assert(size == 8);
@@ -856,6 +866,7 @@ LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
 
         flags.set(Flag::TranslationFinished);
         if (fault == NoFault) {
+            appendFunctionalTranslation(request, _inst->functionalTranslations);
             _inst->physEffAddr = request->getPaddr();
             _inst->memReqFlags = request->getFlags();
             if (request->isCondSwap()) {
@@ -896,6 +907,11 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
             _inst->translationCompleted(true);
 
             for (i = 0; i < _fault.size() && _fault[i] == NoFault; i++);
+            // Completion callbacks may arrive out of order. Record only the
+            // executable successful prefix in virtual request order. Facts
+            // beyond a partial fault never belong to this memory operation.
+            replaceFunctionalTranslationPrefix(_reqs, i,
+                                                _inst->functionalTranslations);
             if (i > 0) {
                 _inst->physEffAddr = LSQRequest::req()->getPaddr();
                 _inst->memReqFlags = _mainReq->getFlags();
@@ -965,6 +981,7 @@ LSQ::SplitDataRequest::initiateTranslation()
     _mainReq = std::make_shared<Request>(base_addr,
                 _size, _flags, _inst->requestorId(),
                 _inst->pcState().instAddr(), _inst->contextId());
+    _mainReq->setReqInstSeqNum(_inst->seqNum);
     _mainReq->setByteEnable(_byteEnable);
 
     // Paddr is not used in _mainReq. However, we will accumulate the flags
@@ -1058,6 +1075,13 @@ LSQ::LSQRequest::LSQRequest(
               _inst->isLoad());
     flags.set(Flag::IsAtomic, _inst->isAtomic());
     install();
+}
+
+void
+LSQ::LSQRequest::markDelayed()
+{
+    flags.set(Flag::Delayed);
+    _inst->dataTlbMissObserved(true);
 }
 
 void
@@ -1185,6 +1209,28 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
     numReceivedPackets++;
     if (numReceivedPackets == _packets.size()) {
         flags.set(Flag::Complete);
+        // The synthetic split main response did not traverse Ruby. Aggregate
+        // response facts from every physical fragment onto its Request so the
+        // O3 completion observer sees the complete line population.
+        auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
+        // sendPacketToCache() closes issuance on _mainReq before any fragment
+        // can respond.  Preserve that identity-wide state when replacing the
+        // main extension with the fragment aggregate; otherwise a completed
+        // split access has admissions == responses but appears permanently
+        // open when it is imported at a measurement/target boundary.
+        if (const auto main =
+                _mainReq->getExtension<TaoTraceRubyResponseExtension>()) {
+            aggregate->merge(*main);
+        }
+        for (const auto &request : _reqs) {
+            auto fragment =
+                request->getExtension<TaoTraceRubyResponseExtension>();
+            if (fragment) aggregate->merge(*fragment);
+        }
+        if (aggregate->responses != 0 || aggregate->terminalNoRuby ||
+            aggregate->issuanceClosed) {
+            _mainReq->setExtension(aggregate);
+        }
         /* Assemble packets. */
         PacketPtr resp = isLoad()
             ? Packet::createRead(_mainReq)
@@ -1302,8 +1348,10 @@ void
 LSQ::SingleDataRequest::sendPacketToCache()
 {
     assert(_numOutstandingPackets == 0);
-    if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0)))
+    if (lsqUnit()->trySendPacket(isLoad(), _packets.at(0))) {
         _numOutstandingPackets = 1;
+        noteNativeIssuanceClosed();
+    }
 }
 
 void
@@ -1314,6 +1362,9 @@ LSQ::SplitDataRequest::sendPacketToCache()
             lsqUnit()->trySendPacket(isLoad(),
                 _packets.at(numReceivedPackets + _numOutstandingPackets))) {
         _numOutstandingPackets++;
+    }
+    if (numReceivedPackets + _numOutstandingPackets == _packets.size()) {
+        noteNativeIssuanceClosed();
     }
 }
 

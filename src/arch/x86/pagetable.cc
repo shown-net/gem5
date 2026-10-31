@@ -80,6 +80,9 @@ TlbEntry::serialize(CheckpointOut &cp) const
 void
 TlbEntry::unserialize(CheckpointIn &cp)
 {
+    // Checkpoints predate functional path observations. Keep target state
+    // unchanged and report unknown path until this entry is naturally replaced.
+    functionalTranslation = {};
     UNSERIALIZE_SCALAR(paddr);
     UNSERIALIZE_SCALAR(vaddr);
     UNSERIALIZE_SCALAR(logBytes);

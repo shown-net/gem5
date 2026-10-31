@@ -28,6 +28,7 @@ import math
 
 from m5.objects import (
     ClockDomain,
+    LRURP,
     MESI_Three_Level_L1Cache_Controller,
     MessageBuffer,
     RubyCache,
@@ -69,6 +70,7 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
             assoc=l2_assoc,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
+            replacement_policy=LRURP(),
         )
         # l2_select_num_bits is ruby backend terminology.
         # In stdlib terms, it is number of bits for selecting L3 cache.

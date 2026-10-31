@@ -157,6 +157,7 @@ structure (Sequencer, external = "yes") {
   void llscClearLocalMonitor();
 
   void evictionCallback(Addr);
+  void storePrepareComplete();
 
   void invL1Callback();
 
@@ -192,6 +193,11 @@ structure(RubyRequest, desc="...", interface="Message", external="yes") {
   bool isSecure,             default="false",desc="If flag is set, request is in secure PA space";
 
   RequestPtr getRequestPtr();
+  int fillAuditRole();
+  Addr perfTransactionId();
+  bool traceIdentityValid();
+  int traceContextId();
+  Addr traceInstSeqNum();
 }
 
 structure(AbstractCacheEntry, primitive="yes", external = "yes") {
