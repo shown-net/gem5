@@ -36,6 +36,7 @@
  */
 
 #include "cpu/kvm/base.hh"
+#include "cpu/o3/probe/calibration_marker.hh"
 
 #include <linux/kvm.h>
 #include <sys/ioctl.h>
@@ -537,6 +538,13 @@ BaseKvmCPU::activateContext(ThreadID thread_num)
 
     assert(_status == Idle);
     assert(!tickEvent.scheduled());
+
+    // Calibration HANDOFF may reactivate a drained KVM context. The normal
+    // deployment path retains its original scheduling behavior.
+    if (o3::CalibrationMarker::hasInstances() &&
+        drainState() == DrainState::Drained) {
+        return;
+    }
 
     baseStats.numCycles +=
         ticksToCycles(thread->lastActivate - thread->lastSuspend);

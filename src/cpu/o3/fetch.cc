@@ -41,6 +41,7 @@
  */
 
 #include "cpu/o3/fetch.hh"
+#include "arch/x86/regs/misc.hh"
 
 #include <algorithm>
 #include <cstring>
@@ -1058,6 +1059,12 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
     instruction->setTid(tid);
+    if (cpu->markerObservation) {
+        instruction->fetchedFromUser = cpu->inUserMode(tid);
+        instruction->fetchedAddressSpaceId =
+            cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
+            ~uint64_t(0xfff);
+    }
 
     instruction->setThreadState(cpu->thread[tid]);
 

@@ -58,6 +58,32 @@ X86IdeController::clearInterrupt(bool is_primary)
         wire->lower();
 }
 
+void
+X86IdeController::serialize(CheckpointOut &cp) const
+{
+    IdeController::serialize(cp);
+    for (size_t i = 0; i < intPrimary.size(); ++i)
+        paramOut(cp, csprintf("intPrimary.%d", i), intPrimary[i]->state());
+    for (size_t i = 0; i < intSecondary.size(); ++i)
+        paramOut(cp, csprintf("intSecondary.%d", i), intSecondary[i]->state());
+}
+
+void
+X86IdeController::unserialize(CheckpointIn &cp)
+{
+    IdeController::unserialize(cp);
+    for (size_t i = 0; i < intPrimary.size(); ++i) {
+        bool state;
+        paramIn(cp, csprintf("intPrimary.%d", i), state);
+        intPrimary[i]->set(state, true);
+    }
+    for (size_t i = 0; i < intSecondary.size(); ++i) {
+        bool state;
+        paramIn(cp, csprintf("intSecondary.%d", i), state);
+        intSecondary[i]->set(state, true);
+    }
+}
+
 Port &
 X86IdeController::getPort(const std::string &if_name, PortID idx)
 {

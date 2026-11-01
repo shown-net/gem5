@@ -7,7 +7,7 @@
 # single_core_mvp/doc/02_gem5_probe_adaptation.md.
 
 from m5.objects.Probe import ProbeListenerObject
-from m5.params import Param, Bool, String
+from m5.params import Param, VectorParam, Bool, String
 from m5.SimObject import PyBindMethod
 
 
@@ -16,7 +16,23 @@ class TaoTrace(ProbeListenerObject):
     cxx_class = "gem5::o3::TaoTrace"
     cxx_header = "cpu/o3/probe/tao_trace.hh"
 
-    cxx_exports = [PyBindMethod("startFunctionalMeasurement")]
+    cxx_exports = [PyBindMethod("startFunctionalMeasurement"),
+                   PyBindMethod("startMarkerCapture"),
+                   PyBindMethod("selectMarkerWindow"),
+                   PyBindMethod("resumeMarkerHandoff"),
+                   PyBindMethod("startFixedWorkCapture"),
+                   PyBindMethod("finishFixedWorkCapture"),
+                   PyBindMethod("exportFixedWorkResult"),
+                   PyBindMethod("resumeFixedWorkHandoff")]
+
+    marker_pc = Param.Addr(0, "CPU calibration Marker PC; zero selects FastSim producer")
+    fixed_work_source_core = Param.Int(-1, "Explicit physical source core; -1 disables fixed work")
+    fixed_work_begin_pcs = VectorParam.Addr([], "Static worker BEGIN NOP PCs")
+    fixed_work_end_pcs = VectorParam.Addr([], "Static worker END NOP PCs")
+    fixed_work_result_pc = Param.Addr(0, "Post-END result-buffer NOP PC; zero uses guest exit")
+    fixed_work_result_max_bytes = Param.UInt64(0, "Maximum bytes per exported input/output buffer")
+    fixed_work_core_ids = VectorParam.Unsigned([], "Worker physical source cores")
+    fixed_work_workids = VectorParam.UInt64([], "Expected workid in RDI; worker index in RSI")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "

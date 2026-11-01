@@ -51,6 +51,8 @@ namespace o3
 
 class CPU;
 
+class CalibrationMarker;
+class FixedWorkMarker;
 class TaoTrace : public ProbeListenerObject
 {
   public:
@@ -65,6 +67,11 @@ class TaoTrace : public ProbeListenerObject
     }
 
   private:
+    std::unique_ptr<CalibrationMarker> calibration_marker_;
+    friend class FixedWorkMarker;
+    std::unique_ptr<FixedWorkMarker> fixed_work_marker_;
+    int32_t explicit_source_core_ = -1;
+    int32_t sourceCoreId() const;
     enum class InstrType : uint8_t {
         INT = 0, FP, LD, ST, ATOMIC, FENCE, BR, SYS, OTHER
     };
@@ -324,10 +331,19 @@ public:
     //   require_roi_=true 时方启用闸门；require_roi_=false 时退化为
     //   "全程 emit"（默认，向后兼容 V9.5 行为）。
     static void traceSourceRoiCheckpoint(gem5::ThreadContext *tc);
+    static void traceFstSourceRoiCheckpoint(gem5::ThreadContext *tc);
     static void traceWorkBegin(uint32_t core_id, uint64_t workid,
                                uint64_t threadid);
     static void traceWorkEnd  (uint32_t core_id, uint64_t workid,
                                uint64_t threadid);
+    void startMarkerCapture(const std::string &directory);
+    void selectMarkerWindow(uint64_t begin, uint64_t end);
+    void resumeMarkerHandoff();
+    void startFixedWorkCapture();
+    void finishFixedWorkCapture();
+    void exportFixedWorkResult();
+    void resumeFixedWorkHandoff();
+    static void traceMarkerHandoff(gem5::ThreadContext *tc);
     static void traceMeasurementBegin();
     void startFunctionalMeasurement() { traceMeasurementBegin(); }
     static void traceMeasurementEnd();
@@ -364,6 +380,7 @@ private:
 
     void openOutput();
     void accountCplCommit(const DynInstPtr &inst, bool is_syscall);
+    bool fixedWorkNativeOnly() const;
     bool cplMeasurementActive() const;
     uint64_t cplMeasurementBeginTick() const;
     uint64_t cplMeasurementEndTick() const;

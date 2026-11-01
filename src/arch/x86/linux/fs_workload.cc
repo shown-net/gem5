@@ -37,6 +37,9 @@
 
 #include "arch/x86/linux/fs_workload.hh"
 
+#include <fstream>
+#include <vector>
+
 #include "arch/x86/regs/int.hh"
 #include "base/trace.hh"
 #include "cpu/pc_event.hh"
@@ -132,6 +135,38 @@ FsLinux::initState()
     uint32_t guestCommandLineBuff = htole((uint32_t)commandLineBuff);
     phys_proxy.writeBlob(commandLinePointer, &guestCommandLineBuff,
                          sizeof(guestCommandLineBuff));
+
+    if (!params().initrd.empty()) {
+        std::ifstream input(params().initrd, std::ios::binary | std::ios::ate);
+        fatal_if(!input, "Cannot open initrd %s", params().initrd);
+        const auto file_size = input.tellg();
+        const Addr addr = params().initrd_addr;
+        // The 32-bit boot protocol uses inclusive 0x37ffffff as the legacy
+        // maximum, which also fits within the low RAM of the x86 board.
+        fatal_if(file_size <= 0 || file_size > 0x38000000 ||
+                 addr > 0x37ffffff ||
+                 uint64_t(file_size) > 0x38000000 - addr,
+                 "Initrd does not fit in the Linux x86 boot protocol range");
+        const Addr size = uint64_t(file_size);
+        fatal_if(!system->isMemAddr(addr) || !system->isMemAddr(addr + size - 1),
+                 "Initrd is outside guest RAM");
+        fatal_if(addr <= image.maxAddr() && addr + size > image.minAddr(),
+                 "Initrd overlaps the loaded kernel image");
+        std::vector<char> contents(size);
+        input.seekg(0);
+        input.read(contents.data(), size);
+        fatal_if(!input, "Cannot read initrd %s", params().initrd);
+        phys_proxy.writeBlob(addr, contents.data(), size);
+
+        // Linux boot protocol offsets are relative to boot_params, not the
+        // setup header. An unassigned loader identifies itself as 0xff.
+        const uint8_t loader = 0xff;
+        const uint32_t guestAddr = htole(static_cast<uint32_t>(addr));
+        const uint32_t guestSize = htole(static_cast<uint32_t>(size));
+        phys_proxy.writeBlob(realModeData + 0x210, &loader, sizeof(loader));
+        phys_proxy.writeBlob(realModeData + 0x218, &guestAddr, sizeof(guestAddr));
+        phys_proxy.writeBlob(realModeData + 0x21c, &guestSize, sizeof(guestSize));
+    }
 
     /*
      * Screen Info.

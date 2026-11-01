@@ -96,6 +96,8 @@ class ThreadContext;
 class CPU : public BaseCPU
 {
   public:
+    bool markerObservation = false;
+    const bool tmaEnabled;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -613,6 +615,64 @@ class CPU : public BaseCPU
          * quiesce operation or waiting for an interrupt. */
         statistics::Scalar quiesceCycles;
     } cpuStats;
+    struct UnhaltedClockStats : public statistics::Group
+    {
+        explicit UnhaltedClockStats(CPU *cpu);
+        void setActive(ThreadID tid, bool active);
+        void account();
+        void preDumpStats() override;
+        void resetStats() override;
+        CPU *owner;
+        std::array<bool, MaxThreads> running{};
+        std::array<uint64_t, MaxThreads> lastCycle{};
+        statistics::Scalar THREAD;
+    } unhaltedClockStats;
+
+    struct TmaStats : public statistics::Group
+    {
+        explicit TmaStats(CPU *cpu, unsigned width);
+        void setActive(bool active);
+        void begin();
+        void end();
+        void allocated(const DynInstPtr &inst);
+        void onRetire(const DynInstPtr &inst);
+        void onOtherSquash(const DynInstPtr &inst);
+        void squashAfter(InstSeqNum sequence, bool speculation);
+        void renameCycle(bool blocked, bool squashing);
+        void preDumpStats() override;
+        void resetStats() override;
+
+      private:
+        enum class EmptyReason { Frontend, Backend, Recovery };
+        void accountUntil(uint64_t now);
+        void emptySlots(uint64_t slots, EmptyReason reason);
+        CPU *owner;
+        const unsigned width;
+        bool active = false, tracking = false, recovery = false;
+        bool sawRecoverySquash = false;
+        uint64_t lastCycle = 0;
+        unsigned accepted = 0;
+        EmptyReason previous = EmptyReason::Frontend;
+        std::set<InstSeqNum> outstanding;
+      public:
+        statistics::Scalar slots, retiring, badSpeculation, frontendBound;
+        statistics::Scalar backendBound, pending, retired, otherSquashes;
+        statistics::Scalar allocatedOps, fusedPairs;
+    } tmaStats;
+
+    struct InstRetiredStats : public statistics::Group
+    {
+        explicit InstRetiredStats(CPU *cpu);
+        statistics::Scalar ANY;
+    } instRetiredStats;
+
+    struct UopsRetiredStats : public statistics::Group
+    {
+        explicit UopsRetiredStats(CPU *cpu);
+        statistics::Scalar SLOTS;
+    } uopsRetiredStats;
+
+
 
   public:
     // hardware transactional memory

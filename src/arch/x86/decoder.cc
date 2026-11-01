@@ -425,6 +425,16 @@ Decoder::processOpcode(ByteTable &immTable, ByteTable &modrmTable,
     else
         logOpSize = defOp;
 
+    // Near relative CALL/JMP and Jcc use rel32 in 64-bit mode, even with
+    // an operand-size override. Their control-transfer size is also 64 bit.
+    if (emi.mode.submode == SixtyFourBitMode && emi.legacy.op &&
+        ((emi.opcode.type == OneByteOpcode &&
+          (opcode == 0xe8 || opcode == 0xe9)) ||
+         (emi.opcode.type == TwoByteOpcode &&
+          opcode >= 0x80 && opcode <= 0x8f))) {
+        logOpSize = 3;
+    }
+
     // Set the actual op size.
     emi.opSize = 1 << logOpSize;
 

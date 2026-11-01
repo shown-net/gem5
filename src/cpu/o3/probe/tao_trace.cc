@@ -11,6 +11,8 @@
  *   <name>.diag.jsonl     诊断（tick）
  */
 #include "cpu/o3/probe/tao_trace.hh"
+#include "cpu/o3/probe/calibration_marker.hh"
+#include "cpu/o3/probe/fixed_work_marker.hh"
 #include "cpu/o3/probe/fst_dependencies.hh"
 #include "cpu/o3/probe/fst_memory_requests.hh"
 #include "cpu/o3/probe/fst_retirement.hh"
@@ -712,8 +714,21 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       output_dir_(params.output_dir),
       uarch_profile_path_(params.uarch_profile_path)
 {
+    explicit_source_core_ = params.fixed_work_source_core;
+    if (explicit_source_core_ >= 0) {
+        fatal_if(params.marker_pc || params.functional_warmup ||
+                 params.functional_user_target || params.require_roi ||
+                 !params.functional_include_kernel || !params.emit_micro ||
+                 toLower(params.trace_format) != "fst",
+                 "fixed-work requires continuous kernel-inclusive direct FST");
+        fixed_work_marker_ = std::make_unique<FixedWorkMarker>(*this, params);
+    }
+    if (params.marker_pc) {
+        calibration_marker_ = std::make_unique<CalibrationMarker>(*this, params);
+        return;
+    }
     live_instances_ += 1;
-    wrong_path_core_id_ = parseFstCoreIdFromName(name());
+    wrong_path_core_id_ = sourceCoreId();
     if (functional_user_only_ && functional_include_kernel_) {
         throw std::runtime_error(
             "TaoTrace functional_user_only and functional_include_kernel "
@@ -778,6 +793,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
 
 TaoTrace::~TaoTrace()
 {
+    if (calibration_marker_) return;
     for (auto it = wrong_path_instances_.begin();
          it != wrong_path_instances_.end();) {
         if (it->second == this) {
@@ -921,7 +937,7 @@ TaoTrace::openOutput()
             } else {
                 // header core_id 从 probe name 解析（与下游 manifest CORE_RE
                 //   和离线转换器 --core 同口径）；解析失败回退 0 并告警。
-                int32_t parsed = parseFstCoreIdFromName(name());
+                int32_t parsed = sourceCoreId();
                 if (parsed < 0) {
                     warn("TaoTrace: cannot parse core id from '%s'; "
                          "FST header core_id defaults to 0", name().c_str());
@@ -1001,7 +1017,12 @@ TaoTrace::openOutput()
     }
     if (measure_cpl_) {
         registerExitCallback([this]() { finalizeCplMeasurement(); });
-        const int32_t native_core_id = parseFstCoreIdFromName(name());
+        const int32_t native_core_id = sourceCoreId();
+        if (fixed_work_marker_ && native_core_id >= 0) {
+            // Preserve native facts for finite in-flight requests across BEGIN.
+            // Prefix retirement removes older identities without scoring them.
+            TaoTraceNativeAccessRegistry::prepareContext(uint32_t(native_core_id));
+        }
         if (functional_warmup_ && native_core_id >= 0) {
             TaoTraceNativeAccessRegistry::prepareContext(
                 uint32_t(native_core_id));
@@ -1079,7 +1100,7 @@ TaoTrace::openOutput()
 // emit 必须查询该 core 自己的 depth，避免先结束的 core 把 join/futex 尾部
 // 混入仍在执行的其他 core 的 ROI。
 void
-TaoTrace::traceSourceRoiCheckpoint(gem5::ThreadContext *tc)
+TaoTrace::traceFstSourceRoiCheckpoint(gem5::ThreadContext *tc)
 {
     if (!tc || !tc->getSystemPtr()) return;
     X86ISA::Efer efer =
@@ -1360,6 +1381,10 @@ TaoTrace::getL1iMshr(uint32_t cid)
 void
 TaoTrace::regProbeListeners()
 {
+    if (calibration_marker_) {
+        calibration_marker_->regProbeListeners();
+        return;
+    }
     // 在第一个 callback 触发之前装载 uarch_profile.json：保证后续 LRU/TLB/walker
     // 视图均按 schema v2 配置。
     ensureUarchLoaded(output_dir_, uarch_profile_path_);
@@ -1550,6 +1575,10 @@ TaoTrace::pteAddressSpaceMatches(const DynInstPtr &inst) const
 void
 TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
 {
+    // Fixed work may contain multiple independent fork roots. Dynamic
+    // translation facts retain their identities; no single PTE snapshot
+    // certifies the whole stream.
+    if (fixed_work_marker_) return;
     if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
         !isUserInstruction(inst) || !inst || !inst->tcBase()) {
         return;
@@ -1700,7 +1729,14 @@ TaoTrace::getTraceThreadId(const DynInstPtr &inst) const
 uint32_t
 TaoTrace::getCoreId(const DynInstPtr &inst) const
 {
+    if (explicit_source_core_ >= 0) return uint32_t(explicit_source_core_);
     return inst->cpu ? inst->cpu->cpuId() : 0u;
+}
+
+int32_t TaoTrace::sourceCoreId() const
+{
+    return explicit_source_core_ >= 0 ? explicit_source_core_ :
+           parseFstCoreIdFromName(name());
 }
 
 void
@@ -1708,7 +1744,7 @@ TaoTrace::noteCplSyscallEntry(const DynInstPtr &inst)
 {
     if (!measure_cpl_) return;
     if (cpl_core_id_ < 0) {
-        cpl_core_id_ = parseFstCoreIdFromName(name());
+        cpl_core_id_ = sourceCoreId();
         if (cpl_core_id_ < 0) cpl_core_id_ = 0;
     }
     if (!cplMeasurementActive()) return;
@@ -1722,8 +1758,16 @@ TaoTrace::noteCplSyscallEntry(const DynInstPtr &inst)
 }
 
 bool
+TaoTrace::fixedWorkNativeOnly() const
+{
+    return fixed_work_marker_ && !emit_macro_ && !out_records_micro_ &&
+        !out_labels_micro_ && !out_mem_events_ && !emit_native_response_jsonl_;
+}
+
+bool
 TaoTrace::cplMeasurementActive() const
 {
+    if (fixed_work_marker_) return fixed_work_marker_->scoring() && !cpl_finalized_;
     // The architectural WORKBEGIN instruction is observed before the guest's
     // serial marker line reaches Terminal::writeData().  Functional warmup
     // uses that serial line as its exact measurement boundary, so do not let
@@ -1743,6 +1787,7 @@ TaoTrace::cplMeasurementActive() const
 uint64_t
 TaoTrace::cplMeasurementBeginTick() const
 {
+    if (fixed_work_marker_) return fixed_work_marker_->beginTick();
     if (require_roi_ && cpl_core_id_ >= 0) {
         auto it = cpl_measurement_begin_tick_per_core_.find(
             uint32_t(cpl_core_id_));
@@ -1756,6 +1801,7 @@ TaoTrace::cplMeasurementBeginTick() const
 uint64_t
 TaoTrace::cplMeasurementEndTick() const
 {
+    if (fixed_work_marker_) return fixed_work_marker_->endTick();
     if (require_roi_ && cpl_core_id_ >= 0) {
         auto it = cpl_measurement_end_tick_per_core_.find(
             uint32_t(cpl_core_id_));
@@ -1904,7 +1950,7 @@ TaoTrace::emitFunctionalSyscallMarker(
         return;
     }
     if (cpl_core_id_ < 0) {
-        cpl_core_id_ = parseFstCoreIdFromName(name());
+        cpl_core_id_ = sourceCoreId();
         if (cpl_core_id_ < 0) cpl_core_id_ = 0;
     }
     const uint64_t pc = inst->pcState().instAddr();
@@ -2087,6 +2133,7 @@ TaoTrace::maybeCompleteFunctionalSyscall(const DynInstPtr &inst)
 bool
 TaoTrace::functionalCaptureActive() const
 {
+    if (fixed_work_marker_) return fixed_work_marker_->capturing();
     return functional_warmup_ || cplMeasurementActive();
 }
 
@@ -2255,6 +2302,7 @@ TaoTrace::pollFunctionalTargetDrain()
 void
 TaoTrace::writeFunctionalBoundary()
 {
+    if (fixed_work_marker_) return;
     if (!functionalTraceEnabled()) return;
     char path[1024];
     const int32_t core_id = fst_core_id_ >= 0
@@ -2972,19 +3020,25 @@ TaoTrace::finalizeNativeResponseDiagnostic()
 
     static constexpr const char *path_names[] = {
         "proxy_l1", "proxy_l2", "proxy_llc", "proxy_remote", "proxy_dram"};
-    std::fputs("\"proxy_native_confusion\":{", summary);
-    for (unsigned path = 0; path < native_diag_proxy_confusion_.size(); ++path) {
-        if (path) std::fputc(',', summary);
-        std::fprintf(summary,
-            "\"%s\":{\"native_hit_fragments\":%lu,"
-            "\"native_miss_fragments\":%lu}", path_names[path],
-            (unsigned long)native_diag_proxy_confusion_[path][0],
-            (unsigned long)native_diag_proxy_confusion_[path][1]);
+    std::fputs("\"proxy_native_confusion\":", summary);
+    if (fixedWorkNativeOnly()) {
+        std::fputs("null", summary);
+    } else {
+        std::fputc('{', summary);
+        for (unsigned path = 0; path < native_diag_proxy_confusion_.size(); ++path) {
+            if (path) std::fputc(',', summary);
+            std::fprintf(summary,
+                "\"%s\":{\"native_hit_fragments\":%lu,"
+                "\"native_miss_fragments\":%lu}", path_names[path],
+                (unsigned long)native_diag_proxy_confusion_[path][0],
+                (unsigned long)native_diag_proxy_confusion_[path][1]);
+        }
+        std::fputc('}', summary);
     }
     static constexpr const char *reason_names[] = {
         "predicated_off", "no_request", "store_forward", "local_access",
         "failed_store_conditional", "zero_size", "prefetch_skipped"};
-    std::fputs("},\"terminal_reason_counts\":{", summary);
+    std::fputs(",\"terminal_reason_counts\":{", summary);
     bool first_reason = true;
     for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
          ++bit) {
@@ -3761,9 +3815,16 @@ void
 TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
 {
     if (!measure_cpl_ || !inst || !inst->tcBase()) return;
+    if (fixed_work_marker_ && !fixed_work_marker_->scoring()) {
+        // Native tracking and continuous FST emission have distinct bounds.
+        // Retired prefix/suffix identities are not business-window members.
+        const auto si = inst->staticInst;
+        if (si && (si->isLoad() || si->isStore() || isLockedAtomicMicro(inst)))
+            TaoTraceNativeAccessRegistry::erase(getTraceThreadId(inst), inst->seqNum);
+    }
     if (cpl_finalized_) return;
     if (cpl_core_id_ < 0) {
-        cpl_core_id_ = parseFstCoreIdFromName(name());
+        cpl_core_id_ = sourceCoreId();
         if (cpl_core_id_ < 0) cpl_core_id_ = int32_t(getCoreId(inst));
     }
     if (!cplMeasurementActive()) {
@@ -3951,47 +4012,57 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
         }
         ++cpl_committed_memory_uops_;
         cpl_line_requests_ += line_requests;
-        const auto completed = pending_shared_attr_.find(data_key);
-        const bool is_store_commit =
-            si->isStore() || isLockedAtomicMicro(inst);
-        const bool is_load_commit =
-            si->isLoad() && !is_store_commit;
-        if (completed != pending_shared_attr_.end()) {
-            PerfMemClass perf_class{is_load_commit, is_store_commit,
-                completed->second.mshr_same_line_outstanding, false};
-            accountCplDataPmu(
-                completed->second, commit_class, cpl_active_sysnum_,
-                line_requests, dtlb_outcome, perf_class);
-            ++cpl_packet_attributed_uops_;
+        if (fixedWorkNativeOnly()) {
+            // Request extensions and the native registry carry actual Ruby
+            // lifecycles, including split accesses and post-commit stores.
+            // Software cache/TLB predictions are not part of this capture.
+            SharedAttr native_only;
+            native_only.path_class = 255; // No software proxy classification.
             writeNativeResponseCommit(
-                inst, completed->second, commit_class, line_requests,
-                false);
+                inst, native_only, commit_class, line_requests, true);
         } else {
-            const bool skips_accumulate =
-                (functional_user_only_ && !decoded_user) ||
-                (functionalTraceEnabled() && !functional_syscall_microops_ && isSyscallMacro(inst)) ||
-                (!functional_syscall_microops_ && isSyscallInst(inst) &&
-                 pending_syscalls_.count(inst->seqNum));
-            if (skips_accumulate) {
-                const bool is_store =
-                    si->isStore() || isLockedAtomicMicro(inst);
-                const SharedAttr fallback = deriveSharedAttrFromLineState(
-                    inst->physEffAddr, getCoreId(inst), is_store);
+            const auto completed = pending_shared_attr_.find(data_key);
+            const bool is_store_commit =
+                si->isStore() || isLockedAtomicMicro(inst);
+            const bool is_load_commit =
+                si->isLoad() && !is_store_commit;
+            if (completed != pending_shared_attr_.end()) {
                 PerfMemClass perf_class{is_load_commit, is_store_commit,
-                    fallback.mshr_same_line_outstanding, false};
+                    completed->second.mshr_same_line_outstanding, false};
                 accountCplDataPmu(
-                    fallback, commit_class, cpl_active_sysnum_, line_requests,
-                    dtlb_outcome, perf_class);
-                ++cpl_fallback_attributed_uops_;
+                    completed->second, commit_class, cpl_active_sysnum_,
+                    line_requests, dtlb_outcome, perf_class);
+                ++cpl_packet_attributed_uops_;
                 writeNativeResponseCommit(
-                    inst, fallback, commit_class, line_requests, true);
+                    inst, completed->second, commit_class, line_requests,
+                    false);
             } else {
-                // accumulateMicro will use the same fallback attribution that
-                // it emits into FST. Freeze the commit-time scope and line
-                // count here so a later CPL transition cannot move the event.
-                pending_cpl_data_class_[data_key] = {
-                    commit_class, cpl_active_sysnum_, line_requests,
-                    dtlb_outcome};
+                const bool skips_accumulate =
+                    (functional_user_only_ && !decoded_user) ||
+                    (functionalTraceEnabled() && !functional_syscall_microops_ && isSyscallMacro(inst)) ||
+                    (!functional_syscall_microops_ && isSyscallInst(inst) &&
+                     pending_syscalls_.count(inst->seqNum));
+                if (skips_accumulate) {
+                    const bool is_store =
+                        si->isStore() || isLockedAtomicMicro(inst);
+                    const SharedAttr fallback = deriveSharedAttrFromLineState(
+                        inst->physEffAddr, getCoreId(inst), is_store);
+                    PerfMemClass perf_class{is_load_commit, is_store_commit,
+                        fallback.mshr_same_line_outstanding, false};
+                    accountCplDataPmu(
+                        fallback, commit_class, cpl_active_sysnum_, line_requests,
+                        dtlb_outcome, perf_class);
+                    ++cpl_fallback_attributed_uops_;
+                    writeNativeResponseCommit(
+                        inst, fallback, commit_class, line_requests, true);
+                } else {
+                    // accumulateMicro will use the same fallback attribution that
+                    // it emits into FST. Freeze the commit-time scope and line
+                    // count here so a later CPL transition cannot move the event.
+                    pending_cpl_data_class_[data_key] = {
+                        commit_class, cpl_active_sysnum_, line_requests,
+                        dtlb_outcome};
+                }
             }
         }
     }
@@ -4005,7 +4076,8 @@ TaoTrace::accountCplCommit(const DynInstPtr &inst, bool is_syscall)
         ++cpl_syscall_boundaries_;
         ++cpl_entries_[static_cast<size_t>(CplCycleClass::SYSCALL)];
         ++cpl_syscalls_[cpl_active_sysnum_].count;
-        emitFunctionalSyscallMarker(inst, cpl_active_sysnum_);
+        if (!fixed_work_marker_)
+            emitFunctionalSyscallMarker(inst, cpl_active_sysnum_);
     }
 
     if (!decoded_user && isInterruptReturn(inst) &&
@@ -4195,6 +4267,10 @@ TaoTrace::finalizeCplMeasurement()
         (unsigned long)cpl_syscall_boundaries_,
         measured_ticks == span_ticks ? 1u : 0u);
     std::fflush(global_cpl_class_);
+
+    // Fixed-work consumers use exact endpoint counters and native summaries.
+    // Do not publish uncomputed legacy software cache PMU as measured zeros.
+    if (fixedWorkNativeOnly()) return;
 
     char path[1024];
     std::snprintf(path, sizeof(path), "%s/oracle/cpi-core%d.json",
@@ -5108,11 +5184,13 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
         acc.op_class = int(si->opClass());
         acc.first_fetch_tick = (inst->fetchTick != Tick(-1))
                                 ? uint64_t(inst->fetchTick) : curTick();
-        if (inst->macroop) {
-            acc.macro_disasm_lower = toLower(
-                inst->macroop->disassemble(acc.macro_pc));
-        } else {
-            acc.macro_disasm_lower = toLower(si->disassemble(acc.macro_pc));
+        if (emit_macro_) {
+            if (inst->macroop) {
+                acc.macro_disasm_lower = toLower(
+                    inst->macroop->disassemble(acc.macro_pc));
+            } else {
+                acc.macro_disasm_lower = toLower(si->disassemble(acc.macro_pc));
+            }
         }
         acc.macro_legacy_lock = isMacroopLocked(inst);
     }
@@ -5140,7 +5218,7 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
                          isLockedAtomicMicro(inst));
     SharedAttr emit_oracle;        // V3 mem_events.jsonl 输出用
     int        emit_oracle_src = 1; // 0=packet 1=fallback
-    if (mem_touching) {
+    if (mem_touching && !fixedWorkNativeOnly()) {
         const uint32_t core_id_local = acc.core_id;
         uint64_t key = (uint64_t(tid) << 48) | uint64_t(inst->seqNum);
         auto it_pa = pending_shared_attr_.find(key);
@@ -5242,7 +5320,7 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
     }
 
     // V1 多核新增：累积 reg read/write bitmap（按 IntRegClass index 折叠 mod 64）
-    {
+    if (emit_macro_) {
         const size_t ns = si->numSrcRegs();
         for (size_t i = 0; i < ns; ++i) {
             const RegId &r = si->srcRegIdx(i);
@@ -5309,7 +5387,8 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
             //   d-side 不改 coh 分类（packet 是 ground truth），仅维护 outstanding
             //   表，让上层 dataset builder 在 Step 3.6 能基于 MSHR 视图做合并。
             uint64_t mshr_cl = inst->physEffAddr & ~uint64_t(63);
-            getL1dMshr(acc.core_id).retire(mshr_cl);
+            if (!fixedWorkNativeOnly())
+                getL1dMshr(acc.core_id).retire(mshr_cl);
         }
 
         // i-side oracle：按 macro_pc cacheline 在 last_i_attr_per_core_ 查最近一次
@@ -5320,7 +5399,9 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
         InstSharedAttr i_attr;
         const uint64_t i_cl = inst->pcState().instAddr() & ~uint64_t(63);
         bool i_attr_filled = false;
-        auto it_core = last_i_attr_per_core_.find(acc.core_id);
+        auto it_core = last_i_attr_per_core_.end();
+        if (out_records_micro_)
+            it_core = last_i_attr_per_core_.find(acc.core_id);
         if (it_core != last_i_attr_per_core_.end()) {
             auto it_cl = it_core->second.find(i_cl);
             if (it_cl != it_core->second.end()) {
@@ -5328,7 +5409,7 @@ TaoTrace::accumulateMicro(const DynInstPtr &inst)
                 i_attr_filled = true;
             }
         }
-        if (!i_attr_filled) {
+        if (out_records_micro_ && !i_attr_filled) {
             // fallback：oracle i-side LRU peek（contains 是 const，不动 LRU 顺序）
             //   全部走 i-side 独立视图（vaddr 域），与 d-side line_states_/L*_lru
             //   严格隔离，不会被 d-side paddr 状态机污染。
@@ -5689,13 +5770,17 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     const bool functional_user = instruction_cpl == 3;
     const uint8_t encoded_cpl =
         functional_include_kernel_ ? instruction_cpl : 3;
+    // Idle filtering is only used by the legacy privileged-stream gate.
+    // User records and fixed-work streams never need instruction text here.
     const bool warmup_kernel_idle =
+        !fixed_work_marker_ && thread_state_marker_pc_ == 0 &&
+        functional_include_kernel_ && !functional_user &&
         !functional_measurement_started_ &&
         (isIdleInstruction(inst) || isPollIdleInstruction(inst));
     // Task ownership needs the complete committed kernel stream. The legacy
     // CPL gate can drop idle-to-task switches before a core's first user commit
     // at the common measurement boundary, including entire hook macro-ops.
-    if (thread_state_marker_pc_ == 0 && functional_include_kernel_ &&
+    if (!fixed_work_marker_ && thread_state_marker_pc_ == 0 && functional_include_kernel_ &&
         !functional_user &&
         (warmup_kernel_idle ||
          (functional_measurement_started_ &&
@@ -7076,6 +7161,14 @@ TaoTrace::onDataAccessComplete(
     if (!si) return;
     if (!(si->isLoad() || si->isStore() || isLockedAtomicMicro(inst))) return;
 
+    if (fixedWorkNativeOnly()) {
+        // Ruby publishes native facts independently of the proxy descriptor.
+        // Loads are reduced at commit; pending stores can resolve here or
+        // during the final drain after SLICC publishes its hierarchy outcome.
+        refreshNativeResponsePending();
+        return;
+    }
+
     const uint32_t tid     = getTraceThreadId(inst);
     const uint32_t core_id = getCoreId(inst);
     const bool is_store    = si->isStore() || isLockedAtomicMicro(inst);
@@ -7209,6 +7302,9 @@ TaoTrace::onDataAccessComplete(
 void
 TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
 {
+    // These software hierarchy descriptors are only emitted in JSON. Native
+    // accounting and functional FST translations use independent observers.
+    if (!out_records_micro_ && !global_mem_events_) return;
     if (!pkt) return;
     if (!uarch_loaded_) return;
 
@@ -7923,6 +8019,13 @@ TaoTrace::onCommit(const DynInstPtr &inst)
         premeasurement_page_fault_pending_ = false;
     }
     const bool syscall_boundary = isSyscallBoundary(inst);
+    if (fixed_work_marker_ && functionalCaptureActive() && syscall_boundary &&
+        isUserInstruction(inst)) {
+        // Functional syscall evidence belongs to the continuous stream,
+        // including unscored prefix/finalize, independently of CPL counters.
+        emitFunctionalSyscallMarker(
+            inst, uint64_t(inst->tcBase()->getReg(X86ISA::int_reg::Rax)));
+    }
     if (syscall_boundary && functional_warmup_ &&
         !cplMeasurementActive() && isUserInstruction(inst)) {
         emitFunctionalSyscallMarker(
@@ -7965,6 +8068,7 @@ TaoTrace::onCommit(const DynInstPtr &inst)
     const bool state_capture = out_thread_state_ && functionalCaptureActive() &&
                                !functionalTargetReached();
     accumulateMicro(inst);
+    if (fixed_work_marker_) fixed_work_marker_->observe(inst, sync_ordinal);
     // Emit only a successful, user-side commit actually retained in the FST.
     // The target-closing marker itself remains included, even if emission
     // closes measurement while accumulateMicro processes this last record.
@@ -7981,3 +8085,55 @@ TaoTrace::onCommit(const DynInstPtr &inst)
 
 } // namespace o3
 } // namespace gem5
+
+namespace gem5 { namespace o3 {
+void TaoTrace::startMarkerCapture(const std::string &directory)
+{
+    fatal_if(!calibration_marker_, "Marker capture requires marker_pc");
+    calibration_marker_->startMarkerCapture(directory);
+}
+void TaoTrace::selectMarkerWindow(uint64_t begin, uint64_t end)
+{
+    fatal_if(!calibration_marker_, "Marker window requires marker_pc");
+    calibration_marker_->selectMarkerWindow(begin, end);
+}
+void TaoTrace::resumeMarkerHandoff()
+{
+    fatal_if(!calibration_marker_, "Marker handoff requires marker_pc");
+    calibration_marker_->resumeMarkerHandoff();
+}
+void TaoTrace::traceMarkerHandoff(gem5::ThreadContext *tc)
+{
+    if (FixedWorkMarker::hasInstances()) FixedWorkMarker::handoff(tc);
+    else CalibrationMarker::traceMarkerHandoff(tc);
+}
+void TaoTrace::traceSourceRoiCheckpoint(gem5::ThreadContext *tc)
+{
+    if (CalibrationMarker::hasInstances())
+        CalibrationMarker::traceSourceRoiCheckpoint(tc);
+    else
+        traceFstSourceRoiCheckpoint(tc);
+}
+} }
+
+namespace gem5 { namespace o3 {
+void TaoTrace::startFixedWorkCapture()
+{
+    fatal_if(!fixed_work_marker_, "fixed-work capture is not configured");
+    fixed_work_marker_->start();
+}
+void TaoTrace::finishFixedWorkCapture()
+{
+    fatal_if(!fixed_work_marker_, "fixed-work capture is not configured");
+    fixed_work_marker_->finish();
+}
+void TaoTrace::resumeFixedWorkHandoff()
+{
+    FixedWorkMarker::resume();
+}
+void TaoTrace::exportFixedWorkResult()
+{
+    fatal_if(!fixed_work_marker_, "fixed-work capture is not configured");
+    fixed_work_marker_->exportResult();
+}
+} }

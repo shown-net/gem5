@@ -71,7 +71,7 @@ namespace o3
 {
 
 CPU::CPU(const BaseO3CPUParams &params)
-    : BaseCPU(params),
+    : BaseCPU(params), tmaEnabled(params.enableCalibrationTMA),
       mmu(params.mmu),
       tickEvent([this] { tick(); }, "O3CPU tick", false, Event::CPU_Tick_Pri),
       threadExitEvent([this] { exitThreads(); }, "O3CPU exit threads", false,
@@ -113,7 +113,9 @@ CPU::CPU(const BaseO3CPUParams &params)
       globalFTSeqNum(1),
       system(params.system),
       lastRunningCycle(curCycle()),
-      cpuStats(this)
+      cpuStats(this), unhaltedClockStats(this),
+      tmaStats(this, params.renameWidth), instRetiredStats(this),
+      uopsRetiredStats(this)
 {
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
@@ -458,6 +460,8 @@ CPU::startup()
 void
 CPU::activateThread(ThreadID tid)
 {
+    unhaltedClockStats.setActive(tid, true);
+    if (tid == 0) tmaStats.setActive(true);
     auto active_it = std::find(
             activeThreads.begin(), activeThreads.end(), tid);
 
@@ -474,6 +478,8 @@ CPU::activateThread(ThreadID tid)
 void
 CPU::deactivateThread(ThreadID tid)
 {
+    unhaltedClockStats.setActive(tid, false);
+    if (tid == 0) tmaStats.setActive(false);
     // hardware transactional memory
     // shouldn't deactivate thread in the middle of a transaction
     assert(!commit.executingHtmTransaction(tid));

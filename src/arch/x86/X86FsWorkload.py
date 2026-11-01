@@ -90,6 +90,8 @@ class X86FsLinux(X86FsWorkload):
     e820_table = Param.X86E820Table(
         X86E820Table(), "E820 map of physical memory"
     )
+    initrd = Param.String("", "Initial ramdisk image for the Linux kernel")
+    initrd_addr = Param.Addr(0x20000000, "Physical address of the initrd")
     exit_on_kernel_panic = Param.Bool(
         True, "Generate gem5 panic upon the guest's kernel panic."
     )

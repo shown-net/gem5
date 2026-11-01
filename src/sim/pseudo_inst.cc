@@ -57,6 +57,7 @@
 #include "base/debug.hh"
 #include "base/output.hh"
 #include "cpu/base.hh"
+#include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Loader.hh"
 #include "debug/Quiesce.hh"
@@ -625,6 +626,9 @@ void
 m5Hypercall(ThreadContext *tc, uint64_t hypercall_id)
 {
     DPRINTF(PseudoInst, "pseudo_inst::m5Hypercall(%i)\n", hypercall_id);
+    if (hypercall_id == 4) {
+        gem5::o3::TaoTrace::traceMarkerHandoff(tc);
+    }
     exitSimLoopWithHypercall("m5_hypercall instruction encountered", 0,
     curTick(),0, std::map<std::string, std::string>(), hypercall_id, true);
 }

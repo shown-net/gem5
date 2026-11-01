@@ -59,6 +59,7 @@ class TSOStore(Enum):
 
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
+    enableCalibrationTMA = Param.Bool(False, "Enable single-thread Marker TMA accounting")
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/dyn_inst.hh"
 

@@ -131,7 +131,8 @@ IdeController::Channel::postInterrupt()
 void
 IdeController::Channel::clearInterrupt()
 {
-    bmiRegs.status.intStatus = 0;
+    // The DMA completion latch is cleared by a W1C write to BMIStatus.
+    // Deasserting the ATA device IRQ must preserve that completion status.
     _pendingInterrupt = false;
     ctrl->clearInterrupt(isPrimary());
 }
@@ -423,6 +424,7 @@ IdeController::Channel::serialize(const std::string &base,
     paramOut(cp, base + ".bmiRegs.reserved1", bmiRegs.reserved1);
     paramOut(cp, base + ".bmiRegs.bmidtp", bmiRegs.bmidtp);
     paramOut(cp, base + ".selectBit", selectBit);
+    paramOut(cp, base + ".pendingInterrupt", _pendingInterrupt);
 }
 
 void
@@ -452,6 +454,7 @@ IdeController::Channel::unserialize(const std::string &base, CheckpointIn &cp)
     paramIn(cp, base + ".bmiRegs.reserved1", bmiRegs.reserved1);
     paramIn(cp, base + ".bmiRegs.bmidtp", bmiRegs.bmidtp);
     paramIn(cp, base + ".selectBit", selectBit);
+    paramIn(cp, base + ".pendingInterrupt", _pendingInterrupt);
     select(selectBit);
 }
 

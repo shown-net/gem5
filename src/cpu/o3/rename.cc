@@ -444,6 +444,13 @@ Rename::tick()
         rename(status_change, tid);
     }
 
+    if (numThreads == 1 && !activeThreads->empty()) {
+        const bool blocked = blockThisCycle || renameStatus[0] == Blocked ||
+            renameStatus[0] == SerializeStall || calcFreeROBEntries(0) < int(renameWidth) ||
+            calcFreeIQEntries(0) < int(renameWidth) || renameMap[0]->minFreeEntries() < renameWidth;
+        cpu->tmaStats.renameCycle(blocked, renameStatus[0] == Squashing);
+    }
+
     if (status_change) {
         updateStatus();
     }
@@ -752,6 +759,7 @@ Rename::renameInsts(ThreadID tid)
         }
 
         ++renamed_insts;
+        cpu->tmaStats.allocated(inst);
         // Notify potential listeners that source and destination registers for
         // this instruction have been renamed.
         ppRename->notify(inst);

@@ -519,6 +519,7 @@ Commit::squashAll(ThreadID tid)
     // Hopefully nothing breaks.)
     youngestSeqNum[tid] = lastCommitedSeqNum[tid];
 
+    if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, false);
     rob->squash(squashed_inst, tid);
     changedROBNumEntries[tid] = true;
 
@@ -843,6 +844,7 @@ Commit::commit()
             // number as the youngest instruction in the ROB.
             youngestSeqNum[tid] = squashed_inst;
 
+            if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, true);
             rob->squash(squashed_inst, tid);
             changedROBNumEntries[tid] = true;
 
@@ -984,6 +986,7 @@ Commit::commitInsts()
             DPRINTF(Commit, "Retiring squashed instruction from "
                     "ROB.\n");
 
+            cpu->tmaStats.onOtherSquash(head_inst);
             rob->retireHead(commit_thread);
 
             ++stats.commitSquashedInsts;
@@ -1017,6 +1020,8 @@ Commit::commitInsts()
 
             if (commit_success) {
                 ++num_committed;
+                cpu->tmaStats.onRetire(head_inst);
+                ++cpu->uopsRetiredStats.SLOTS;
                 cpu->commitStats[tid]
                     ->committedInstType[head_inst->opClass()]++;
                 stats.committedInstType[tid][head_inst->opClass()]++;
@@ -1391,6 +1396,7 @@ Commit::updateComInstStats(const DynInstPtr &inst)
     // double count Microops as insts.
     if (!inst->isMicroop() || inst->isLastMicroop()) {
         cpu->commitStats[tid]->numInsts++;
+        ++cpu->instRetiredStats.ANY;
         cpu->baseStats.numInsts++;
         if (in_user_mode) {
             cpu->commitStats[tid]->numUserInsts++;
