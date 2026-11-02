@@ -236,6 +236,14 @@ class AssociativeCache : public Named
     virtual Entry*
     findVictim(const KeyType &key)
     {
+        return findVictim(key, [](const Entry &) {});
+    }
+
+    // Clients with victim buffers need the intact entry before invalidation.
+    template <typename BeforeInvalidate>
+    Entry*
+    findVictim(const KeyType &key, BeforeInvalidate before_invalidate)
+    {
         auto candidates = indexingPolicy->getPossibleEntries(key);
 
         auto victim = static_cast<Entry*>(replPolicy->getVictim(candidates));
@@ -246,6 +254,7 @@ class AssociativeCache : public Named
                 "Replacing entry: %s\n", victim->print());
         }
 
+        before_invalidate(*victim);
         invalidate(victim);
 
         return victim;

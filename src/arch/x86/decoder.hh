@@ -265,6 +265,20 @@ class Decoder : public InstDecoder
         emi.mode.submode = submode;
     }
 
+    uint64_t frontendContext() const
+    {
+        HandyM5Reg value = 0;
+        value.cpl = cpl;
+        value.mode = mode;
+        value.submode = submode;
+        value.altOp = altOp;
+        value.defOp = defOp;
+        value.altAddr = altAddr;
+        value.defAddr = defAddr;
+        value.stack = stack;
+        return value;
+    }
+
     void
     setM5Reg(HandyM5Reg m5Reg)
     {

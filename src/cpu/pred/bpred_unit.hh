@@ -138,6 +138,21 @@ class BPredUnit : public SimObject
         return btb->valid(tid, pc);
     }
 
+    void invalidateBTB(ThreadID tid, Addr pc)
+    {
+        btb->invalidate(tid, pc);
+    }
+
+    Cycles btbLookupLatency(ThreadID tid, Addr pc) const
+    {
+        return btb->lookupLatency(tid, pc);
+    }
+
+    void setUserMode(ThreadID tid, bool user)
+    {
+        if (iPred) iPred->setUserMode(tid, user);
+    }
+
     /**
      * Looks up a given PC in the BTB to get the predicted target. The PC may
      * be changed or deleted in the future, so it needs to be used immediately,
@@ -411,6 +426,7 @@ class BPredUnit : public SimObject
      * This info is only available from the BTB.
      * Low-end CPUs predecoding might be used to identify branches. */
     const bool requiresBTBHit;
+    const bool useReturnFallback;
 
     /** Update the BTB at squash time instead of commit. This can be useful
      * to update the BTB earlier to avoid BTB misses on subsequent branches.
@@ -458,6 +474,7 @@ class BPredUnit : public SimObject
         /** Target prediction per branch type */
         statistics::Vector2d targetProvider;
         statistics::Vector2d targetWrong;
+        statistics::Vector2d returnTargetProvider;
 
         /** Additional scalar stats for conditional branches */
         statistics::Scalar condPredicted;

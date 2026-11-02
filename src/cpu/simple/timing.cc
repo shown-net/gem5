@@ -854,7 +854,8 @@ TimingSimpleCPU::completeIfetch(PacketPtr pkt)
             thread->htmTransactionStarts);
     }
 
-    if (curStaticInst && curStaticInst->isMemRef()) {
+    if (curStaticInst &&
+        (curStaticInst->isMemRef() || curStaticInst->isStoreData())) {
         // load or store: just send to dcache
         Fault fault = curStaticInst->initiateAcc(&t_info, traceData);
 

@@ -44,6 +44,7 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <array>
 #include <iostream>
 #include <list>
 #include <queue>
@@ -60,6 +61,7 @@
 #include "cpu/o3/decode.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/fetch.hh"
+#include "cpu/o3/frontend.hh"
 #include "cpu/o3/free_list.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/iew.hh"
@@ -79,6 +81,7 @@ namespace gem5
 template <class>
 class Checker;
 class ThreadContext;
+class ResultForwarding;
 
 class Checkpoint;
 class Process;
@@ -87,6 +90,8 @@ namespace o3
 {
 
 class ThreadContext;
+class ZeroIdiom;
+class FrontendCoordinator;
 
 /**
  * O3CPU class, has each of the stages (fetch through commit)
@@ -98,6 +103,9 @@ class CPU : public BaseCPU
   public:
     bool markerObservation = false;
     const bool tmaEnabled;
+    FrontendCoordinator *frontend = nullptr;
+    ResultForwarding *resultForwarding = nullptr;
+    ZeroIdiom *zeroIdiom = nullptr;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -589,6 +597,12 @@ class CPU : public BaseCPU
                 flags, res, std::move(amo_op), byte_enable);
     }
 
+    Fault
+    writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+    {
+        return iew.ldstQueue.writeStoreData(inst, data, size);
+    }
+
     /** Used by the fetch unit to get a hold of the instruction port. */
     Port &
     getInstPort() override
@@ -625,9 +639,10 @@ class CPU : public BaseCPU
         CPU *owner;
         std::array<bool, MaxThreads> running{};
         std::array<uint64_t, MaxThreads> lastCycle{};
-        statistics::Scalar THREAD;
+        statistics::Scalar THREAD, REF_TSC;
     } unhaltedClockStats;
 
+    /** Window-local allocation-slot model; not Intel's internal PMU logic. */
     struct TmaStats : public statistics::Group
     {
         explicit TmaStats(CPU *cpu, unsigned width);
@@ -653,12 +668,24 @@ class CPU : public BaseCPU
         uint64_t lastCycle = 0;
         unsigned accepted = 0;
         EmptyReason previous = EmptyReason::Frontend;
-        std::set<InstSeqNum> outstanding;
+        std::map<InstSeqNum, AllocationGroupPtr> outstanding;
       public:
         statistics::Scalar slots, retiring, badSpeculation, frontendBound;
         statistics::Scalar backendBound, pending, retired, otherSquashes;
         statistics::Scalar allocatedOps, fusedPairs;
     } tmaStats;
+
+    struct BranchInstStats : public statistics::Group
+    {
+        explicit BranchInstStats(CPU *cpu);
+        statistics::Scalar ALL_BRANCHES, COND, INDIRECT, NEAR_RETURN;
+    } branchInstStats;
+
+    struct BranchMispStats : public statistics::Group
+    {
+        explicit BranchMispStats(CPU *cpu);
+        statistics::Scalar ALL_BRANCHES, COND, INDIRECT, RET;
+    } branchMispStats;
 
     struct InstRetiredStats : public statistics::Group
     {
@@ -672,9 +699,41 @@ class CPU : public BaseCPU
         statistics::Scalar SLOTS;
     } uopsRetiredStats;
 
+    struct MoveEliminationStats : public statistics::Group
+    {
+        explicit MoveEliminationStats(CPU *cpu);
+        statistics::Scalar accepted, retired;
+    } moveEliminationStats;
 
+    struct MemoryInstRetiredStats : public statistics::Group
+    {
+        explicit MemoryInstRetiredStats(CPU *cpu);
+        statistics::Scalar ALL_LOADS, ALL_STORES;
+    } memoryInstRetiredStats;
+    struct MemoryLoadRetiredStats : public statistics::Group
+    {
+        explicit MemoryLoadRetiredStats(CPU *cpu);
+        statistics::Scalar L1_HIT, L1_MISS, L2_HIT, L2_MISS, L3_HIT, L3_MISS, FB_HIT;
+        statistics::Scalar storeForward, unknownSource;
+    } memoryLoadRetiredStats;
+    struct PendingMemoryRetirement {
+        bool load = false, store = false, unknown = false;
+        uint8_t sources = 0;
+    };
+    std::array<PendingMemoryRetirement, MaxThreads> pendingMemoryRetirement{};
+    bool memoryObservationActive = false;
+    void beginMemoryObservation();
+    void endMemoryObservation();
+    void recordMemoryRetirement(const DynInstPtr &inst);
+    void releaseMemoryRetirement(const DynInstPtr &inst, bool squashed = false);
+    void discardMemoryRetirement(ThreadID tid) { pendingMemoryRetirement[tid] = {}; }
+
+    void recordBranchRetirement(const DynInstPtr &inst);
+    void resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next)
+    { fetch.resolveMicrocodeControl(inst, next); }
 
   public:
+
     // hardware transactional memory
     void htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
                             HtmFailureFaultCause cause) override;

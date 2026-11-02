@@ -116,6 +116,12 @@ class X86MicroopBase : public X86StaticInst
             unsigned shift = i * ChunkSize * 8;
             flags |= (std::bitset<Num_Flags>(setFlags >> shift) << shift);
         }
+        if (__opClass == X86StoreAddressOp) {
+            flags[IsStore] = true;
+            flags[IsStoreAddress] = true;
+        } else if (__opClass == X86StoreDataOp) {
+            flags[IsStoreData] = true;
+        }
     }
 
     std::string

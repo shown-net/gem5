@@ -49,6 +49,8 @@
 #include "debug/RubySequencer.hh"
 #include "debug/RubyStats.hh"
 #include "mem/packet.hh"
+#include "mem/inst_code.hh"
+#include "mem/tso_ordered_store.hh"
 #include "mem/taotrace_response.hh"
 #include "mem/perf_cache_native.hh"
 #include "mem/llc_fill_audit.hh"
@@ -65,12 +67,45 @@ namespace gem5
 namespace ruby
 {
 
+Sequencer::OrderedStoreStats::OrderedStoreStats(Sequencer *owner)
+    : statistics::Group(owner, "orderedStore"),
+      ADD_STAT(retries, statistics::units::Count::get(),
+               "Ordered aliased store retries after an older line callback"),
+      ADD_STAT(overlappedCycles, statistics::units::Cycle::get(),
+               "Sum of retry entry cycles overlapped with alias waiting"),
+      ADD_STAT(deferredNoWriteCallbacks, statistics::units::Count::get(),
+               "Write callbacks deferred before completing any store"),
+      ADD_STAT(parked, statistics::units::Count::get(),
+               "Out-of-order store callbacks parked until predecessor completion"),
+      ADD_STAT(woken, statistics::units::Count::get(),
+               "Parked ordered lines reissued through L0 as the new head"),
+      ADD_STAT(headRateRetries, statistics::units::Count::get(),
+               "Head stores retried after the same-cycle visibility limit")
+{}
+
+Sequencer::StorePrepareStats::StorePrepareStats(Sequencer *owner)
+    : statistics::Group(owner, "storePrepare"),
+      ADD_STAT(accepted, statistics::units::Count::get(),
+               "Permission-prepare hints admitted to the Ruby optional queue"),
+      ADD_STAT(dropped, statistics::units::Count::get(),
+               "Permission-prepare hints dropped at the configured bound"),
+      ADD_STAT(completed, statistics::units::Count::get(),
+               "Permission-prepare hints removed from the outstanding budget"),
+      ADD_STAT(outstanding, statistics::units::Count::get(),
+               "Current permission-prepare hints outstanding")
+{
+    outstanding.functor([owner]() { return owner->m_store_prepare_outstanding; });
+}
+
 Sequencer::Sequencer(const Params &p)
-    : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
+    : RubyPort(p), orderedStoreStats(this), storePrepareStats(this),
+      m_IncompleteTimes(MachineType_NUM),
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
     m_store_prepare_outstanding = 0;
+    m_maxStorePrepareOutstanding = p.max_store_prepare_outstanding;
+    m_parkOrderedStores = p.park_ordered_stores;
 
     m_ruby_system = p.ruby_system;
 
@@ -279,6 +314,7 @@ Sequencer::functionalWrite(Packet *func_pkt)
 
 void Sequencer::resetStats()
 {
+    orderedStoreStats.resetStats();
     m_outstandReqHist.reset();
     m_latencyHist.reset();
     m_hitLatencyHist.reset();
@@ -383,6 +419,14 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     seq_req_list.emplace_back(pkt, primary_type,
         secondary_type, curCycle());
     m_outstanding_count++;
+    if (auto ordered = pkt->req->getExtension<TSOOrderedStore>()) {
+        fatal_if(m_ruby_system->getProtocolInfo().getName() !=
+                     "MESI_Three_Level",
+                 "ordered TSO stores require MESI_Three_Level Ruby");
+        assert(primary_type == RubyRequestType_ST);
+        ordered->acceptedBySequencer = true;
+        m_orderedStores.push_back(pkt->req.get());
+    }
 
     if (seq_req_list.size() > 1) {
         return RequestStatus_Aliased;
@@ -391,6 +435,49 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     m_outstandReqHist.sample(m_outstanding_count);
 
     return RequestStatus_Ready;
+}
+
+bool
+Sequencer::isOrderedStoreReady(const RequestPtr &req) const
+{
+    if (!req || !req->getExtension<TSOOrderedStore>())
+        return true;
+    if (m_orderedStores.empty() || m_orderedStores.front() != req.get())
+        return false;
+    // One different line can become visible per cycle. Consecutive writes
+    // to the same line may share its callback and retain their byte order.
+    return !m_orderedLineValid || m_orderedLineCycle != curCycle() ||
+        m_orderedLine == makeLineAddress(req->getPaddr());
+}
+
+void
+Sequencer::wakeParkedOrderedHead()
+{
+    if (m_orderedStores.empty()) {
+        panic_if(!m_parkedOrderedLines.empty(),
+                 "Parked ordered stores remain without a global head");
+        return;
+    }
+    const auto *head = m_orderedStores.front();
+    const Addr line = makeLineAddress(head->getPaddr());
+    if (!m_parkedOrderedLines.erase(line))
+        return;
+
+    const auto it = m_RequestTable.find(line);
+    panic_if(it == m_RequestTable.end() || it->second.empty() ||
+                 it->second.front().pkt->req.get() != head,
+             "Parked ordered head is not at the front of its line queue");
+    auto &request = it->second.front();
+    // Re-enter L0 instead of assuming the earlier permission still holds.
+    issueRequest(request.pkt, request.m_second_type,
+                 curCycle() - request.issue_time);
+    ++orderedStoreStats.woken;
+}
+
+bool
+Sequencer::isBlockedLine(Addr address) const
+{
+    return m_controller->isBlocked(makeLineAddress(address));
 }
 
 void
@@ -404,6 +491,7 @@ Sequencer::storePrepareComplete()
 {
     assert(m_store_prepare_outstanding > 0);
     --m_store_prepare_outstanding;
+    ++storePrepareStats.completed;
     testDrainComplete();
 }
 
@@ -480,7 +568,7 @@ Sequencer::writeCallbackScFail(Addr address, DataBlock& data)
     writeCallback(address, data);
 }
 
-void
+bool
 Sequencer::writeCallback(Addr address, DataBlock& data,
                          const bool externalHit, const MachineType mach,
                          const Cycles initialRequestTime,
@@ -502,6 +590,33 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     bool ruby_request = true;
     while (!seq_req_list.empty()) {
         SequencerRequest &seq_req = seq_req_list.front();
+        if (!isOrderedStoreReady(seq_req.pkt->req)) {
+            // An older unrelated request can have caused this line's
+            // callback before a later marked store reaches the global head.
+            // Keep it in the request table; the optional parked path reissues
+            // it through L0 only once it becomes the global head.
+            ++orderedStoreStats.retries;
+            if (m_parkOrderedStores) {
+                panic_if(m_orderedStores.empty(),
+                         "Ordered store callback has no global head");
+                if (m_orderedStores.front() != seq_req.pkt->req.get()) {
+                    const bool inserted =
+                        m_parkedOrderedLines.insert(address).second;
+                    panic_if(!inserted, "Duplicate parked ordered line callback");
+                    ++orderedStoreStats.parked;
+                } else {
+                    // A different line became visible this cycle. There is
+                    // no predecessor left to wake us; retry on a later cycle.
+                    ++orderedStoreStats.headRateRetries;
+                    issueRequest(seq_req.pkt, seq_req.m_second_type,
+                                 curCycle() - seq_req.issue_time);
+                }
+            } else {
+                issueRequest(seq_req.pkt, seq_req.m_second_type,
+                             curCycle() - seq_req.issue_time);
+            }
+            break;
+        }
         // Atomic Request may be executed remotly in the cache hierarchy
         bool atomic_req =
            ((seq_req.m_type == RubyRequestType_ATOMIC_RETURN) ||
@@ -527,6 +642,14 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
         if ((seq_req.m_type != RubyRequestType_LD) &&
             (seq_req.m_type != RubyRequestType_Load_Linked) &&
             (seq_req.m_type != RubyRequestType_IFETCH)) {
+            if (seq_req.pkt->req->getExtension<TSOOrderedStore>()) {
+                panic_if(!isOrderedStoreReady(seq_req.pkt->req),
+                         "Ruby TSO store became visible out of order");
+                m_orderedLineValid = true;
+                m_orderedLineCycle = curCycle();
+                m_orderedLine = makeLineAddress(seq_req.pkt->req->getPaddr());
+                m_orderedStores.pop_front();
+            }
             // LL/SC support (tested with ARMv8)
             bool success = true;
 
@@ -582,6 +705,14 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     if (seq_req_list.empty()) {
         m_RequestTable.erase(address);
     }
+    if (m_parkOrderedStores)
+        wakeParkedOrderedHead();
+    // The first request may have been deferred to preserve TSO order. In
+    // that case no data was written, so the controller must not mark a
+    // clean line dirty or refresh replacement state for this action.
+    if (ruby_request)
+        ++orderedStoreStats.deferredNoWriteCallbacks;
+    return !ruby_request;
 }
 
 bool
@@ -616,7 +747,7 @@ Sequencer::readCallback(Addr address, DataBlock& data,
                         bool externalHit, const MachineType mach,
                         Cycles initialRequestTime,
                         Cycles forwardRequestTime,
-                        Cycles firstResponseTime)
+                        Cycles firstResponseTime, const bool code_stale)
 {
     //
     // Free up read requests until we hit the first Write request
@@ -632,6 +763,11 @@ Sequencer::readCallback(Addr address, DataBlock& data,
     bool ruby_request = true;
     while (!seq_req_list.empty()) {
         SequencerRequest &seq_req = seq_req_list.front();
+        if (code_stale && seq_req.m_type == RubyRequestType_IFETCH) {
+            auto validity = std::make_shared<InstructionCodeValidity>();
+            validity->stale = true;
+            seq_req.pkt->req->setExtension(validity);
+        }
         if (processReadCallback(seq_req, data, ruby_request, externalHit, mach,
                                 initialRequestTime, forwardRequestTime,
                                 firstResponseTime)) {
@@ -980,6 +1116,15 @@ RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
     if (pkt->req->isStorePrepare()) {
+        // Preparation is a hint: if the optional bound is reached, consume
+        // it without blocking demand requests or modifying architectural data.
+        if (m_maxStorePrepareOutstanding &&
+            static_cast<unsigned>(m_store_prepare_outstanding) >=
+                m_maxStorePrepareOutstanding) {
+            ++storePrepareStats.dropped;
+            return RequestStatus_Issued;
+        }
+        ++storePrepareStats.accepted;
         ++m_store_prepare_outstanding;
         m_controller->enqueuePrefetch(
             makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
@@ -1140,7 +1285,8 @@ Sequencer::makeRequest(PacketPtr pkt)
 }
 
 void
-Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
+                        Cycles overlapped)
 {
     assert(pkt != NULL);
     ContextID proc_id = pkt->req->hasContextId() ?
@@ -1221,8 +1367,22 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
         msg->m_htmTransactionUid = pkt->getHtmTransactionUid();
     }
 
-    Tick latency = cyclesToTicks(
-                        m_controller->mandatoryQueueLatency(secondary_type));
+    Cycles service = m_controller->mandatoryQueueLatency(secondary_type);
+    if (secondary_type != RubyRequestType_IFETCH &&
+        m_dataCache_ptr->getDataLatency() > Cycles(1)) {
+        // The baseline one-cycle queue covers the default array service.
+        // A longer configured data-array pipeline delays hierarchy entry.
+        service += m_dataCache_ptr->getDataLatency() - Cycles(1);
+    }
+    if (overlapped > Cycles(0) && !m_mandatory_q_ptr->getOrdered()) {
+        // The aliased request has waited for an earlier access to this same
+        // line. Allow that wait to overlap the entry pipeline, while still
+        // passing through the L0 state machine and its permission checks.
+        const Cycles saved = std::min(overlapped, service - Cycles(1));
+        service = service - saved;
+        orderedStoreStats.overlappedCycles += uint64_t(saved);
+    }
+    Tick latency = cyclesToTicks(service);
     assert(latency > 0);
 
     assert(m_mandatory_q_ptr != NULL);

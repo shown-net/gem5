@@ -42,4 +42,9 @@ def macroop LEA_R_P {
     rdip t7
     lea reg, seg, riprel, disp
 };
+
+def macroop LEA_R_M_16 {
+    lea t1, seg, sib, disp, dataSize=8
+    mov reg, reg, t1
+};
 """

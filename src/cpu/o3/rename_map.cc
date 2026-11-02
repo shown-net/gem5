@@ -119,8 +119,11 @@ UnifiedRenameMap::init(const BaseISA::RegClasses &regClasses,
 bool
 UnifiedRenameMap::canRename(DynInstPtr inst) const
 {
+    if (inst->eliminatedMove) return true;
     for (int i = 0; i < renameMaps.size(); i++) {
-        if (inst->numDestRegs((RegClassType)i) >
+        const unsigned required = inst->allocationLeader() ?
+            inst->allocationGroup->renameDests[i] : inst->numDestRegs((RegClassType)i);
+        if (required >
                 renameMaps[i].numFreeEntries()) {
             return false;
         }

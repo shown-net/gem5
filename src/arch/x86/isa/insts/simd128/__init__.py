@@ -41,3 +41,135 @@ microcode = """
 for category in categories:
     exec(f"from . import {category} as cat")
     microcode += cat.microcode
+
+# Full-width lane-independent SSE operations have one execution record.
+# Memory operands retain a separate load record and share allocation where
+# Golden Cove supports load-operation fusion. Shuffle keeps its own two slots.
+import re
+
+_families = {
+    **{f"PADD{suffix}": ("mxmmaddi", size, 0)
+       for suffix, size in (("B", 1), ("W", 2), ("D", 4), ("Q", 8))},
+    **{f"PCMPEQ{suffix}": ("mxmmcmpi2r", size, 0)
+       for suffix, size in (("B", 1), ("W", 2), ("D", 4))},
+    **{f"PCMPGT{suffix}": ("mxmmcmpi2r", size, 2)
+       for suffix, size in (("B", 1), ("W", 2), ("D", 4), ("Q", 8))},
+    "PMULLW": ("mxmmmuli", 2, 0),
+    "PMULHUW": ("mxmmmuli", 2, "MultHi"),
+    "PMULUDQ": ("mxmmmuli", 4, "Scalar"),
+    "ADDPS": ("mxmmpsaddf", 4, 0),
+    "SUBPS": ("mxmmpssubf", 4, 0),
+    "MULPS": ("mxmmpsmulf", 4, 0),
+    "DIVPS": ("mxmmpsdivf", 4, 0),
+}
+
+
+def _full_width(match):
+    name, body = match.group(1), match.group(2)
+    parts = name.split("_")
+    family, form = parts[0], parts[-1]
+    if family not in _families:
+        return match.group(0)
+    op, size, ext = _families[family]
+    sizes = "srcSize=4, destSize=8" if family == "PMULUDQ" else f"size={size}"
+    if form == "XMM":
+        body = f"{op} xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, {sizes}, ext={ext}"
+    else:
+        load = "ldfpxmmrip" if form == "P" else "ldfpxmm"
+        address = "riprel" if form == "P" else "sib"
+        body = (f".microfused_load\n    {load} (ufp1, ufp2), seg, {address}, disp\n"
+                f"    {op} xmml, xmmh, xmml, xmmh, ufp1, ufp2, {sizes}, ext={ext}")
+    return f"def macroop {name} {{\n    {body}\n}};"
+
+
+microcode = re.sub(r"def macroop (\w+) \{(.*?)\};", _full_width,
+                   microcode, flags=re.S)
+
+
+def _full_shift(match):
+    name = match.group(1)
+    parts = name.split("_")
+    family, form = parts[0], parts[-1]
+    if family not in {"PSLLW", "PSLLD", "PSLLQ", "PSRLW", "PSRLD", "PSRLQ",
+                      "PSRAW", "PSRAD"}:
+        return match.group(0)
+    size = {"W": 2, "D": 4, "Q": 8}[family[-1]]
+    op = "mxmm" + {"PSLL": "sll", "PSRL": "srl", "PSRA": "sra"}[family[:-1]]
+    body = ""
+    if form == "I":
+        op += "i"
+        count = "imm"
+    elif form == "XMM":
+        count = "xmmlm"
+    else:
+        load = "ldfprip" if form == "P" else "ldfp"
+        address = "riprel" if form == "P" else "sib"
+        body = f".microfused_load\n    {load} ufp1, seg, {address}, disp, dataSize=8\n    "
+        count = "ufp1"
+    body += f"{op} xmml, xmmh, xmml, xmmh, {count}, size={size}, ext=0"
+    return f"def macroop {name} {{\n    {body}\n}};"
+
+
+microcode = re.sub(r"def macroop (\w+) \{(.*?)\};", _full_shift,
+                   microcode, flags=re.S)
+
+
+def _full_unpack(match):
+    name = match.group(1)
+    family, form = name.split("_")[0], name.split("_")[-1]
+    if not family.startswith("PUNPCK"):
+        return match.group(0)
+    suffix = family[7:]
+    sizes = {"BW": 1, "WD": 2, "DQ": 4, "QDQ": 8}
+    if suffix not in sizes:
+        return match.group(0)
+    high = int(family[6] == "H")
+    body = ""
+    source = "xmmlm, xmmhm"
+    if form in ("M", "P"):
+        load = "ldfpxmmrip" if form == "P" else "ldfpxmm"
+        address = "riprel" if form == "P" else "sib"
+        body = f".microfused_load\n    {load} (ufp1, ufp2), seg, {address}, disp\n    "
+        source = "ufp1, ufp2"
+    body += f"mxmmunpack xmml, xmmh, xmml, xmmh, {source}, size={sizes[suffix]}, ext={high}"
+    return f"def macroop {name} {{\n    {body}\n}};"
+
+
+microcode = re.sub(r"def macroop (\w+) \{(.*?)\};", _full_unpack,
+                   microcode, flags=re.S)
+
+
+def _pack_mask_shuffle(match):
+    name = match.group(1)
+    parts = name.split("_")
+    family, form = parts[0], parts[2] if len(parts) > 2 else ""
+    if family in {"PMOVMSKB", "MOVMSKPS", "MOVMSKPD"}:
+        size = {"PMOVMSKB": 1, "MOVMSKPS": 4, "MOVMSKPD": 8}[family]
+        body = f"mxmmsign reg, xmmlm, xmmhm, size={size}"
+    elif family in {"PACKSSDW", "PACKSSWB", "PACKUSDW", "PACKUSWB"}:
+        size = 4 if family.endswith("DW") else 2
+        signed = "Signed" if family.startswith("PACKSS") else 0
+        body, source = "", "xmmlm, xmmhm"
+        if form in ("M", "P"):
+            load = "ldfpxmmrip" if form == "P" else "ldfpxmm"
+            address = "riprel" if form == "P" else "sib"
+            body = f".microfused_load\n    {load} (ufp1, ufp2), seg, {address}, disp\n    "
+            source = "ufp1, ufp2"
+        body += (f"mxmmpack xmml, xmmh, xmml, xmmh, {source}, "
+                 f"srcSize={size}, destSize={size // 2}, ext={signed}")
+    elif family in {"PSHUFLW", "PSHUFHW"}:
+        body, source = "", "xmmlm, xmmhm"
+        if form in ("M", "P"):
+            load = "ldfpxmmrip" if form == "P" else "ldfpxmm"
+            address = "riprel" if form == "P" else "sib"
+            body = f"{load} (ufp1, ufp2), seg, {address}, disp\n    "
+            source = "ufp1, ufp2"
+        high = 256 if family == "PSHUFHW" else 0
+        body += f'mxmmwordshuffle xmml, xmmh, {source}, size=2, ext="IMMEDIATE | {high}"'
+    else:
+        return match.group(0)
+    return f"def macroop {name} {{\n    {body}\n}};"
+
+
+microcode = re.sub(r"def macroop (\w+) \{(.*?)\};", _pack_mask_shuffle,
+                   microcode, flags=re.S)

@@ -72,6 +72,14 @@ class BranchTargetBuffer : public ClockedObject
      */
     virtual bool valid(ThreadID tid, Addr instPC) = 0;
 
+    /** Remove a target whose decoded instruction is not a branch. */
+    virtual void invalidate(ThreadID tid, Addr instPC) = 0;
+
+    virtual Cycles lookupLatency(ThreadID tid, Addr instPC) const
+    {
+        return Cycles(0);
+    }
+
     /** Looks up an address in the BTB to get the target of the branch.
      *  @param inst_PC The address of the branch to look up.
      *  @param type Optional type of the branch to look up.

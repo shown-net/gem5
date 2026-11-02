@@ -69,6 +69,46 @@ namespace gem5
 
 namespace X86ISA {
 
+Walker::ItlbStats::ItlbStats(Walker *parent)
+    : statistics::Group(parent, "ITLB_MISSES"), owner(parent),
+      ADD_STAT(WALK_COMPLETED_4K, statistics::units::Count::get(),
+               "Successful modeled instruction walks with a 4 KiB leaf"),
+      ADD_STAT(WALK_COMPLETED, statistics::units::Count::get(),
+               "Completed modeled instruction walks including faults"),
+      ADD_STAT(WALK_ACTIVE, statistics::units::Cycle::get(),
+               "Cycles with an instruction walk in service"),
+      ADD_STAT(WALK_PENDING, statistics::units::Cycle::get(),
+               "Integral of instruction walks in service; excludes queue")
+{}
+
+Walker::DtlbLoadStats::DtlbLoadStats(Walker *parent)
+    : statistics::Group(parent, "DTLB_LOAD_MISSES"),
+      ADD_STAT(WALK_COMPLETED, statistics::units::Count::get(),
+               "Completed timing demand-read walks including faults and completed speculation")
+{}
+
+void
+Walker::accountInstructionWalks()
+{
+    const uint64_t now = uint64_t(curCycle());
+    const uint64_t elapsed = now - lastInstructionWalkCycle;
+    if (activeInstructionWalks) itlbStats.WALK_ACTIVE += elapsed;
+    itlbStats.WALK_PENDING += elapsed * activeInstructionWalks;
+    lastInstructionWalkCycle = now;
+}
+
+void Walker::ItlbStats::preDumpStats()
+{
+    owner->accountInstructionWalks();
+    statistics::Group::preDumpStats();
+}
+
+void Walker::ItlbStats::resetStats()
+{
+    owner->accountInstructionWalks();
+    statistics::Group::resetStats();
+}
+
 Fault
 Walker::start(ThreadContext * _tc, BaseMMU::Translation *_translation,
               const RequestPtr &_req, BaseMMU::Mode _mode)
@@ -78,20 +118,15 @@ Walker::start(ThreadContext * _tc, BaseMMU::Translation *_translation,
     // another one (i.e. either coalesce or start walk)
     WalkerState * newState = new WalkerState(this, _translation, _req);
     newState->initState(_tc, _mode, sys->isTimingMode());
-    if (currStates.size()) {
-        assert(newState->isTiming());
-        DPRINTF(PageTableWalker, "Walks in progress: %d\n", currStates.size());
-        currStates.push_back(newState);
-        return NoFault;
-    } else {
-        currStates.push_back(newState);
+    if (!newState->isTiming()) {
+        assert(currStates.empty());
         Fault fault = newState->startWalk();
-        if (!newState->isTiming()) {
-            currStates.pop_front();
-            delete newState;
-        }
+        delete newState;
         return fault;
     }
+    currStates.push_back(newState);
+    startWalkWrapper();
+    return NoFault;
 }
 
 Fault
@@ -117,6 +152,11 @@ Walker::recvTimingResp(PacketPtr pkt)
     bool walkComplete = senderWalk->recvPacket(pkt);
     delete senderState;
     if (walkComplete) {
+        if (senderWalk->mode == BaseMMU::Execute && senderWalk->wasStarted()) {
+            accountInstructionWalks();
+            assert(activeInstructionWalks);
+            --activeInstructionWalks;
+        }
         std::list<WalkerState *>::iterator iter;
         for (iter = currStates.begin(); iter != currStates.end(); iter++) {
             WalkerState * walkerState = *(iter);
@@ -145,22 +185,26 @@ Walker::WalkerPort::recvReqRetry()
 void
 Walker::recvReqRetry()
 {
+    portBlocked = false;
     std::list<WalkerState *>::iterator iter;
     for (iter = currStates.begin(); iter != currStates.end(); iter++) {
         WalkerState * walkerState = *(iter);
         if (walkerState->isRetrying()) {
             walkerState->retry();
+            if (portBlocked) break;
         }
     }
 }
 
 bool Walker::sendTiming(WalkerState* sendingState, PacketPtr pkt)
 {
+    if (portBlocked) return false;
     WalkerSenderState* walker_state = new WalkerSenderState(sendingState);
     pkt->pushSenderState(walker_state);
     if (port.sendTimingReq(pkt)) {
         return true;
     } else {
+        portBlocked = true;
         // undo the adding of the sender state and delete it, as we
         // will do it again the next time we attempt to send it
         pkt->popSenderState();
@@ -193,38 +237,34 @@ Walker::WalkerState::initState(ThreadContext * _tc,
 void
 Walker::startWalkWrapper()
 {
-    unsigned num_squashed = 0;
-    WalkerState *currState = currStates.front();
-    while ((num_squashed < numSquashable) && currState &&
-        currState->translation->squashed()) {
-        currStates.pop_front();
-        num_squashed++;
-
-        DPRINTF(PageTableWalker, "Squashing table walk for address %#x\n",
-            currState->req->getVaddr());
-
-        // finish the translation which will delete the translation object
-        currState->translation->finish(
-            std::make_shared<UnimpFault>("Squashed Inst"),
-            currState->req, currState->tc, currState->mode);
-
-        // delete the current request if there are no inflight packets.
-        // if there is something in flight, delete when the packets are
-        // received and inflight is zero.
-        if (currState->numInflight() == 0) {
-            delete currState;
+    unsigned active = 0, num_squashed = 0;
+    for (auto *walk : currStates)
+        if (walk->wasStarted()) ++active;
+    bool more_squashes = false;
+    for (auto it = currStates.begin(); it != currStates.end();) {
+        WalkerState *walk = *it;
+        if (walk->wasStarted()) { ++it; continue; }
+        if (walk->translation->squashed()) {
+            if (num_squashed >= numSquashable) {
+                more_squashes = true;
+                ++it;
+                continue;
+            }
+            it = currStates.erase(it);
+            ++num_squashed;
+            walk->translation->finish(std::make_shared<UnimpFault>("Squashed Inst"),
+                                      walk->req, walk->tc, walk->mode);
+            delete walk;
+        } else if (active < maxActiveWalks) {
+            ++it;
+            ++active;
+            walk->startWalk();
         } else {
-            currState->squash();
+            ++it;
         }
-
-        // check the next translation request, if it exists
-        if (currStates.size())
-            currState = currStates.front();
-        else
-            currState = NULL;
     }
-    if (currState && !currState->wasStarted())
-        currState->startWalk();
+    if (more_squashes && !startWalkWrapperEvent.scheduled())
+        schedule(startWalkWrapperEvent, clockEdge(Cycles(1)));
 }
 
 Fault
@@ -233,6 +273,10 @@ Walker::WalkerState::startWalk()
     Fault fault = NoFault;
     assert(!started);
     started = true;
+    if (timing && mode == BaseMMU::Execute) {
+        walker->accountInstructionWalks();
+        ++walker->activeInstructionWalks;
+    }
     setupWalk(req->getVaddr());
     if (timing) {
         nextState = state;
@@ -307,6 +351,8 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     bool doTLBInsert = false;
     bool doEndWalk = false;
     bool badNX = pte.nx && mode == BaseMMU::Execute && enableNX;
+    if (dataSize == 8 && enableNX)
+        entry.noExec = entry.noExec || pte.nx;
     switch(state) {
       case LongPML4:
         DPRINTF(PageTableWalker, "Got long mode PML4 entry %#016x.\n", pte);
@@ -320,7 +366,6 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             fault = pageFault(pte.p);
             break;
         }
-        entry.noExec = pte.nx;
         nextState = LongPDP;
         break;
       case LongPDP:
@@ -518,7 +563,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     }
     if (doEndWalk) {
         if (doTLBInsert)
-            if (!functional) {
+            if (!functional && !timing) {
 
                 // Check if PCIDE is set in CR4
                 CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
@@ -572,6 +617,7 @@ Walker::WalkerState::endWalk()
 void
 Walker::WalkerState::setupWalk(Addr vaddr)
 {
+    if (timing) translationGeneration = walker->tlb->generation();
     VAddr addr = vaddr;
     CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
     CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
@@ -607,6 +653,7 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     nextState = Ready;
     entry.vaddr = vaddr;
+    entry.noExec = false;
 
     const Addr root = efer.lma ? Addr(cr3.longPdtb) << 12 :
         (cr4.pae ? Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
@@ -662,7 +709,29 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
     if (inflight == 0 && read == NULL && writes.size() == 0) {
         state = Ready;
         nextState = Waiting;
+        if (translationGeneration != walker->tlb->generation()) {
+            if (translation->squashed()) {
+                translation->finish(std::make_shared<UnimpFault>("Squashed Inst"),
+                                    req, tc, mode);
+                return true;
+            }
+            // An invalidate raced this walk. Re-read the page tables rather
+            // than installing a stale leaf or reporting its stale fault.
+            entry = TlbEntry();
+            timingFault = NoFault;
+            setupWalk(req->getVaddr());
+            nextState = state;
+            state = Waiting;
+            sendPackets();
+            return false;
+        }
+        if (mode == BaseMMU::Execute)
+            ++walker->itlbStats.WALK_COMPLETED;
+        if (mode == BaseMMU::Read && timing && !req->isPrefetch())
+            ++walker->dtlbLoadStats.WALK_COMPLETED;
         if (timingFault == NoFault) {
+            if (mode == BaseMMU::Execute && entry.logBytes == 12)
+                ++walker->itlbStats.WALK_COMPLETED_4K;
             /*
              * Finish the translation. Now that we know the right entry is
              * in the TLB, this should work with no memory accesses.
@@ -670,10 +739,18 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
              * permissions violations, so we'll need the return value as
              * well.
              */
+            // Install only once all walk packets have completed, then perform
+            // the permission check before another walk can evict this leaf.
+            CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+            CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+            walker->tlb->insert(entry.vaddr, entry,
+                                cr4.pcide ? uint64_t(cr3.pcid) : uint64_t(0));
             bool delayedResponse;
             Fault fault = walker->tlb->translate(req, tc, NULL, mode,
                                                  delayedResponse, true);
             assert(!delayedResponse);
+            if (mode == BaseMMU::Execute && fault == NoFault && entry.logBytes == 12)
+                ++walker->itlbStats.WALK_COMPLETED_4K;
             // Let the CPU continue.
             translation->finish(fault, req, tc, mode);
         } else {

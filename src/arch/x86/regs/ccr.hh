@@ -51,10 +51,11 @@ namespace cc_reg
 enum : RegIndex
 {
     _ZapsIdx,
-    _CfofIdx,
+    _CfIdx,
     _DfIdx,
     _EcfIdx,
     _EzfIdx,
+    _OfIdx,
 
     NumRegs
 };
@@ -69,10 +70,11 @@ namespace cc_reg
 
 inline constexpr RegId
     Zaps = ccRegClass[_ZapsIdx],
-    Cfof = ccRegClass[_CfofIdx],
+    Cf = ccRegClass[_CfIdx],
     Df = ccRegClass[_DfIdx],
     Ecf = ccRegClass[_EcfIdx],
-    Ezf = ccRegClass[_EzfIdx];
+    Ezf = ccRegClass[_EzfIdx],
+    Of = ccRegClass[_OfIdx];
 
 } // namespace cc_reg
 

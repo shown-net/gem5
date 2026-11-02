@@ -123,7 +123,11 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
 
     updateLSQNextCycle = false;
 
-    skidBufferMax = (renameToIEWDelay + 1) * params.renameWidth;
+    // Rename limits allocation slots, not DynInst count: a zero-slot
+    // follower may still be emitted after renameWidth slots are consumed.
+    // Bound the skid queue by the actual per-cycle transfer array capacity
+    // across the forward and backpressure propagation delays.
+    skidBufferMax = (renameToIEWDelay + params.iewToRenameDelay) * MaxWidth;
 }
 
 std::string
@@ -461,7 +465,12 @@ IEW::squash(ThreadID tid)
             toRename->iewInfo[tid].dispatchedToSQ++;
         }
 
-        toRename->iewInfo[tid].dispatched++;
+        toRename->iewInfo[tid].dispatched += skidBuffer[tid].front()->backendSlots();
+        if (!skidBuffer[tid].front()->bypassesIQ())
+            toRename->iewInfo[tid].extraIQDispatched +=
+                skidBuffer[tid].front()->iqSlots() - skidBuffer[tid].front()->backendSlots();
+        if (skidBuffer[tid].front()->bypassesIQ())
+            toRename->iewInfo[tid].noIQDispatched += skidBuffer[tid].front()->backendSlots();
 
         skidBuffer[tid].pop();
     }
@@ -569,6 +578,12 @@ void
 IEW::replayMemInst(const DynInstPtr& inst)
 {
     instQueue.replayMemInst(inst);
+}
+
+bool
+IEW::replayOneMemInst(const DynInstPtr& inst)
+{
+    return instQueue.replayOneMemInst(inst);
 }
 
 void
@@ -805,7 +820,12 @@ IEW::emptyRenameInsts(ThreadID tid)
             toRename->iewInfo[tid].dispatchedToSQ++;
         }
 
-        toRename->iewInfo[tid].dispatched++;
+        toRename->iewInfo[tid].dispatched += insts[tid].front()->backendSlots();
+        if (!insts[tid].front()->bypassesIQ())
+            toRename->iewInfo[tid].extraIQDispatched +=
+                insts[tid].front()->iqSlots() - insts[tid].front()->backendSlots();
+        if (insts[tid].front()->bypassesIQ())
+            toRename->iewInfo[tid].noIQDispatched += insts[tid].front()->backendSlots();
 
         insts[tid].pop();
     }
@@ -891,14 +911,17 @@ IEW::dispatchInsts(ThreadID tid)
     DynInstPtr inst;
     bool add_to_iq = false;
     int dis_num_inst = 0;
+    unsigned dispatch_slots = 0;
 
     // Loop through the instructions, putting them in the instruction
     // queue.
     for ( ; dis_num_inst < insts_to_add &&
-              dis_num_inst < dispatchWidth;
+              dis_num_inst < MaxWidth &&
+              (dispatch_slots < dispatchWidth || !insts_to_dispatch.front()->allocationSlots());
           ++dis_num_inst)
     {
         inst = insts_to_dispatch.front();
+        dispatch_slots += inst->allocationSlots();
 
         if (dispatchStatus[tid] == Unblocking) {
             DPRINTF(IEW, "[tid:%i] Issue: Examining instruction from skid "
@@ -933,13 +956,18 @@ IEW::dispatchInsts(ThreadID tid)
                 toRename->iewInfo[tid].dispatchedToSQ++;
             }
 
-            toRename->iewInfo[tid].dispatched++;
+            toRename->iewInfo[tid].dispatched += inst->backendSlots();
+            if (!inst->bypassesIQ())
+                toRename->iewInfo[tid].extraIQDispatched +=
+                    inst->iqSlots() - inst->backendSlots();
+            if (inst->bypassesIQ())
+                toRename->iewInfo[tid].noIQDispatched += inst->backendSlots();
 
             continue;
         }
 
         // Check for full conditions.
-        if (instQueue.isFull(inst)) {
+        if (!inst->bypassesIQ() && instQueue.isFull(inst)) {
             DPRINTF(IEW, "[tid:%i] Issue: IQ has become full.\n", tid);
 
             // Call function to start blocking.
@@ -1042,10 +1070,27 @@ IEW::dispatchInsts(ThreadID tid)
             }
 
             toRename->iewInfo[tid].dispatchedToSQ++;
+        } else if (inst->isStoreData()) {
+            ldstQueue.insertStoreData(inst);
+            add_to_iq = true;
         } else if (inst->isReadBarrier() || inst->isWriteBarrier()) {
             // Same as non-speculative stores.
             inst->setCanCommit();
             instQueue.insertBarrier(inst);
+            add_to_iq = false;
+        } else if (inst->eliminatedMove) {
+            // The destination names the source producer's physical register.
+            // Preserve its scoreboard and result-forwarding identity.
+            inst->setIssued();
+            inst->setExecuted();
+            inst->setCanCommit();
+            add_to_iq = false;
+        } else if (inst->staticInst->isZeroIdiom()) {
+            inst->setIssued();
+            inst->setExecuted();
+            inst->setCanCommit();
+            if (inst->getFault() == NoFault)
+                instQueue.recordCompletedProducer(inst);
             add_to_iq = false;
         } else if (inst->isNop()) {
             DPRINTF(IEW, "[tid:%i] Issue: Nop instruction encountered, "
@@ -1088,7 +1133,12 @@ IEW::dispatchInsts(ThreadID tid)
 
         insts_to_dispatch.pop();
 
-        toRename->iewInfo[tid].dispatched++;
+        toRename->iewInfo[tid].dispatched += inst->backendSlots();
+        if (!inst->bypassesIQ())
+            toRename->iewInfo[tid].extraIQDispatched +=
+                inst->iqSlots() - inst->backendSlots();
+        if (inst->bypassesIQ())
+            toRename->iewInfo[tid].noIQDispatched += inst->backendSlots();
 
         ++iewStats.dispatchedInsts;
 
@@ -1262,7 +1312,7 @@ IEW::executeInsts()
             // Such case can happen when it faulted during ITLB translation.
             // If we execute the instruction (even if it's a nop) the fault
             // will be replaced and we will lose it.
-            if (inst->getFault() == NoFault) {
+            if (inst->getFault() == NoFault && !inst->wasEvaluatedByResource()) {
                 inst->execute();
                 if (!inst->readPredicate())
                     inst->forwardOldRegs();
@@ -1285,6 +1335,13 @@ IEW::executeInsts()
         // instruction first, so the branch resolution order will be correct.
         ThreadID tid = inst->threadNumber;
 
+        if (inst->staticInst->isMicrocodeControl() && inst->isExecuted() && inst->getFault() == NoFault) {
+            auto next = inst->pcState().clone();
+            inst->staticInst->advancePC(*next);
+            cpu->resolveMicrocodeControl(inst, *next);
+            inst->setPredTarg(*next);
+        }
+
         if (!fetchRedirect[tid] ||
             !toCommit->squash[tid] ||
             toCommit->squashedSeqNum[tid] > inst->seqNum) {
@@ -1293,7 +1350,9 @@ IEW::executeInsts()
             // that have not been executed.
             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
 
-            if (inst->mispredicted() && !loadNotExecuted) {
+            if (!inst->staticInst->isMicrocodeControl() && inst->mispredicted() && !loadNotExecuted) {
+                inst->executionBranchMispredicted =
+                    inst->mispredictedArchitecturalAddress();
                 inst->setBranchPredMispredicted();
                 fetchRedirect[tid] = true;
 
@@ -1405,7 +1464,7 @@ IEW::writebackInsts()
         // when it's ready to execute the strictly ordered load.
         if (!inst->isSquashed() && inst->isExecuted() &&
                 inst->getFault() == NoFault) {
-            int dependents = instQueue.wakeDependents(inst);
+            int dependents = inst->wereResultsWoken() ? 0 : instQueue.wakeDependents(inst);
 
             for (int i = 0; i < inst->numDestRegs(); i++) {
                 // Mark register as ready if not pinned
@@ -1597,12 +1656,23 @@ void
 IEW::checkMisprediction(const DynInstPtr& inst)
 {
     ThreadID tid = inst->threadNumber;
+    if (inst->staticInst->isMicrocodeControl()) {
+        if (inst->getFault() == NoFault) {
+            auto next = inst->pcState().clone();
+            inst->staticInst->advancePC(*next);
+            cpu->resolveMicrocodeControl(inst, *next);
+            inst->setPredTarg(*next);
+        }
+        return;
+    }
 
     if (!fetchRedirect[tid] ||
         !toCommit->squash[tid] ||
         toCommit->squashedSeqNum[tid] > inst->seqNum) {
 
         if (inst->mispredicted()) {
+            inst->executionBranchMispredicted =
+                inst->mispredictedArchitecturalAddress();
             inst->setBranchPredMispredicted();
             fetchRedirect[tid] = true;
 

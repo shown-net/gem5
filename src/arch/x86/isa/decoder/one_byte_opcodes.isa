@@ -320,7 +320,10 @@
             }
         }
         0x12: decode OPCODE_OP_BOTTOM3 {
-            0x0: NopInst::NOP(); //XXX repe makes this a "pause"
+            0x0: decode REX_B {
+                0x0: NopInst::NOP(); //XXX repe makes this a "pause"
+                0x1: XCHG(Bv,rAv);
+            }
             default: XCHG(Bv,rAv);
         }
         0x13: decode OPCODE_OP_BOTTOM3 {

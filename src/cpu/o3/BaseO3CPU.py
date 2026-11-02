@@ -44,6 +44,9 @@ from m5.objects.BaseCPU import BaseCPU
 # from m5.objects.O3Checker import O3Checker
 from m5.objects.BranchPredictor import *
 from m5.objects.FUPool import *
+from m5.objects.Frontend import FrontendCoordinator
+from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, ResultForwarding
+from m5.objects.ZeroIdiom import ZeroIdiom
 from m5.objects.IndexingPolicies import *
 from m5.objects.IQUnit import *
 from m5.objects.ReplacementPolicies import *
@@ -53,15 +56,27 @@ from m5.proxy import *
 from m5.SimObject import *
 
 
-class TSOStore(Enum):
-    vals = ["serial", "buffer"]
-
-
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     enableCalibrationTMA = Param.Bool(False, "Enable single-thread Marker TMA accounting")
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/dyn_inst.hh"
+    executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
+    resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
+    zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+    frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
+    frontendDirectMultiTaken = Param.Bool(
+        False, "Diagnostic: continue across ready direct JMP fetch targets"
+    )
+    bacDirectChainZeroLatency = Param.Bool(
+        False, "Diagnostic: chain zero-latency direct JMP predictions"
+    )
+    intALU = Param.IntExecutionResource(NULL, "ALU execution family")
+    intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
+    intSHFT = Param.IntExecutionResource(NULL, "Shift/carry execution family")
+    intSlow = Param.IntExecutionResource(NULL, "Slow integer execution family")
+    intBM = Param.IntExecutionResource(NULL, "Bit-manipulation execution family")
+    intBranch = Param.IntExecutionResource(NULL, "Branch resolution execution family")
 
     @classmethod
     def memory_mode(cls):
@@ -81,6 +96,15 @@ class BaseO3CPU(BaseCPU):
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
+    sprL1LoadBankConflicts = Param.Bool(
+        False, "Limit a third same-bank L1 data load in one cycle"
+    )
+    sprStoreBuffer = Param.Bool(
+        False, "Use a shared-credit committed store buffer for x86 TSO"
+    )
+    sprEarlyStorePrepare = Param.Bool(
+        False, "Speculatively prepare translated ordinary stores before retirement"
+    )
 
     # Backward pipeline delays
     fetchToBacDelay = Param.Cycles(1, "Fetch to Branch address calc. delay")
@@ -123,6 +147,10 @@ class BaseO3CPU(BaseCPU):
     )
     dispatchWidth = Param.Unsigned(8, "Dispatch width")
     issueWidth = Param.Unsigned(8, "Issue width")
+    directJumpPortless = Param.Bool(
+        False,
+        "Diagnostic: issue direct unconditional non-call jumps without an execution port",
+    )
     wbWidth = Param.Unsigned(8, "Writeback width")
 
     iewToCommitDelay = Param.Cycles(
@@ -211,11 +239,8 @@ class BaseO3CPU(BaseCPU):
         "Branch Predictor",
     )
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
-    tsoStore = Param.TSOStore(
-        "serial", "Committed-store implementation used by TSO CPUs"
-    )
-    tsoStoreBufferSize = Param.Unsigned(
-        114, "Store-buffer entries used only by the buffer TSO implementation"
+    tsoOrderedStoreLineWindow = Param.Unsigned(
+        4, "Maximum distinct cache lines awaiting ordered TSO store completion"
     )
 
     recvRespThrottling = Param.Bool(

@@ -57,7 +57,9 @@
 #include "cpu/inst_res.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/cpu.hh"
+#include "cpu/o3/allocation_group.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/int_execution.hh"
 #include "cpu/o3/lsq_unit.hh"
 #include "cpu/op_class.hh"
 #include "cpu/reg_class.hh"
@@ -115,6 +117,33 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Executes the instruction.*/
     Fault execute();
+    void bindSourceResults();
+    void prepareResultValues(unsigned port, Tick nominal_at);
+    void evaluateResultValues(Tick available_at);
+    void writeResultValues();
+    bool hasResultValue(RegIndex index) const
+    { return index < resultValues.size() && resultValues[index].isValid(); }
+    RegVal resultValue(RegIndex index) const
+    { return resultValues.at(index).asRegVal(); }
+    Tick resultAvailableAt() const { return resultAvailableTick; }
+    Tick resultNominalAt() const { return resultNominalTick; }
+    unsigned resultProducerPort() const { return resultPort; }
+    const auto &sourceResults() const { return sourceResultValues; }
+    bool wasEvaluatedByResource() const { return resourceEvaluated; }
+    bool wereResultsWoken() const { return resourceResultsWoken; }
+    void setResultsWoken() { resourceResultsWoken = true; }
+
+  private:
+    std::vector<InstResult> resultValues;
+    std::vector<ResultForwarding::Reference> sourceResultValues;
+    bool captureResultValues = false;
+    bool resourceEvaluated = false;
+    bool resourceResultsWoken = false;
+    Tick resultAvailableTick = 0;
+    Tick resultNominalTick = 0;
+    unsigned resultPort = 0;
+
+  public:
 
     /** Initiates the access.  Only valid for memory operations. */
     Fault initiateAcc();
@@ -324,8 +353,29 @@ class DynInst : public ExecContext, public RefCounted
 
     // Optional Marker observations; none drive the pipeline.
     bool fetchedFromUser = false;
+    bool pendingFrontendAcceptance = false;
+    AllocationGroupPtr allocationGroup;
+    unsigned allocationSlots() const
+    { return !allocationGroup || seqNum == allocationGroup->leader; }
+    bool independentBackendEntries() const
+    { return allocationGroup && allocationGroup->independentBackendEntries; }
+    bool independentIQEntries() const
+    {
+        return allocationGroup && (allocationGroup->independentBackendEntries ||
+                                   allocationGroup->independentIQEntries);
+    }
+    unsigned backendSlots() const
+    { return independentBackendEntries() ? 1 : allocationSlots(); }
+    unsigned iqSlots() const
+    { return independentIQEntries() ? 1 : backendSlots(); }
+    bool fusedLeader() const
+    { return allocationGroup && allocationGroup->branch && allocationGroup->branchProducer == seqNum; }
+    bool fusedFollower() const
+    { return allocationGroup && allocationGroup->branch && allocationGroup->branch == seqNum; }
+    bool allocationLeader() const
+    { return allocationGroup && allocationGroup->leader == seqNum; }
+    bool executionBranchMispredicted = false;
     uint64_t fetchedAddressSpaceId = 0;
-
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -412,6 +462,10 @@ class DynInst : public ExecContext, public RefCounted
             const std::vector<bool> &byte_enable) override;
 
     Fault initiateMemMgmtCmd(Request::Flags flags) override;
+
+    Fault initiateStoreAddress(Addr addr, unsigned size,
+                               Request::Flags flags) override;
+    Fault writeStoreData(uint8_t *data, unsigned size) override;
 
     Fault writeMem(uint8_t *data, unsigned size, Addr addr,
                    Request::Flags flags, uint64_t *res,
@@ -579,13 +633,26 @@ class DynInst : public ExecContext, public RefCounted
         return *next_pc != *predPC;
     }
 
+    bool
+    mispredictedArchitecturalAddress() const
+    {
+        std::unique_ptr<PCStateBase> next_pc(pc->clone());
+        staticInst->advancePC(*next_pc);
+        return next_pc->instAddr() != predPC->instAddr();
+    }
+
     //
     //  Instruction types.  Forward checks to StaticInst object.
     //
     bool isNop()          const { return staticInst->isNop(); }
+    bool eliminatedMove = false;
+    bool bypassesIQ() const
+    { return isNop() || staticInst->isZeroIdiom() || eliminatedMove; }
     bool isMemRef()       const { return staticInst->isMemRef(); }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
+    bool isStoreAddress() const { return staticInst->isStoreAddress(); }
+    bool isStoreData()    const { return staticInst->isStoreData(); }
     bool isAtomic()       const { return staticInst->isAtomic(); }
     bool isStoreConditional() const
     { return staticInst->isStoreConditional(); }
@@ -1204,6 +1271,13 @@ class DynInst : public ExecContext, public RefCounted
         const PhysRegIdPtr reg = renamedSrcIdx(idx);
         if (reg->is(InvalidRegClass))
             return 0;
+        if (idx < sourceResultValues.size() && sourceResultValues[idx].producer) {
+            const auto &ref = sourceResultValues[idx];
+            panic_if(!ref.producer->hasResultValue(ref.destination) ||
+                     ref.producer->resultAvailableAt() > curTick(),
+                     "Consumer read a result before its value was available");
+            return ref.producer->resultValue(ref.destination);
+        }
         return cpu->getReg(reg, threadNumber);
     }
 
@@ -1231,7 +1305,10 @@ class DynInst : public ExecContext, public RefCounted
         const PhysRegIdPtr reg = renamedDestIdx(idx);
         if (reg->is(InvalidRegClass))
             return;
-        cpu->setReg(reg, val, threadNumber);
+        if (captureResultValues)
+            resultValues.at(idx) = InstResult(reg->regClass(), val);
+        else
+            cpu->setReg(reg, val, threadNumber);
         setResult(reg->regClass(), val);
     }
 

@@ -33,6 +33,11 @@ def template MediaOpExecute {{
     {
         Fault fault = NoFault;
 
+        if (isZeroIdiom()) {
+            for (RegIndex i = 0; i < numDestRegs(); ++i)
+                xc->setRegOperand(this, i, zeroIdiomResult(i));
+            return NoFault;
+        }
         %(op_decl)s;
         %(op_rd)s;
 
@@ -62,9 +67,11 @@ def template MediaOpDeclare {{
         {
             %(set_reg_idx_arr)s;
             %(constructor)s;
+            %(zero_idiom)s;
         }
 
         Fault execute(ExecContext *, trace::InstRecord *) const override;
+        %(move_elimination)s;
     };
 }};
 
@@ -111,8 +118,28 @@ let {{
             opt_args = []
             if self.op_class:
                 opt_args.append(self.op_class)
-            iop = InstObjParams(name, Name + suffix, base, {"code" : code},
+            zero_idiom = ''
+            if Name in ('Mxmmxor', 'Mxmmsub'):
+                kind = 'XmmXor' if Name == 'Mxmmxor' else 'XmmSub'
+                zero_idiom = '''
+                    if (!mach_inst.vex.present && src1 == src3 && src2 == src4) {
+                        zeroIdiomInfo = ZeroIdiomKind::%s;
+                        _numSrcRegs = 0;
+                    }
+                ''' % kind
+            move_elimination = (
+                'bool isFullXmmMove() const override '
+                '{ return !machInst.vex.present; }'
+                if Name == 'Mxmmmov' else '')
+            iop = InstObjParams(name, Name + suffix, base,
+                                {"code": code, "zero_idiom": zero_idiom,
+                                 "move_elimination": move_elimination},
                                 opt_args)
+            scalar_classes = {'Maddf': 'FloatAddOp', 'Msubf': 'FloatAddOp',
+                              'Mmulf': 'FloatMultOp', 'Mdivf': 'FloatDivOp'}
+            if Name in scalar_classes:
+                iop.op_class = '(src_size == 8 ? %s : %s)' % (
+                    scalar_classes[Name], self.op_class)
 
             # Generate the actual code (finally!)
             header_output += MediaOpDeclare.subst(iop)
@@ -448,6 +475,194 @@ let {{
             }
             FpDestReg_uqw = result;
         '''
+
+    class Mxmmxor(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op,
+                         FloatSrc2Op, FloatSrc3Op, FloatSrc4Op)
+        op_class = 'SimdAluOp'
+        code = '''
+            FpDestReg_uqw = FpSrcReg1_uqw ^ FpSrcReg3_uqw;
+            FpDestHiReg_uqw = FpSrcReg2_uqw ^ FpSrcReg4_uqw;
+        '''
+
+    class Mxmmsub(Mxmmxor):
+        op_class = 'SimdAddOp'
+        code = '''
+            const unsigned width = srcSize * 8;
+            auto subtract = [width](uint64_t left, uint64_t right) {
+                uint64_t result = 0;
+                for (unsigned offset = 0; offset < 64; offset += width) {
+                    const uint64_t value =
+                        (bits(left, offset + width - 1, offset) -
+                         bits(right, offset + width - 1, offset)) & mask(width);
+                    result = insertBits(result, offset + width - 1, offset, value);
+                }
+                return result;
+            };
+            FpDestReg_uqw = subtract(FpSrcReg1_uqw, FpSrcReg3_uqw);
+            FpDestHiReg_uqw = subtract(FpSrcReg2_uqw, FpSrcReg4_uqw);
+        '''
+
+    class Mxmmand(Mxmmxor):
+        code = Mxmmxor.code.replace('^', '&')
+
+    class Mxmmandn(Mxmmxor):
+        code = '''
+            FpDestReg_uqw = ~FpSrcReg1_uqw & FpSrcReg3_uqw;
+            FpDestHiReg_uqw = ~FpSrcReg2_uqw & FpSrcReg4_uqw;
+        '''
+
+    class Mxmmor(Mxmmxor):
+        code = Mxmmxor.code.replace('^', '|')
+
+    class Mxmmshuffle(Mxmmxor):
+        op_class = 'SimdMiscOp'
+        code = '''
+            const uint64_t left[2] = {FpSrcReg1_uqw, FpSrcReg2_uqw};
+            const uint64_t right[2] = {FpSrcReg3_uqw, FpSrcReg4_uqw};
+            if (srcSize == 8) {
+                FpDestReg_uqw = left[ext & 1];
+                FpDestHiReg_uqw = right[(ext >> 1) & 1];
+            } else {
+                auto lane = [](const uint64_t *values, unsigned i) {
+                    return bits(values[i / 2], (i % 2) * 32 + 31,
+                                (i % 2) * 32);
+                };
+                FpDestReg_uqw = lane(left, ext & 3) |
+                    (lane(left, (ext >> 2) & 3) << 32);
+                FpDestHiReg_uqw = lane(right, (ext >> 4) & 3) |
+                    (lane(right, (ext >> 6) & 3) << 32);
+            }
+        '''
+
+    class Mxmmunpack(Mxmmxor):
+        op_class = 'SimdMiscOp'
+        code = '''
+            const uint64_t left = ext ? FpSrcReg2_uqw : FpSrcReg1_uqw;
+            const uint64_t right = ext ? FpSrcReg4_uqw : FpSrcReg3_uqw;
+            const unsigned width = srcSize * 8;
+            uint64_t result[2] = {};
+            for (unsigned i = 0; i < 64 / width; ++i) {
+                const unsigned pos = 2 * i * width;
+                result[pos / 64] |=
+                    bits(left, (i + 1) * width - 1, i * width) << (pos % 64);
+                const unsigned next = pos + width;
+                result[next / 64] |=
+                    bits(right, (i + 1) * width - 1, i * width) << (next % 64);
+            }
+            FpDestReg_uqw = result[0];
+            FpDestHiReg_uqw = result[1];
+        '''
+
+    class Mxmmmov(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'FloatMiscOp'
+        code = '''
+            FpDestReg_uqw = FpSrcReg1_uqw;
+            FpDestHiReg_uqw = FpSrcReg2_uqw;
+        '''
+
+    class Mxmmmovq(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op)
+        op_class = 'FloatMiscOp'
+        code = '''
+            FpDestReg_uqw = FpSrcReg1_uqw;
+            FpDestHiReg_uqw = 0;
+        '''
+
+    class Mxmmfromint(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, IntSrc1Op)
+        op_class = 'SimdInsertOp'
+        code = '''
+            FpDestReg_uqw = PMSrcReg1 & mask(srcSize * 8);
+            FpDestHiReg_uqw = 0;
+        '''
+
+    class Mxmmtoint(Mov2int):
+        op_class = 'SimdExtractOp'
+
+    class Mxmmsign(MediaOp):
+        operand_types = (IntDestOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'SimdExtractOp'
+        code = '''
+            const uint64_t lanes[2] = {FpSrcReg1_uqw, FpSrcReg2_uqw};
+            uint64_t result = 0;
+            const unsigned count = 8 / srcSize;
+            for (unsigned lane = 0; lane < 2; ++lane)
+                for (unsigned i = 0; i < count; ++i)
+                    result |= bits(lanes[lane], (i + 1) * srcSize * 8 - 1)
+                        << (lane * count + i);
+            DestReg = result;
+        '''
+
+    class Mxmmpack(Mxmmxor):
+        op_class = 'SimdPackOp'
+        code = '''
+            const uint64_t input[4] = {FpSrcReg1_uqw, FpSrcReg2_uqw,
+                                      FpSrcReg3_uqw, FpSrcReg4_uqw};
+            uint64_t output[2] = {};
+            const unsigned width = srcSize * 8;
+            const unsigned narrow = destSize * 8;
+            for (unsigned lane = 0; lane < 4; ++lane) {
+                for (unsigned i = 0; i < 64 / width; ++i) {
+                    const uint64_t raw = bits(input[lane], (i + 1) * width - 1,
+                                              i * width);
+                    const int64_t value = raw |
+                        (0 - (raw & (1ULL << (width - 1))));
+                    const int64_t lower = signedOp() ? -(1LL << (narrow - 1)) : 0;
+                    const int64_t upper = signedOp() ?
+                        (1LL << (narrow - 1)) - 1 : mask(narrow);
+                    const uint64_t packed = std::min(upper, std::max(lower, value));
+                    const unsigned offset = (lane % 2) * 32 + i * narrow;
+                    output[lane / 2] |= (packed & mask(narrow)) << offset;
+                }
+            }
+            FpDestReg_uqw = output[0];
+            FpDestHiReg_uqw = output[1];
+        '''
+
+    class Mxmmwordshuffle(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'SimdMiscOp'
+        code = '''
+            const uint64_t lanes[2] = {FpSrcReg1_uqw, FpSrcReg2_uqw};
+            const unsigned selected = (ext >> 8) & 1;
+            uint64_t result = 0;
+            for (unsigned i = 0; i < 4; ++i) {
+                const unsigned source = (ext >> (i * 2)) & 3;
+                result |= bits(lanes[selected], source * 16 + 15, source * 16)
+                    << (i * 16);
+            }
+            FpDestReg_uqw = selected ? lanes[0] : result;
+            FpDestHiReg_uqw = selected ? result : lanes[1];
+        '''
+
+    class Mxmmaddf(Mxmmxor):
+        op_class = 'FloatAddOp'
+        code = '''
+            union doubleInt { double d; uint64_t i; };
+            doubleInt low1, high1, low2, high2;
+            low1.i = FpSrcReg1_uqw;
+            high1.i = FpSrcReg2_uqw;
+            low2.i = FpSrcReg3_uqw;
+            high2.i = FpSrcReg4_uqw;
+            low1.d += low2.d;
+            high1.d += high2.d;
+            FpDestReg_uqw = low1.i;
+            FpDestHiReg_uqw = high1.i;
+        '''
+
+    class Mxmmsubf(Mxmmaddf):
+        op_class = 'FloatAddOp'
+        code = Mxmmaddf.code.replace('+=', '-=')
+
+    class Mxmmmulf(Mxmmaddf):
+        op_class = 'FloatMultOp'
+        code = Mxmmaddf.code.replace('+=', '*=')
+
+    class Mxmmdivf(Mxmmaddf):
+        op_class = 'FloatDivOp'
+        code = Mxmmaddf.code.replace('+=', '/=')
 
     class Mxor(Media3Op):
         def __init__(self, dest, src1, src2):
@@ -1543,14 +1758,14 @@ let {{
             // Equal          1  0  0
             //           OF = SF = AF = 0
             ccFlagBits = ccFlagBits & ~(SFBit | AFBit | ZFBit | PFBit);
-            cfofBits   = cfofBits   & ~(OFBit | CFBit);
+            { const uint64_t flagsValue = (cfBit | ofBit)   & ~(OFBit | CFBit); cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
 
             if (std::isnan(arg1) || std::isnan(arg2)) {
                 ccFlagBits = ccFlagBits | (ZFBit | PFBit);
-                cfofBits = cfofBits | CFBit;
+                { const uint64_t flagsValue = (cfBit | ofBit) | CFBit; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             }
             else if(arg1 < arg2)
-                cfofBits = cfofBits | CFBit;
+                { const uint64_t flagsValue = (cfBit | ofBit) | CFBit; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }
             else if(arg1 == arg2)
                 ccFlagBits = ccFlagBits | ZFBit;
         '''
@@ -1897,4 +2112,35 @@ let {{
                     insertBits(FpDestReg_uqw, hiIndex, loIndex, arg1Bits);
             }
         '''
+
+    # Reuse the established element arithmetic while scheduling the entire
+    # XMM operation once. Both halves are read before either destination writes.
+    for lane_class in (Maddi, Mmuli, Mcmpi2r, Maddf, Msubf, Mmulf, Mdivf,
+                       Msrl, Msra, Msll):
+        is_shift = lane_class in (Msrl, Msra, Msll)
+        lane_code = lane_class.code.replace('FpDestReg_uqw', 'result_lane')
+        lane_code = lane_code.replace('FpSrcReg1_uqw', 'left_lane')
+        lane_code = lane_code.replace('FpSrcReg2_uqw', 'right_lane')
+        lane_code = lane_code.replace('op2_uqw', 'right_lane')
+        code = '''
+            auto lane = [this](uint64_t left_lane, uint64_t right_lane) {
+                uint64_t result_lane = 0;
+                %s
+                return result_lane;
+            };
+            FpDestReg_uqw = lane(FpSrcReg1_uqw, %s);
+            FpDestHiReg_uqw = lane(%s, %s);
+        ''' % (lane_code,
+               'op2_uqw' if is_shift else 'FpSrcReg3_uqw',
+               'FpSrcReg3_uqw' if is_shift else 'FpSrcReg2_uqw',
+               'op2_uqw' if is_shift else 'FpSrcReg4_uqw')
+        operands = ((FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc3Op, Op2)
+                    if is_shift else Mxmmxor.operand_types)
+        prefix = ('Mxmmps' if lane_class in (Maddf, Msubf, Mmulf, Mdivf)
+                  else 'Mxmm')
+        MediaOpMeta(prefix + lane_class.__name__[1:], (MediaOp,),
+                    {'code': code, 'op_class': ('SimdCmpOp'
+                                               if lane_class == Mcmpi2r
+                                               else lane_class.op_class),
+                     'operand_types': operands})
 }};

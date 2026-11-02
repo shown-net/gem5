@@ -180,6 +180,8 @@ class IEW
     /** Re-executes all rescheduled memory instructions. */
     void replayMemInst(const DynInstPtr &inst);
 
+    bool replayOneMemInst(const DynInstPtr &inst);
+
     /** Moves memory instruction onto the list of cache blocked instructions */
     void blockMemInst(const DynInstPtr &inst);
 

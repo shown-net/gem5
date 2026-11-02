@@ -539,10 +539,10 @@ BaseKvmCPU::activateContext(ThreadID thread_num)
     assert(_status == Idle);
     assert(!tickEvent.scheduled());
 
-    // Calibration HANDOFF may reactivate a drained KVM context. The normal
-    // deployment path retains its original scheduling behavior.
-    if (o3::CalibrationMarker::hasInstances() &&
-        drainState() == DrainState::Drained) {
+    // A context may be reactivated by a fork handler while the machine
+    // remains drained. drainResume() owns scheduling in that case, as
+    // with O3; scheduling here would insert the tick event twice.
+    if (drainState() == DrainState::Drained) {
         return;
     }
 

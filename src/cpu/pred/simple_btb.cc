@@ -72,6 +72,13 @@ SimpleBTB::findEntry(Addr instPC, ThreadID tid)
     return btb.findEntry({instPC, tid});
 }
 
+void
+SimpleBTB::invalidate(ThreadID tid, Addr instPC)
+{
+    if (auto *entry = btb.findEntry({instPC, tid}))
+        btb.invalidate(entry);
+}
+
 bool
 SimpleBTB::valid(ThreadID tid, Addr instPC)
 {

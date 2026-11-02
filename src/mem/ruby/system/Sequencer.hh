@@ -42,8 +42,10 @@
 #define __MEM_RUBY_SYSTEM_SEQUENCER_HH__
 
 #include <iostream>
+#include <deque>
 #include <list>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "mem/ruby/common/Address.hh"
@@ -96,12 +98,18 @@ class Sequencer : public RubyPort
     void writeCallbackScFail(Addr address,
                         DataBlock& data);
 
+    /** The L0 controller may make marked stores visible only in this order. */
+    bool isOrderedStoreReady(const RequestPtr &req) const;
+
+    /** A locked RMW line must not be selected as a prefetch victim. */
+    bool isBlockedLine(Addr address) const;
+
     // Public Methods
     virtual void wakeup(); // Used only for deadlock detection
     void resetStats() override;
     void collateStats();
 
-    void writeCallback(Addr address,
+    bool writeCallback(Addr address,
                        DataBlock& data,
                        const bool externalHit = false,
                        const MachineType mach = MachineType_NUM,
@@ -123,7 +131,11 @@ class Sequencer : public RubyPort
                       const MachineType mach = MachineType_NUM,
                       const Cycles initialRequestTime = Cycles(0),
                       const Cycles forwardRequestTime = Cycles(0),
-                      const Cycles firstResponseTime = Cycles(0));
+                      const Cycles firstResponseTime = Cycles(0),
+                      const bool code_stale = false);
+    void readCallbackStale(Addr address, DataBlock &data)
+    { readCallback(address, data, true, MachineType_NUM,
+                   Cycles(0), Cycles(0), Cycles(0), true); }
 
     void atomicCallback(Addr address,
                         DataBlock& data,
@@ -214,7 +226,8 @@ class Sequencer : public RubyPort
     { return m_IncompleteTimes[t]; }
 
   protected:
-    void issueRequest(PacketPtr pkt, RubyRequestType type);
+    void issueRequest(PacketPtr pkt, RubyRequestType type,
+                      Cycles overlapped = Cycles(0));
     virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
                              bool llscSuccess,
                              const MachineType mach, const bool externalHit,
@@ -246,6 +259,13 @@ class Sequencer : public RubyPort
   protected:
     // RequestTable contains both read and write requests, handles aliasing
     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
+    std::deque<const Request *> m_orderedStores;
+    bool m_parkOrderedStores = false;
+    std::unordered_set<Addr> m_parkedOrderedLines;
+    void wakeParkedOrderedHead();
+    bool m_orderedLineValid = false;
+    Cycles m_orderedLineCycle = Cycles(0);
+    Addr m_orderedLine = 0;
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other
     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
@@ -277,6 +297,7 @@ class Sequencer : public RubyPort
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
     int m_store_prepare_outstanding;
+    unsigned m_maxStorePrepareOutstanding;
     bool m_deadlock_check_scheduled;
 
     int m_coreId;
@@ -318,6 +339,18 @@ class Sequencer : public RubyPort
     std::vector<statistics::Histogram *> m_InitialToForwardDelayHist;
     std::vector<statistics::Histogram *> m_ForwardToFirstResponseDelayHist;
     std::vector<statistics::Histogram *> m_FirstResponseToCompletionDelayHist;
+    struct OrderedStoreStats : statistics::Group
+    {
+        statistics::Scalar retries, overlappedCycles, deferredNoWriteCallbacks;
+        statistics::Scalar parked, woken, headRateRetries;
+        explicit OrderedStoreStats(Sequencer *owner);
+    } orderedStoreStats;
+    struct StorePrepareStats : statistics::Group
+    {
+        statistics::Scalar accepted, dropped, completed;
+        statistics::Value outstanding;
+        explicit StorePrepareStats(Sequencer *owner);
+    } storePrepareStats;
     std::vector<statistics::Counter> m_IncompleteTimes;
 
     EventFunctionWrapper deadlockCheckEvent;

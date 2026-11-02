@@ -985,7 +985,7 @@ private:
         native_diag_by_scope_{};
     std::array<std::array<uint64_t, 2>, 5>
         native_diag_proxy_confusion_{};
-    std::array<uint64_t, 7> native_diag_terminal_reason_counts_{};
+    std::array<uint64_t, 9> native_diag_terminal_reason_counts_{};
     std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
     uint64_t native_diag_anomaly_samples_dropped_ = 0;
     bool native_diag_finalized_ = false;

@@ -43,9 +43,11 @@
 #define __CPU_O3_LSQ_HH__
 
 #include <cassert>
+#include <array>
 #include <cstdint>
 #include <list>
 #include <map>
+#include <memory>
 #include <queue>
 #include <vector>
 
@@ -80,6 +82,13 @@ class LSQ
     class LSQRequest;
     struct StorePrepareSenderState : public Packet::SenderState
     {
+    };
+    struct StoreBufferSenderState : public Packet::SenderState
+    {
+        StoreBufferSenderState(ThreadID thread, uint64_t entry)
+            : threadId(thread), entryId(entry) {}
+        ThreadID threadId;
+        uint64_t entryId;
     };
 
     /**
@@ -736,6 +745,8 @@ class LSQ
     void insertLoad(const DynInstPtr &load_inst);
     /** Inserts a store into the LSQ. */
     void insertStore(const DynInstPtr &store_inst);
+    void insertStoreData(const DynInstPtr &store_inst);
+    Fault writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size);
 
     /** Executes a load. */
     Fault executeLoad(const DynInstPtr &inst);
@@ -938,6 +949,8 @@ class LSQ
     bool cachePortAvailable(bool is_load) const;
     /** Another store port is in use */
     void cachePortBusy(bool is_load);
+    bool loadBankAvailable(Addr addr) const;
+    void noteLoadBank(Addr addr);
 
     RequestPort &getDataPort() { return dcachePort; }
 
@@ -954,6 +967,8 @@ class LSQ
     int cacheLoadPorts;
     /** The number of used cache ports in this cycle by loads. */
     int usedLoadPorts;
+    const bool sprL1LoadBankConflicts;
+    std::array<unsigned, 16> loadBankUses{};
 
     /** If the LSQ is currently waiting for stale translations */
     bool waitingForStaleTranslation;

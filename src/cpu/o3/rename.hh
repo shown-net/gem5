@@ -302,9 +302,9 @@ class Rename
     {
         RenameHistory(InstSeqNum _instSeqNum, const RegId& _archReg,
                       PhysRegIdPtr _newPhysReg,
-                      PhysRegIdPtr _prevPhysReg)
+                      PhysRegIdPtr _prevPhysReg, bool _alias = false)
             : instSeqNum(_instSeqNum), archReg(_archReg),
-              newPhysReg(_newPhysReg), prevPhysReg(_prevPhysReg)
+              newPhysReg(_newPhysReg), prevPhysReg(_prevPhysReg), alias(_alias)
         {
         }
 
@@ -317,6 +317,7 @@ class Rename
         /** The old physical register that the arch. register was renamed to.
          */
         PhysRegIdPtr prevPhysReg;
+        bool alias;
     };
 
     /** A per-thread list of all destination register renames, used to either
@@ -376,6 +377,8 @@ class Rename
      * and ROB, but are not yet included in their occupancy counts.
      */
     int instsInProgress[MaxThreads];
+    int noIQInstsInProgress[MaxThreads];
+    int extraIQInstsInProgress[MaxThreads];
 
     /** Count of Load instructions in progress that have been sent off to the
      * IQ and ROB, but are not yet included in their occupancy counts.
@@ -512,6 +515,8 @@ class Rename
         /** Stat for total number of times that rename runs out of free
          *  registers to use to rename. */
         statistics::Scalar fullRegistersEvents;
+        /** Register classes short on a failed allocation check; may overlap. */
+        statistics::Vector fullRegistersByClass;
         /** Stat for total number of renamed destination registers. */
         statistics::Scalar renamedOperands;
         /** Stat for total number of source register rename lookups. */

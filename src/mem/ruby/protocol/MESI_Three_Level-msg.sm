@@ -85,6 +85,7 @@ structure(CoherenceMsg, desc="...", interface="Message") {
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
   bool Dirty, default="false",  desc="Dirty bit";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
+  bool TrainPrefetch, default="false", desc="Eligible demand access for private L2 prefetch training";
   int FillAuditRole, default="0", desc="Observer-only originating request role";
   Addr PerfTransactionId, default="0", desc="Independent native transaction ID, no retirement gate";
   bool TraceValid, default="false", desc="Oracle trace identity is valid";

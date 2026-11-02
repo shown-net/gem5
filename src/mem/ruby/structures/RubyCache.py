@@ -43,6 +43,9 @@ class RubyCache(SimObject):
     block_size = Param.MemorySize(
         "0B", "block size in bytes. 0 means default RubyBlockSize"
     )
+    fill_capacity = Param.Unsigned(
+        0, "Maximum tracked line fills; zero leaves the fill budget unlimited"
+    )
 
     # Atomic parameters only applicable to GPU atomics
     # Zero atomic latency corresponds to instantanous atomic ALU operations

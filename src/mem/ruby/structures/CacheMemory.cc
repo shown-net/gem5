@@ -80,8 +80,39 @@ CacheMemory::CacheMemory(const Params &p)
     m_is_instruction_only_cache = p.is_icache;
     m_resource_stalls = p.resourceStalls;
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
+    m_fill_capacity = p.fill_capacity;
     m_use_occupancy = dynamic_cast<replacement_policy::WeightedLRU*>(
                                     m_replacementPolicy_ptr) ? true : false;
+}
+
+bool
+CacheMemory::canAllocateFill() const
+{
+    return m_fill_capacity == 0 || m_fill_in_flight < m_fill_capacity;
+}
+
+void
+CacheMemory::allocateFill()
+{
+    assert(canAllocateFill());
+    ++m_fill_in_flight;
+    ++cacheMemoryStats.fillAllocations;
+    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+}
+
+void
+CacheMemory::releaseFill()
+{
+    assert(m_fill_in_flight > 0);
+    --m_fill_in_flight;
+    ++cacheMemoryStats.fillCompletions;
+    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+}
+
+void
+CacheMemory::recordFillBlocked()
+{
+    ++cacheMemoryStats.fillBlockedRequests;
 }
 
 void
@@ -556,6 +587,10 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(numDataArrayStalls, "Number of stalls caused by data array"),
       ADD_STAT(numAtomicALUOperations, "Number of atomic ALU operations"),
       ADD_STAT(numAtomicALUArrayStalls, "Number of stalls caused by atomic ALU array"),
+      ADD_STAT(fillAllocations, "New cache-line fill transactions allocated"),
+      ADD_STAT(fillCompletions, "Cache-line fill transactions released"),
+      ADD_STAT(fillBlockedRequests, "Fill admissions retried because the budget was full"),
+      ADD_STAT(fillOccupancy, "Average number of live tracked line fills"),
       ADD_STAT(htmTransCommitReadSet, "Read set size of a committed "
                                       "transaction"),
       ADD_STAT(htmTransCommitWriteSet, "Write set size of a committed "

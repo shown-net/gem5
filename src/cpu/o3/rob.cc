@@ -198,7 +198,9 @@ ROB::insertInst(const DynInstPtr &inst)
 
     DPRINTF(ROB, "Adding inst PC %s to the ROB.\n", inst->pcState());
 
-    assert(numInstsInROB != numEntries);
+    const bool shared = inst->allocationGroup && !inst->independentBackendEntries();
+    const unsigned slots = shared ? !inst->allocationGroup->robMembers : 1;
+    assert(numInstsInROB + slots <= numEntries);
 
     ThreadID tid = inst->threadNumber;
 
@@ -217,8 +219,8 @@ ROB::insertInst(const DynInstPtr &inst)
 
     inst->setInROB();
 
-    ++numInstsInROB;
-    ++threadEntries[tid];
+    numInstsInROB += shared ? inst->allocationGroup->enterROB() : 1;
+    threadEntries[tid] += slots;
 
     assert((*tail) == inst);
 
@@ -245,8 +247,11 @@ ROB::retireHead(ThreadID tid)
             "instruction PC %s, [sn:%llu]\n", tid, head_inst->pcState(),
             head_inst->seqNum);
 
-    --numInstsInROB;
-    --threadEntries[tid];
+    const bool shared = head_inst->allocationGroup &&
+                        !head_inst->independentBackendEntries();
+    const unsigned slots = shared ? head_inst->allocationGroup->leaveROB() : 1;
+    numInstsInROB -= slots;
+    threadEntries[tid] -= slots;
 
     head_inst->clearInROB();
     head_inst->setCommitted();

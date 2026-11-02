@@ -220,6 +220,8 @@ constexpr uint64_t kFstFeatureDestClass   = uint64_t(1) << 2;
 constexpr uint64_t kFstFeatureSyscallMetadata = uint64_t(1) << 3;
 constexpr uint64_t kFstFeaturePrivilege       = uint64_t(1) << 4;
 constexpr uint64_t kFstRawSyscallMicroops = uint64_t(1) << 8;
+// This producer's OpClass enum includes SPR-specific SIMD and split stores.
+constexpr uint64_t kFstFeatureSprOpClass = uint64_t(1) << 10;
 constexpr uint64_t kFstLinuxX86_64 = 1;
 constexpr uint32_t kFstVirtualPageMapVersion = 1;
 constexpr uint32_t kFstAddressSpaceMapVersion = 1;
@@ -771,6 +773,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     // 记录流物理格式：默认 jsonl；"fst" 时 records.micro 直写 FST 二进制。
     if (toLower(params.trace_format) == "fst") {
         trace_format_ = TraceFormat::FST;
+        fst_feature_flags_ |= kFstFeatureSprOpClass;
     }
     if (functional_syscall_microops_) {
         if (!functional_include_kernel_ || !emit_micro_ ||
@@ -3037,7 +3040,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
     }
     static constexpr const char *reason_names[] = {
         "predicated_off", "no_request", "store_forward", "local_access",
-        "failed_store_conditional", "zero_size", "prefetch_skipped"};
+        "failed_store_conditional", "zero_size", "prefetch_skipped",
+        "store_overwrite_elided", "store_buffer_combined"};
     std::fputs(",\"terminal_reason_counts\":{", summary);
     bool first_reason = true;
     for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();

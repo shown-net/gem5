@@ -44,6 +44,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <queue>
@@ -60,7 +61,6 @@
 #include "cpu/timebuf.hh"
 #include "debug/HtmCpu.hh"
 #include "debug/LSQUnit.hh"
-#include "enums/TSOStore.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
 
@@ -93,6 +93,24 @@ class LSQUnit
 
     using LSQRequest = LSQ::LSQRequest;
   private:
+    struct CommittedStoreEntry
+    {
+        uint64_t id;
+        Addr line;
+        ContextID context;
+        RequestorID requestor;
+        Request::Flags flags;
+        Addr pc;
+        InstSeqNum firstSeq;
+        InstSeqNum lastSeq;
+        std::vector<uint8_t> data;
+        std::vector<bool> mask;
+        bool issued = false;
+        bool completed = false;
+        bool staleTranslation = false;
+        bool invalidated = false;
+    };
+
     class LSQEntry
     {
       private:
@@ -160,6 +178,13 @@ class LSQUnit
         bool _completed = false;
         /** Whether a buffer-mode exclusive permission prefetch was sent. */
         bool _storePrepareIssued = false;
+        /** This entry was sent as a TSO store and awaits its response. */
+        bool _tsoIssued = false;
+        bool _tsoOrderTracked = false;
+        DynInstPtr _dataInstruction;
+        bool _addressReady = false;
+        bool _dataReady = false;
+        unsigned _dataBytes = 0;
         /** Does this request write all zeros and thus doesn't
          * have any data attached to it. Used for cache block zero
          * style instructs (ARM DC ZVA; ALPHA WH64)
@@ -180,19 +205,31 @@ class LSQUnit
         clear()
         {
             LSQEntry::clear();
-            _canWB = _completed = _committed = _storePrepareIssued =
-                _isAllZeros = false;
+            _canWB = _completed = _committed = _storePrepareIssued = _tsoIssued =
+                _tsoOrderTracked = _isAllZeros = false;
+            _dataInstruction = nullptr;
+            _addressReady = _dataReady = false;
+            _dataBytes = 0;
         }
 
         /** Member accessors. */
         /** @{ */
         bool& canWB() { return _canWB; }
+        DynInstPtr &dataInstruction() { return _dataInstruction; }
+        const DynInstPtr &dataInstruction() const { return _dataInstruction; }
+        bool &addressReady() { return _addressReady; }
+        bool addressReady() const { return _addressReady; }
+        bool &dataReady() { return _dataReady; }
+        bool dataReady() const { return _dataReady; }
+        unsigned &dataBytes() { return _dataBytes; }
         const bool& canWB() const { return _canWB; }
         bool& completed() { return _completed; }
         const bool& completed() const { return _completed; }
         bool& committed() { return _committed; }
         const bool& committed() const { return _committed; }
         bool& storePrepareIssued() { return _storePrepareIssued; }
+        bool& tsoIssued() { return _tsoIssued; }
+        bool& tsoOrderTracked() { return _tsoOrderTracked; }
         const bool& storePrepareIssued() const
         {
             return _storePrepareIssued;
@@ -252,6 +289,8 @@ class LSQUnit
     void insertLoad(const DynInstPtr &load_inst);
     /** Inserts a store instruction. */
     void insertStore(const DynInstPtr &store_inst);
+    void insertStoreData(const DynInstPtr &store_inst);
+    Fault writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size);
 
     /** Check for ordering violations in the LSQ. For a store squash if we
      * ever find a conflicting load. For a load, only squash if we
@@ -315,7 +354,7 @@ class LSQUnit
     int numLoads() { return loadQueue.size(); }
 
     /** Returns the number of stores in the SQ. */
-    int numStores() { return storeQueue.size(); }
+    int numStores() { return storeQueue.size() + committedStoreBuffer.size(); }
 
     /** Returns the current occupancy of the passed
      * queue (store queue or load queue) */
@@ -353,36 +392,44 @@ class LSQUnit
     bool lqFull() { return loadQueue.full(); }
 
     /** Returns if the SQ is full. */
-    bool sqFull() { return storeQueue.full(); }
+    bool sqFull() { return numFreeStoreEntries() == 0; }
 
     /** Returns if the LQ is empty. */
     bool lqEmpty() const { return loadQueue.size() == 0; }
 
     /** Returns if the SQ is empty. */
-    bool sqEmpty() const { return storeQueue.size() == 0; }
+    bool sqEmpty() const
+    { return storeQueue.empty() && committedStoreBuffer.empty(); }
 
     /** Returns the number of instructions in the LSQ. */
-    unsigned getCount() { return loadQueue.size() + storeQueue.size(); }
+    unsigned getCount()
+    { return loadQueue.size() + storeQueue.size() + committedStoreBuffer.size(); }
 
     /** Returns if there are any stores to writeback. */
-    bool hasStoresToWB() { return storesToWB; }
+    bool hasStoresToWB() { return storesToWB || !committedStoreBuffer.empty(); }
 
     /** Returns the number of stores to writeback. */
-    int numStoresToWB() { return storesToWB; }
+    int numStoresToWB() { return storesToWB + committedStoreBuffer.size(); }
 
     /** Returns if the LSQ unit will writeback on this cycle. */
     bool
     willWB()
     {
-        return storeWBIt.dereferenceable() &&
+        const bool sq_ready = storeWBIt.dereferenceable() &&
                         storeWBIt->valid() &&
                         storeWBIt->canWB() &&
-                        !storeWBIt->completed() &&
-                        !isStoreBlocked;
+                        !storeWBIt->completed();
+        const bool buffer_ready = std::any_of(
+            committedStoreBuffer.begin(), committedStoreBuffer.end(),
+            [](const auto &entry) { return !entry.issued; });
+        return (sq_ready || buffer_ready) && !isStoreBlocked;
     }
 
     /** Handles doing the retry. */
     void recvRetry();
+
+    void completeStoreBufferWrite(uint64_t entry_id);
+    void sampleStoreOccupancy();
 
     unsigned int cacheLineSize();
   private:
@@ -394,9 +441,24 @@ class LSQUnit
 
     /** Try to finish a previously blocked write back attempt */
     void writebackBlockedStore();
+    void offloadCommittedStores();
+    void drainCommittedStoreBuffer();
+    bool forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx);
 
     /** Issue buffer-mode exclusive permission prefetches. */
     void issueStorePrepareRequests();
+
+    /** Ordinary store and the committed subset eligible for merge probes. */
+    bool isOrdinaryStore(StoreQueue::iterator entry);
+    bool isCoalescibleStore(StoreQueue::iterator entry);
+    bool canSendTSOStore(StoreQueue::iterator entry);
+
+    /** Wake loads whose recorded partial-overlap blocker has advanced. */
+    void wakeSelectiveBlockedLoads(InstSeqNum store_seq, bool data_only = false);
+
+    /** Whether consecutive committed stores can use the younger full write. */
+    bool canElideOverwrittenStore(StoreQueue::iterator older,
+                                 StoreQueue::iterator younger);
 
     /** Completes the store at the specified index. */
     void completeStore(typename StoreQueue::iterator store_idx);
@@ -488,6 +550,11 @@ class LSQUnit
 
     /** The number of store instructions in the SQ waiting to writeback. */
     int storesToWB;
+    bool sprStoreBuffer = false;
+    bool sprEarlyStorePrepare = false;
+    uint64_t nextStoreBufferId = 1;
+    std::deque<CommittedStoreEntry> committedStoreBuffer;
+    std::map<Addr, unsigned> storeBufferLinesInFlight;
 
     // hardware transactional memory
     // nesting depth
@@ -515,6 +582,14 @@ class LSQUnit
     InstSeqNum stallingStoreIsn;
     /** The index of the above store. */
     ssize_t stallingLoadIdx;
+    struct SelectiveBlockedLoad {
+        InstSeqNum storeSeq;
+        DynInstPtr load;
+        bool waitForData = false;
+    };
+    // Keyed by load sequence so squash can remove a suffix without relying
+    // on SQ/LQ indices that may already have wrapped.
+    std::map<InstSeqNum, SelectiveBlockedLoad> selectiveBlockedLoads;
 
     /** The packet that needs to be retried. */
     PacketPtr retryPkt;
@@ -525,11 +600,17 @@ class LSQUnit
     /** Whether or not a store is in flight. */
     bool storeInFlight;
 
-    /** Selected TSO committed-store implementation. */
-    enums::TSOStore tsoStore;
+    /** Ordinary stores retain ordered visibility across a bounded line window. */
+    unsigned tsoStoresInFlight = 0;
+    bool tsoInFlightSameLineEligible = false;
+    Addr tsoInFlightLine = 0;
+    bool tsoInFlightSecure = false;
+    std::map<Addr, unsigned> tsoLinesInFlight;
+    Addr tsoLastIssuedLine = 0;
+    Cycles tsoLastIssuedLineCycle = Cycles(0);
+    bool tsoLastIssuedLineValid = false;
 
-    /** Configured buffer-mode store capacity. */
-    unsigned tsoStoreBufferSize;
+    unsigned tsoOrderedStoreLineWindow;
 
     /** The oldest load that caused a memory ordering violation. */
     DynInstPtr memDepViolator;
@@ -563,6 +644,22 @@ class LSQUnit
 
         /** Number of loads that were rescheduled. */
         statistics::Scalar rescheduledLoads;
+        statistics::Scalar selectivePartialWaits;
+        statistics::Scalar selectivePartialWakeups;
+        statistics::Scalar selectivePartialSquashedWaits;
+        statistics::Scalar splitStoreAddressFirst;
+        statistics::Scalar splitStoreDataFirst;
+        statistics::Scalar splitStoreDataWaits;
+        statistics::Scalar loadBankConflicts;
+        statistics::Scalar storeBufferOffloaded;
+        statistics::Scalar storeBufferMerged;
+        statistics::Scalar storeBufferSent;
+        statistics::Scalar storeBufferCompleted;
+        statistics::Scalar storeBufferForwardedLoads;
+        statistics::Scalar storeBufferPartialWaits;
+        statistics::Scalar storeBufferEntryCycles;
+        statistics::Scalar sharedStoreEntryCycles;
+        statistics::Scalar sharedStoreFullCycles;
 
         /** Number of times the LSQ is blocked due to the cache. */
         statistics::Scalar blockedByCache;
@@ -570,8 +667,22 @@ class LSQUnit
         /** Buffer-mode exclusive permission prefetches issued. */
         statistics::Scalar storePrepareIssued;
 
+        /** Preparation requests sent before retirement, and without data. */
+        statistics::Scalar storePrepareSpeculativeIssued;
+        statistics::Scalar storePrepareBeforeData;
+        statistics::Scalar storePrepareSquashed;
+
         /** Buffer-mode permission prefetches rejected for retry. */
         statistics::Scalar storePrepareBlocked;
+
+        /** Committed stores omitted because a consecutive write overwrote them. */
+        statistics::Scalar storeOverwriteElisions;
+
+        /** Same-line adjacent ordinary stores ready when the older is sent. */
+        statistics::Scalar storeSameLineReadyPairs;
+        /** Ordinary stores admitted while an older same-line store is in flight. */
+        statistics::Scalar storeSameLineConcurrentIssued;
+        statistics::Scalar storeOrderedCrossLineIssued;
 
         /** Distribution of cycle latency between the first time a load
          * is issued and its completion */
@@ -605,7 +716,7 @@ class LSQUnit
     InstSeqNum getStoreHeadSeqNum();
 
     /** Returns whether or not the LSQ unit is stalled. */
-    bool isStalled()  { return stalled; }
+    bool isStalled()  { return stalled || !selectiveBlockedLoads.empty(); }
   public:
     typedef typename CircularQueue<LQEntry>::iterator LQIterator;
     typedef typename CircularQueue<SQEntry>::iterator SQIterator;

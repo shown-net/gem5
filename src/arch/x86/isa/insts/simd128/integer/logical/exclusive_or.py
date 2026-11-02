@@ -35,24 +35,18 @@
 
 microcode = """
 def macroop PXOR_XMM_XMM {
-    mxor xmml, xmml, xmmlm
-    mxor xmmh, xmmh, xmmhm
+    mxmmxor xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop PXOR_XMM_M {
-    lea t1, seg, sib, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mxor xmml, xmml, ufp1
-    mxor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmxor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop PXOR_XMM_P {
-    rdip t7
-    lea t1, seg, riprel, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mxor xmml, xmml, ufp1
-    mxor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmxor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 """

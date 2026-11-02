@@ -35,46 +35,34 @@
 
 microcode = """
 def macroop PAND_XMM_XMM {
-    mand xmml, xmml, xmmlm
-    mand xmmh, xmmh, xmmhm
+    mxmmand xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop PAND_XMM_M {
-    lea t1, seg, sib, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mand xmml, xmml, ufp1
-    mand xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmand xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop PAND_XMM_P {
-    rdip t7
-    lea t1, seg, riprel, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mand xmml, xmml, ufp1
-    mand xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmand xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop PANDN_XMM_XMM {
-    mandn xmml, xmml, xmmlm
-    mandn xmmh, xmmh, xmmhm
+    mxmmandn xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop PANDN_XMM_M {
-    lea t1, seg, sib, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mandn xmml, xmml, ufp1
-    mandn xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmandn xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop PANDN_XMM_P {
-    rdip t7
-    lea t1, seg, riprel, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mandn xmml, xmml, ufp1
-    mandn xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmandn xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 """

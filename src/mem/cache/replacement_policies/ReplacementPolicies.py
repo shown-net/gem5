@@ -79,6 +79,13 @@ class LRURP(BaseReplacementPolicy):
     cxx_header = "mem/cache/replacement_policies/lru_rp.hh"
 
 
+class QLRUH00M1R0U1RP(BaseReplacementPolicy):
+    type = "QLRUH00M1R0U1RP"
+    cxx_class = "gem5::replacement_policy::QLRUH00M1R0U1"
+    cxx_header = "mem/cache/replacement_policies/qlru_rp.hh"
+    num_ways = Param.Unsigned("Number of ways sharing replacement state")
+
+
 class BIPRP(LRURP):
     type = "BIPRP"
     cxx_class = "gem5::replacement_policy::BIP"

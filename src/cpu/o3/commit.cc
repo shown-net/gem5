@@ -507,6 +507,7 @@ Commit::generateTCEvent(ThreadID tid)
 void
 Commit::squashAll(ThreadID tid)
 {
+    cpu->discardMemoryRetirement(tid);
     // If we want to include the squashing instruction in the squash,
     // then use one older sequence number.
     // Hopefully this doesn't mess things up.  Basically I want to squash
@@ -514,12 +515,13 @@ Commit::squashAll(ThreadID tid)
     InstSeqNum squashed_inst = rob->isEmpty(tid) ?
         lastCommitedSeqNum[tid] : rob->readHeadInst(tid)->seqNum - 1;
 
+    if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, false);
+
     // All younger instructions will be squashed. Set the sequence
     // number as the youngest instruction in the ROB (0 in this case.
     // Hopefully nothing breaks.)
     youngestSeqNum[tid] = lastCommitedSeqNum[tid];
 
-    if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, false);
     rob->squash(squashed_inst, tid);
     changedROBNumEntries[tid] = true;
 
@@ -825,10 +827,25 @@ Commit::commit()
                 oracle_cause_inst = rob->findInst(tid, cause_seq);
             }
             InstSeqNum squashed_inst = cause_seq;
+            std::unique_ptr<PCStateBase> redirect_pc(fromIEW->pc[tid]->clone());
 
             if (fromIEW->includeSquashInst[tid]) {
                 squashed_inst--;
             }
+
+            if (oracle_cause_inst && oracle_cause_inst->allocationGroup &&
+                (fromIEW->includeSquashInst[tid] ||
+                 squashed_inst < oracle_cause_inst->allocationGroup->end)) {
+                // Recovery cannot preserve half of a shared allocation unit.
+                // Re-fetch the architectural instruction from its first op.
+                const auto group = oracle_cause_inst->allocationGroup;
+                auto leader = rob->findInst(tid, group->leader);
+                squashed_inst = group->leader - 1;
+                redirect_pc->set(leader ? leader->pcState().instAddr() :
+                                         oracle_cause_inst->pcState().instAddr());
+            }
+
+            if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, true);
 
             TaoTrace::traceSquashEpisode(
                 cpu, uint32_t(tid),
@@ -844,7 +861,6 @@ Commit::commit()
             // number as the youngest instruction in the ROB.
             youngestSeqNum[tid] = squashed_inst;
 
-            if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, true);
             rob->squash(squashed_inst, tid);
             changedROBNumEntries[tid] = true;
 
@@ -869,7 +885,7 @@ Commit::commit()
                 ++stats.branchMispredicts;
             }
 
-            set(toIEW->commitInfo[tid].pc, fromIEW->pc[tid]);
+            set(toIEW->commitInfo[tid].pc, *redirect_pc);
         }
 
         if (commitStatus[tid] == ROBSquashing) {
@@ -938,17 +954,18 @@ Commit::commitInsts()
     DPRINTF(Commit, "Trying to commit instructions in the ROB.\n");
 
     unsigned num_committed = 0;
+    ThreadID follow_thread = InvalidThreadID;
 
     DynInstPtr head_inst;
 
     // Commit as many instructions as possible until the commit bandwidth
     // limit is reached, or it becomes impossible to commit any more.
-    while (num_committed < commitWidth) {
+    while (num_committed < commitWidth || follow_thread != InvalidThreadID) {
         // hardware transactionally memory
         // If executing within a transaction,
         // need to handle interrupts specially
 
-        ThreadID commit_thread = getCommittingThread();
+        ThreadID commit_thread = num_committed == commitWidth ? follow_thread : getCommittingThread();
 
         // Check for any interrupt that we've already squashed for
         // and start processing it.
@@ -970,6 +987,22 @@ Commit::commitInsts()
             break;
 
         head_inst = rob->readHeadInst(commit_thread);
+        if (num_committed == commitWidth && head_inst->allocationSlots()) break;
+        if (head_inst->allocationLeader() && !head_inst->isSquashed() && head_inst->getFault() == NoFault) {
+            auto follower = rob->findInst(commit_thread, head_inst->allocationGroup->end);
+            if (!follower || !follower->readyToCommit()) {
+                // A fault in a middle memory record must reach the trap path
+                // even when its dependent final record cannot complete.
+                bool fault_ready = false;
+                for (InstSeqNum sn = head_inst->seqNum;
+                     sn <= head_inst->allocationGroup->end; ++sn) {
+                    auto member = rob->findInst(commit_thread, sn);
+                    if (member && member->readyToCommit() && member->getFault() != NoFault)
+                        fault_ready = true;
+                }
+                if (!fault_ready) break;
+            }
+        }
 
         ThreadID tid = head_inst->threadNumber;
 
@@ -986,12 +1019,12 @@ Commit::commitInsts()
             DPRINTF(Commit, "Retiring squashed instruction from "
                     "ROB.\n");
 
-            cpu->tmaStats.onOtherSquash(head_inst);
             rob->retireHead(commit_thread);
 
             ++stats.commitSquashedInsts;
             // Notify potential listeners that this instruction is squashed
             ppSquash->notify(head_inst);
+            cpu->releaseMemoryRetirement(head_inst, true);
 
             // Record that the number of ROB entries has changed.
             changedROBNumEntries[tid] = true;
@@ -1019,13 +1052,29 @@ Commit::commitInsts()
             bool commit_success = commitHead(head_inst, num_committed);
 
             if (commit_success) {
-                ++num_committed;
+                if (head_inst->eliminatedMove) {
+                    // Older source producers have retired. Materialize the
+                    // functional result for observers without writing a new
+                    // PRF value or creating a new readiness dependency.
+                    head_inst->prepareResultValues(12, curTick());
+                    head_inst->evaluateResultValues(curTick());
+                    ++cpu->moveEliminationStats.retired;
+                }
+                num_committed += head_inst->allocationSlots();
+                follow_thread = head_inst->allocationGroup &&
+                    head_inst->seqNum != head_inst->allocationGroup->end ?
+                    commit_thread : InvalidThreadID;
                 cpu->tmaStats.onRetire(head_inst);
-                ++cpu->uopsRetiredStats.SLOTS;
+                if (!head_inst->allocationGroup ||
+                    head_inst->seqNum == head_inst->allocationGroup->end)
+                    ++cpu->uopsRetiredStats.SLOTS;
+                cpu->recordBranchRetirement(head_inst);
+                cpu->recordMemoryRetirement(head_inst);
                 cpu->commitStats[tid]
                     ->committedInstType[head_inst->opClass()]++;
                 stats.committedInstType[tid][head_inst->opClass()]++;
                 ppCommit->notify(head_inst);
+                cpu->releaseMemoryRetirement(head_inst);
 
                 // hardware transactional memory
 
@@ -1050,7 +1099,7 @@ Commit::commitInsts()
                 toIEW->commitInfo[tid].doneSeqNum = head_inst->seqNum;
 
                 if (tid == 0)
-                    canHandleInterrupts = !head_inst->isDelayedCommit();
+                    canHandleInterrupts = !head_inst->isDelayedCommit() && !head_inst->fusedLeader();
 
                 // at this point store conditionals should either have
                 // been completed or predicated false
@@ -1220,6 +1269,7 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     }
 
     if (inst_fault != NoFault) {
+        cpu->discardMemoryRetirement(tid);
         DPRINTF(Commit, "Inst [tid:%i] [sn:%llu] PC %s has a fault\n",
                 tid, head_inst->seqNum, head_inst->pcState());
 
@@ -1339,7 +1389,9 @@ Commit::getInsts()
     DPRINTF(Commit, "Getting instructions from Rename stage.\n");
 
     // Read any renamed instructions and place them into the ROB.
-    int insts_to_process = std::min((int)renameWidth, fromRename->size);
+    // Rename has already enforced the allocation-unit budget. A fused unit
+    // can carry two functional records, so receive the complete message.
+    int insts_to_process = fromRename->size;
 
     for (int inst_num = 0; inst_num < insts_to_process; ++inst_num) {
         const DynInstPtr &inst = fromRename->insts[inst_num];

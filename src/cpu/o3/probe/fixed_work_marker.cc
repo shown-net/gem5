@@ -90,17 +90,52 @@ void FixedWorkMarker::start()
 void FixedWorkMarker::snapshot(bool begin, const DynInstPtr &inst)
 {
     // CPU native retirement counters are updated before the Commit probe.
+    cpu_->unhaltedClockStats.account();
     std::fprintf(snapshots_,
-        "{\"schema\":\"gem5-fixed-work-snapshot-v1\",\"kind\":\"%s\","
+        "{\"schema\":\"gem5-fixed-work-snapshot-v2\",\"kind\":\"%s\","
         "\"worker\":%u,\"source_core\":%u,\"workid\":%lu,\"cr3\":%lu,"
         "\"pc\":%lu,\"tick\":%lu,\"record_after\":%lu,\"macro_after\":%lu,"
         "\"clock_period_ticks\":%lu,\"numCycles\":%.0f,"
-        "\"INST_RETIRED.ANY\":%.0f,\"UOPS_RETIRED.SLOTS\":%.0f}\n",
+        "\"INST_RETIRED.ANY\":%.0f,\"UOPS_RETIRED.SLOTS\":%.0f,"
+        "\"gem5_functional_uops\":%.0f,"
+        "\"CPU_CLK_UNHALTED.THREAD\":%.0f,\"CPU_CLK_UNHALTED.REF_TSC\":%.0f,"
+        "\"BR_INST_RETIRED.ALL_BRANCHES\":%.0f,\"BR_MISP_RETIRED.ALL_BRANCHES\":%.0f,"
+        "\"MEM_INST_RETIRED.ALL_LOADS\":%.0f,\"MEM_INST_RETIRED.ALL_STORES\":%.0f,"
+        "\"MEM_LOAD_RETIRED.L1_HIT\":%.0f,\"MEM_LOAD_RETIRED.L1_MISS\":%.0f,"
+        "\"MEM_LOAD_RETIRED.L2_HIT\":%.0f,\"MEM_LOAD_RETIRED.L2_MISS\":%.0f,"
+        "\"MEM_LOAD_RETIRED.L3_HIT\":%.0f,\"MEM_LOAD_RETIRED.L3_MISS\":%.0f,"
+        "\"MEM_LOAD_RETIRED.FB_HIT\":%.0f,\"MEM_LOAD_RETIRED.unknownSource\":%.0f,"
+        "\"tma.slots\":%.0f,\"tma.retiring\":%.0f,\"tma.badSpeculation\":%.0f,"
+        "\"tma.frontendBound\":%.0f,\"tma.backendBound\":%.0f,\"tma.pending\":%.0f",
         begin ? "BEGIN" : "END", worker_, cores_[worker_], workids_[worker_],
         cr3_, uint64_t(inst->pcState().instAddr()), uint64_t(curTick()),
         owner_.fst_record_count_, owner_.functional_instruction_count_,
         uint64_t(cpu_->clockPeriod()), cpu_->baseStats.numCycles.value(),
-        cpu_->instRetiredStats.ANY.value(), cpu_->uopsRetiredStats.SLOTS.value());
+        cpu_->instRetiredStats.ANY.value(), cpu_->uopsRetiredStats.SLOTS.value(),
+        cpu_->commitStats[inst->threadNumber]->numOps.value(),
+        cpu_->unhaltedClockStats.THREAD.value(), cpu_->unhaltedClockStats.REF_TSC.value(),
+        cpu_->branchInstStats.ALL_BRANCHES.value(), cpu_->branchMispStats.ALL_BRANCHES.value(),
+        cpu_->memoryInstRetiredStats.ALL_LOADS.value(), cpu_->memoryInstRetiredStats.ALL_STORES.value(),
+        cpu_->memoryLoadRetiredStats.L1_HIT.value(), cpu_->memoryLoadRetiredStats.L1_MISS.value(),
+        cpu_->memoryLoadRetiredStats.L2_HIT.value(), cpu_->memoryLoadRetiredStats.L2_MISS.value(),
+        cpu_->memoryLoadRetiredStats.L3_HIT.value(), cpu_->memoryLoadRetiredStats.L3_MISS.value(),
+        cpu_->memoryLoadRetiredStats.FB_HIT.value(), cpu_->memoryLoadRetiredStats.unknownSource.value(),
+        cpu_->tmaStats.slots.value(), cpu_->tmaStats.retiring.value(),
+        cpu_->tmaStats.badSpeculation.value(), cpu_->tmaStats.frontendBound.value(),
+        cpu_->tmaStats.backendBound.value(), cpu_->tmaStats.pending.value());
+    auto emitScalar = [this](const statistics::Group *group,
+                             const char *path, const char *name) {
+        const auto *stat = dynamic_cast<const statistics::ScalarInfo *>(group->resolveStat(path));
+        if (stat) std::fprintf(snapshots_, ",\"%s\":%.0f", name, double(stat->value()));
+    };
+    const auto *mmu = cpu_->tcBase(inst->threadNumber)->getMMUPtr();
+    emitScalar(mmu, "dtb.DTLB_LOAD_MISSES.STLB_HIT", "DTLB_LOAD_MISSES.STLB_HIT");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.WALK_COMPLETED", "DTLB_LOAD_MISSES.WALK_COMPLETED");
+    emitScalar(cpu_, "frontend.notDeliveredSlots", "frontend.notDeliveredSlots");
+    emitScalar(cpu_, "frontend.zeroDeliveryCycles", "frontend.zeroDeliveryCycles");
+    emitScalar(cpu_, "frontend.mite.sourceOps", "frontend.mite.sourceOps");
+    emitScalar(cpu_, "frontend.dsb.sourceOps", "frontend.dsb.sourceOps");
+    std::fputs("}\n", snapshots_);
     std::fflush(snapshots_);
 }
 void FixedWorkMarker::observe(const DynInstPtr &inst, uint64_t before)
@@ -128,6 +163,8 @@ void FixedWorkMarker::observe(const DynInstPtr &inst, uint64_t before)
                  (end && root != cr3_), "invalid fixed-work BEGIN/END or CR3 continuity");
         if (begin) {
             cr3_ = root;
+            cpu_->beginMemoryObservation();
+            cpu_->tmaStats.begin();
             begin_record_ = owner_.fst_record_count_;
             begin_tick_ = curTick();
             begin_macro_ = owner_.functional_instruction_count_;
@@ -140,6 +177,8 @@ void FixedWorkMarker::observe(const DynInstPtr &inst, uint64_t before)
             end_record_ = owner_.fst_record_count_;
             end_tick_ = curTick();
             end_macro_ = owner_.functional_instruction_count_;
+            cpu_->tmaStats.end();
+            cpu_->endMemoryObservation();
             snapshot(false, inst);
             phase_ = 2;
             // Existing identities still accept responses. Finalize must not

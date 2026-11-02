@@ -253,6 +253,15 @@ class RubyRequest : public Message
     const int& getSize() const { return m_Size; }
     const PrefetchBit& getPrefetch() const { return m_Prefetch; }
     RequestPtr getRequestPtr() const { return m_pkt->req; }
+    bool prefetchTrainingEligible() const
+    {
+        if (!m_pkt || !m_pkt->req)
+            return false;
+        const auto &req = m_pkt->req;
+        return req->hasPaddr() && !req->isUncacheable() &&
+            !req->isStrictlyOrdered() && !req->isPrefetch() &&
+            !req->isPTWalk() && !req->isSecure();
+    }
     Addr perfTransactionId() const { return m_perfTransactionId; }
     bool traceIdentityValid() const { return m_traceIdentityValid; }
     int traceContextId() const { return m_traceContextId; }

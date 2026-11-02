@@ -107,7 +107,7 @@ let {{
     iop = InstObjParams("fault", "MicroFaultFlags",
             "X86ISA::InstOperands<X86ISA::MicroCondBase, X86ISA::FaultOp>",
             {"code": "",
-             "cond_test": "checkCondition(ccFlagBits | cfofBits | dfBit | \
+             "cond_test": "checkCondition(ccFlagBits | (cfBit | ofBit) | dfBit | \
                                           ecfBit | ezfBit, cc)"})
     exec_output = MicroFaultExecute.subst(iop)
     header_output = MicroFaultDeclare.subst(iop)

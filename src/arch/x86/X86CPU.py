@@ -31,10 +31,19 @@ from m5.objects.BaseTimingSimpleCPU import BaseTimingSimpleCPU
 from m5.objects.FuncUnit import *
 from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
+from m5.objects.ZeroIdiom import ZeroIdiom
+from m5.objects.Frontend import FrontendCoordinator
+from m5.objects.IntExecution import (
+    ExecutionPorts,
+    IntegerALU,
+    IntExecutionResource,
+    ResultForwarding,
+)
 from m5.objects.X86Decoder import X86Decoder
 from m5.objects.X86ISA import X86ISA
 from m5.objects.X86LocalApic import X86LocalApic
 from m5.objects.X86MMU import X86MMU
+from m5.objects.X86TLB import X86TLB
 from m5.proxy import Self
 
 
@@ -57,37 +66,81 @@ class X86TimingSimpleCPU(BaseTimingSimpleCPU, X86CPU):
     mmu = X86MMU()
 
 
-class X86IntMultDiv(IntMultDiv):
+class X86IntMult(IntMultDiv):
+    opList = [OpDesc(opClass="IntMult", opLat=3)]
+    count = 1
+
+
+class X86IntDiv(IntMultDiv):
     # DIV and IDIV instructions in x86 are implemented using a loop which
     # issues division microops.  The latency of these microops should really be
     # one (or a small number) cycle each since each of these computes one bit
     # of the quotient.
     opList = [
-        OpDesc(opClass="IntMult", opLat=3),
         OpDesc(opClass="IntDiv", opLat=1, pipelined=False),
     ]
 
     count = 2
 
 
+class X86StoreAddressPort(FUDesc):
+    opList = [OpDesc(opClass="X86StoreAddress")]
+    count = 2
+
+
+class X86StoreDataPort(FUDesc):
+    opList = [OpDesc(opClass="X86StoreData")]
+    count = 2
+
+
 class DefaultX86FUPool(FUPool):
     FUList = [
         IntALU(),
-        X86IntMultDiv(),
+        X86IntMult(),
+        X86IntDiv(),
         FP_ALU(),
         FP_MultDiv(),
         ReadPort(),
         SIMD_Unit(),
         PredALU(),
         WritePort(),
+        X86StoreAddressPort(),
+        X86StoreDataPort(),
         RdWrPort(),
         System_Unit(),
     ]
 
 
-class X86O3CPU(BaseO3CPU, X86CPU):
+def x86_o3_mmu():
+    """Default O3 instruction translation and shared second-level proxy."""
     mmu = X86MMU()
+    mmu.stlb = X86TLB(size=2048, entry_type="unified", spr_shared_domains=True)
+    mmu.itb.size = 256
+    mmu.itb.itlb_4k_ways = 8
+    mmu.itb.next_level = mmu.stlb
+    mmu.dtb.next_level = mmu.stlb
+    return mmu
+
+
+class X86O3CPU(BaseO3CPU, X86CPU):
+    mmu = x86_o3_mmu()
     needsTSO = True
+
+    # Development measurements always use the implemented integer structure.
+    # SimObject cloning preserves shared port references within each core.
+    executionPorts = ExecutionPorts()
+    intALUs = [
+        IntegerALU(port=port)
+        for port in executionPorts.ports
+        if int(port.number) in (0, 1, 5, 6, 11)
+    ]
+    resultForwarding = ResultForwarding()
+    zeroIdiom = ZeroIdiom()
+    frontend = FrontendCoordinator()
+    intSHFT = IntExecutionResource(family=2)
+    intSlow = IntExecutionResource(family=3)
+    intBM = IntExecutionResource(family=4)
+    intBranch = IntExecutionResource(family=5)
 
     # For x86, each CC reg is used to hold only a subset of the
     # flags, so we need 4-5 times the number of CC regs as

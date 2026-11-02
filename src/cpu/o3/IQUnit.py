@@ -37,6 +37,7 @@ from m5.objects.FUPool import (
     DefaultFUPool,
     FUPool,
 )
+from m5.objects.FuncUnit import OpClass
 from m5.objects.SMT import SMTQueuePolicy
 from m5.params import *
 from m5.proxy import Parent
@@ -51,6 +52,11 @@ class IQUnit(SimObject):
     numEntries = Param.Unsigned(64, "Number of instruction queue entries")
 
     fuPool = Param.FUPool(DefaultFUPool(), "Functional Unit pool")
+
+    allowedOpClasses = VectorParam.OpClass(
+        [], "Allowed classes; an empty list accepts all FU-supported classes"
+    )
+    excludedOpClasses = VectorParam.OpClass([], "Classes this queue cannot admit")
 
     numThreads = Param.Unsigned(
         Parent.numThreads, "number of HW thread contexts"

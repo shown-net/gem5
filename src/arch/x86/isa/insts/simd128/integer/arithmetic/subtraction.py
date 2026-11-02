@@ -35,83 +35,67 @@
 
 microcode = """
 def macroop PSUBB_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=1, ext=0
-    msubi xmmh, xmmh, xmmhm, size=1, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=1
 };
 
 def macroop PSUBB_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=1, ext=0
-    msubi xmmh, xmmh, ufp2, size=1, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=1
 };
 
 def macroop PSUBB_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=1, ext=0
-    msubi xmmh, xmmh, ufp2, size=1, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=1
 };
 
 def macroop PSUBW_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=2, ext=0
-    msubi xmmh, xmmh, xmmhm, size=2, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=2
 };
 
 def macroop PSUBW_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=2, ext=0
-    msubi xmmh, xmmh, ufp2, size=2, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=2
 };
 
 def macroop PSUBW_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=2, ext=0
-    msubi xmmh, xmmh, ufp2, size=2, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=2
 };
 
 def macroop PSUBD_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=4, ext=0
-    msubi xmmh, xmmh, xmmhm, size=4, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=4
 };
 
 def macroop PSUBD_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=4, ext=0
-    msubi xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop PSUBD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=4, ext=0
-    msubi xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop PSUBQ_XMM_XMM {
-    msubi xmml, xmml, xmmlm, size=8, ext=0
-    msubi xmmh, xmmh, xmmhm, size=8, ext=0
+    mxmmsub xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop PSUBQ_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=8, ext=0
-    msubi xmmh, xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop PSUBQ_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    msubi xmml, xmml, ufp1, size=8, ext=0
-    msubi xmmh, xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmsub xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop PSUBSB_XMM_XMM {

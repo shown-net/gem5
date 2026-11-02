@@ -63,6 +63,7 @@ MessageBuffer::MessageBuffer(const Params &p)
     m_time_last_time_enqueue(0), m_time_last_time_pop(0),
     m_last_arrival_time(0), m_last_message_strict_fifo_bypassed(false),
     m_strict_fifo(p.ordered),
+    m_delay_to_preserve_order(p.delay_to_preserve_order),
     m_randomization(p.randomization),
     m_allow_zero_latency(p.allow_zero_latency),
     m_routing_priority(p.routing_priority),
@@ -82,8 +83,14 @@ MessageBuffer::MessageBuffer(const Params &p)
              "Average stall ticks per message"),
     ADD_STAT(m_occupancy, statistics::units::Rate<
                 statistics::units::Ratio, statistics::units::Tick>::get(),
-             "Average occupancy of buffer capacity")
+             "Average occupancy of buffer capacity"),
+    ADD_STAT(fifoOrderDeferrals, statistics::units::Count::get(),
+             "Overtaking enqueues delayed to preserve ordered arrival"),
+    ADD_STAT(fifoDeferredTicks, statistics::units::Tick::get(),
+             "Sum of extra arrival ticks for delayed enqueues")
 {
+    fatal_if(m_delay_to_preserve_order && !m_strict_fifo,
+             "delay_to_preserve_order requires an ordered MessageBuffer");
     m_msg_counter = 0;
     m_consumer = NULL;
     m_size_last_time_size_checked = 0;
@@ -258,10 +265,16 @@ MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
     if (m_strict_fifo &&
         !(bypassStrictFIFO || m_last_message_strict_fifo_bypassed)) {
         if (arrival_time < m_last_arrival_time) {
-            panic("FIFO ordering violated: %s name: %s current time: %d "
-                  "delta: %d arrival_time: %d last arrival_time: %d\n",
-                  *this, name(), current_time, delta, arrival_time,
-                  m_last_arrival_time);
+            if (m_delay_to_preserve_order) {
+                ++fifoOrderDeferrals;
+                fifoDeferredTicks += m_last_arrival_time - arrival_time;
+                arrival_time = m_last_arrival_time;
+            } else {
+                panic("FIFO ordering violated: %s name: %s current time: %d "
+                      "delta: %d arrival_time: %d last arrival_time: %d\n",
+                      *this, name(), current_time, delta, arrival_time,
+                      m_last_arrival_time);
+            }
         }
     }
 

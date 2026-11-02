@@ -70,10 +70,11 @@ class OpDesc : public SimObject
   public:
     OpClass opClass;
     Cycles opLat;
+    Cycles issueLat;
     bool pipelined;
 
     OpDesc(const OpDescParams &p)
-        : SimObject(p), opClass(p.opClass), opLat(p.opLat),
+        : SimObject(p), opClass(p.opClass), opLat(p.opLat), issueLat(p.issueLat),
           pipelined(p.pipelined) {};
 };
 

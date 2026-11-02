@@ -30,6 +30,8 @@ enum class TaoTraceNativeTerminalReason : uint32_t
     FailedStoreConditional = 1u << 4,
     ZeroSize = 1u << 5,
     PrefetchSkipped = 1u << 6,
+    StoreOverwriteElided = 1u << 7,
+    StoreBufferCombined = 1u << 8,
 };
 
 enum class TaoTraceNativeCacheOutcome : uint32_t
@@ -270,6 +272,35 @@ class TaoTraceNativeAccessRegistry
         pretracking_contexts_.erase(context_id);
     }
 
+    static void enableRetirementContext(uint32_t context_id)
+    {
+        retirement_contexts_.insert(context_id);
+    }
+
+    static void disableRetirementContext(uint32_t context_id)
+    {
+        retirement_contexts_.erase(context_id);
+        if (!traceOwnsContext(context_id)) records_.erase(context_id);
+    }
+
+    // Marker counters read before the commit probes. TaoTrace may retain a
+    // retired store until its response, so only the standalone marker owner
+    // releases identities here.
+    static void releaseRetired(uint32_t context_id, uint64_t seq_num,
+                               bool pending_store = false)
+    {
+        if (traceOwnsContext(context_id)) return;
+        const auto facts = snapshot(context_id, seq_num);
+        if (!facts.found) {
+            // Stores may enter Ruby only after retirement. Retain that exact
+            // identity so their later response can release the marker record.
+            if (pending_store) noteCommitted(context_id, seq_num);
+            return;
+        }
+        if (facts.resolved()) erase(context_id, seq_num);
+        else noteCommitted(context_id, seq_num);
+    }
+
     static void
     noteAdmission(const RequestPtr &req, bool aliased)
     {
@@ -329,7 +360,9 @@ class TaoTraceNativeAccessRegistry
         }
         facts.hasResponseTick = true;
         facts.lastResponseTick = std::max(facts.lastResponseTick, tick);
-        if (facts.squashed && facts.resolved()) {
+        if ((facts.squashed ||
+             (facts.committed && retirement_contexts_.count(context_id) &&
+              !traceOwnsContext(context_id))) && facts.resolved()) {
             erase(context_id, seq_num);
         }
     }
@@ -542,6 +575,13 @@ class TaoTraceNativeAccessRegistry
     inline static std::unordered_map<uint32_t, ContextRecords> records_;
     inline static std::unordered_set<uint32_t> enabled_contexts_;
     inline static std::unordered_set<uint32_t> pretracking_contexts_;
+    inline static std::unordered_set<uint32_t> retirement_contexts_;
+
+    static bool traceOwnsContext(uint32_t context_id)
+    {
+        return enabled_contexts_.count(context_id) ||
+            pretracking_contexts_.count(context_id);
+    }
 
     static bool
     identity(const RequestPtr &req, uint32_t &context_id, uint64_t &seq_num)
@@ -565,7 +605,8 @@ class TaoTraceNativeAccessRegistry
     static bool
     shouldTrack(uint32_t context_id, uint64_t seq_num)
     {
-        if (enabled_contexts_.count(context_id) != 0) return true;
+        if (enabled_contexts_.count(context_id) != 0 ||
+            retirement_contexts_.count(context_id) != 0) return true;
         const auto context = records_.find(context_id);
         return context != records_.end() &&
             context->second.count(seq_num) != 0;
@@ -633,6 +674,7 @@ class TaoTraceFrontendRegistry
         RetryDiscard,
         Response,
         SquashedResponse,
+        DsbValidation,
         Count
     };
 

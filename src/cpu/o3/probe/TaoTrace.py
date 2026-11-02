@@ -33,6 +33,7 @@ class TaoTrace(ProbeListenerObject):
     fixed_work_result_max_bytes = Param.UInt64(0, "Maximum bytes per exported input/output buffer")
     fixed_work_core_ids = VectorParam.Unsigned([], "Worker physical source cores")
     fixed_work_workids = VectorParam.UInt64([], "Expected workid in RDI; worker index in RSI")
+    marker_pc_trace_file = Param.String("", "Committed PC protobuf stream")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "

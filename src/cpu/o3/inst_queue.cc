@@ -41,6 +41,7 @@
 
 #include "cpu/o3/inst_queue.hh"
 
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -71,7 +72,9 @@ IQUnit::IQUnit(const IQUnitParams &params)
       activeThreads(nullptr),
       _freeEntries(params.numEntries),
       _numEntries(params.numEntries),
-      _fuPool(params.fuPool)
+      _fuPool(params.fuPool),
+      allowedOpClasses(params.allowedOpClasses),
+      excludedOpClasses(params.excludedOpClasses)
 {
     assert(_fuPool);
     // Figure out resource sharing policy
@@ -118,21 +121,31 @@ IQUnit::IQUnit(const IQUnitParams &params)
 void
 IQUnit::insert(const DynInstPtr &inst)
 {
-    assert(_freeEntries != 0);
-    _freeEntries--;
+    const bool shared = inst->allocationGroup && !inst->independentIQEntries();
+    const unsigned slots = shared ? !inst->allocationGroup->iqMembers : 1;
+    assert(_freeEntries >= slots);
+    if (shared) {
+        panic_if(inst->allocationGroup->iqMembers && inst->allocationGroup->iq != this,
+                 "Fused allocation group must share one IQ reservation");
+        inst->allocationGroup->iq = this;
+    }
+    _freeEntries -= shared ? inst->allocationGroup->enterIQ() : 1;
 
     inst->setInIQ(this);
 
-    count[inst->threadNumber]++;
+    count[inst->threadNumber] += slots;
 }
 
 void
 IQUnit::remove(const DynInstPtr &inst)
 {
-    _freeEntries++;
+    const bool shared = inst->allocationGroup && !inst->independentIQEntries();
+    const unsigned slots = shared ? inst->allocationGroup->leaveIQ() : 1;
+    if (shared && slots) inst->allocationGroup->iq = nullptr;
+    _freeEntries += slots;
     assert(_freeEntries <= _numEntries);
 
-    count[inst->threadNumber]--;
+    count[inst->threadNumber] -= slots;
 }
 
 void
@@ -183,11 +196,23 @@ IQUnit::numFreeEntries(const DynInstPtr &inst) const
     const ThreadID tid = inst->threadNumber;
     const OpClass op_class = inst->opClass();
     // Return 0 if the IQ cannot accept the specific op class
-    if (op_class != No_OpClass && !_fuPool->isCapable(op_class)) {
+    if (!allows(inst) ||
+        (op_class != No_OpClass && !_fuPool->isCapable(op_class))) {
         return 0;
     } else {
         return numFreeEntries(tid);
     }
+}
+
+bool
+IQUnit::allows(const DynInstPtr &inst) const
+{
+    const OpClass op_class = inst->opClass();
+    const auto contains = [op_class](const auto &items) {
+        return std::find(items.begin(), items.end(), op_class) != items.end();
+    };
+    return (allowedOpClasses.empty() || contains(allowedOpClasses)) &&
+           !contains(excludedOpClasses);
 }
 
 InstructionQueue::FUCompletion::FUCompletion(const DynInstPtr &_inst,
@@ -227,6 +252,7 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       iqs(params.instQueues),
       numThreads(params.numThreads),
       totalWidth(params.issueWidth),
+      directJumpPortless(params.directJumpPortless),
       commitToIEWDelay(params.commitToIEWDelay),
       iqStats(cpu, totalWidth),
       iqIOStats(cpu)
@@ -256,6 +282,12 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     }
 
     resetState();
+    if (params.resultForwarding)
+        params.resultForwarding->bindCPU(cpu);
+    for (auto iq : iqs)
+        iq->fuPool()->bindIntegerResources(params.executionPorts, params.resultForwarding,
+            params.intALU, params.intSHFT, params.intSlow, params.intBM,
+            params.intBranch, params.intALUs);
 }
 
 InstructionQueue::~InstructionQueue()
@@ -287,6 +319,8 @@ InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width)
                "Number of float instructions issued"),
       ADD_STAT(branchInstsIssued, statistics::units::Count::get(),
                "Number of branch instructions issued"),
+      ADD_STAT(directJumpPortlessIssued, statistics::units::Count::get(),
+               "Direct jumps issued without an execution-port grant"),
       ADD_STAT(memInstsIssued, statistics::units::Count::get(),
                "Number of memory instructions issued"),
       ADD_STAT(miscInstsIssued, statistics::units::Count::get(),
@@ -557,6 +591,8 @@ InstructionQueue::isDrained() const
                    wbOutstanding == 0;
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         drained = drained && memDepUnit[tid].isDrained();
+    for (auto iq : iqs)
+        drained = drained && iq->fuPool()->isDrained();
 
     return drained;
 }
@@ -623,7 +659,9 @@ InstructionQueue::isFull(ThreadID tid)
 bool
 InstructionQueue::isFull(const DynInstPtr &inst)
 {
-    return numFreeEntries(inst) == 0;
+    const bool shared = inst->allocationGroup && !inst->independentIQEntries();
+    const unsigned slots = shared ? !inst->allocationGroup->iqMembers : 1;
+    return numFreeEntries(inst) < slots;
 }
 
 std::vector<FUPool *>
@@ -631,7 +669,8 @@ InstructionQueue::allFUPools()
 {
     std::vector<FUPool *> res;
     for (auto iq : iqs) {
-        res.push_back(iq->fuPool());
+        if (std::find(res.begin(), res.end(), iq->fuPool()) == res.end())
+            res.push_back(iq->fuPool());
     }
     return res;
 }
@@ -655,6 +694,13 @@ InstructionQueue::hasReadyInsts()
 IQUnit *
 InstructionQueue::findIQ(const DynInstPtr &inst)
 {
+    // A follower can join its existing reservation even when that IQ is full.
+    if (inst->allocationGroup && !inst->independentIQEntries() &&
+        inst->allocationGroup->iqMembers) {
+        panic_if(!inst->allocationGroup->iq->allows(inst),
+                 "Fused allocation group spans incompatible IQ filters");
+        return inst->allocationGroup->iq;
+    }
     for (auto iq : iqs) {
         // If the IQ can store the selected instruction,
         // return the IQ as valid
@@ -872,6 +918,7 @@ InstructionQueue::scheduleReadyInsts()
     // This will avoid trying to schedule a certain op class if there are no
     // FUs that handle it.
     int total_issued = 0;
+    std::vector<DynInstPtr> resource_deferred;
     ListOrderIt order_it = listOrder.begin();
     ListOrderIt order_end_it = listOrder.end();
 
@@ -916,8 +963,46 @@ InstructionQueue::scheduleReadyInsts()
         IQUnit *iq = issuing_inst->iq;
         assert(iq);
         auto fu_pool = iq->fuPool();
-        if (op_class != No_OpClass) {
-            idx = fu_pool->getUnit(op_class);
+        // Diagnostic only: keep normal IQ, issue, execution and recovery
+        // semantics while removing the execution-port grant for simple direct jumps.
+        const bool portless_jump = directJumpPortless &&
+            issuing_inst->isDirectCtrl() && issuing_inst->isUncondCtrl() &&
+            !issuing_inst->isCall() && !issuing_inst->isReturn() &&
+            !issuing_inst->staticInst->isMicrocodeControl() &&
+            // x86 Jmprel reads the CS effective-base misc register. IQ
+            // readiness and functional execution still process that source.
+            issuing_inst->numSrcRegs() <= 1 && issuing_inst->numDestRegs() == 0;
+        const bool managed = !portless_jump &&
+            fu_pool->usesIntegerResources(issuing_inst);
+        bool path_blocked = false;
+        if (!managed && cpu->resultForwarding) {
+            auto pathAvailable = [this](const DynInstPtr &inst) {
+                const Tick ready = cpu->resultForwarding->availableAt(inst, 12);
+                if (ready > curTick() && ready != std::numeric_limits<Tick>::max())
+                    cpu->resultForwarding->defer(inst, ready);
+                else if (ready <= curTick())
+                    cpu->resultForwarding->clearWait(inst);
+                return ready <= curTick();
+            };
+            path_blocked = !pathAvailable(issuing_inst);
+        }
+        if (managed) {
+            if (fu_pool->issueInteger(cpu, issuing_inst,
+                [this, issuing_inst] { wakeDependents(issuing_inst); },
+                [this, issuing_inst] { processFUCompletion(issuing_inst, nullptr, -1); })) {
+                ++wbOutstanding;
+                idx = FUPool::NoNeedFU;
+            } else {
+                idx = FUPool::NoFreeFU;
+            }
+            iqIOStats.intAluAccesses++;
+        }
+        if (op_class != No_OpClass && !managed && !path_blocked &&
+            !portless_jump) {
+            idx = fu_pool->getUnit(op_class, cpu->curCycle(),
+                                   issuing_inst->isStore() &&
+                                   !issuing_inst->isStoreAddress(),
+                                   issuing_inst->isControl() && op_class == IntAluOp);
             if (issuing_inst->isFloating()) {
                 iqIOStats.fpAluAccesses++;
             } else if (issuing_inst->isVector()) {
@@ -930,11 +1015,16 @@ InstructionQueue::scheduleReadyInsts()
             }
         }
 
+        if (path_blocked)
+            idx = FUPool::NoFreeFU;
+
         // If we have an instruction that doesn't require a FU, or a
         // valid FU, then schedule for execution.
         if (idx > FUPool::NoFreeFU || idx == FUPool::NoNeedFU ||
             idx == FUPool::NoCapableFU) {
-            if (op_latency == Cycles(1)) {
+            if (managed) {
+                // The execution family owns evaluation and completion.
+            } else if (op_latency == Cycles(1)) {
                 i2e_info->size++;
                 instsToExecute.push_back(issuing_inst);
 
@@ -949,8 +1039,9 @@ InstructionQueue::scheduleReadyInsts()
                 // the opportunity to trigger a fault
                 // if the instruction is unsupported.
                 // Otherwise, commit will panic.
-                if (idx == FUPool::NoCapableFU)
+                if (idx == FUPool::NoCapableFU) {
                   issuing_inst->setNoCapableFU();
+                }
             } else {
                 assert(idx != FUPool::NoCapableFU);
                 bool pipelined = fu_pool->isPipelined(op_class);
@@ -987,6 +1078,8 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
+            if (portless_jump)
+                ++iqStats.directJumpPortlessIssued;
             ++total_issued;
 
 #if TRACING_ON
@@ -1010,10 +1103,24 @@ InstructionQueue::scheduleReadyInsts()
             assert(idx == FUPool::NoFreeFU);
             iqStats.statFuBusy[op_class]++;
             iqStats.fuBusy[tid]++;
-            ++order_it;
+            if (managed) {
+                resource_deferred.push_back(issuing_inst);
+                readyInsts[op_class].pop();
+                if (!readyInsts[op_class].empty())
+                    moveToYoungerInst(order_it);
+                else {
+                    readyIt[op_class] = listOrder.end();
+                    queueOnList[op_class] = false;
+                }
+                listOrder.erase(order_it++);
+            } else {
+                ++order_it;
+            }
         }
     }
 
+    for (const auto &inst : resource_deferred)
+        addIfReady(inst);
     iqStats.numIssuedDist.sample(total_issued);
     iqStats.instsIssued+= total_issued;
 
@@ -1140,21 +1247,18 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
 
         //Go through the dependency chain, marking the registers as
         //ready within the waiting instructions.
-        DynInstPtr dep_inst = dependGraph.pop(dest_reg->flatIndex());
+        RegIndex src_index = 0;
+        DynInstPtr dep_inst = dependGraph.pop(dest_reg->flatIndex(), src_index);
 
         while (dep_inst) {
             DPRINTF(IQ, "Waking up a dependent instruction, [sn:%llu] "
                     "PC %s.\n", dep_inst->seqNum, dep_inst->pcState());
 
-            // Might want to give more information to the instruction
-            // so that it knows which of its source registers is
-            // ready.  However that would mean that the dependency
-            // graph entries would need to hold the src_reg_idx.
-            dep_inst->markSrcRegReady();
+            dep_inst->markSrcRegReady(src_index);
 
             addIfReady(dep_inst);
 
-            dep_inst = dependGraph.pop(dest_reg->flatIndex());
+            dep_inst = dependGraph.pop(dest_reg->flatIndex(), src_index);
 
             ++dependents;
         }
@@ -1167,6 +1271,9 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
         // Mark the scoreboard as having that register ready.
         regScoreboard[dest_reg->flatIndex()] = true;
     }
+    if (completed_inst->opClass() == FloatAddOp && cpu->resultForwarding &&
+        cpu->resultForwarding->tracksFastAdder())
+        cpu->resultForwarding->release(completed_inst);
     return dependents;
 }
 
@@ -1211,6 +1318,12 @@ void
 InstructionQueue::replayMemInst(const DynInstPtr &replay_inst)
 {
     memDepUnit[replay_inst->threadNumber].replay();
+}
+
+bool
+InstructionQueue::replayOneMemInst(const DynInstPtr &replay_inst)
+{
+    return memDepUnit[replay_inst->threadNumber].replayOne(replay_inst);
 }
 
 void
@@ -1337,6 +1450,8 @@ InstructionQueue::doSquash(ThreadID tid)
             --squash_it;
             continue;
         }
+        if (cpu->resultForwarding && !squashed_inst->isIssued())
+            cpu->resultForwarding->release(squashed_inst);
 
         if (!squashed_inst->isIssued() ||
             (squashed_inst->isMemRef() &&
@@ -1377,7 +1492,7 @@ InstructionQueue::doSquash(ThreadID tid)
                     if (!squashed_inst->readySrcIdx(src_reg_idx) &&
                         !src_reg->isAlwaysReady()) {
                         dependGraph.remove(src_reg->flatIndex(),
-                                           squashed_inst);
+                                           squashed_inst, src_reg_idx);
                     }
 
                     ++iqStats.squashedOperandsExamined;
@@ -1438,6 +1553,8 @@ InstructionQueue::doSquash(ThreadID tid)
             assert(dependGraph.empty(dest_reg->flatIndex()));
             dependGraph.clearInst(dest_reg->flatIndex());
         }
+        if (cpu->resultForwarding)
+            cpu->resultForwarding->cancel(squashed_inst);
         instList[tid].erase(squash_it--);
         ++iqStats.squashedInstsExamined;
     }
@@ -1453,6 +1570,7 @@ InstructionQueue::PqCompare::operator()(
 bool
 InstructionQueue::addToDependents(const DynInstPtr &new_inst)
 {
+    new_inst->bindSourceResults();
     // Loop through the instruction's source registers, adding
     // them to the dependency list if they are not ready.
     int8_t total_src_regs = new_inst->numSrcRegs();
@@ -1478,7 +1596,7 @@ InstructionQueue::addToDependents(const DynInstPtr &new_inst)
                         new_inst->pcState(), src_reg->index(),
                         src_reg->className());
 
-                dependGraph.insert(src_reg->flatIndex(), new_inst);
+                dependGraph.insert(src_reg->flatIndex(), new_inst, src_reg_idx);
 
                 // Change the return value to indicate that something
                 // was added to the dependency graph.
@@ -1500,6 +1618,9 @@ InstructionQueue::addToDependents(const DynInstPtr &new_inst)
 void
 InstructionQueue::addToProducers(const DynInstPtr &new_inst)
 {
+    if (cpu->resultForwarding)
+        cpu->resultForwarding->track(new_inst,
+            new_inst->iq->fuPool()->usesIntegerResources(new_inst));
     // Nothing really needs to be marked when an instruction becomes
     // the producer of a register's value, but for convenience a ptr
     // to the producing instruction will be placed in the head node of
@@ -1529,6 +1650,19 @@ InstructionQueue::addToProducers(const DynInstPtr &new_inst)
 
         // Mark the scoreboard to say it's not yet ready.
         regScoreboard[dest_reg->flatIndex()] = false;
+    }
+}
+
+void
+InstructionQueue::recordCompletedProducer(const DynInstPtr &inst)
+{
+    for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
+        auto reg = inst->renamedDestIdx(i);
+        if (reg->isAlwaysReady()) continue;
+        panic_if(!dependGraph.empty(reg->flatIndex()),
+                 "Completed rename result reused a live destination");
+        dependGraph.setInst(reg->flatIndex(), nullptr);
+        regScoreboard[reg->flatIndex()] = true;
     }
 }
 

@@ -433,6 +433,7 @@ class PhysRegId : private RegId
     RegIndex flatIdx;
     int numPinnedWritesToComplete;
     bool pinned;
+    unsigned renameReferences = 0;
 
   public:
     explicit PhysRegId() : RegId(invalidRegClass, -1), flatIdx(-1),
@@ -492,6 +493,14 @@ class PhysRegId : private RegId
 
     /** Flat index accessor */
     const RegIndex& flatIndex() const { return flatIdx; }
+
+    unsigned numRenameReferences() const { return renameReferences; }
+    void allocateRenameReference()
+    { assert(!renameReferences); renameReferences = 1; }
+    void retainRenameReference()
+    { assert(renameReferences); ++renameReferences; }
+    bool releaseRenameReference()
+    { assert(renameReferences); return --renameReferences == 0; }
 
     int getNumPinnedWrites() const { return numPinnedWrites; }
 

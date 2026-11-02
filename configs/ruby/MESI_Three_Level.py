@@ -182,6 +182,8 @@ def create_system(
             l1_cntrl = MESI_Three_Level_L1Cache_Controller(
                 version=i * num_cpus_per_cluster + j,
                 cache=l1_cache,
+                prefetcher=RubyPrefetcher(block_size=options.cacheline_size),
+                enable_prefetch=options.enable_prefetch,
                 l2_select_num_bits=l2_bits,
                 cluster_id=i,
                 transitions_per_cycle=options.l1_transitions_per_cycle,
@@ -209,6 +211,7 @@ def create_system(
             l0_cntrl.mandatoryQueue = MessageBuffer()
             l0_cntrl.bufferToL1 = MessageBuffer(ordered=True)
             l1_cntrl.bufferFromL0 = l0_cntrl.bufferToL1
+            l1_cntrl.prefetchQueue = MessageBuffer()
             l0_cntrl.bufferFromL1 = MessageBuffer(ordered=True)
             l1_cntrl.bufferToL0 = l0_cntrl.bufferFromL1
 

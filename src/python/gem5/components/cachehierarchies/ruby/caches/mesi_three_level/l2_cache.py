@@ -68,6 +68,7 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
         self.cache = RubyCache(
             size=l2_size,
             assoc=l2_assoc,
+            fill_capacity=48,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
             replacement_policy=LRURP(),
@@ -77,7 +78,10 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
         self.l2_select_num_bits = int(math.log(num_l3Caches, 2))
         self.cluster_id = cluster_id
         self.clk_domain = clk_domain
-        self.prefetcher = RubyPrefetcher(block_size=cache_line_size)
+        self.prefetcher = RubyPrefetcher(
+            block_size=cache_line_size, queue_dedup=True
+        )
+        self.enable_prefetch = True
         self.transitions_per_cycle = 32
         # l1_request_latency, l1_response_latency, to_l2_latency are
         # ruby backend terminology.
@@ -97,6 +101,7 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
         return bits
 
     def connectQueues(self, network):
+        self.prefetchQueue = MessageBuffer()
         self.mandatoryQueue = MessageBuffer()
         self.optionalQueue = MessageBuffer()
 

@@ -53,6 +53,8 @@ class RubyPrefetcher(SimObject):
     )
     train_misses = Param.UInt32(4, "")
     num_startup_pfs = Param.UInt32(1, "")
+    ip_stride = Param.Bool(False, "Train a per-PC demand-data stride predictor")
+    queue_dedup = Param.Bool(False, "Deduplicate targets until controller dequeue")
     cross_page = Param.Bool(
         False,
         """True if prefetched address can be on a

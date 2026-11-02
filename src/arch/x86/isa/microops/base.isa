@@ -107,6 +107,10 @@ let {{
         idx_name = 'Src2'
     class Src3Op(object):
         idx_name = 'Src3'
+    class Src4Op(object):
+        idx_name = 'Src4'
+    class DestHiOp(object):
+        idx_name = 'DestHi'
 
     class RegisterOp(object):
         def __init__(self, it):
@@ -158,6 +162,8 @@ let {{
         pass
     class FloatDestOp(FloatOp, DestOp, Operand):
         pass
+    class FloatDestHiOp(FloatOp, DestHiOp, Operand):
+        pass
     class IntDestOp(IntOp, DestOp, Operand):
         pass
 
@@ -193,6 +199,8 @@ let {{
 
     class FloatSrc3Op(FloatOp, Src3Op, Operand):
         pass
+    class FloatSrc4Op(FloatOp, Src4Op, Operand):
+        pass
 
     class Op2(object):
         @classmethod
@@ -202,6 +210,11 @@ let {{
         RegType = FoldedSrc2Op
         FloatType = FloatSrc2Op
         ImmType = Imm8Op
+
+    class RegOp2(Op2):
+        # Integer register work accepts full decoded immediates. SIMD
+        # controls using Op2 retain their architectural imm8 encoding.
+        ImmType = Imm64Op
 
     class Op3(object):
         @classmethod

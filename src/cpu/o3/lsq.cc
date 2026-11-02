@@ -114,6 +114,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       _cacheBlocked(false),
       cacheStorePorts(params.cacheStorePorts), usedStorePorts(0),
       cacheLoadPorts(params.cacheLoadPorts), usedLoadPorts(0),
+      sprL1LoadBankConflicts(params.sprL1LoadBankConflicts),
       waitingForStaleTranslation(false),
       staleTranslationWaitTxnId(0),
       lsqPolicy(params.smtLSQPolicy),
@@ -223,12 +224,15 @@ LSQ::takeOverFrom()
 void
 LSQ::tick()
 {
+    for (ThreadID tid : *activeThreads)
+        thread[tid].sampleStoreOccupancy();
     // Re-issue loads which got blocked on the per-cycle load ports limit.
     if (usedLoadPorts == cacheLoadPorts && !_cacheBlocked)
         iewStage->cacheUnblocked();
 
     usedLoadPorts = 0;
     usedStorePorts = 0;
+    loadBankUses.fill(0);
 }
 
 bool
@@ -266,6 +270,19 @@ LSQ::cachePortBusy(bool is_load)
     }
 }
 
+bool
+LSQ::loadBankAvailable(Addr addr) const
+{
+    return !sprL1LoadBankConflicts || loadBankUses[(addr >> 2) & 15] < 2;
+}
+
+void
+LSQ::noteLoadBank(Addr addr)
+{
+    if (sprL1LoadBankConflicts)
+        ++loadBankUses[(addr >> 2) & 15];
+}
+
 void
 LSQ::insertLoad(const DynInstPtr &load_inst)
 {
@@ -280,6 +297,18 @@ LSQ::insertStore(const DynInstPtr &store_inst)
     ThreadID tid = store_inst->threadNumber;
 
     thread[tid].insertStore(store_inst);
+}
+
+void
+LSQ::insertStoreData(const DynInstPtr &inst)
+{
+    thread[inst->threadNumber].insertStoreData(inst);
+}
+
+Fault
+LSQ::writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+{
+    return thread[inst->threadNumber].writeStoreData(inst, data, size);
 }
 
 Fault
@@ -454,6 +483,15 @@ LSQ::recvTimingResp(PacketPtr pkt)
     if (dynamic_cast<StorePrepareSenderState*>(pkt->senderState)) {
         delete pkt->popSenderState();
         delete pkt;
+        return true;
+    }
+
+    if (auto *state = dynamic_cast<StoreBufferSenderState*>(pkt->senderState)) {
+        thread.at(state->threadId).completeStoreBufferWrite(state->entryId);
+        delete pkt->popSenderState();
+        delete pkt;
+        if (waitingForStaleTranslation)
+            checkStaleTranslations();
         return true;
     }
 

@@ -403,6 +403,20 @@ MemDepUnit::replay()
     }
 }
 
+bool
+MemDepUnit::replayOne(const DynInstPtr &inst)
+{
+    for (auto it = instsToReplay.begin(); it != instsToReplay.end(); ++it) {
+        if ((*it)->seqNum != inst->seqNum)
+            continue;
+        MemDepEntryPtr entry = findInHash(*it);
+        moveToReady(entry);
+        instsToReplay.erase(it);
+        return true;
+    }
+    return false;
+}
+
 void
 MemDepUnit::completed(const DynInstPtr &inst)
 {

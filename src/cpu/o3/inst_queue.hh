@@ -106,6 +106,7 @@ class IQUnit : public SimObject
     }
 
     unsigned numFreeEntries(const DynInstPtr &inst) const;
+    bool allows(const DynInstPtr &inst) const;
 
     /** Returns the number of used entries for a thread. */
     unsigned
@@ -156,6 +157,8 @@ class IQUnit : public SimObject
 
     /** Function unit pool. */
     FUPool *_fuPool;
+    std::vector<OpClass> allowedOpClasses;
+    std::vector<OpClass> excludedOpClasses;
 };
 
 /**
@@ -309,6 +312,8 @@ class InstructionQueue
         addToProducers(inst);
     }
 
+    void recordCompletedProducer(const DynInstPtr &inst);
+
     /** Process FU completion event. */
     void processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                              int fu_idx);
@@ -342,6 +347,9 @@ class InstructionQueue
 
     /** Replays a memory instruction. It must be rescheduled first. */
     void replayMemInst(const DynInstPtr &replay_inst);
+
+    /** Replay only this instruction if it is still on the replay list. */
+    bool replayOneMemInst(const DynInstPtr &replay_inst);
 
     /**
      * Defers a memory instruction when its DTB translation incurs a hw
@@ -509,6 +517,7 @@ class InstructionQueue
 
     /** The total number of instructions that can be issued in one cycle. */
     unsigned totalWidth;
+    const bool directJumpPortless;
 
     /** The number of physical registers in the CPU. */
     unsigned numPhysRegs;
@@ -567,6 +576,7 @@ class InstructionQueue
         statistics::Scalar floatInstsIssued;
         /** Stat for number of branch instructions issued. */
         statistics::Scalar branchInstsIssued;
+        statistics::Scalar directJumpPortlessIssued;
         /** Stat for number of memory instructions issued. */
         statistics::Scalar memInstsIssued;
         /** Stat for number of miscellaneous instructions issued. */

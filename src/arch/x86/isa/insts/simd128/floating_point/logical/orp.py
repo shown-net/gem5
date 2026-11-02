@@ -35,46 +35,34 @@
 
 microcode = """
 def macroop ORPS_XMM_XMM {
-    mor xmml, xmml, xmmlm
-    mor xmmh, xmmh, xmmhm
+    mxmmor xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop ORPS_XMM_M {
-    lea t1, seg, sib, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mor xmml, xmml, ufp1
-    mor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop ORPS_XMM_P {
-    rdip t7
-    lea t1, seg, riprel, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mor xmml, xmml, ufp1
-    mor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop ORPD_XMM_XMM {
-    mor xmml, xmml, xmmlm
-    mor xmmh, xmmh, xmmhm
+    mxmmor xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop ORPD_XMM_M {
-    lea t1, seg, sib, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mor xmml, xmml, ufp1
-    mor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop ORPD_XMM_P {
-    rdip t7
-    lea t1, seg, riprel, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], dataSize=8
-    ldfp ufp2, seg, [1, t0, t1], 8, dataSize=8
-    mor xmml, xmml, ufp1
-    mor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 """

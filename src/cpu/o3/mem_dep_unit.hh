@@ -143,6 +143,9 @@ class MemDepUnit
      */
     void replay();
 
+    /** Replay one previously rescheduled instruction, if still waiting. */
+    bool replayOne(const DynInstPtr &inst);
+
     /** Notifies completion of an instruction. */
     void completeInst(const DynInstPtr &inst);
 

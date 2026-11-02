@@ -49,6 +49,7 @@ class X86PagetableWalker(ClockedObject):
     num_squash_per_cycle = Param.Unsigned(
         4, "Number of outstanding walks that can be squashed per cycle"
     )
+    max_active_walks = Param.Unsigned(1, "Concurrent timing page walks")
 
 
 class X86TLB(BaseTLB):
@@ -57,6 +58,10 @@ class X86TLB(BaseTLB):
     cxx_header = "arch/x86/tlb.hh"
 
     size = Param.Unsigned(64, "TLB size")
+    itlb_4k_ways = Param.Unsigned(0, "4K instruction TLB ways; zero uses fully associative replacement")
+    dtlb_4k_ways = Param.Unsigned(0, "4K unified data TLB candidate ways; zero uses fully associative replacement")
+    spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
+    next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
     system = Param.System(Parent.any, "system object")
     walker = Param.X86PagetableWalker(
         X86PagetableWalker(), "page table walker"

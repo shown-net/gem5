@@ -53,6 +53,8 @@
 #include "base/logging.hh"
 #include "base/refcnt.hh"
 #include "cpu/op_class.hh"
+#include "cpu/int_execution_info.hh"
+#include "cpu/zero_idiom_info.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst_fwd.hh"
 #include "enums/StaticInstFlags.hh"
@@ -87,7 +89,20 @@ class InstRecord;
  */
 class StaticInst : public RefCounted, public StaticInstFlags
 {
+  protected:
+    IntExecutionInfo intExecutionInfo;
+    ZeroIdiomKind zeroIdiomInfo = ZeroIdiomKind::None;
+
   public:
+    const IntExecutionInfo &intExecution() const { return intExecutionInfo; }
+    void clearIntExecution() { intExecutionInfo = {}; }
+    virtual bool usesMicrocodeService() const { return false; }
+    virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
+    ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
+    bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
+    virtual RegVal zeroIdiomResult(RegIndex destination) const { return 0; }
+    virtual IntResultRole intResultRole(RegIndex destination) const
+    { return IntResultRole::Other; }
     using RegIdArrayPtr = RegId (StaticInst:: *)[];
 
   private:
@@ -146,6 +161,8 @@ class StaticInst : public RefCounted, public StaticInstFlags
     }
     bool isLoad()         const { return flags[IsLoad]; }
     bool isStore()        const { return flags[IsStore]; }
+    bool isStoreAddress() const { return flags[IsStoreAddress]; }
+    bool isStoreData()    const { return flags[IsStoreData]; }
     bool isAtomic()       const { return flags[IsAtomic]; }
     bool isStoreConditional()     const { return flags[IsStoreConditional]; }
     bool isInstPrefetch() const { return flags[IsInstPrefetch]; }
@@ -165,6 +182,13 @@ class StaticInst : public RefCounted, public StaticInstFlags
     bool isIndirectCtrl() const { return flags[IsIndirectControl]; }
     bool isCondCtrl()     const { return flags[IsCondControl]; }
     bool isUncondCtrl()   const { return flags[IsUncondControl]; }
+
+    virtual bool isRasCall() const { return isCall(); }
+    virtual bool isRasReturn() const { return isReturn(); }
+    virtual bool isArchitecturalBranch() const { return isControl(); }
+    virtual bool isArchitecturalConditionalBranch() const { return isCondCtrl(); }
+    virtual bool isNearIndirectBranch() const
+    { return isIndirectCtrl() && !isReturn(); }
 
     bool isSerializing()  const { return flags[IsSerializing] ||
                                       flags[IsSerializeBefore] ||
@@ -186,6 +210,14 @@ class StaticInst : public RefCounted, public StaticInstFlags
     bool isSyscall() const { return flags[IsSyscall]; }
     bool isMacroop() const { return flags[IsMacroop]; }
     bool isMicroop() const { return flags[IsMicroop]; }
+    bool isMicrocodeControl() const { return flags[IsMicrocodeControl]; }
+    bool isMicroFusedMemory() const { return flags[IsMicroFusedMemory]; }
+    bool isStackRegAllocation() const { return flags[IsStackRegAllocation]; }
+    virtual unsigned functionalMicroops() const { return 1; }
+    virtual bool isArchitecturalPortIO() const { return false; }
+    virtual bool isArchitecturalLockedMemory() const { return isAtomic(); }
+    virtual bool isFullGprMove() const { return false; }
+    virtual bool isFullXmmMove() const { return false; }
     bool isDelayedCommit() const { return flags[IsDelayedCommit]; }
     bool isLastMicroop() const { return flags[IsLastMicroop]; }
     bool isFirstMicroop() const { return flags[IsFirstMicroop]; }

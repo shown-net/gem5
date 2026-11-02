@@ -38,7 +38,10 @@
 #ifndef __ARCH_X86_TLB_HH__
 #define __ARCH_X86_TLB_HH__
 
+#include <functional>
 #include <list>
+#include <functional>
+#include <memory>
 #include <vector>
 
 #include "arch/generic/tlb.hh"
@@ -92,13 +95,21 @@ namespace X86ISA
         Walker *getWalker();
 
         void flushAll() override;
+        void onCodeInvalidation(std::function<void()> callback)
+        { codeInvalidation = std::move(callback); }
 
         void flushNonGlobal();
 
         void demapPage(Addr va, uint64_t asn) override;
+        uint64_t generation() const { return invalidationGeneration; }
 
       protected:
+        std::function<void()> codeInvalidation;
+        uint64_t invalidationGeneration = 0;
         uint32_t size;
+        uint32_t smallPageWays;
+        bool sprSharedDomains;
+        Cycles nextLevelHitLatency;
 
         std::vector<TlbEntry> tlb;
 
@@ -119,7 +130,24 @@ namespace X86ISA
             statistics::Scalar rdMisses;
             statistics::Scalar wrMisses;
             statistics::Scalar exMisses;
+            statistics::Scalar stlbResponses;
+            statistics::Scalar stlbSquashes;
+            statistics::Scalar stlbRestarts;
         } stats;
+
+        struct ItlbMissStats : public statistics::Group
+        {
+            explicit ItlbMissStats(statistics::Group *parent);
+            statistics::Scalar STLB_HIT;
+        };
+        std::unique_ptr<ItlbMissStats> itlbMissStats;
+
+        struct DtlbLoadMissStats : public statistics::Group
+        {
+            explicit DtlbLoadMissStats(statistics::Group *parent);
+            statistics::Scalar STLB_HIT;
+        };
+        std::unique_ptr<DtlbLoadMissStats> dtlbLoadMissStats;
 
         Fault translateInt(bool read, RequestPtr req, ThreadContext *tc);
 
@@ -163,7 +191,8 @@ namespace X86ISA
         Fault finalizePhysical(const RequestPtr &req, ThreadContext *tc,
                                BaseMMU::Mode mode) const override;
 
-        TlbEntry *insert(Addr vpn, const TlbEntry &entry, uint64_t pcid);
+        TlbEntry *insert(Addr vpn, const TlbEntry &entry, uint64_t pcid,
+                         bool fillNextLevel = true);
 
         // Checkpointing
         void serialize(CheckpointOut &cp) const override;

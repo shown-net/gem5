@@ -115,6 +115,7 @@ namespace X86ISA
             bool retrying;
             bool started;
             bool squashed;
+            uint64_t translationGeneration = 0;
           public:
             WalkerState(Walker * _walker, BaseMMU::Translation *_translation,
                         const RequestPtr &_req, bool _isFunctional = false) :
@@ -177,6 +178,26 @@ namespace X86ISA
 
         // The number of outstanding walks that can be squashed per cycle.
         unsigned numSquashable;
+        const unsigned maxActiveWalks;
+        bool portBlocked = false;
+
+        struct ItlbStats : statistics::Group
+        {
+            explicit ItlbStats(Walker *owner);
+            void preDumpStats() override;
+            void resetStats() override;
+            Walker *owner;
+            statistics::Scalar WALK_COMPLETED_4K, WALK_COMPLETED;
+            statistics::Scalar WALK_ACTIVE, WALK_PENDING;
+        } itlbStats;
+        struct DtlbLoadStats : statistics::Group
+        {
+            explicit DtlbLoadStats(Walker *owner);
+            statistics::Scalar WALK_COMPLETED;
+        } dtlbLoadStats;
+        unsigned activeInstructionWalks = 0;
+        uint64_t lastInstructionWalkCycle = 0;
+        void accountInstructionWalks();
 
         // Wrapper for checking for squashes before starting a translation.
         void startWalkWrapper();
@@ -205,8 +226,11 @@ namespace X86ISA
             funcState(this, NULL, NULL, true), tlb(NULL), sys(params.system),
             requestorId(sys->getRequestorId(this)),
             numSquashable(params.num_squash_per_cycle),
+            maxActiveWalks(params.max_active_walks), itlbStats(this),
+            dtlbLoadStats(this),
             startWalkWrapperEvent([this]{ startWalkWrapper(); }, name())
         {
+            fatal_if(!maxActiveWalks, "Page walker needs an active walk slot");
         }
     };
 

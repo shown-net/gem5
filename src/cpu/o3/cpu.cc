@@ -47,6 +47,8 @@
 #include "cpu/checker/cpu.hh"
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/zero_idiom.hh"
+#include "arch/x86/mmu.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/simple_thread.hh"
@@ -71,7 +73,7 @@ namespace o3
 {
 
 CPU::CPU(const BaseO3CPUParams &params)
-    : BaseCPU(params), tmaEnabled(params.enableCalibrationTMA),
+    : BaseCPU(params), tmaEnabled(params.numThreads == 1),
       mmu(params.mmu),
       tickEvent([this] { tick(); }, "O3CPU tick", false, Event::CPU_Tick_Pri),
       threadExitEvent([this] { exitThreads(); }, "O3CPU exit threads", false,
@@ -113,12 +115,25 @@ CPU::CPU(const BaseO3CPUParams &params)
       globalFTSeqNum(1),
       system(params.system),
       lastRunningCycle(curCycle()),
-      cpuStats(this), unhaltedClockStats(this),
-      tmaStats(this, params.renameWidth), instRetiredStats(this),
-      uopsRetiredStats(this)
+      cpuStats(this),
+      unhaltedClockStats(this),
+      tmaStats(this, params.renameWidth),
+      branchInstStats(this), branchMispStats(this), instRetiredStats(this),
+      uopsRetiredStats(this), moveEliminationStats(this),
+      memoryInstRetiredStats(this), memoryLoadRetiredStats(this)
 {
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
+    resultForwarding = params.resultForwarding;
+    zeroIdiom = params.zeroIdiom;
+    frontend = params.frontend;
+    if (frontend) {
+        frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
+        auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
+        fatal_if(!x86_mmu, "Component frontend requires an x86 MMU");
+        x86_mmu->onInstructionCodeInvalidation(
+            [this] { fetch.invalidateTranslations(); });
+    }
 
     fatal_if(!FullSystem && params.numThreads < params.workload.size(),
             "More workload items (%d) than threads (%d) on CPU %s.",
@@ -171,6 +186,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     decode.setFetchQueue(&fetchQueue);
     commit.setFetchQueue(&fetchQueue);
     decode.setDecodeQueue(&decodeQueue);
+    fetch.setRenameQueue(&decodeQueue);
     rename.setDecodeQueue(&decodeQueue);
     rename.setRenameQueue(&renameQueue);
     iew.setRenameQueue(&renameQueue);
@@ -383,7 +399,7 @@ CPU::tick()
 
     fetch.tick();
 
-    decode.tick();
+    if (!frontend) decode.tick();
 
     rename.tick();
 
@@ -824,6 +840,7 @@ bool
 CPU::isCpuDrained() const
 {
     bool drained(true);
+    if (zeroIdiom && !zeroIdiom->empty()) drained = false;
 
     if (!instList.empty() || !removeList.empty()) {
         DPRINTF(Drain, "Main CPU structures not drained.\n");
@@ -904,6 +921,9 @@ void
 CPU::switchOut()
 {
     DPRINTF(O3CPU, "Switching out\n");
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        unhaltedClockStats.setActive(tid, false);
+    tmaStats.setActive(false);
     BaseCPU::switchOut();
 
     activityRec.reset();
@@ -1185,6 +1205,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 void
 CPU::removeFrontInst(const DynInstPtr &inst)
 {
+    if (inst->isSquashed()) tmaStats.onOtherSquash(inst);
     DPRINTF(O3CPU, "Removing committed instruction [tid:%i] PC %s "
             "[sn:%lli]\n",
             inst->threadNumber, inst->pcState(), inst->seqNum);
@@ -1291,6 +1312,8 @@ void
 CPU::cleanUpRemovedInsts()
 {
     while (!removeList.empty()) {
+        if ((*removeList.front())->isSquashed())
+            tmaStats.onOtherSquash(*removeList.front());
         DPRINTF(O3CPU, "Removing instruction, "
                 "[tid:%i] [sn:%lli] PC %s\n",
                 (*removeList.front())->threadNumber,

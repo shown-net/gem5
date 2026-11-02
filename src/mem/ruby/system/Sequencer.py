@@ -96,6 +96,12 @@ class RubySequencer(RubyPort):
     max_outstanding_requests = Param.Int(
         16, "max requests (incl. prefetches) outstanding"
     )
+    park_ordered_stores = Param.Bool(
+        False, "Park out-of-order TSO callbacks until their predecessor completes"
+    )
+    max_store_prepare_outstanding = Param.Unsigned(
+        0, "Drop permission-prepare hints above this bound; zero is unlimited"
+    )
     deadlock_threshold = Param.Cycles(
         500000,
         "max outstanding cycles for a request "

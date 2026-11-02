@@ -59,8 +59,7 @@ class DependencyEntry
     { }
 
     DynInstPtr inst;
-    //Might want to include data about what arch. register the
-    //dependence is waiting on.
+    RegIndex srcIndex = 0;
     DependencyEntry<DynInstPtr> *next;
 };
 
@@ -93,7 +92,7 @@ class DependencyGraph
     void reset();
 
     /** Inserts an instruction to be dependent on the given index. */
-    void insert(RegIndex idx, const DynInstPtr &new_inst);
+    void insert(RegIndex idx, const DynInstPtr &new_inst, RegIndex src_index);
 
     /** Sets the producing instruction of a given register. */
     void setInst(RegIndex idx, const DynInstPtr &new_inst)
@@ -104,10 +103,11 @@ class DependencyGraph
     { dependGraph[idx].inst = NULL; }
 
     /** Removes an instruction from a single linked list. */
-    void remove(RegIndex idx, const DynInstPtr &inst_to_remove);
+    void remove(RegIndex idx, const DynInstPtr &inst_to_remove,
+                RegIndex src_index);
 
     /** Removes and returns the newest dependent of a specific register. */
-    DynInstPtr pop(RegIndex idx);
+    DynInstPtr pop(RegIndex idx, RegIndex &src_index);
 
     /** Checks if the entire dependency graph is empty. */
     bool empty() const;
@@ -185,7 +185,8 @@ DependencyGraph<DynInstPtr>::reset()
 
 template <class DynInstPtr>
 void
-DependencyGraph<DynInstPtr>::insert(RegIndex idx, const DynInstPtr &new_inst)
+DependencyGraph<DynInstPtr>::insert(RegIndex idx, const DynInstPtr &new_inst,
+                                   RegIndex src_index)
 {
     //Add this new, dependent instruction at the head of the dependency
     //chain.
@@ -195,6 +196,7 @@ DependencyGraph<DynInstPtr>::insert(RegIndex idx, const DynInstPtr &new_inst)
     DepEntry *new_entry = new DepEntry;
     new_entry->next = dependGraph[idx].next;
     new_entry->inst = new_inst;
+    new_entry->srcIndex = src_index;
 
     // Then actually add it to the chain.
     dependGraph[idx].next = new_entry;
@@ -206,7 +208,8 @@ DependencyGraph<DynInstPtr>::insert(RegIndex idx, const DynInstPtr &new_inst)
 template <class DynInstPtr>
 void
 DependencyGraph<DynInstPtr>::remove(RegIndex idx,
-                                    const DynInstPtr &inst_to_remove)
+                                    const DynInstPtr &inst_to_remove,
+                                    RegIndex src_index)
 {
     DepEntry *prev = &dependGraph[idx];
     DepEntry *curr = dependGraph[idx].next;
@@ -222,7 +225,7 @@ DependencyGraph<DynInstPtr>::remove(RegIndex idx,
     nodesRemoved++;
 
     // Find the instruction to remove within the dependency linked list.
-    while (curr->inst != inst_to_remove) {
+    while (curr->inst != inst_to_remove || curr->srcIndex != src_index) {
         prev = curr;
         curr = curr->next;
         nodesTraversed++;
@@ -243,13 +246,14 @@ DependencyGraph<DynInstPtr>::remove(RegIndex idx,
 
 template <class DynInstPtr>
 DynInstPtr
-DependencyGraph<DynInstPtr>::pop(RegIndex idx)
+DependencyGraph<DynInstPtr>::pop(RegIndex idx, RegIndex &src_index)
 {
     DepEntry *node;
     node = dependGraph[idx].next;
     DynInstPtr inst = NULL;
     if (node) {
         inst = node->inst;
+        src_index = node->srcIndex;
         dependGraph[idx].next = node->next;
         node->inst = NULL;
         memAllocCounter--;

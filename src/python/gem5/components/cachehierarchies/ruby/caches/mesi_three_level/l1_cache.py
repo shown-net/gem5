@@ -75,15 +75,18 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         self.Dcache = RubyCache(
             size=l1d_size,
             assoc=l1d_assoc,
+            fill_capacity=16,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
             replacement_policy=LRURP(),
         )
         self.clk_domain = clk_domain
-        self.prefetcher = RubyPrefetcher(block_size=cache_line_size)
+        self.prefetcher = RubyPrefetcher(
+            block_size=cache_line_size, ip_stride=True, queue_dedup=True
+        )
         self.send_evictions = core.requires_send_evicts()
         self.transitions_per_cycle = 32
-        self.enable_prefetch = False
+        self.enable_prefetch = True
         self.request_latency = 2
         self.response_latency = 2
 
@@ -105,11 +108,11 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         # In stdlib terms, they are bufferToL2 and bufferFromL2 respectively.
         # These buffers are connections between L1 cache and L2 cache.
         # Later on, we'll need to connect those buffers to L2.
-        # ordered=True 会触发 MessageBuffer.cc:261 的 strict-FIFO 单调性检查，
-        # 在 8 核高争用 workload (ads_ctr) 下，L0 recycle() → delayHead() 路径
-        # 会出现 arrival_time < last_arrival_time 的 1 cycle 级越位，panic abort。
-        # L0 协议用 block_on="addr" 已保证同地址串行化，跨地址消息不需要全局
-        # arrival 单调；关掉 ordered 仅放宽入队侧时间戳约束，dequeue 仍按
-        # arrival_time 最小堆顺序，不影响协议正确性。
+        # This workspace historically changed both local buffers from the
+        # upstream ordered default after a strict-FIFO arrival-time panic.
+        # Address blocking alone does not establish message ordering across
+        # the two controllers. Local WriteBack transition panics have since
+        # been observed; their cause and the safety of this setting are not
+        # yet established. Keep both settings available for controlled study.
         self.bufferToL1 = MessageBuffer(ordered=False)
         self.bufferFromL1 = MessageBuffer(ordered=False)

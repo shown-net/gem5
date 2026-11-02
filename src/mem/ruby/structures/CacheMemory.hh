@@ -147,6 +147,13 @@ class CacheMemory : public SimObject
     bool checkResourceAvailable(CacheResourceType res, Addr addr);
     void recordRequestType(CacheRequestType requestType, Addr addr);
 
+    // MESI controllers own the transaction in their TBE. This budget counts
+    // only the TBEs which actually fetch a line, not every coherence TBE.
+    bool canAllocateFill() const;
+    void allocateFill();
+    void releaseFill();
+    void recordFillBlocked();
+
     // hardware transactional memory
     void htmAbortTransaction();
     void htmCommitTransaction();
@@ -195,6 +202,8 @@ class CacheMemory : public SimObject
     int m_start_index_bit;
     bool m_resource_stalls;
     int m_block_size;
+    unsigned m_fill_capacity;
+    unsigned m_fill_in_flight = 0;
 
     /**
      * We store all the ReplacementData in a 2-dimensional array. By doing
@@ -235,6 +244,11 @@ class CacheMemory : public SimObject
 
           statistics::Scalar numAtomicALUOperations;
           statistics::Scalar numAtomicALUArrayStalls;
+
+          statistics::Scalar fillAllocations;
+          statistics::Scalar fillCompletions;
+          statistics::Scalar fillBlockedRequests;
+          statistics::Average fillOccupancy;
 
           // hardware transactional memory
           statistics::Histogram htmTransCommitReadSet;

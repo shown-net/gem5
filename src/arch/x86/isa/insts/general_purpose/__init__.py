@@ -35,6 +35,7 @@
 
 categories = [
     "arithmetic",
+    "bit_manipulation",
     "cache_and_memory_management",
     "compare_and_test",
     "control_transfer",

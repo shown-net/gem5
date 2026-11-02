@@ -80,7 +80,17 @@ class SimpleFreeList
     SimpleFreeList() {};
 
     /** Add a physical register to the free list */
-    void addReg(PhysRegIdPtr reg) { freeRegs.push(reg); }
+    bool addReg(PhysRegIdPtr reg)
+    {
+        // Initial population has no rename owner. Otherwise a physical
+        // register is reusable only after every architectural version/alias
+        // has left the rename history.
+        if (!reg->numRenameReferences() || reg->releaseRenameReference()) {
+            freeRegs.push(reg);
+            return true;
+        }
+        return false;
+    }
 
     /** Add physical registers to the free list */
     template<class InputIt>
@@ -97,6 +107,7 @@ class SimpleFreeList
         assert(!freeRegs.empty());
         PhysRegIdPtr free_reg = freeRegs.front();
         freeRegs.pop();
+        free_reg->allocateRenameReference();
         return free_reg;
     }
 
@@ -170,10 +181,10 @@ class UnifiedFreeList
     }
 
     /** Adds a register back to the free list. */
-    void
+    bool
     addReg(PhysRegIdPtr freed_reg)
     {
-        freeLists[freed_reg->classValue()].addReg(freed_reg);
+        return freeLists[freed_reg->classValue()].addReg(freed_reg);
     }
 
     /** Checks if there are any free registers of type type. */

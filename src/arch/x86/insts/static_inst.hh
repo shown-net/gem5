@@ -39,6 +39,7 @@
 #define __ARCH_X86_INSTS_STATICINST_HH__
 
 #include "arch/x86/pcstate.hh"
+#include "arch/x86/regs/ccr.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/types.hh"
 #include "base/trace.hh"
@@ -100,6 +101,135 @@ struct SegRegIndex
 class X86StaticInst : public StaticInst
 {
   public:
+    bool isArchitecturalBranch() const override
+    {
+        if (!isControl()) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (machInst.opcode.type == TwoByteOpcode)
+            return (opcode >= 0x80 && opcode <= 0x8f) || opcode == 0x05 ||
+                opcode == 0x07 || opcode == 0x34 || opcode == 0x35;
+        if (machInst.opcode.type != OneByteOpcode) return false;
+        return (opcode >= 0x70 && opcode <= 0x7f) ||
+            (opcode >= 0xe0 && opcode <= 0xe3) || opcode == 0xe8 ||
+            opcode == 0xe9 || opcode == 0xeb || opcode == 0x9a ||
+            opcode == 0xea || opcode == 0xc2 || opcode == 0xc3 ||
+            opcode == 0xca || opcode == 0xcb || opcode == 0xcf ||
+            (opcode == 0xff && machInst.modRM.reg >= 2 && machInst.modRM.reg <= 5);
+    }
+    bool isArchitecturalConditionalBranch() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return isArchitecturalBranch() &&
+            ((machInst.opcode.type == OneByteOpcode &&
+              ((opcode >= 0x70 && opcode <= 0x7f) ||
+               (opcode >= 0xe0 && opcode <= 0xe3))) ||
+             (machInst.opcode.type == TwoByteOpcode && opcode >= 0x80 && opcode <= 0x8f));
+    }
+    bool isRasCall() const override
+    {
+        if (!isCall() || machInst.opcode.type != OneByteOpcode) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return (opcode == 0xe8 && machInst.immediate != 0) ||
+            (opcode == 0xff && machInst.modRM.reg == 2);
+    }
+    bool isRasReturn() const override
+    {
+        if (!isReturn() || machInst.opcode.type != OneByteOpcode) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return opcode == 0xc2 || opcode == 0xc3;
+    }
+
+    bool isArchitecturalPortIO() const override
+    {
+        if (machInst.opcode.type != OneByteOpcode) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return (opcode >= 0x6c && opcode <= 0x6f) ||
+               (opcode >= 0xe4 && opcode <= 0xe7) ||
+               (opcode >= 0xec && opcode <= 0xef);
+    }
+
+    bool isArchitecturalLockedMemory() const override
+    {
+        // XCHG with memory is implicitly locked even without a LOCK prefix.
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return machInst.legacy.lock ||
+            (machInst.opcode.type == OneByteOpcode &&
+             (opcode == 0x86 || opcode == 0x87) && machInst.modRM.mod != 3);
+    }
+
+    bool isFullGprMove() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return machInst.opcode.type == OneByteOpcode &&
+            (opcode == 0x89 || opcode == 0x8b) && machInst.modRM.mod == 3 &&
+            machInst.rex.w && machInst.mode.submode == SixtyFourBitMode;
+    }
+
+    bool canMacroFuseWith(const StaticInst &next) const override
+    {
+        const auto *branch = dynamic_cast<const X86StaticInst *>(&next);
+        if (!branch || machInst.opcode.type != OneByteOpcode) return false;
+        const auto bop = uint8_t(branch->machInst.opcode.op);
+        unsigned condition;
+        if (branch->machInst.opcode.type == OneByteOpcode && bop >= 0x70 && bop <= 0x7f)
+            condition = bop & 15;
+        else if (branch->machInst.opcode.type == TwoByteOpcode && bop >= 0x80 && bop <= 0x8f)
+            condition = bop & 15;
+        else return false;
+
+        // A bounded flag-producer/Jcc model. Memory and partial-register
+        // expansions are excluded by the allocation accountant's one-op gate.
+        const auto opcode = uint8_t(machInst.opcode.op);
+        unsigned family = 0; // 1=arithmetic/compare, 2=test/and, 3=inc/dec
+        if (opcode == 0x01 || opcode == 0x03 || opcode == 0x05 ||
+            opcode == 0x29 || opcode == 0x2b || opcode == 0x2d ||
+            opcode == 0x39 || opcode == 0x3b || opcode == 0x3d)
+            family = 1;
+        else if (opcode == 0x21 || opcode == 0x23 || opcode == 0x25 ||
+                 opcode == 0x85 || opcode == 0xa9 ||
+                 (opcode == 0xf7 && machInst.modRM.reg == 0))
+            family = 2;
+        else if (opcode == 0xff && machInst.modRM.reg <= 1)
+            family = 3;
+        else if (opcode == 0x81 || opcode == 0x83) {
+            const auto group = unsigned(machInst.modRM.reg);
+            if (group == 0 || group == 5 || group == 7) family = 1;
+            else if (group == 4) family = 2;
+        }
+        if (family == 2) return true;
+        if (family == 3) return condition == 4 || condition == 5 || condition >= 12;
+        return family == 1 && ((condition >= 2 && condition <= 7) || condition >= 12);
+    }
+    bool isNearIndirectBranch() const override
+    {
+        return isIndirectCtrl() && !isReturn() &&
+            machInst.opcode.type == OneByteOpcode &&
+            uint8_t(machInst.opcode.op) == 0xff &&
+            (machInst.modRM.reg == 2 || machInst.modRM.reg == 4);
+    }
+
+    RegVal zeroIdiomResult(RegIndex destination) const override
+    {
+        const auto &reg = destRegIdx(destination);
+        return reg.is(CCRegClass) && reg.index() == cc_reg::_ZapsIdx ?
+            0x44 /* PF | ZF; the other arithmetic flags are clear. */ : 0;
+    }
+
+    IntResultRole intResultRole(RegIndex destination) const override
+    {
+        const auto &reg = destRegIdx(destination);
+        if (reg.is(IntRegClass))
+            return IntResultRole::GPR;
+        if (reg.is(CCRegClass)) {
+            if (reg.index() == cc_reg::_CfIdx)
+                return IntResultRole::CF;
+            if (reg.index() == cc_reg::_OfIdx)
+                return IntResultRole::OF;
+            return IntResultRole::Flags;
+        }
+        return IntResultRole::Other;
+    }
+
     static void printMnemonic(std::ostream &os, const char *mnemonic);
     static void printMnemonic(std::ostream &os, const char *instMnemonic,
             const char *mnemonic);

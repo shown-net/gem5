@@ -36,337 +36,273 @@
 microcode = """
 def macroop CMOVZ_R_R
 {
-    mov reg, reg, reg, flags=(nCZF,)
-    mov reg, reg, regm, flags=(CZF,)
+    cmovzvalue reg, reg, regm
 };
 
 def macroop CMOVZ_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCZF,)
-    mov reg, reg, t1, flags=(CZF,)
+    cmovzvalue reg, reg, t1
 };
 
 def macroop CMOVZ_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCZF,)
-    mov reg, reg, t1, flags=(CZF,)
+    ldrip t1, seg, riprel, disp
+    cmovzvalue reg, reg, t1
 };
 
 def macroop CMOVNZ_R_R
 {
-    mov reg, reg, reg, flags=(CZF,)
-    mov reg, reg, regm, flags=(nCZF,)
+    cmovnzvalue reg, reg, regm
 };
 
 def macroop CMOVNZ_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CZF,)
-    mov reg, reg, t1, flags=(nCZF,)
+    cmovnzvalue reg, reg, t1
 };
 
 def macroop CMOVNZ_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CZF,)
-    mov reg, reg, t1, flags=(nCZF,)
+    ldrip t1, seg, riprel, disp
+    cmovnzvalue reg, reg, t1
 };
 
 def macroop CMOVB_R_R
 {
-    mov reg, reg, reg, flags=(nCCF,)
-    mov reg, reg, regm, flags=(CCF,)
+    cmovbvalue reg, reg, regm
 };
 
 def macroop CMOVB_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCCF,)
-    mov reg, reg, t1, flags=(CCF,)
+    cmovbvalue reg, reg, t1
 };
 
 def macroop CMOVB_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCCF,)
-    mov reg, reg, t1, flags=(CCF,)
+    ldrip t1, seg, riprel, disp
+    cmovbvalue reg, reg, t1
 };
 
 def macroop CMOVNB_R_R
 {
-    mov reg, reg, reg, flags=(CCF,)
-    mov reg, reg, regm, flags=(nCCF,)
+    cmovnbvalue reg, reg, regm
 };
 
 def macroop CMOVNB_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CCF,)
-    mov reg, reg, t1, flags=(nCCF,)
+    cmovnbvalue reg, reg, t1
 };
 
 def macroop CMOVNB_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CCF,)
-    mov reg, reg, t1, flags=(nCCF,)
+    ldrip t1, seg, riprel, disp
+    cmovnbvalue reg, reg, t1
 };
 
-def macroop CMOVBE_R_R
-{
-    mov reg, reg, reg, flags=(nCCvZF,)
-    mov reg, reg, regm, flags=(CCvZF,)
+def macroop CMOVBE_R_R {
+    conditionbe
+    cmovcondition reg, reg, regm
 };
 
-def macroop CMOVBE_R_M
-{
+def macroop CMOVBE_R_M {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCCvZF,)
-    mov reg, reg, t1, flags=(CCvZF,)
+    conditionbe
+    cmovcondition reg, reg, t1
 };
 
-def macroop CMOVBE_R_P
-{
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCCvZF,)
-    mov reg, reg, t1, flags=(CCvZF,)
+def macroop CMOVBE_R_P {
+    ldrip t1, seg, riprel, disp
+    conditionbe
+    cmovcondition reg, reg, t1
 };
 
-def macroop CMOVNBE_R_R
-{
-    mov reg, reg, reg, flags=(CCvZF,)
-    mov reg, reg, regm, flags=(nCCvZF,)
+def macroop CMOVNBE_R_R {
+    conditionnbe
+    cmovcondition reg, reg, regm
 };
 
-def macroop CMOVNBE_R_M
-{
+def macroop CMOVNBE_R_M {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CCvZF,)
-    mov reg, reg, t1, flags=(nCCvZF,)
+    conditionnbe
+    cmovcondition reg, reg, t1
 };
 
-def macroop CMOVNBE_R_P
-{
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CCvZF,)
-    mov reg, reg, t1, flags=(nCCvZF,)
+def macroop CMOVNBE_R_P {
+    ldrip t1, seg, riprel, disp
+    conditionnbe
+    cmovcondition reg, reg, t1
 };
 
 def macroop CMOVS_R_R
 {
-    mov reg, reg, reg, flags=(nCSF,)
-    mov reg, reg, regm, flags=(CSF,)
+    cmovsvalue reg, reg, regm
 };
 
 def macroop CMOVS_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCSF,)
-    mov reg, reg, t1, flags=(CSF,)
+    cmovsvalue reg, reg, t1
 };
 
 def macroop CMOVS_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCSF,)
-    mov reg, reg, t1, flags=(CSF,)
+    ldrip t1, seg, riprel, disp
+    cmovsvalue reg, reg, t1
 };
 
 def macroop CMOVNS_R_R
 {
-    mov reg, reg, reg, flags=(CSF,)
-    mov reg, reg, regm, flags=(nCSF,)
+    cmovnsvalue reg, reg, regm
 };
 
 def macroop CMOVNS_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CSF,)
-    mov reg, reg, t1, flags=(nCSF,)
+    cmovnsvalue reg, reg, t1
 };
 
 def macroop CMOVNS_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CSF,)
-    mov reg, reg, t1, flags=(nCSF,)
+    ldrip t1, seg, riprel, disp
+    cmovnsvalue reg, reg, t1
 };
 
 def macroop CMOVP_R_R
 {
-    mov reg, reg, reg, flags=(nCPF,)
-    mov reg, reg, regm, flags=(CPF,)
+    cmovpvalue reg, reg, regm
 };
 
 def macroop CMOVP_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCPF,)
-    mov reg, reg, t1, flags=(CPF,)
+    cmovpvalue reg, reg, t1
 };
 
 def macroop CMOVP_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCPF,)
-    mov reg, reg, t1, flags=(CPF,)
+    ldrip t1, seg, riprel, disp
+    cmovpvalue reg, reg, t1
 };
 
 def macroop CMOVNP_R_R
 {
-    mov reg, reg, reg, flags=(CPF,)
-    mov reg, reg, regm, flags=(nCPF,)
+    cmovnpvalue reg, reg, regm
 };
 
 def macroop CMOVNP_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CPF,)
-    mov reg, reg, t1, flags=(nCPF,)
+    cmovnpvalue reg, reg, t1
 };
 
 def macroop CMOVNP_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CPF,)
-    mov reg, reg, t1, flags=(nCPF,)
+    ldrip t1, seg, riprel, disp
+    cmovnpvalue reg, reg, t1
 };
 
 def macroop CMOVL_R_R
 {
-    mov reg, reg, reg, flags=(nCSxOF,)
-    mov reg, reg, regm, flags=(CSxOF,)
+    cmovlvalue reg, reg, regm
 };
 
 def macroop CMOVL_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCSxOF,)
-    mov reg, reg, t1, flags=(CSxOF,)
+    cmovlvalue reg, reg, t1
 };
 
 def macroop CMOVL_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCSxOF,)
-    mov reg, reg, t1, flags=(CSxOF,)
+    ldrip t1, seg, riprel, disp
+    cmovlvalue reg, reg, t1
 };
 
 def macroop CMOVNL_R_R
 {
-    mov reg, reg, reg, flags=(CSxOF,)
-    mov reg, reg, regm, flags=(nCSxOF,)
+    cmovnlvalue reg, reg, regm
 };
 
 def macroop CMOVNL_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CSxOF,)
-    mov reg, reg, t1, flags=(nCSxOF,)
+    cmovnlvalue reg, reg, t1
 };
 
 def macroop CMOVNL_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CSxOF,)
-    mov reg, reg, t1, flags=(nCSxOF,)
+    ldrip t1, seg, riprel, disp
+    cmovnlvalue reg, reg, t1
 };
 
 def macroop CMOVLE_R_R
 {
-    mov reg, reg, reg, flags=(nCSxOvZF,)
-    mov reg, reg, regm, flags=(CSxOvZF,)
+    cmovlevalue reg, reg, regm
 };
 
 def macroop CMOVLE_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCSxOvZF,)
-    mov reg, reg, t1, flags=(CSxOvZF,)
+    cmovlevalue reg, reg, t1
 };
 
 def macroop CMOVLE_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCSxOvZF,)
-    mov reg, reg, t1, flags=(CSxOvZF,)
+    ldrip t1, seg, riprel, disp
+    cmovlevalue reg, reg, t1
 };
 
 def macroop CMOVNLE_R_R
 {
-    mov reg, reg, reg, flags=(CSxOvZF,)
-    mov reg, reg, regm, flags=(nCSxOvZF,)
+    cmovnlevalue reg, reg, regm
 };
 
 def macroop CMOVNLE_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(CSxOvZF,)
-    mov reg, reg, t1, flags=(nCSxOvZF,)
+    cmovnlevalue reg, reg, t1
 };
 
 def macroop CMOVNLE_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(CSxOvZF,)
-    mov reg, reg, t1, flags=(nCSxOvZF,)
+    ldrip t1, seg, riprel, disp
+    cmovnlevalue reg, reg, t1
 };
 
 def macroop CMOVO_R_R
 {
-    mov reg, reg, reg, flags=(nCOF,)
-    mov reg, reg, regm, flags=(COF,)
+    cmovovalue reg, reg, regm
 };
 
 def macroop CMOVO_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(nCOF,)
-    mov reg, reg, t1, flags=(COF,)
+    cmovovalue reg, reg, t1
 };
 
 def macroop CMOVO_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(nCOF,)
-    mov reg, reg, t1, flags=(COF,)
+    ldrip t1, seg, riprel, disp
+    cmovovalue reg, reg, t1
 };
 
 def macroop CMOVNO_R_R
 {
-    mov reg, reg, reg, flags=(COF,)
-    mov reg, reg, regm, flags=(nCOF,)
+    cmovnovalue reg, reg, regm
 };
 
 def macroop CMOVNO_R_M
 {
     ld t1, seg, sib, disp
-    mov reg, reg, reg, flags=(COF,)
-    mov reg, reg, t1, flags=(nCOF,)
+    cmovnovalue reg, reg, t1
 };
 
 def macroop CMOVNO_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
-    mov reg, reg, reg, flags=(COF,)
-    mov reg, reg, t1, flags=(nCOF,)
+    ldrip t1, seg, riprel, disp
+    cmovnovalue reg, reg, t1
 };
 """

@@ -46,7 +46,8 @@ namespace gem5
 namespace o3
 {
 
-static constexpr int MaxWidth = 16;
+// Eight retiring allocation units can contain four functional records each.
+static constexpr int MaxWidth = 32;
 static constexpr int MaxThreads = 4;
 
 } // namespace o3

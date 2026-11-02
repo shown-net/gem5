@@ -55,6 +55,10 @@ class MessageBuffer(SimObject):
     cxx_header = "mem/ruby/network/MessageBuffer.hh"
 
     ordered = Param.Bool(False, "Whether the buffer is ordered")
+    delay_to_preserve_order = Param.Bool(
+        False,
+        "Delay overtaking enqueues on an ordered buffer instead of panicking",
+    )
     buffer_size = Param.Unsigned(
         0,
         "Maximum number of entries to buffer \
