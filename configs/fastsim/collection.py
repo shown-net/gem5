@@ -17,6 +17,8 @@ def parse_args(argv=None):
     p.add_argument("--extra-cores", type=int, default=0)
     p.add_argument("--functional-user-target", type=int, default=10000000)
     p.add_argument("--functional-sync", action="store_true")
+    p.add_argument("--functional-translation-origins", action="store_true",
+                   help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
     p.add_argument("--functional-instruction-translations", action="store_true",
                    help="observe retired instruction translation provenance; no MMU-control qualification")
     p.add_argument("--thread-state", action="store_true")
@@ -154,6 +156,7 @@ def trace_options(args, trace_dir, profile_path, identity, thread_params=None):
         functional_frontend=True, functional_retirement=True, functional_asid_static_map=True,
         functional_task_clock=args.task_clock,
         functional_instruction_translations=args.functional_instruction_translations,
+        functional_translation_origins=args.functional_translation_origins,
         functional_warmup=True, functional_user_target=args.functional_user_target,
         functional_sync_marker_pc=identity.get("marker_pc", 0),
         functional_sync_initial_context=args.sync_initial_context,

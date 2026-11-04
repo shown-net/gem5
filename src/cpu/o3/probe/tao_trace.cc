@@ -704,6 +704,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_syscall_microops_(params.functional_syscall_microops),
       functional_frontend_(params.functional_frontend),
       functional_instruction_translations_(params.functional_instruction_translations),
+      functional_translation_origins_(params.functional_translation_origins),
       functional_retirement_(params.functional_retirement),
       functional_asid_static_map_(params.functional_asid_static_map),
       functional_warmup_(params.functional_warmup),
@@ -812,6 +813,10 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     if (functional_include_kernel_) {
         fst_feature_flags_ |= kFstFeaturePrivilege;
     }
+    if (functional_translation_origins_ &&
+        (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
+         !functional_asid_static_map_ || functional_user_only_))
+        throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
     if (functional_instruction_translations_) {
         if (!functional_frontend_ || !task_clock_cpu_ || !FullSystem)
             throw std::runtime_error("instruction translation observation requires FS O3 retired frontend capture");
@@ -1000,7 +1005,8 @@ TaoTrace::openOutput()
                 fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
                 if (FullSystem) {
                     fst_translations_ = std::make_unique<fastsim::fst::DynamicTranslationWriter>(
-                        fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
+                        fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_),
+                        functional_translation_origins_, fastsim::fst::kStaticUopPolicySha256);
                     fst_feature_flags_ |= fastsim::fst::kDynamicTranslations;
                 }
                 if ((functional_retirement_ || thread_state_marker_pc_) &&

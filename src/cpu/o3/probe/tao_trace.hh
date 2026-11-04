@@ -557,7 +557,8 @@ private:
     uint64_t    fst_feature_flags_ = 0; // header.feature_flags（累积）
     bool        fst_finalized_ = false;
     // virtual-page token interning: the CR3 root is part of the identity, so
-    // identical virtual/physical pages in two processes never alias.
+    // identical virtual/physical pages in two processes never alias. This is
+    // retirement-observed ASID, independent of each frozen translation origin.
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint32_t>
         fst_page_tokens_;
     uint32_t    fst_next_page_token_ = 1;
@@ -658,6 +659,7 @@ private:
     bool functional_syscall_microops_ = false;
     bool functional_frontend_ = false;
     bool functional_instruction_translations_ = false;
+    bool functional_translation_origins_ = false;
     bool functional_retirement_ = false;
     bool functional_asid_static_map_ = false;
     bool functional_warmup_ = false;

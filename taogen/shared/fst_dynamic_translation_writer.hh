@@ -12,7 +12,10 @@ class DynamicTranslationWriter {
     gzFile file_=nullptr;
     std::vector<unsigned char> buffer_;
     std::map<TranslationMapping,std::uint64_t> dictionary_;
-    std::map<std::uint32_t,std::uint64_t> token_state_;
+    // Tokens identify retirement namespace + VA4K + PA4K, never mapping origin.
+    // Sparse reuse additionally binds the independently observed retirement ASID.
+    std::map<std::uint32_t,std::pair<std::uint64_t,std::uint64_t>> token_state_;
+    bool origins_=false;
     std::uint64_t definitions_=0,bindings_=0,memory_=0,unknown_=0,last_ordinal_=0;
     bool finished_=false;
     void flush() {
@@ -43,21 +46,21 @@ class DynamicTranslationWriter {
         }
         return size && size-1<=UINT64_MAX-pa;
     }
-    static bool valid(const TranslationFragment& f,std::uint64_t asid) {
+    bool valid(const TranslationFragment& f,std::uint64_t asid) const {
         const auto& m=f.mapping;
         if(static_cast<unsigned>(m.kind)>6 ||
            (m.kind==TranslationKind::kPaged && (m.request_physical_base || m.request_virtual_base)))return false;
         std::uint64_t special_pa=0;
         if(m.kind!=TranslationKind::kPaged && !specialPhysical(m,f.virtual_address,f.size,special_pa))return false;
         if(m.kind!=TranslationKind::kPaged && !(m.flags&kTranslationLeafKnown)) {
-            if(!f.size || m.address_space_id!=asid || m.flags || m.page_bits || m.levels || m.walk_root || m.physical_base ||
+            if(!f.size || (!origins_ && m.address_space_id!=asid) || m.flags || m.page_bits || m.levels || m.walk_root || m.physical_base ||
                (m.virtual_base&4095) || f.virtual_address<m.virtual_base ||
                f.virtual_address-m.virtual_base>4095 || f.size-1>4095-(f.virtual_address-m.virtual_base) ||
                f.physical_address!=special_pa)return false;
             for(auto p:m.pte_addresses)if(p)return false;
             return true;
         }
-        if(!f.size || m.address_space_id!=asid || !(m.flags&kTranslationLeafKnown) ||
+        if(!f.size || (!origins_ && m.address_space_id!=asid) || !(m.flags&kTranslationLeafKnown) ||
            (m.flags&~7) || (m.page_bits!=12 && m.page_bits!=21 && m.page_bits!=22 && m.page_bits!=30) ||m.levels>8)
             return false;
         const auto mask=(std::uint64_t(1)<<m.page_bits)-1;
@@ -82,20 +85,25 @@ class DynamicTranslationWriter {
         return id;
     }
     void bind(std::uint64_t ordinal,const void* record,std::uint32_t token,
-              std::uint64_t va,std::uint32_t size,std::uint64_t id,bool force) {
+              std::uint64_t va,std::uint32_t size,std::uint64_t id,std::uint64_t asid,bool force) {
         const auto old=token_state_.find(token);
-        if(!force && token && old!=token_state_.end() && old->second==id)return;
+        if(!force && token && old!=token_state_.end() && old->second==std::make_pair(id,origins_?asid:0))return;
         if(ordinal<last_ordinal_)throw std::runtime_error("dynamic translation ordinal reversed");
         byte(2);var(ordinal-last_ordinal_);fixed(hash(record),4);var(token);var(va);var(size);var(id);
+        if(origins_)var(asid);
         last_ordinal_=ordinal;++bindings_;
-        if(token)token_state_[token]=id;
+        if(token)token_state_[token]={id,origins_?asid:0};
     }
 public:
-    explicit DynamicTranslationWriter(const std::string& path,std::uint32_t core) {
+    explicit DynamicTranslationWriter(const std::string& path,std::uint32_t core,
+        bool origins=false,const std::array<std::uint8_t,32>& policy={}):origins_(origins) {
+        if(origins_ && policy==std::array<std::uint8_t,32>{})
+            throw std::invalid_argument("data translation origin policy undeclared");
         file_=gzopen(path.c_str(),"wb1");if(!file_)throw std::runtime_error("cannot open dynamic translation companion");
         gzbuffer(file_,1u<<20);buffer_.reserve(65536);
         for(unsigned char c:std::string("FSTXLT1\0",8))byte(c);
-        fixed(2,4);fixed(32,4);fixed(core,4);fixed(1,4);fixed(0,8);
+        fixed(origins_?3:2,4);fixed(origins_?64:32,4);fixed(core,4);fixed(1,4);fixed(0,8);
+        if(origins_)for(auto c:policy)byte(c);
     }
     DynamicTranslationWriter(const DynamicTranslationWriter&)=delete;
     DynamicTranslationWriter& operator=(const DynamicTranslationWriter&)=delete;
@@ -114,11 +122,11 @@ public:
         std::uint64_t hot_pa=0;std::memcpy(&hot_pa,static_cast<const unsigned char*>(record)+8,8);
         if(complete && fragments.front().physical_address!=hot_pa)complete=false;
         if(!complete) {
-            ++unknown_;bind(ordinal,record,token,va,size,0,token==0);return;
+            ++unknown_;bind(ordinal,record,token,va,size,0,asid,token==0);return;
         }
         if(!known)++unknown_;
         const bool force=!token || fragments.size()!=1;
-        for(const auto& f:fragments)bind(ordinal,record,token,f.virtual_address,f.size,valid(f,asid)?intern(f.mapping):0,force);
+        for(const auto& f:fragments)bind(ordinal,record,token,f.virtual_address,f.size,valid(f,asid)?intern(f.mapping):0,asid,force);
         if(force && token)token_state_.erase(token);
     }
     void finish(std::uint64_t count,std::uint64_t full_hash) {
