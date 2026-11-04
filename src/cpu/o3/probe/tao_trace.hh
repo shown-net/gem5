@@ -523,7 +523,10 @@ private:
     void writeFstMemoryRequestHeader(bool finalized);
     std::FILE *out_fst_retirement_ = nullptr;
     uint64_t fst_retirement_rows_ = 0;
-    void noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
+    void noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
+    void validateFunctionalRetirement(const TaoTraceParams &params) const;
+    void accountFstRetirementCommit(const DynInstPtr &inst);
+    retirement::Ledger functional_retirement_ledger_;
 
     std::unique_ptr<fastsim::fst::RetiredFrontendWriter> fst_frontend_;
     fastsim::fst::RetiredFrontendMacro fst_frontend_pending_{};
@@ -636,6 +639,7 @@ private:
     bool functional_include_kernel_ = false;
     bool functional_syscall_microops_ = false;
     bool functional_frontend_ = false;
+    bool functional_retirement_ = false;
     bool functional_warmup_ = false;
     uint64_t functional_user_target_ = 0;
     uint64_t functional_sync_marker_pc_ = 0;

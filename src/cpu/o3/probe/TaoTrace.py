@@ -103,6 +103,11 @@ class TaoTrace(ProbeListenerObject):
     functional_frontend = Param.Bool(False,
         "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
         "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
+    functional_retirement = Param.Bool(False,
+        "Emit full-population-bound .fsem v2 functional hardware-entry and precise-fault "
+        "origin facts without task-state accounting. Requires kernel-inclusive direct FST "
+        "and raw syscall micro-ops; retains all committed kernel records and does not "
+        "certify task ownership or native cache/PMU qualification.")
     functional_warmup = Param.Bool(False,
         "Capture CPL3 records before traceMeasurementBegin as a functional "
         "warmup prefix. The functional user target then counts only records "

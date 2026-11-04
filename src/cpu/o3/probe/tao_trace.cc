@@ -700,6 +700,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_include_kernel_(params.functional_include_kernel),
       functional_syscall_microops_(params.functional_syscall_microops),
       functional_frontend_(params.functional_frontend),
+      functional_retirement_(params.functional_retirement),
       functional_warmup_(params.functional_warmup),
       functional_user_target_(params.functional_user_target),
       functional_sync_marker_pc_(params.functional_sync_marker_pc),
@@ -717,6 +718,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       output_dir_(params.output_dir),
       uarch_profile_path_(params.uarch_profile_path)
 {
+    validateFunctionalRetirement(params);
     explicit_source_core_ = params.fixed_work_source_core;
     if (explicit_source_core_ >= 0) {
         fatal_if(params.marker_pc || params.functional_warmup ||
@@ -963,7 +965,8 @@ TaoTrace::openOutput()
                         fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
                     fst_feature_flags_ |= fastsim::fst::kDynamicTranslations;
                 }
-                if (thread_state_marker_pc_ && functional_include_kernel_ && !functional_user_only_) {
+                if ((functional_retirement_ || thread_state_marker_pc_) &&
+                    functional_include_kernel_ && !functional_user_only_) {
                     out_fst_retirement_=std::fopen((fst_path_+".fsem").c_str(),"w+b");
                     if (!out_fst_retirement_)
                         throw std::runtime_error("TaoTrace cannot open functional retirement companion");
@@ -1871,8 +1874,11 @@ TaoTrace::onKernelEntry(const KernelEntryEvent &event)
     if (event.fault == NoFault) return;
     const auto page_fault =
         std::dynamic_pointer_cast<X86ISA::PageFault>(event.fault);
-    if (page_fault && event.source==KernelEntrySource::SynchronousFault && event.contextId!=UINT32_MAX)
+    if (page_fault && event.source==KernelEntrySource::SynchronousFault && event.contextId!=UINT32_MAX) {
         perf_retirement_.notePreciseFault(event.contextId,event.instructionPc);
+        if (functional_retirement_)
+            functional_retirement_ledger_.notePreciseFault(event.contextId,event.instructionPc);
+    }
     if (functional_warmup_ && !functional_measurement_started_ &&
         event.fromUser && page_fault) {
         premeasurement_page_fault_pending_ = true;
@@ -2019,7 +2025,7 @@ TaoTrace::emitFunctionalSyscallMarker(
         if (!functional_syscall_microops_) {
             if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                 throw std::runtime_error("TaoTrace failed to write FST syscall");
-            noteFstMemoryRequest(&record, false, 0);
+            noteFstMemoryRequest(inst, &record, false, 0);
             ++fst_record_count_;
             if (out_thread_state_ && !thread_state_initial_owner_)
                 emitThreadState(inst, record_ordinal,
@@ -5786,14 +5792,14 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     // Idle filtering is only used by the legacy privileged-stream gate.
     // User records and fixed-work streams never need instruction text here.
     const bool warmup_kernel_idle =
-        !fixed_work_marker_ && thread_state_marker_pc_ == 0 &&
+        !fixed_work_marker_ && !functional_retirement_ && thread_state_marker_pc_ == 0 &&
         functional_include_kernel_ && !functional_user &&
         !functional_measurement_started_ &&
         (isIdleInstruction(inst) || isPollIdleInstruction(inst));
     // Task ownership needs the complete committed kernel stream. The legacy
     // CPL gate can drop idle-to-task switches before a core's first user commit
     // at the common measurement boundary, including entire hook macro-ops.
-    if (!fixed_work_marker_ && thread_state_marker_pc_ == 0 && functional_include_kernel_ &&
+    if (!fixed_work_marker_ && !functional_retirement_ && thread_state_marker_pc_ == 0 && functional_include_kernel_ &&
         !functional_user &&
         (warmup_kernel_idle ||
          (functional_measurement_started_ &&
@@ -6154,7 +6160,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         llc_fill_audit::observer().member(getCoreId(inst),getTraceThreadId(inst),inst->seqNum,
             fst_record_count_,rec.pc,rec.address,rec.size,rec.flags,
             !functional_warmup_||functional_measurement_started_,uint64_t(curTick()));
-        noteFstMemoryRequest(&rec, (inst->memReqFlags & Request::NO_ACCESS) != 0,
+        noteFstMemoryRequest(inst, &rec, (inst->memReqFlags & Request::NO_ACCESS) != 0,
                              uint32_t(micro_pc), inst->isDataPrefetch(),
                              perf_retirement_.lastHardwareEntry(),perf_retirement_.lastPreciseFaultAbandonment());
         if (fst_translations_ && rec.size && (rec.flags & (kFstLoad | kFstStore | kFstAtomic))) {
@@ -6303,8 +6309,66 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
 }
 
 void
-TaoTrace::noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
+TaoTrace::validateFunctionalRetirement(const TaoTraceParams &params) const
 {
+    if (!params.functional_retirement) return;
+    if (!params.functional_include_kernel || params.functional_user_only ||
+        !params.emit_micro || !params.functional_syscall_microops ||
+        !params.measure_cpl || toLower(params.trace_format) != "fst" ||
+        params.marker_pc)
+        throw std::runtime_error("functional retirement requires kernel-inclusive direct FST, "
+            "measure_cpl and raw syscall micro-ops; calibration marker mode is unsupported");
+}
+
+void
+TaoTrace::accountFstRetirementCommit(const DynInstPtr &inst)
+{
+    // This ledger sees exactly the hot records written to FST, including warmup
+    // and kernel idle work. It records only functional origins: no owner,
+    // disassembly, native service facts, clocks or PMU qualification.
+    if (!inst || !inst->staticInst)
+        throw std::runtime_error("functional retirement lacks committed static identity");
+    const auto si = inst->staticInst;
+    retirement::Member member;
+    member.context = getTraceThreadId(inst);
+    member.sequence = inst->seqNum;
+    member.pc = inst->pcState().instAddr();
+    member.user = isUserInstruction(inst);
+    member.first = !si->isMicroop() || si->isFirstMicroop();
+    member.last = !si->isMicroop() || si->isLastMicroop();
+    member.rom = isRomMicroPC(inst->pcState().microPC());
+    if (!member.first && !member.rom && inst->macroop) {
+        member.first = retirement::debugOnlyPrefix(inst->pcState().microPC(), [&](uint64_t i) {
+            const auto prefix = inst->macroop->fetchMicroop(i);
+            const bool debug = typeid(*prefix.get()) == typeid(X86ISA::MicroDebug) &&
+                retirement::debugControlName(prefix->getName());
+            return retirement::DebugPrefixMember{
+                prefix->isMicroop(), prefix->isFirstMicroop(), debug};
+        });
+    }
+    using namespace X86ISAInst::rom_labels;
+    member.rom_entry = member.rom && retirement::knownRomEntry(
+        inst->pcState().microPC(), MicroPCRomBit,
+        {extern_label_longModeInterrupt, extern_label_longModeSoftInterrupt,
+         extern_label_longModeInterruptWithError, extern_label_legacyModeInterrupt,
+         extern_label_initIntHalt, extern_label_realModeInterrupt});
+    member.hardware_entry = member.rom_entry && !inst->macroop;
+    if (member.rom && !inst->macroop && !member.rom_entry &&
+        !functional_retirement_ledger_.hasOpen(member.context))
+        throw std::runtime_error("functional retirement ROM stream lacks a known hardware-entry origin");
+    // Leave memory/measurement membership unset. The functional ledger must
+    // neither accumulate unresolved native requests nor publish PMU totals.
+    functional_retirement_ledger_.commit(member);
+}
+
+void
+TaoTrace::noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch, bool hardware_entry, bool precise_fault_abandonment)
+{
+    if (functional_retirement_) {
+        accountFstRetirementCommit(inst);
+        hardware_entry = functional_retirement_ledger_.lastHardwareEntry();
+        precise_fault_abandonment = functional_retirement_ledger_.lastPreciseFaultAbandonment();
+    }
     fst_memory_request_hash_ = fastsim::fst::memory_request_stream_hash(
         fst_memory_request_hash_, record);
     const auto& hot = *static_cast<const FstRecord*>(record);
