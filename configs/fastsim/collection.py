@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import re
 
 
 def parse_args(argv=None):
@@ -48,13 +49,15 @@ def parse_args(argv=None):
     p.add_argument("--trace-subdir", default="tao_trace")
     p.add_argument("--max-ticks", type=int, default=0)
     p.add_argument("--kvm-quantum-us", type=float, default=1000)
+    p.add_argument("--mem-size", default="2GiB", help="guest RAM capacity; native DDR5 timings and channels stay fixed")
+    p.add_argument("--x86-large-memory", action="store_true", help="explicit split-range RAM above the x86 PCI hole")
     # Donor workload helpers consume these protocol options. Reusing old staged
     # checkpoints with a different target would require a new identity contract.
     p.set_defaults(checkpoint_phase="staged", save_boot_checkpoint=None,
                    restore_boot_checkpoint=None, checkpoint_only=False,
                    trace_format="fst", functional_include_kernel=True,
                    functional_syscall_microops=True, functional_frontend=True,
-                   functional_retirement=True, functional_asid_static_map=True, clk="2.6GHz", mem_size="2GiB",
+                   functional_retirement=True, functional_asid_static_map=True, clk="2.6GHz",
                    mem_channels=16)
     return p.parse_args(argv)
 
@@ -66,6 +69,14 @@ def validate_options(args):
         raise ValueError("common-end target must be positive; warmup/tick limits nonnegative")
     if args.kvm_quantum_us <= 0:
         raise ValueError("KVM quantum must be positive")
+    size = memory_size_bytes(args.mem_size)
+    if size > 3 * 2**30 and not args.x86_large_memory:
+        raise ValueError("RAM above 3GiB requires --x86-large-memory")
+    if args.native_workers:
+        if not args.task_clock or not args.thread_state:
+            raise ValueError("native business tasks require --thread-state --task-clock")
+        if not args.native_warmup_after_identities or args.warmup_insts <= 0:
+            raise ValueError("native business tasks require --native-warmup-after-identities and positive warmup")
     if args.task_clock and not args.thread_state:
         raise ValueError("--task-clock requires --thread-state")
     if args.thread_state and not args.scheduler_profile:
@@ -75,6 +86,37 @@ def validate_options(args):
     trace = Path(args.trace_subdir)
     if trace.is_absolute() or ".." in trace.parts or not trace.parts:
         raise ValueError("trace subdirectory must stay inside the output directory")
+
+
+def memory_size_bytes(value):
+    match = re.fullmatch(r"([0-9]+)(GiB|MiB|KiB|B)", value)
+    if not match or int(match[1]) <= 0:
+        raise ValueError("memory capacity must be a positive integer with GiB/MiB/KiB/B units")
+    return int(match[1]) * {"GiB": 2**30, "MiB": 2**20, "KiB": 2**10, "B": 1}[match[2]]
+
+
+def guest_memory_boot_script(args, original):
+    size = memory_size_bytes(args.mem_size)
+    if size <= 3 * 2**30:
+        return original
+    if not args.x86_large_memory:
+        raise ValueError("guest high-memory visibility requires --x86-large-memory")
+    first, separator, body = original.partition("\n")
+    if first != "#!/bin/sh" or not separator:
+        raise ValueError("guest boot script must begin with #!/bin/sh")
+    minimum_kib = (size - 2**30) // 1024
+    report = f'''set -e
+swapoff -a
+echo '[fastsim-spr-memory] begin visibility-only'
+cat /proc/meminfo
+cat /proc/iomem
+dmesg | grep -E 'e820|BIOS-provided physical RAM map|Memory:' || true
+awk '/^MemTotal:/ {{ if ($2 >= {minimum_kib}) good=1 }} END {{ exit !good }}' /proc/meminfo
+awk '/System RAM/ {{ split($1, range, "-"); sub(/^0+/, "", range[1]); if (length(range[1]) > 8) good=1 }} END {{ exit !good }}' /proc/iomem
+echo '[fastsim-spr-memory] visibility-passed minimum-kib={minimum_kib}'
+echo '[fastsim-spr-memory] end'
+'''
+    return first + "\n" + report + body
 
 
 def participant_ids(args):

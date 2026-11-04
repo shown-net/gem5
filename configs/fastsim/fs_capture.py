@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from collection import (
     attach_traces, load_donor, parse_args, participant_ids, sha256,
     trace_options, validate_options, write_profile,
+    guest_memory_boot_script,
 )
 
 
@@ -17,10 +18,7 @@ def main():
     # Imports are delayed so policy tests and --help work without gem5.
     import m5
     from m5.objects import TaoTrace
-    from gem5.components.boards.x86_board import X86Board
     from gem5.components.cachehierarchies.ruby.mesi_three_level_cache_hierarchy import SPRCacheHierarchy
-    from gem5.components.memory.dram_interfaces.ddr5 import DDR5_4400_4x8
-    from gem5.components.memory.memory import ChanneledMemory
     from gem5.components.processors.cpu_types import CPUTypes
     from gem5.components.processors.simple_switchable_processor import SimpleSwitchableProcessor
     from gem5.isas import ISA
@@ -80,12 +78,13 @@ def main():
                                  num_cores=num_cores, isa=ISA.X86)
     # Native CPU classes carry SPR frontend/allocation/partitioned-IQ/store
     # behavior. No generic O3 setter belongs in this entry.
-    memory = ChanneledMemory(DDR5_4400_4x8, 16, 64, size="2GiB")
+    from configlarge_memory import make_memory
+    board_class, memory = make_memory(args)
     cache = SPRCacheHierarchy(l3_size="12MiB", l3_assoc=12, num_l3_banks=8)
-    board = X86Board(clk_freq="2.6GHz", processor=processor,
+    board = board_class(clk_freq="2.6GHz", processor=processor,
                      memory=memory, cache_hierarchy=cache)
     board.set_kernel_disk_workload(kernel=kernel, disk_image=disk,
-                                   readfile_contents=donor.boot_script(args),
+                                   readfile_contents=guest_memory_boot_script(args, donor.boot_script(args)),
                                    exit_on_work_items=True)
     traced = [wrapped.get_simobject() for wrapped in
               processor._switchable_cores["switch"][:args.omp_threads]]
@@ -121,6 +120,8 @@ def main():
             warmup.identities_ready()
             milestone("native-identities-ready")
             traced[0].scheduleInstStopAnyThread(args.warmup_insts)
+            milestone("warmup-armed")
+            print("[fastsim-spr] native identities ready: warmup instruction budget armed", flush=True)
         return False
 
     def on_workbegin():
