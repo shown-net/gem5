@@ -9,11 +9,15 @@ at one common end. A premature guest exit or tick limit fails the capture.
 
 The legacy begin helper prints `operation=workbegin-serial` and issues an
 `m5_work_begin` work-item notification. UART delivery can lag behind the m5op.
-Nonzero WORKBEGIN exit codes identify work items and are logged as
-`raw-work-item-notification`; they do not open measurement or reset statistics.
-The serial terminal invokes `traceMeasurementBegin` and raises the code-0
-WORKBEGIN event. Only this event opens the host measurement state and resets
-statistics. A duplicate serial measurement start is rejected.
+Work-item IDs may be zero, so exit codes cannot identify the genuine boundary.
+The handler reads each producer's read-only `functionalMeasurementStarted()`
+state. If no participant has begun, the event is logged as
+`raw-work-item-notification` without opening measurement or resetting statistics.
+The serial terminal invokes `traceMeasurementBegin` globally; all participants
+must then report that they have started before the handler opens the host
+measurement state and resets statistics once. Mixed participant states fail.
+Later work-item notifications, including ID zero, are logged as
+`work-item-notification-after-measurement` and do not reset statistics again.
 
 Example with local legacy assets and an independently audited scheduler profile:
 

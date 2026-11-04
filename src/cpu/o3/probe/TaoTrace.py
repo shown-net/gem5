@@ -17,6 +17,7 @@ class TaoTrace(ProbeListenerObject):
     cxx_header = "cpu/o3/probe/tao_trace.hh"
 
     cxx_exports = [PyBindMethod("startFunctionalMeasurement"),
+                   PyBindMethod("functionalMeasurementStarted"),
                    PyBindMethod("startMarkerCapture"),
                    PyBindMethod("selectMarkerWindow"),
                    PyBindMethod("resumeMarkerHandoff"),

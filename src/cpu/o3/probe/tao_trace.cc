@@ -4559,6 +4559,7 @@ TaoTrace::finalizeCplMeasurement()
         "\"retry_discards\":%lu,"
         "\"icache_responses\":%lu,"
         "\"icache_squashed_responses\":%lu,"
+        "\"dsb_validation_terminals\":%lu,"
         "\"inflight_at_end\":%lu,"
         "\"squash_events\":%lu,"
         "\"squash_events_with_outstanding\":%lu,"
@@ -4601,6 +4602,8 @@ TaoTrace::finalizeCplMeasurement()
             TaoTraceFrontendRegistry::Terminal::Response),
         (unsigned long)terminal(
             TaoTraceFrontendRegistry::Terminal::SquashedResponse),
+        (unsigned long)terminal(
+            TaoTraceFrontendRegistry::Terminal::DsbValidation),
         (unsigned long)frontend.inflightAtEnd,
         (unsigned long)frontend.squashEvents,
         (unsigned long)frontend.squashEventsWithOutstanding,

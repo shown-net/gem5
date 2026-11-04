@@ -125,17 +125,23 @@ def main():
 
     def on_workbegin():
         # The workload emits both a work-item m5op and a serial marker. UART
-        # delivery may lag behind the m5op: only terminal.cc's code-0 event
-        # follows traceMeasurementBegin and therefore defines the FST boundary.
+        # delivery may lag behind the m5op, and a work-item ID may be zero.
+        # Only the producers' actual functional boundary disambiguates them.
         work_item = simulator.get_last_exit_event_code()
-        if work_item != 0:
+        started = [cpu.tao_trace.functionalMeasurementStarted() for cpu in traced]
+        if not any(started):
             print(f"[fastsim-spr] raw WORKBEGIN work-item {work_item}: notification only", flush=True)
             milestone("raw-work-item-notification")
             return False
+        if not all(started):
+            raise RuntimeError("inconsistent participant functional measurement state")
+        if state["measurement_open"]:
+            # A delayed raw work-item notification can arrive after the UART
+            # marker. Its code cannot prove a second serial marker occurred.
+            milestone("work-item-notification-after-measurement")
+            return False
         if not state["switched"] or args.warmup_insts:
             raise RuntimeError("unexpected workload WORKBEGIN outside switched marker mode")
-        if state["measurement_open"]:
-            raise RuntimeError("duplicate serial WORKBEGIN measurement start")
         state["measurement_open"] = True
         print("[fastsim-spr] WORKBEGIN serial marker: measurement window open", flush=True)
         # The serial terminal already invoked traceMeasurementBegin globally.

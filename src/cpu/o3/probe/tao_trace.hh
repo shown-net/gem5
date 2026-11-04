@@ -348,6 +348,10 @@ public:
     static void traceMarkerHandoff(gem5::ThreadContext *tc);
     static void traceMeasurementBegin();
     void startFunctionalMeasurement() { traceMeasurementBegin(); }
+    bool functionalMeasurementStarted() const
+    {
+        return functional_measurement_started_;
+    }
     static void traceMeasurementEnd();
     // Offline-only exact squash boundary. Commit calls this when it accepts
     // an IEW redirect, before ROB::squash mutates the younger instructions.
