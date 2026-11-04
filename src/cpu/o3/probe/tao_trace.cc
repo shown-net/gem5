@@ -15,6 +15,8 @@
 #include "cpu/o3/probe/fixed_work_marker.hh"
 #include "cpu/o3/probe/fst_dependencies.hh"
 #include "cpu/o3/probe/fst_memory_requests.hh"
+#include "cpu/o3/probe/fst_store_requests.hh"
+#include "cpu/o3/probe/static_uop_policy.hh"
 #include "cpu/o3/probe/fst_retirement.hh"
 #include "thread_state_kernel_identity.hh"
 
@@ -874,6 +876,9 @@ TaoTrace::~TaoTrace()
     if (out_fst_retirement_) {
         std::fclose(out_fst_retirement_);out_fst_retirement_=nullptr;
     }
+    if (out_fst_store_requests_) {
+        std::fclose(out_fst_store_requests_); out_fst_store_requests_=nullptr;
+    }
     if (out_fst_memory_requests_) {
         std::fclose(out_fst_memory_requests_);
         out_fst_memory_requests_ = nullptr;
@@ -977,6 +982,14 @@ TaoTrace::openOutput()
                 if (!out_fst_memory_requests_)
                     throw std::runtime_error("TaoTrace cannot open memory request companion");
                 fst_feature_flags_ |= fastsim::fst::kMemoryRequestRoles;
+                out_fst_store_requests_ = std::fopen((fst_path_ + ".sreq").c_str(), "w+b");
+                if (!out_fst_store_requests_)
+                    throw std::runtime_error("TaoTrace cannot open functional store companion");
+                fst_feature_flags_ |= fastsim::fst::kStoreRequestFacts;
+                fst_static_uops_ = std::make_unique<fastsim::fst::StaticUopWriter>(
+                    fst_path_+".uops.gz", static_cast<uint32_t>(fst_core_id_),
+                    fastsim::fst::kStaticUopPolicySha256);
+                fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
                 if (FullSystem) {
                     fst_translations_ = std::make_unique<fastsim::fst::DynamicTranslationWriter>(
                         fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_));
@@ -1619,11 +1632,14 @@ TaoTrace::maybeCaptureInitialPteState(const DynInstPtr &inst)
     // certifies the whole stream.
     if (fixed_work_marker_) return;
     if (!functionalTraceEnabled() || !emit_micro_ || !functionalCaptureActive() ||
-        !isUserInstruction(inst) || !inst || !inst->tcBase()) {
-        return;
-    }
+        !inst || !inst->tcBase()) return;
 
     auto *tc = inst->tcBase();
+    // A bounded warmup can contain kernel instructions only. The exact target
+    // CR3 serialized at the ROI marker is already authoritative; waiting for a
+    // userspace fetch can otherwise leave the initial snapshot absent at BEGIN.
+    // Legacy captures without that identity still require an actual user fetch.
+    if (!isUserInstruction(inst) && !tc->getSystemPtr()->getSourceRoiAddressSpaceId()) return;
     if (initial_pte_root_checked_) return;
 
     X86ISA::Efer efer =
@@ -2050,6 +2066,7 @@ TaoTrace::emitFunctionalSyscallMarker(
             if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                 throw std::runtime_error("TaoTrace failed to write FST syscall");
             noteFstMemoryRequest(inst, &record, false, 0);
+            if (fst_static_uops_) fst_static_uops_->observe(&record,{},{});
             ++fst_record_count_;
             if (out_thread_state_ && !thread_state_initial_owner_)
                 emitThreadState(inst, record_ordinal,
@@ -6203,6 +6220,75 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                 (rec.flags & kFstVpageToken) ? (rec.reserved & ~kFstDestClassMarker) : 0,
                 address_space_id, vaddr, rec.size, inst->functionalTranslations);
         }
+        if (fst_static_uops_) {
+            using namespace fastsim::fst;
+            StaticUopFactsRow facts;
+            facts.flags = kStaticExecutionKnown | kStaticOperandRolesKnown;
+            const auto &execution = si->intExecution();
+            if (ns > 256 || nd > UINT16_MAX || execution.resultLatency > UINT16_MAX)
+                throw std::runtime_error("static UOP descriptor exceeds wire width");
+            facts.source_count = uint16_t(ns);
+            facts.destination_count = uint16_t(nd);
+            facts.integer_family = uint8_t(execution.family);
+            facts.candidate_ports = execution.ports;
+            facts.nominal_latency = uint16_t(execution.resultLatency);
+            facts.zero_idiom = uint8_t(si->zeroIdiom());
+            std::vector<StaticUopOperand> operands;
+            operands.reserve(ns);
+            for (size_t i=0; i<ns; ++i) {
+                const auto &reg=si->srcRegIdx(i);
+                StaticUopOperand operand;
+                operand.consumer_operand=uint16_t(i);
+                const int cls=static_cast<int>(reg.classValue());
+                if (isTrackableRegClassMicro(cls)) {
+                    operand.reg_class=encodeRegClassValueMicro(cls);
+                    const auto writer=lw.find(encodeReg(operand.reg_class,uint32_t(reg.index())));
+                    if (writer!=lw.end() && writer->second && writer->second<micro_seq) {
+                        const auto distance=micro_seq-writer->second;
+                        if (distance>UINT32_MAX) throw std::runtime_error("static UOP dependency distance overflow");
+                        operand.producer_distance=uint32_t(distance);
+                    }
+                    if (reg.is(IntRegClass)) operand.producer_role=1;
+                    else if (reg.is(CCRegClass)) {
+                        operand.producer_role=reg.index()==X86ISA::cc_reg::_CfIdx?2:
+                            reg.index()==X86ISA::cc_reg::_OfIdx?3:4;
+                    }
+                }
+                operands.push_back(operand);
+            }
+            // The grouping reflects static split members sharing one SQ entry,
+            // not observed execute/retire time. The opaque joining keys stay here.
+            if (perf_retirement_.lastPreciseFaultAbandonment()) {
+                facts.flags |= kStaticAbandonStoreGroups;
+                fst_pending_store_groups_.clear();
+            }
+            if (inst->isStoreAddress() || inst->isStoreData()) {
+                facts.store_role=inst->isStoreAddress()?StaticStoreRole::Address:StaticStoreRole::Data;
+                auto pending=fst_pending_store_groups_.find(inst->seqNum);
+                if (pending!=fst_pending_store_groups_.end()) {
+                    facts.store_group=pending->second;
+                    fst_pending_store_groups_.erase(pending);
+                    facts.flags |= kStaticStorePairKnown;
+                } else if (inst->sqIt.dereferenceable()) {
+                    const auto &entry=*inst->sqIt;
+                    const auto &address=entry.instruction();
+                    const auto &data=entry.dataInstruction();
+                    if (address && data && (address.get()==inst.get() || data.get()==inst.get())) {
+                        facts.store_group=++fst_next_store_group_;
+                        facts.flags |= kStaticStorePairKnown;
+                        const auto other=address.get()==inst.get()?data:address;
+                        fst_pending_store_groups_.emplace(other->seqNum,facts.store_group);
+                    }
+                }
+            } else if (inst->isStore()) facts.store_role=StaticStoreRole::Unified;
+            if (facts.store_role!=StaticStoreRole::None && ns<=64) {
+                facts.flags |= kStaticAddressDataKnown;
+                const auto all=ns==64?UINT64_MAX:(uint64_t(1)<<ns)-1;
+                if (facts.store_role!=StaticStoreRole::Data) facts.address_operands=all;
+                if (facts.store_role!=StaticStoreRole::Address) facts.data_operands=all;
+            }
+            fst_static_uops_->observe(&rec,facts,operands);
+        }
         if (prods.size() > 4) {
             fastsim::fst::DependencyRow row{fst_record_count_, uint32_t(prods.size() - 4),
                 fastsim::fst::dependency_record_hash(&rec)};
@@ -6428,6 +6514,89 @@ TaoTrace::noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool 
         (software_prefetch && (hot.size == 0 || !(hot.flags & kFstLoad) ||
                               (hot.flags & (kFstStore | kFstAtomic)))))
         throw std::runtime_error("TaoTrace invalid functional software-prefetch role");
+    if (out_fst_store_requests_ && (hot.flags & (kFstLoad | kFstStore | kFstAtomic))) {
+        using namespace fastsim::fst;
+        StoreRequestFacts facts;
+        facts.record_ordinal=fst_record_count_;
+        facts.hot_record_hash=dependency_record_hash(record);
+        facts.micro_pc=micro_pc; facts.address=hot.address; facts.size=hot.size;
+        const bool read_only=(hot.flags&kFstLoad) && !(hot.flags&(kFstStore|kFstAtomic));
+        if(read_only) facts.attributes |= kMemoryRead;
+        if (no_access) facts.attributes |= kStoreNoAccess;
+        if (inst->isAtomic() || inst->isStoreConditional()) facts.attributes |= kStoreAtomic;
+        if (inst->inHtmTransactionalState()) facts.attributes |= kStoreHtm;
+        if (inst->isDataPrefetch() || inst->isReadBarrier() || inst->isWriteBarrier())
+            facts.attributes |= kStoreSpecial;
+        auto *saved=inst->savedRequest;
+        if (saved && saved->isSplit()) facts.attributes |= kStoreSplit;
+        // SplitDataRequest overrides mainReq(): its flags/mask are real, but
+        // its PADDR=0 is a placeholder. Physical identity is checked below.
+        const auto req=saved ? saved->mainReq() : RequestPtr{};
+        if (req && (req->hasPaddr() || req->hasVaddr())) {
+            facts.request_flags=req->getFlags();
+            if(req->isMasked()) facts.attributes |= kStoreMasked;
+            if(req->isAtomic() || req->isLLSC()) facts.attributes |= kStoreAtomic;
+            if(req->isSecure()) facts.attributes |= kStoreSecure;
+            if(req->isUncacheable()) facts.attributes |= kStoreUncacheable;
+            if(req->isStrictlyOrdered()) facts.attributes |= kStoreStrictlyOrdered;
+            const bool special=req->hasNoAddr() || req->isLLSC() || req->isAtomic() ||
+                req->isReadModifyWrite() || req->isSwap() || req->isMemMgmt() ||
+                req->isRelease() || req->isLocalAccess() || req->isCacheMaintenance() ||
+                (req->getFlags() & Request::STORE_NO_DATA);
+            if(special) facts.attributes |= kStoreSpecial;
+            const auto &mask=req->getByteEnable();
+            bool physical_identity=!saved->isSplit() && req->hasPaddr() &&
+                req->getPaddr()==hot.address;
+            if(saved->isSplit() && req->hasVaddr() && req->hasContextId() &&
+               hot.size && hot.size<=64 && req->getSize()==hot.size && mask.size()==hot.size &&
+               req->getVaddr()<=UINT64_MAX-(hot.size-1) && hot.address<=UINT64_MAX-(hot.size-1) &&
+               std::all_of(mask.begin(),mask.end(),[](bool byte){return byte;})) {
+                uint64_t covered=0;
+                physical_identity=true;
+                try {
+                    // v1 supports at most 64 bytes with the target's 64B
+                    // lines: a dense split has at most two real fragments.
+                    for(unsigned index=0;covered<hot.size;++index) {
+                        if(index>=2) {physical_identity=false;break;}
+                        const auto part=saved->req(index);
+                        if(!part || !part->hasPaddr() || !part->hasVaddr() || !part->hasContextId() ||
+                           !part->getSize() || part->getSize()>hot.size-covered ||
+                           part->getPaddr()!=hot.address+covered || part->getVaddr()!=req->getVaddr()+covered ||
+                           part->contextId()!=req->contextId() || part->requestorId()!=req->requestorId() ||
+                           uint64_t(part->getFlags())!=uint64_t(req->getFlags()) ||
+                           part->isMasked() || part->isLocalAccess()) {
+                            physical_identity=false;break;
+                        }
+                        covered+=part->getSize();
+                    }
+                } catch(const std::out_of_range&) {
+                    physical_identity=false;
+                }
+                physical_identity &= covered==hot.size;
+            }
+            const bool identity=physical_identity && req->hasVaddr() && req->hasContextId() &&
+                req->getSize()==hot.size && hot.size<=64 && mask.size()==hot.size;
+            if(identity) {
+                facts.attributes |= kStoreFactsComplete;
+                facts.context=req->contextId();facts.requestor=req->requestorId();
+                for(unsigned i=0;i<mask.size();++i) if(mask[i]) facts.byte_enable |= uint64_t(1)<<i;
+                // Functional subset of LSQUnit::isOrdinaryStore, excluding
+                // canWB/commit/issue/completion state and native merge outcomes.
+                if(inst->isStore() && hot.size &&
+                   !(facts.attributes & (kStoreNoAccess|kStoreSplit|kStoreMasked|kStoreAtomic|
+                     kStoreUncacheable|kStoreStrictlyOrdered|kStoreHtm|kStoreSpecial)))
+                    facts.attributes |= kStoreOrdinary;
+                if(read_only && inst->isLoad() && hot.size &&
+                   !(req->getFlags() & (Request::PREFETCH|Request::INST_FETCH|Request::PT_WALK)) &&
+                   !(facts.attributes & (kStoreNoAccess|kStoreMasked|kStoreAtomic|
+                     kStoreUncacheable|kStoreStrictlyOrdered|kStoreHtm|kStoreSpecial)))
+                    facts.attributes |= kOrdinaryLoad;
+            }
+        }
+        if(std::fwrite(&facts,sizeof(facts),1,out_fst_store_requests_)!=1)
+            throw std::runtime_error("TaoTrace failed writing functional store facts");
+        ++fst_store_request_rows_;
+    }
     if (!no_access && !software_prefetch) return;
     fastsim::fst::MemoryRequestRow row;
     row.role = software_prefetch ? fastsim::fst::MemoryRequestRole::SoftwarePrefetch
@@ -6444,6 +6613,16 @@ void
 TaoTrace::writeFstMemoryRequestHeader(bool finalized)
 {
     if (!out_fst_memory_requests_) return;
+    if (out_fst_store_requests_) {
+        fastsim::fst::StoreRequestHeader stores;
+        stores.core_id=fst_core_id_;stores.flags=finalized?1:0;
+        stores.record_count=fst_record_count_;stores.row_count=fst_store_request_rows_;
+        stores.stream_hash=fst_memory_request_hash_;
+        if(std::fseek(out_fst_store_requests_,0,SEEK_SET)!=0 ||
+           std::fwrite(&stores,sizeof(stores),1,out_fst_store_requests_)!=1 ||
+           std::fflush(out_fst_store_requests_)!=0 || std::fseek(out_fst_store_requests_,0,SEEK_END)!=0)
+            throw std::runtime_error("TaoTrace failed finalizing functional store facts");
+    }
     if (out_fst_retirement_) {
         fastsim::fst::RetirementHeader origin;
         origin.core_id=fst_core_id_;origin.record_count=fst_record_count_;
@@ -6913,6 +7092,7 @@ TaoTrace::finalizeFst()
     }
     writeFstDependencyHeader();
     writeFstMemoryRequestHeader(true);
+    if (fst_static_uops_) fst_static_uops_->finish(fst_record_count_);
     if (fst_translations_)
         fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
     if (fst_frontend_) {

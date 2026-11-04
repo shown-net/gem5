@@ -32,6 +32,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/probe/perf_retirement.hh"
+#include "cpu/o3/probe/fst_static_uops.hh"
 #include "cpu/o3/probe/native_task_clock.hh"
 #include "lru_banked.hh"
 #include "fst_dynamic_translation_writer.hh"
@@ -523,6 +524,12 @@ private:
     uint64_t fst_extra_distances_ = 0;
     void writeFstDependencyHeader();
     std::FILE *out_fst_memory_requests_ = nullptr;
+    std::FILE *out_fst_store_requests_ = nullptr;
+    std::unique_ptr<fastsim::fst::StaticUopWriter> fst_static_uops_;
+    // Native identities are internal joining keys only, never trace outputs.
+    std::unordered_map<uint64_t,uint64_t> fst_pending_store_groups_;
+    uint64_t fst_next_store_group_ = 0;
+    uint64_t fst_store_request_rows_ = 0;
     std::unique_ptr<fastsim::fst::DynamicTranslationWriter> fst_translations_;
     uint64_t fst_memory_request_rows_ = 0;
     uint64_t fst_memory_request_hash_ = 14695981039346656037ull;
