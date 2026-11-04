@@ -664,6 +664,9 @@ private:
     bool functional_task_clock_ = false;
     uint64_t scheduler_account_out_pc_ = 0, scheduler_account_in_pc_ = 0;
     CPU *task_clock_cpu_ = nullptr;
+    void ensureTaskClockCounter();
+    bool taskClockContinuousCapture() const;
+    std::string taskClockInitialResolution() const;
     task_clock::Ledger native_task_clock_;
     bool emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
     void onTaskClockActive(const uint64_t &delta);

@@ -2203,9 +2203,11 @@ TaoTrace::beginFunctionalMeasurement()
     functional_warmup_user_instruction_count_ =
         functional_user_instruction_count_;
     functional_measurement_started_ = true;
-    if (functional_task_clock_)
+    if (functional_task_clock_) {
+        ensureTaskClockCounter();
         native_task_clock_.begin(uint64_t(curTick()), uint64_t(task_clock_cpu_->curCycle()),
                                  uint64_t(task_clock_cpu_->clockPeriod()), fst_record_count_);
+    }
     const int32_t context_id = fst_core_id_ >= 0
         ? fst_core_id_ : parseFstCoreIdFromName(name());
     if (context_id >= 0) {
@@ -7870,26 +7872,62 @@ TaoTrace::emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measur
     writeThreadStateRow(text.str(),id,ordinal,kind);
     const auto tick=uint64_t(curTick()),cycle=uint64_t(task_clock_cpu_->curCycle());
     const auto period=uint64_t(task_clock_cpu_->clockPeriod());
-    if(outgoing)native_task_clock_.out(prev_pid,next_pid,tick,cycle,period,ordinal);
+    if(outgoing)native_task_clock_.out(prev_pid,next_pid,tick,cycle,period,ordinal,
+                                     taskClockContinuousCapture());
     else native_task_clock_.in(prev_pid,next_pid,tick,cycle,period,ordinal);
     return true;
 }
 
 void
+TaoTrace::ensureTaskClockCounter()
+{
+    if (!functional_task_clock_ || native_task_clock_.observed()) return;
+    const auto previous = task_clock_cpu_->observeCycleCounter();
+    const auto state = previous.was_on ? task_clock::State::On :
+        previous.was_sleeping ? task_clock::State::Sleep : task_clock::State::Wakeup;
+    native_task_clock_.bootstrap(uint64_t(curTick()), uint64_t(task_clock_cpu_->curCycle()),
+        uint64_t(task_clock_cpu_->clockPeriod()), previous.previous_cycle, state);
+}
+
+bool
+TaoTrace::taskClockContinuousCapture() const
+{
+    return functional_warmup_ && functional_include_kernel_ && !functional_user_only_ &&
+        functional_syscall_microops_ && !fixed_work_marker_ &&
+        !thread_state_read_failures_ && !thread_state_identity_failures_ &&
+        !thread_state_unretained_hooks_;
+}
+
+std::string
+TaoTrace::taskClockInitialResolution() const
+{
+    if (!native_task_clock_.initial_resolution() || !taskClockContinuousCapture()) return "null";
+    std::ostringstream out;
+    out << "{\"kind\":\"" << (native_task_clock_.initial_pid()==0 ?
+        "first-account-out-idle-prefix-v1" : "first-account-out-task-prefix-v1") << "\",\"record_ordinal\":"
+        << native_task_clock_.initial_resolution_ordinal()
+        << ",\"prev_pid\":" << native_task_clock_.initial_pid() << ",\"source_stream_hash\":" << fst_memory_request_hash_ << '}';
+    return out.str();
+}
+
+void
 TaoTrace::onTaskClockActive(const uint64_t &delta)
 {
+    ensureTaskClockCounter();
     if (!native_task_clock_.closed()) native_task_clock_.active(delta);
 }
 
 void
 TaoTrace::onTaskClockSleeping(const bool &sleeping)
 {
+    ensureTaskClockCounter();
     if (!native_task_clock_.closed()) native_task_clock_.sleeping(sleeping);
 }
 
 void
 TaoTrace::onTaskClockCycles(const uint64_t &delta)
 {
+    ensureTaskClockCounter();
     if (!native_task_clock_.closed())
         native_task_clock_.cycles(delta, uint64_t(curTick()),
             uint64_t(task_clock_cpu_->curCycle()), uint64_t(task_clock_cpu_->clockPeriod()));
@@ -7913,6 +7951,8 @@ TaoTrace::taskClockMetadata() const
         << "\",\"task_clock_initial_known\":" << (native_task_clock_.initial_known()?"true":"false")
         << ",\"task_clock_initial_enabled\":" << (native_task_clock_.initial_enabled()?"true":"false")
         << ",\"task_clock_initial_pid\":" << native_task_clock_.initial_pid()
+        << ",\"task_clock_continuous_capture\":" << (taskClockContinuousCapture()?"true":"false")
+        << ",\"task_clock_initial_resolution\":" << taskClockInitialResolution()
         << ",\"task_clock_common_cut_complete\":"
         << (native_task_clock_.closed() && functional_target_exit_scheduled_ ? "true":"false");
     return out.str();
@@ -7927,7 +7967,11 @@ TaoTrace::finalizeTaskClock()
         if (entry.second.runtime_id && entry.second.pid > 0) tasks.insert(entry.second.pid);
     uint64_t active=0, other=0, transition=0, unknown=0, macros=0;
     for (const auto &span : native_task_clock_.intervals()) {
-        if (!span.known) unknown += span.active_cycles;
+        if (native_task_clock_.resolved_prefix(span) && taskClockContinuousCapture()) {
+            if(tasks.count(span.pid))active += span.active_cycles;
+            else other += span.active_cycles;
+        }
+        else if (!span.known) unknown += span.active_cycles;
         else if (!span.enabled) transition += span.active_cycles;
         else if (tasks.count(span.pid)) active += span.active_cycles;
         else other += span.active_cycles;
@@ -7941,7 +7985,9 @@ TaoTrace::finalizeTaskClock()
     if (tasks.empty()) native_task_clock_.reject("missing-native-runtime-task-population");
     bool begin=false;
     for (const auto &snapshot : native_task_clock_.snapshots())
-        if (snapshot.kind=="roi_begin") {begin=true;if(!snapshot.known)
+        if (snapshot.kind=="roi_begin") {begin=true;if(!snapshot.known &&
+            !(native_task_clock_.initial_resolution() && taskClockContinuousCapture() &&
+              snapshot.record_ordinal<=native_task_clock_.initial_resolution_ordinal()))
             native_task_clock_.reject("native-roi-initial-eligibility-unknown");}
     if (!begin) native_task_clock_.reject("missing-native-roi-begin");
     if (unknown) native_task_clock_.reject("unknown-native-task-clock-coverage");
@@ -7964,6 +8010,7 @@ TaoTrace::finalizeTaskClock()
         << ",\"initial_known\":" << (native_task_clock_.initial_known()?"true":"false")
         << ",\"initial_enabled\":" << (native_task_clock_.initial_enabled()?"true":"false")
         << ",\"initial_pid\":" << native_task_clock_.initial_pid()
+        << ",\"initial_resolution\":" << taskClockInitialResolution()
         << ",\"common_cut_complete\":" << (native_task_clock_.closed()?"true":"false")
         << ",\"active_cycles\":" << active << ",\"other_active_cycles\":" << other
         << ",\"transition_active_cycles\":" << transition << ",\"unknown_active_cycles\":" << unknown
