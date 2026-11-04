@@ -1179,8 +1179,12 @@ TaoTrace::traceWorkBegin(uint32_t core_id, uint64_t workid,
     core_depth += 1;
     roi_active_count_ += 1;
     roi_active_ = (roi_active_count_ > 0);
-    cpl_measurement_active_ = true;
-    cpl_measurement_begin_tick_ = uint64_t(curTick());
+    // Functional common-window ownership belongs to traceMeasurementBegin,
+    // not an earlier/later work-item notification. Legacy ROI keeps its gate.
+    if (functional_warmup_instances_.empty()) {
+        cpl_measurement_active_ = true;
+        cpl_measurement_begin_tick_ = uint64_t(curTick());
+    }
     if (global_roi_boundaries_) {
         std::fprintf(global_roi_boundaries_,
             "{\"event\":\"begin\",\"core_id\":%u,\"workid\":%lu,"
@@ -1211,7 +1215,7 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
         warn("TaoTrace: unmatched WORKEND on core %u", core_id);
     }
     roi_active_ = (roi_active_count_ > 0);
-    if (!roi_active_) cpl_measurement_active_ = false;
+    if (!roi_active_ && functional_warmup_instances_.empty()) cpl_measurement_active_ = false;
     if (global_roi_boundaries_) {
         std::fprintf(global_roi_boundaries_,
             "{\"event\":\"end\",\"core_id\":%u,\"workid\":%lu,"
@@ -1227,6 +1231,13 @@ TaoTrace::traceWorkEnd(uint32_t core_id, uint64_t workid,
 void
 TaoTrace::traceMeasurementBegin()
 {
+    // Auto instruction warmup and a delayed workload serial marker can both
+    // notify BEGIN. Reopening only the CPL clock would disagree with retained
+    // functional ordinals and the already-open independent native counters.
+    if (!functional_warmup_instances_.empty() &&
+        std::all_of(functional_warmup_instances_.begin(), functional_warmup_instances_.end(),
+            [](const TaoTrace *trace) { return trace->functional_measurement_started_; }))
+        return;
     // The serial marker is the one process-wide functional boundary. Capture
     // guest page-table state before opening any per-core measurement stream.
     if (!functional_warmup_instances_.empty()) {
