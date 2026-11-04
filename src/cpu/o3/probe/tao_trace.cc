@@ -6558,37 +6558,49 @@ TaoTrace::noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool 
             const auto &mask=req->getByteEnable();
             bool physical_identity=!saved->isSplit() && req->hasPaddr() &&
                 req->getPaddr()==hot.address;
+            bool uses_paged_fragments=false;
             if(saved->isSplit() && req->hasVaddr() && req->hasContextId() &&
                hot.size && hot.size<=64 && req->getSize()==hot.size && mask.size()==hot.size &&
                req->getVaddr()<=UINT64_MAX-(hot.size-1) && hot.address<=UINT64_MAX-(hot.size-1) &&
                std::all_of(mask.begin(),mask.end(),[](bool byte){return byte;})) {
                 uint64_t covered=0;
-                physical_identity=true;
+                bool contiguous=true,packets_proved=true;
+                const bool paged_geometry=fst_translations_ &&
+                    paged_request_fragments_match(hot.address,hot.size,inst->functionalTranslations);
+                bool paged_packets=paged_geometry;
                 try {
-                    // v1 supports at most 64 bytes with the target's 64B
-                    // lines: a dense split has at most two real fragments.
+                    // At most two real cache-line packets for this <=64B schema.
+                    // A virtual page boundary need not preserve physical adjacency.
                     for(unsigned index=0;covered<hot.size;++index) {
-                        if(index>=2) {physical_identity=false;break;}
+                        if(index>=2) {packets_proved=false;break;}
                         const auto part=saved->req(index);
                         if(!part || !part->hasPaddr() || !part->hasVaddr() || !part->hasContextId() ||
                            !part->getSize() || part->getSize()>hot.size-covered ||
-                           part->getPaddr()!=hot.address+covered || part->getVaddr()!=req->getVaddr()+covered ||
+                           part->getVaddr()!=req->getVaddr()+covered ||
+                           part->getPaddr()>UINT64_MAX-(part->getSize()-1) ||
+                           (!covered && part->getPaddr()!=hot.address) ||
                            part->contextId()!=req->contextId() || part->requestorId()!=req->requestorId() ||
                            uint64_t(part->getFlags())!=uint64_t(req->getFlags()) ||
                            part->isMasked() || part->isLocalAccess()) {
-                            physical_identity=false;break;
+                            packets_proved=false;break;
                         }
+                        contiguous &= part->getPaddr()==hot.address+covered;
+                        paged_packets &= paged_request_packet_matches(part->getVaddr(),part->getPaddr(),
+                            part->getSize(),inst->functionalTranslations);
                         covered+=part->getSize();
                     }
                 } catch(const std::out_of_range&) {
-                    physical_identity=false;
+                    packets_proved=false;
                 }
-                physical_identity &= covered==hot.size;
+                packets_proved &= covered==hot.size;
+                physical_identity=packets_proved && (contiguous || paged_packets);
+                uses_paged_fragments=physical_identity && !contiguous;
             }
             const bool identity=physical_identity && req->hasVaddr() && req->hasContextId() &&
                 req->getSize()==hot.size && hot.size<=64 && mask.size()==hot.size;
             if(identity) {
                 facts.attributes |= kStoreFactsComplete;
+                if(uses_paged_fragments) facts.attributes |= kStorePagedFragments;
                 facts.context=req->contextId();facts.requestor=req->requestorId();
                 for(unsigned i=0;i<mask.size();++i) if(mask[i]) facts.byte_enable |= uint64_t(1)<<i;
                 // Functional subset of LSQUnit::isOrdinaryStore, excluding
@@ -6626,6 +6638,7 @@ TaoTrace::writeFstMemoryRequestHeader(bool finalized)
     if (!out_fst_memory_requests_) return;
     if (out_fst_store_requests_) {
         fastsim::fst::StoreRequestHeader stores;
+        stores.version=2;
         stores.core_id=fst_core_id_;stores.flags=finalized?1:0;
         stores.record_count=fst_record_count_;stores.row_count=fst_store_request_rows_;
         stores.stream_hash=fst_memory_request_hash_;

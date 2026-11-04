@@ -5,6 +5,9 @@ from pathlib import Path
 POLICY_FILES = (
     'src/cpu/o3/probe/generate_static_uop_policy.py',
     'src/cpu/o3/probe/fst_static_uops.hh',
+    'src/cpu/o3/probe/fst_store_requests.hh',
+    'taogen/shared/fst_translation_facts.hh',
+    'taogen/shared/fst_dynamic_translation_writer.hh',
     'src/cpu/o3/probe/tao_trace.cc',
     'src/cpu/o3/probe/tao_trace.hh',
     'src/cpu/static_inst.hh',
@@ -15,6 +18,10 @@ POLICY_FILES = (
     'src/cpu/zero_idiom_info.hh',
     'src/cpu/o3/dyn_inst.hh',
     'src/cpu/o3/lsq_unit.hh',
+    'src/cpu/o3/lsq.hh',
+    'src/cpu/o3/lsq.cc',
+    'src/mem/request.hh',
+    'src/mem/functional_translation.hh',
     'src/cpu/o3/lsq_unit.cc',
 )
 POLICY_TREES = ('src/arch/x86/isa', 'src/arch/x86/insts', 'src/arch/x86/regs')
