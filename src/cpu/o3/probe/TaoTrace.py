@@ -101,6 +101,9 @@ class TaoTrace(ProbeListenerObject):
         "Retain every committed x86 syscall micro-op and annotate its entry "
         "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
         "preserves partial macros at the exact common cut.")
+    functional_asid_static_map = Param.Bool(False,
+        "Emit retired static instruction geometry and operands keyed by CR3 and PC in .imap v4. "
+        "Requires direct FST; contains no timing or speculative traffic.")
     functional_frontend = Param.Bool(False,
         "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
         "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
@@ -142,6 +145,10 @@ class TaoTrace(ProbeListenerObject):
         "established empty boundary; otherwise 'unknown' (partial coverage).")
     thread_state_marker_pc = Param.Addr(0,
         "Committed fastsim_wait_marker PC; zero disables all task state output.")
+    functional_task_clock = Param.Bool(False,
+        "Observe native BaseCPU task cycles under exact paired lifecycle cuts; oracle only.")
+    scheduler_account_out_pc = Param.Addr(0, "Byte-proved after-record task accounting out cut.")
+    scheduler_account_in_pc = Param.Addr(0, "Byte-proved after-record task accounting in cut.")
     scheduler_switch_pc = Param.Addr(0, "Audited __switch_to_asm entry PC.")
     scheduler_wakeup_pc = Param.Addr(0, "Audited successful trace_sched_wakeup entry PC.")
     scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")

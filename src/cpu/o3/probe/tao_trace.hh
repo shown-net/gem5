@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <list>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -31,6 +32,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/probe/perf_retirement.hh"
+#include "cpu/o3/probe/native_task_clock.hh"
 #include "lru_banked.hh"
 #include "fst_dynamic_translation_writer.hh"
 #include "retired_frontend_facts.hh"
@@ -577,12 +579,14 @@ private:
         std::array<uint64_t, 2> read_register_mask{};
         std::array<uint64_t, 2> write_register_mask{};
     };
+    using FstStaticInstructionKey = std::pair<uint64_t, uint64_t>;
     struct FstStaticInstructionPending : FstStaticInstruction {
+        uint64_t address_space_id = 0;
         std::array<uint64_t, 2> written_register_mask{};
         bool valid = false;
     };
-    std::map<uint64_t, FstStaticInstruction> fst_static_instructions_;
-    std::unordered_set<uint64_t> fst_static_unsupported_pcs_;
+    std::map<FstStaticInstructionKey, FstStaticInstruction> fst_static_instructions_;
+    std::set<FstStaticInstructionKey> fst_static_unsupported_pcs_;
     std::unordered_map<uint32_t, FstStaticInstructionPending>
         fst_static_pending_;
     // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
@@ -644,6 +648,7 @@ private:
     bool functional_syscall_microops_ = false;
     bool functional_frontend_ = false;
     bool functional_retirement_ = false;
+    bool functional_asid_static_map_ = false;
     bool functional_warmup_ = false;
     uint64_t functional_user_target_ = 0;
     uint64_t functional_sync_marker_pc_ = 0;
@@ -656,6 +661,17 @@ private:
     void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                             bool measurement);
     void finalizeFunctionalSync();
+    bool functional_task_clock_ = false;
+    uint64_t scheduler_account_out_pc_ = 0, scheduler_account_in_pc_ = 0;
+    CPU *task_clock_cpu_ = nullptr;
+    task_clock::Ledger native_task_clock_;
+    bool emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
+    void onTaskClockActive(const uint64_t &delta);
+    void onTaskClockSleeping(const bool &sleeping);
+    void onTaskClockCycles(const uint64_t &delta);
+    void closeTaskClock();
+    void finalizeTaskClock();
+    std::string taskClockMetadata() const;
     uint64_t thread_state_marker_pc_ = 0;
     uint64_t scheduler_switch_pc_ = 0;
     uint64_t scheduler_wakeup_pc_ = 0;

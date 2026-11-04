@@ -48,7 +48,7 @@ def main():
         # Re-check actual kernel bytes and machine-code witnesses, never trust
         # profile offsets alone. Unknown/host5.15 builds fail in this helper.
         thread_params, scheduler_identity = donor.thread_state_profile(
-            args.scheduler_profile, kernel.get_local_path())
+            args.scheduler_profile, kernel.get_local_path(), task_clock=args.task_clock)
         thread_params["thread_state_marker_pc"] = wait["marker_pc"]
 
     outdir = Path(m5.options.outdir)
