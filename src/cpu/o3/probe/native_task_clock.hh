@@ -23,6 +23,9 @@ struct Snapshot {
  std::string kind;uint64_t record_ordinal=0,tick=0,cycle=0,active_counter=0,sequence=0;
  int32_t pid=0;bool enabled=false,known=false;
 };
+struct RetirementStop {
+ uint64_t record_ordinal=0,tick=0,cycle=0,active_counter=0,next_sequence=0;
+};
 struct Interval {
  uint64_t start_tick=0,end_tick=0,start_cycle=0,end_cycle=0,active_cycles=0;
  uint64_t start_sequence=0,end_sequence=0;
@@ -117,6 +120,31 @@ class Ledger {
   if(!measuring_||closed_)reject("native-roi-end-order");
   snapshot("roi_end",tick,cycle,period,ordinal);closed_=true;measuring_=false;
  }
+ // A source-stop marker is an observer-local counter read, not a new native
+ // counter event. It neither splits RLE runs nor advances eligibility/sequence.
+ void observe_retirement(uint64_t tick,uint64_t cycle,uint64_t period,uint64_t ordinal) {
+  if(!observed_){reject("native-retirement-stop-unobserved");return;}
+  if(!period||period!=period_){reject("native-retirement-stop-frequency");return;}
+  if(have_active_||have_sleeping_){reject("native-retirement-stop-incomplete-counter");return;}
+  if(!ordinal||cycle<last_cycle_||tick<last_tick_||
+     (state_==State::On&&cycle-last_cycle_>UINT32_MAX)||
+     (have_retirement_stop_&&(ordinal<=retirement_stop_.record_ordinal||
+       tick<retirement_stop_.tick||cycle<retirement_stop_.cycle))){
+   reject("native-retirement-stop-order");return;
+  }
+  if(closed_&&(snapshots_.empty()||snapshots_.back().kind!="roi_end"||
+      tick>snapshots_.back().tick||cycle>snapshots_.back().cycle)){
+   reject("native-retirement-stop-after-common-cut");return;
+  }
+  uint64_t total=counter_;
+  if(state_==State::On){
+   const auto tail=cycle-last_cycle_;
+   if(tail>UINT64_MAX-total){reject("native-retirement-stop-overflow");return;}
+   total+=tail;
+  }
+  retirement_stop_={ordinal,tick,cycle,total,sequence_};have_retirement_stop_=true;
+ }
+ const RetirementStop* retirement_stop()const{return have_retirement_stop_?&retirement_stop_:nullptr;}
  // Exactly the accepted retired macro population, excluding hardware entries.
  void macro(bool completes,bool pseudo) {
   if(measuring_&&!closed_&&completes&&!pseudo) {
@@ -140,6 +168,10 @@ class Ledger {
  const auto& errors()const{return errors_;}
  void reject(const std::string &reason){errors_.insert(reason);}
  void write_json(std::ostream &o)const {
+  if(have_retirement_stop_)o<<"\"retirement_stop\":{\"schema\":\"gem5-retirement-stop-v1\","
+    <<"\"record_ordinal\":"<<retirement_stop_.record_ordinal<<",\"tick\":"<<retirement_stop_.tick
+    <<",\"cycle\":"<<retirement_stop_.cycle<<",\"active_counter\":"<<retirement_stop_.active_counter
+    <<",\"next_sequence\":"<<retirement_stop_.next_sequence<<"},";
   if(epoch_)o<<"\"counter_epoch\":{\"schema\":\"gem5-basecpu-counter-epoch-v1\","
     <<"\"source\":\"BaseCPU::previousState/previousCycle\",\"sequence\":0,\"tick\":"<<epoch_tick_
     <<",\"cycle\":"<<epoch_cycle_<<",\"previous_cycle\":"<<epoch_previous_
@@ -191,6 +223,7 @@ class Ledger {
   }
   snapshots_.push_back(s);break_run_=true;
  }
+ RetirementStop retirement_stop_;bool have_retirement_stop_=false;
  State state_=State::Sleep;uint64_t last_cycle_=0,last_tick_=0,counter_=0,period_=0,sequence_=0,pending_active_=0;
  bool epoch_=false;uint64_t epoch_tick_=0,epoch_cycle_=0,epoch_previous_=0;State epoch_state_=State::Sleep;
  int pending_sleeping_=-1;bool have_active_=false,have_sleeping_=false,observed_=false,break_run_=true;

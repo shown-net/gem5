@@ -7934,6 +7934,16 @@ TaoTrace::onTaskClockCycles(const uint64_t &delta)
 }
 
 void
+TaoTrace::observeTaskClockRetirement(uint64_t record_ordinal)
+{
+    if (!functional_task_clock_) return;
+    ensureTaskClockCounter();
+    native_task_clock_.observe_retirement(uint64_t(curTick()),
+        uint64_t(task_clock_cpu_->curCycle()), uint64_t(task_clock_cpu_->clockPeriod()),
+        record_ordinal);
+}
+
+void
 TaoTrace::closeTaskClock()
 {
     if (!functional_task_clock_ || native_task_clock_.closed()) return;
@@ -8524,6 +8534,11 @@ TaoTrace::onCommit(const DynInstPtr &inst)
         emitFunctionalSync(inst, sync_ordinal, sync_measurement);
     if (out_thread_state_ && fst_record_count_ == sync_ordinal + 1)
         emitThreadState(inst, sync_ordinal, sync_measurement);
+    // Keep the final source counter at this record's retirement, after any
+    // after-record lifecycle cut. The target-closing record is retained even
+    // when accumulateMicro has already closed the shared observation window.
+    if (functional_task_clock_ && fst_record_count_ == sync_ordinal + 1)
+        observeTaskClockRetirement(fst_record_count_);
     if (state_capture && fst_record_count_ == sync_ordinal &&
         (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
         isThreadStateHook(inst->pcState().instAddr()))

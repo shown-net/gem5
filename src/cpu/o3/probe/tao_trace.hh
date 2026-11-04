@@ -673,6 +673,7 @@ private:
     void onTaskClockSleeping(const bool &sleeping);
     void onTaskClockCycles(const uint64_t &delta);
     void closeTaskClock();
+    void observeTaskClockRetirement(uint64_t record_ordinal);
     void finalizeTaskClock();
     std::string taskClockMetadata() const;
     uint64_t thread_state_marker_pc_ = 0;
