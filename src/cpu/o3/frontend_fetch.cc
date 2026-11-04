@@ -164,6 +164,8 @@ Fetch::fetchFrontend(bool &status_change)
                 xpc.size(cached->bytes);
                 xpc.functionalBytes(cached->functionalBytes,cached->functionalByteCount,
                                     cached->functionalDecoderContext);
+                if (cpu->instructionTranslationObservation)
+                    xpc.instructionTranslation(frontend->instructionTranslation(at.instAddr(),cached->bytes));
                 xpc.npc(xpc.pc() + cached->bytes);
                 offset = 0;
                 dec->reset();
@@ -182,6 +184,9 @@ Fetch::fetchFrontend(bool &status_change)
                     decodeCanReuse &= frontend->instructionBytes->canReuse();
                     std::memcpy(dec->moreBytesPtr(),
                                 frontend->instructionBytes->at(chunk), instSize);
+                    if (cpu->instructionTranslationObservation)
+                        dec->observeInstructionChunk(frontend->instructionBytes->instructionTranslation(chunk,instSize),
+                            cpu->tcBase(tid)->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff));
                     dec->moreBytes(at, address);
                     if (dec->needMoreBytes()) offset += instSize;
                 }
@@ -231,6 +236,7 @@ Fetch::fetchFrontend(bool &status_change)
             replay.functionalBytes(decoded.functionalBytes(),
                                    decoded.functionalByteCount(),
                                    decoded.functionalDecoderContext());
+            replay.instructionTranslation(decoded.instructionTranslation());
         }
         if (sharesAllocation(current_macro) &&
             at.microPC() == 0 &&

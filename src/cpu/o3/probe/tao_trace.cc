@@ -703,6 +703,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_include_kernel_(params.functional_include_kernel),
       functional_syscall_microops_(params.functional_syscall_microops),
       functional_frontend_(params.functional_frontend),
+      functional_instruction_translations_(params.functional_instruction_translations),
       functional_retirement_(params.functional_retirement),
       functional_asid_static_map_(params.functional_asid_static_map),
       functional_warmup_(params.functional_warmup),
@@ -810,6 +811,13 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     // particular core happened to retire a CPL0 instruction in the window.
     if (functional_include_kernel_) {
         fst_feature_flags_ |= kFstFeaturePrivilege;
+    }
+    if (functional_instruction_translations_) {
+        if (!functional_frontend_ || !task_clock_cpu_ || !FullSystem)
+            throw std::runtime_error("instruction translation observation requires FS O3 retired frontend capture");
+        // Constructor runs before CPU startup, including fetches before ROI.
+        // Only metadata allocation changes; no native target parameter changes.
+        task_clock_cpu_->instructionTranslationObservation=true;
     }
     openOutput();
     openFunctionalSync();
@@ -1006,6 +1014,12 @@ TaoTrace::openOutput()
                     fst_frontend_ = std::make_unique<fastsim::fst::RetiredFrontendWriter>(
                         fst_path_ + ".ffe.gz", static_cast<uint32_t>(fst_core_id_));
                     fst_feature_flags_ |= fastsim::fst::kRetiredFrontendFacts;
+                    if (functional_instruction_translations_) {
+                        fst_instruction_translations_=std::make_unique<fastsim::fst::InstructionTranslationWriter>(
+                            fst_path_+".ixlat.gz",static_cast<uint32_t>(fst_core_id_),
+                            fastsim::fst::kStaticUopPolicySha256);
+                        fst_feature_flags_|=fastsim::fst::kInstructionTranslations;
+                    }
                 }
                 writeFstMemoryRequestHeader(false);
                 fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
@@ -6336,6 +6350,10 @@ TaoTrace::flushFstFrontend(bool complete)
     if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
     else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
     fst_frontend_->append(fst_frontend_pending_);
+    if (fst_instruction_translations_) {
+        fst_instruction_translations_->append(fst_frontend_pending_,*fst_instruction_pending_);
+        fst_instruction_pending_.reset();
+    }
     fst_frontend_open_ = false;
 }
 
@@ -6401,11 +6419,34 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
             m.code_identity=frontend_hash(kFrontendHashSeed,&context,sizeof(context));
             m.code_identity=frontend_hash(m.code_identity,m.bytes.data(),m.instruction_size);
         }
+        if (fst_instruction_translations_) {
+            if (pseudo) fst_instruction_pending_=InstructionFetchFacts::pseudo(m.pc);
+            else if (pc.instructionTranslation()) fst_instruction_pending_=pc.instructionTranslation();
+            else {
+                auto unknown=std::make_shared<InstructionFetchFacts>();
+                unknown->pc=m.pc;unknown->bytes=m.instruction_size;fst_instruction_pending_=unknown;
+            }
+            const auto& facts=*fst_instruction_pending_;
+            // .ffe ASID is observed at retirement. Byte-origin translation
+            // and decoder-start contexts may predate a CR3 transition; retain
+            // both immutable contexts without relabelling or rewalking them.
+            if (facts.pc!=m.pc || facts.bytes!=m.instruction_size) {
+                auto unknown=std::make_shared<InstructionFetchFacts>();
+                unknown->pc=m.pc;unknown->bytes=m.instruction_size;
+                unknown->reason=InstructionFetchUnknown::ConflictingBytes;fst_instruction_pending_=unknown;
+            }
+        }
         m.semantic_identity=kFrontendHashSeed;
         fst_frontend_started_=first; fst_frontend_root_=root.get();
         fst_frontend_thread_=thread; fst_frontend_open_=true;
     }
     auto& m=fst_frontend_pending_;
+    if (fst_instruction_translations_ && !pseudo && fst_instruction_pending_->status!=InstructionFetchStatus::Unknown &&
+        (!pc.instructionTranslation() || !same_instruction_fetch(*fst_instruction_pending_,*pc.instructionTranslation()))) {
+        auto unknown=std::make_shared<InstructionFetchFacts>();
+        unknown->pc=m.pc;unknown->bytes=m.instruction_size;
+        unknown->reason=InstructionFetchUnknown::ConflictingBytes;fst_instruction_pending_=unknown;
+    }
     // Never use disassembly as identity: x86 operand formatting has scalar
     // width assertions that do not support every valid SIMD memory operation.
     // Exact code/context identity plus ordered static UOP/register facts retain
@@ -6437,6 +6478,7 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
     if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
     ++m.observed_uops; m.end_record=fst_record_count_+1;
     fst_frontend_->observe_record(record);
+    if (fst_instruction_translations_) fst_instruction_translations_->observe_record(record);
     if (!si->isMicroop() || si->isLastMicroop()) flushFstFrontend(true);
 }
 
@@ -7122,6 +7164,7 @@ TaoTrace::finalizeFst()
     if (fst_frontend_) {
         flushFstFrontend(false);
         fst_frontend_->finish(fst_record_count_);
+        if (fst_instruction_translations_) fst_instruction_translations_->finish(fst_record_count_);
     }
     fst_finalized_ = true;
     writeFstHeader();

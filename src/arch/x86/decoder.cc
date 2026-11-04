@@ -47,6 +47,8 @@ Decoder::doResetState()
     origPC = basePC + offset;
     DPRINTF(Decoder, "Setting origPC to %#x\n", origPC);
     instBytes.reset();
+    if (instructionObservation) instructionWitness.begin_observed(origPC,instructionAddressSpace);
+    else instructionWitness.clear();
     chunkIdx = 0;
 
     emi.rex = 0;
@@ -83,6 +85,7 @@ Decoder::process()
     }
 
     instBytes.chunks.push_back(fetchChunk);
+    if (instructionObservation && instructionChunk) instructionWitness.observe(*instructionChunk);
 
     // While there's still something to do...
     while (!instDone && !outOfBytes) {
@@ -683,6 +686,8 @@ Decoder::decode(PCStateBase &next_pc)
         }
         functionalPC.functionalBytes(functionalBytes,functionalSize,frontendContext());
     } else functionalPC.functionalBytes(functionalBytes,0,frontendContext());
+    if (instructionObservation && functionalSize && functionalSize<=15)
+        functionalPC.instructionTranslation(instructionWitness.snapshot(functionalSize));
 
     StaticInstPtr &si = instBytes.si;
     if (si)

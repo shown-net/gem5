@@ -37,6 +37,7 @@
 #include "lru_banked.hh"
 #include "fst_dynamic_translation_writer.hh"
 #include "retired_frontend_facts.hh"
+#include "fst_instruction_translations.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
 #include "params/TaoTrace.hh"
@@ -542,6 +543,8 @@ private:
     retirement::Ledger functional_retirement_ledger_;
 
     std::unique_ptr<fastsim::fst::RetiredFrontendWriter> fst_frontend_;
+    std::unique_ptr<fastsim::fst::InstructionTranslationWriter> fst_instruction_translations_;
+    std::shared_ptr<const fastsim::fst::InstructionFetchFacts> fst_instruction_pending_;
     fastsim::fst::RetiredFrontendMacro fst_frontend_pending_{};
     const StaticInst* fst_frontend_root_ = nullptr;
     uint32_t fst_frontend_thread_ = 0;
@@ -654,6 +657,7 @@ private:
     bool functional_include_kernel_ = false;
     bool functional_syscall_microops_ = false;
     bool functional_frontend_ = false;
+    bool functional_instruction_translations_ = false;
     bool functional_retirement_ = false;
     bool functional_asid_static_map_ = false;
     bool functional_warmup_ = false;

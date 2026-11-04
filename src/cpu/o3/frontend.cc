@@ -40,16 +40,29 @@ InstructionBytes::waiting(bool translation, bool response, bool retry)
 
 void
 InstructionBytes::complete(Addr va, Addr pa, const uint8_t *bytes,
-        unsigned count, uint64_t cycle, bool can_reuse)
+        unsigned count, uint64_t cycle, bool can_reuse,
+        std::optional<fastsim::fst::TranslationFragment> facts)
 {
     fatal_if(count != data.size(), "Instruction response size mismatch");
     std::memcpy(data.data(), bytes, count);
+    translation=std::move(facts);
     virtualBase = va;
     physicalBase = pa;
     valid = true;
     reusable = can_reuse;
     readyCycle = cycle + 1;
     stats.returnedBytes += count;
+}
+
+fastsim::fst::TranslationFragment
+InstructionBytes::instructionTranslation(Addr address, unsigned count) const
+{
+    fastsim::fst::TranslationFragment result;
+    result.virtual_address=address;result.size=count;
+    if (!contains(address) || !count || !contains(address+count-1)) return result;
+    result.physical_address=physicalBase+(address-virtualBase);
+    if (translation) result.mapping=translation->mapping;
+    return result;
 }
 
 bool
@@ -101,6 +114,7 @@ InstructionBytes::invalidate()
     if (valid)
         ++stats.invalidations;
     valid = reusable = false;
+    translation.reset();
 }
 
 InstructionDeliveryQueue::Stats::Stats(statistics::Group *parent, unsigned cap)
@@ -763,16 +777,31 @@ FrontendCodeIdentity FrontendCoordinator::identity(Addr address) const
     return {address, addressSpace, decoderContext};
 }
 void
-FrontendCoordinator::translated(Addr va, Addr pa)
+FrontendCoordinator::translated(Addr va, Addr pa,
+        std::optional<fastsim::fst::TranslationFragment> facts)
 {
     va &= ~Addr(lineSize - 1);
     pa &= ~Addr(lineSize - 1);
     leases.erase(std::remove_if(leases.begin(), leases.end(),
         [&](const CodeLease &lease) { return lease.virtualBlock == va; }), leases.end());
-    leases.push_back({va, pa});
+    leases.push_back({va, pa, std::move(facts)});
     // Two adjacent blocks suffice for a maximum-length x86 instruction.
     while (leases.size() > 2) leases.pop_front();
     ++stats.translationValidations;
+}
+
+std::shared_ptr<const fastsim::fst::InstructionFetchFacts>
+FrontendCoordinator::instructionTranslation(Addr address, unsigned bytes) const
+{
+    fastsim::fst::InstructionByteWitness witness;
+    witness.begin_observed(address,addressSpace & ~uint64_t(0xfff));
+    for (const auto& lease:leases) {
+        fastsim::fst::TranslationFragment piece;
+        piece.virtual_address=lease.virtualBlock;piece.physical_address=lease.physicalBlock;piece.size=lineSize;
+        if (lease.translation) piece.mapping=lease.translation->mapping;
+        witness.observe(piece);
+    }
+    return witness.snapshot(bytes);
 }
 
 bool

@@ -64,6 +64,7 @@
 #include "mem/packet.hh"
 #include "mem/inst_code.hh"
 #include "mem/taotrace_response.hh"
+#include "mem/functional_translation.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/byteswap.hh"
 #include "sim/core.hh"
@@ -396,11 +397,16 @@ Fetch::processCacheCompletion(PacketPtr pkt)
 
     if (frontend) {
         const auto validity = pkt->req->getExtension<InstructionCodeValidity>();
+        std::optional<fastsim::fst::TranslationFragment> translation;
+        if (cpu->instructionTranslationObservation) {
+            const auto extension=pkt->req->getExtension<FunctionalTranslationExtension>();
+            if (extension) translation=extension->fragment;
+        }
         frontend->instructionBytes->complete(pkt->req->getVaddr(),
             pkt->req->getPaddr(), pkt->getConstPtr<uint8_t>(), fetchBufferSize,
             uint64_t(cpu->curCycle()), !pkt->req->isUncacheable() &&
             !(validity && validity->stale) &&
-            requestEpoch[tid] == frontend->dsb->epoch());
+            requestEpoch[tid] == frontend->dsb->epoch(),std::move(translation));
     } else {
         memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
     }
@@ -657,7 +663,12 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
     // If translation was successful, attempt to read the icache block.
     if (fault == NoFault) {
         if (frontend) {
-            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr());
+            std::optional<fastsim::fst::TranslationFragment> translation;
+            if (cpu->instructionTranslationObservation) {
+                const auto extension=mem_req->getExtension<FunctionalTranslationExtension>();
+                if (extension) translation=extension->fragment;
+            }
+            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr(),std::move(translation));
             // A validated DSB hit consumes no native I-cache request.
             const auto identity = frontend->identity(pc[tid]->instAddr());
             const auto *value = frontend->dsb->candidate(identity,

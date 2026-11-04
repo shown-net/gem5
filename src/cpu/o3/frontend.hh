@@ -3,6 +3,8 @@
 #define __CPU_O3_FRONTEND_HH__
 
 #include <array>
+#include <optional>
+#include "fst_instruction_fetch.hh"
 #include <deque>
 #include <functional>
 #include <list>
@@ -28,6 +30,7 @@ class InstructionBytes : public SimObject
     std::vector<uint8_t> data;
     bool valid = false;
     bool reusable = false;
+    std::optional<fastsim::fst::TranslationFragment> translation;
     Addr virtualBase = 0, physicalBase = 0;
     uint64_t readyCycle = 0;
     uint64_t serviceCycle = ~uint64_t(0);
@@ -43,7 +46,9 @@ class InstructionBytes : public SimObject
     void waiting(bool translation, bool response, bool retry);
     void complete(Addr virtual_address, Addr physical_address,
                   const uint8_t *bytes, unsigned count,
-                  uint64_t cycle, bool can_reuse);
+                  uint64_t cycle, bool can_reuse,
+                  std::optional<fastsim::fst::TranslationFragment> facts = std::nullopt);
+    fastsim::fst::TranslationFragment instructionTranslation(Addr address, unsigned count) const;
     bool serve(Addr address, unsigned count, uint64_t cycle);
     const uint8_t *at(Addr address) const;
     bool contains(Addr address) const;
@@ -194,7 +199,8 @@ class DsbTemplates : public MiteService
 /** One clock owner; source components own their accepting and serving state. */
 class FrontendCoordinator : public SimObject
 {
-    struct CodeLease { Addr virtualBlock, physicalBlock; };
+    struct CodeLease { Addr virtualBlock, physicalBlock;
+        std::optional<fastsim::fst::TranslationFragment> translation; };
     std::deque<CodeLease> leases;
     uint64_t addressSpace = ~uint64_t(0), decoderContext = ~uint64_t(0);
     unsigned lineSize = 0, outputWidth = 0;
@@ -249,7 +255,9 @@ class FrontendCoordinator : public SimObject
     void context(uint64_t address_space, uint64_t decoder_context);
     void redirect(InstSeqNum through) { ++stats.redirects; cancelAfter(through); }
     FrontendCodeIdentity identity(Addr address) const;
-    void translated(Addr virtual_address, Addr physical_address);
+    void translated(Addr virtual_address, Addr physical_address,
+        std::optional<fastsim::fst::TranslationFragment> facts = std::nullopt);
+    std::shared_ptr<const fastsim::fst::InstructionFetchFacts> instructionTranslation(Addr address, unsigned bytes) const;
     bool physicalBlocks(Addr address, unsigned bytes, std::vector<Addr> &out) const;
     const FrontendTemplate *lookup(Addr address, uint64_t cycle);
     Addr validationAddress(Addr address, uint64_t cycle) const;

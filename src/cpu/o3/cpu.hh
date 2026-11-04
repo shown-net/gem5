@@ -102,6 +102,8 @@ class CPU : public BaseCPU
 {
   public:
     bool markerObservation = false;
+    // Enabled by the observer constructor before the first Execute request.
+    bool instructionTranslationObservation = false;
     const bool tmaEnabled;
     FrontendCoordinator *frontend = nullptr;
     ResultForwarding *resultForwarding = nullptr;

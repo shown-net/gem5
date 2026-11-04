@@ -107,6 +107,9 @@ class TaoTrace(ProbeListenerObject):
     functional_frontend = Param.Bool(False,
         "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
         "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
+    functional_instruction_translations = Param.Bool(False,
+        "Observe immutable Execute translation provenance from startup and bind retired macro bytes in .ixlat.gz. "
+        "Requires functional_frontend; restored TLB paths remain explicitly unknown. No timing inputs.")
     functional_retirement = Param.Bool(False,
         "Emit full-population-bound .fsem v2 functional hardware-entry and precise-fault "
         "origin facts without task-state accounting. Requires kernel-inclusive direct FST "
