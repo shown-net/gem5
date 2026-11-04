@@ -248,3 +248,15 @@ class MESIThreeLevelCacheHierarchy(
         L2Cache._version = 0
         L3Cache._version = 0
         DMAController._version = 0
+
+
+class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
+    """Selected SPR private caches with system-supplied LLC geometry."""
+
+    def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int):
+        super().__init__(
+            l1i_size="32KiB", l1i_assoc=8,
+            l1d_size="48KiB", l1d_assoc=12,
+            l2_size="2MiB", l2_assoc=16,
+            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
+        )

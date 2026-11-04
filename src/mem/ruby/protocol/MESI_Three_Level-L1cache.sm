@@ -47,7 +47,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
    RubyPrefetcher * prefetcher;
    bool enable_prefetch := "False";
    // Optional access-sequence candidate: allocation already inserted the line.
-   bool preserve_insertion_age := "False";
    MessageBuffer * prefetchQueue;
 
    // Message Buffers between the L1 and the L0 Cache
@@ -177,7 +176,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     bool Dirty, default="false",   desc="data is dirty";
     int pendingAcks, default="0", desc="number of pending acks";
     bool countsLineFill, default="false", desc="This TBE owns an L2 fill credit";
-    bool replacementInserted, default="false", desc="Replacement entry was inserted by this miss";
   }
 
   structure(TBETable, external="yes") {
@@ -531,17 +529,11 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(pm_markPrefetched, "pm", desc="Mark a completed private L2 prefetch") {
     cache_entry.isPrefetched := true;
-    if (!preserve_insertion_age) {
-      cache.setMRU(address);
-    }
+    cache.setMRU(address);
   }
 
   action(pl_observeLatePrefetch, "pl", desc="Observe demand merging into an L2 prefetch") {
     prefetcher.observePfMiss(address);
-    if (preserve_insertion_age) {
-      // Treat demand merging as a hit after the prefetch's insertion.
-      cache.setMRU(address);
-    }
   }
 
   action(a_issueGETS, "a", desc="Issue GETS") {
@@ -882,10 +874,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
           out_msg.MessageSize := MessageSizeType:Response_Data;
       }
 
-      if (!preserve_insertion_age || !is_valid(tbe) ||
-          !tbe.replacementInserted) {
-        cache.setMRU(address);
-      }
+      cache.setMRU(address);
   }
 
   action(hh_xdata_to_l0, "\h", desc="If not prefetch, notify sequencer that store completed.") {
@@ -903,10 +892,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
           //cache_entry.Dirty := true;
       }
 
-      if (!preserve_insertion_age || !is_valid(tbe) ||
-          !tbe.replacementInserted) {
-        cache.setMRU(address);
-      }
+      cache.setMRU(address);
   }
 
   action(h_stale_data_to_l0, "hs", desc="If not prefetch, send data to the L0 cache.") {
@@ -946,7 +932,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(ri_markReplacementInsertion, "ri", desc="Remember that a miss inserted replacement state") {
     assert(is_valid(tbe));
-    tbe.replacementInserted := true;
   }
 
   action(k_popL0RequestQueue, "k", desc="Pop mandatory queue.") {

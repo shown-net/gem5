@@ -80,7 +80,6 @@ BAC::BAC(CPU *_cpu, const BaseO3CPUParams &params)
       ftq(nullptr),
       wroteToTimeBuffer(false),
       decoupledFrontEnd(params.decoupledFrontEnd),
-      bacDirectChainZeroLatency(params.bacDirectChainZeroLatency),
       fetchToBacDelay(params.fetchToBacDelay),
       decodeToFetchDelay(params.decodeToFetchDelay),
       commitToFetchDelay(params.commitToFetchDelay),
@@ -745,19 +744,7 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         const uint64_t ready = branch_found ? lookup_ready + 1 : cycle;
         curFT->setReadyCycle(ready);
         if (predict_taken) {
-            // Diagnostic only: with a configured zero-cycle BTB lookup,
-            // permit the next direct JMP prediction in this same cycle.
-            // Nonzero lookup latency and every other branch keep the
-            // existing target-feedback timing.
-            const bool chainDirect = bacDirectChainZeroLatency &&
-                lookup_ready == cycle && staticInst &&
-                staticInst->isDirectCtrl() && staticInst->isUncondCtrl() &&
-                !staticInst->isCall() && !staticInst->isReturn() &&
-                !staticInst->isMicrocodeControl() &&
-                (!staticInst->isMicroop() ||
-                 (staticInst->isFirstMicroop() && staticInst->isLastMicroop()));
-            targetReadyCycle[tid] = chainDirect ? cycle :
-                std::max(cycle + 1, lookup_ready);
+            targetReadyCycle[tid] = std::max(cycle + 1, lookup_ready);
         }
 
         ftq->insert(tid, curFT);

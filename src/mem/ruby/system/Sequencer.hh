@@ -260,7 +260,6 @@ class Sequencer : public RubyPort
     // RequestTable contains both read and write requests, handles aliasing
     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
     std::deque<const Request *> m_orderedStores;
-    bool m_parkOrderedStores = false;
     std::unordered_set<Addr> m_parkedOrderedLines;
     void wakeParkedOrderedHead();
     bool m_orderedLineValid = false;

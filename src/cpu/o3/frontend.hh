@@ -2,6 +2,7 @@
 #ifndef __CPU_O3_FRONTEND_HH__
 #define __CPU_O3_FRONTEND_HH__
 
+#include <array>
 #include <deque>
 #include <functional>
 #include <list>
@@ -156,6 +157,9 @@ struct FrontendTemplate
     std::vector<Addr> physicalBlocks;
     uint64_t available;
     bool sharedAllocation;
+    std::array<uint8_t,15> functionalBytes{};
+    uint8_t functionalByteCount=0;
+    uint64_t functionalDecoderContext=0;
 };
 
 class DsbTemplates : public MiteService

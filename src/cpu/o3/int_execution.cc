@@ -158,7 +158,7 @@ ResultForwarding::Stats::Stats(statistics::Group *parent)
 }
 
 ResultForwarding::ResultForwarding(const ResultForwardingParams &p)
-    : SimObject(p), paths(p.paths), fpFastAdderBypass(p.fpFastAdderBypass),
+    : SimObject(p), paths(p.paths),
       wakeEvent([this] { wakeConsumers(); }, name() + ".path_ready"), stats(this)
 {}
 
@@ -180,7 +180,7 @@ ResultForwarding::track(const DynInstPtr &inst, bool managed)
         panic_if(found != producers.end() && found->second.producer &&
                  found->second.producer != inst && !found->second.producer->isSquashed(),
                  "Result version reused before PRF writeback");
-        const bool fp_fast = fpFastAdderBypass && !managed &&
+        const bool fp_fast = !managed &&
             inst->opClass() == FloatAddOp && reg->classValue() == FloatRegClass;
         if (!managed && !fp_fast) {
             producers.erase(reg->flatIndex());

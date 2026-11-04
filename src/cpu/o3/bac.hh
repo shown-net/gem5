@@ -392,7 +392,6 @@ class BAC
 
     /** Enables the decoupled front-end */
     const bool decoupledFrontEnd;
-    const bool bacDirectChainZeroLatency;
 
     /** Fetch to BAC delay. */
     const Cycles fetchToBacDelay;

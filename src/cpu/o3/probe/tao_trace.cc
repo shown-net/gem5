@@ -699,6 +699,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_user_only_(params.functional_user_only),
       functional_include_kernel_(params.functional_include_kernel),
       functional_syscall_microops_(params.functional_syscall_microops),
+      functional_frontend_(params.functional_frontend),
       functional_warmup_(params.functional_warmup),
       functional_user_target_(params.functional_user_target),
       functional_sync_marker_pc_(params.functional_sync_marker_pc),
@@ -781,6 +782,9 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
             throw std::runtime_error("raw syscall micro-ops require kernel-inclusive direct FST");
         fst_feature_flags_ |= kFstRawSyscallMicroops;
     }
+    if (functional_frontend_ && (!functional_syscall_microops_ || !functional_include_kernel_ ||
+        !emit_micro_ || trace_format_ != TraceFormat::FST))
+        throw std::runtime_error("functional frontend requires retired kernel-inclusive direct FST and raw syscall micro-ops");
     // The bit declares the configured record encoding, not whether this
     // particular core happened to retire a CPL0 instruction in the window.
     if (functional_include_kernel_) {
@@ -964,6 +968,11 @@ TaoTrace::openOutput()
                     if (!out_fst_retirement_)
                         throw std::runtime_error("TaoTrace cannot open functional retirement companion");
                     fst_feature_flags_|=fastsim::fst::kFunctionalRetirement;
+                }
+                if (functional_frontend_) {
+                    fst_frontend_ = std::make_unique<fastsim::fst::RetiredFrontendWriter>(
+                        fst_path_ + ".ffe.gz", static_cast<uint32_t>(fst_core_id_));
+                    fst_feature_flags_ |= fastsim::fst::kRetiredFrontendFacts;
                 }
                 writeFstMemoryRequestHeader(false);
                 fst_feature_flags_ |= fastsim::fst::kCompleteDependencies;
@@ -6138,6 +6147,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         }
         if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
             throw std::runtime_error("TaoTrace failed writing functional FST record");
+        if (fst_frontend_) observeFstFrontend(inst, &rec, address_space_id);
         // memReqFlags are the functional request flags captured by LSQ
         // translation. NO_ACCESS retains address translation/faults and the SQ
         // entry but uses a local accessor, never a Ruby data write.
@@ -6178,6 +6188,118 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         uint32_t key = encodeReg(kv.first, kv.second);
         lw[key] = micro_seq;
     }
+}
+
+void
+TaoTrace::flushFstFrontend(bool complete)
+{
+    using namespace fastsim::fst;
+    if (!fst_frontend_open_) return;
+    if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
+    else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
+    fst_frontend_->append(fst_frontend_pending_);
+    fst_frontend_open_ = false;
+}
+
+void
+TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_t asid)
+{
+    using namespace fastsim::fst;
+    const auto si=inst->staticInst;
+    if (!si) throw std::runtime_error("retired frontend lacks static semantics");
+    const auto root=inst->macroop ? inst->macroop : si;
+    const bool pseudo=isRomMicroPC(inst->pcState().microPC()) && !inst->macroop;
+    const auto& pc=inst->pcState().as<X86ISA::PCState>();
+    const auto thread=getTraceThreadId(inst);
+    bool first=!si->isMicroop() || si->isFirstMicroop();
+    if (!first && !pseudo && inst->macroop) {
+        first=retirement::debugOnlyPrefix(inst->pcState().microPC(), [&](uint64_t i) {
+            const auto prefix=inst->macroop->fetchMicroop(i);
+            const bool debug=typeid(*prefix.get())==typeid(X86ISA::MicroDebug) &&
+                retirement::debugControlName(prefix->getName());
+            return retirement::DebugPrefixMember{prefix->isMicroop(),prefix->isFirstMicroop(),debug};
+        });
+    }
+    bool hardware_entry=false;
+    if (pseudo) {
+        using namespace X86ISAInst::rom_labels;
+        hardware_entry=retirement::knownRomEntry(inst->pcState().microPC(), MicroPCRomBit,
+            {extern_label_longModeInterrupt,extern_label_longModeSoftInterrupt,
+             extern_label_longModeInterruptWithError,extern_label_legacyModeInterrupt,
+             extern_label_initIntHalt,extern_label_realModeInterrupt});
+        first=hardware_entry;
+    } else if (si->isMicroop() && !inst->macroop) {
+        throw std::runtime_error("retired frontend micro-op has unsupported origin");
+    }
+    if (fst_frontend_open_ && (first || pc.instAddr()!=fst_frontend_pending_.pc ||
+        asid!=fst_frontend_pending_.address_space_id || thread!=fst_frontend_thread_ ||
+        (!pseudo && root.get()!=fst_frontend_root_) ||
+        pseudo!=bool(fst_frontend_pending_.flags&kFrontendPseudo))) flushFstFrontend(false);
+    if (!fst_frontend_open_) {
+        if (pseudo && !hardware_entry)
+            throw std::runtime_error("retired frontend pseudo stream lacks a known hardware-entry origin");
+        auto& m=fst_frontend_pending_; m=RetiredFrontendMacro{};
+        m.begin_record=fst_record_count_; m.end_record=fst_record_count_;
+        m.pc=pc.instAddr(); m.address_space_id=asid;
+        m.known_flags=kFrontendRequiredKnown;
+        if (!pseudo) m.flags|=kFrontendDsbEligible;
+        // A proven debug-only prefix omits no functional UOPs: its first
+        // retained member is the functional leader. The bounded prefix proof
+        // above requires exact unconditional MicroDebug types and checks every
+        // omitted operation; missing functional operations remain non-starts.
+        const bool observed_start=first || (!pseudo && inst->pcState().microPC()==0);
+        if (observed_start) m.flags|=kFrontendStartsMacro;
+        if (root->isMicroFusedMemory() || root->isStackRegAllocation()) m.flags|=kFrontendSharedAllocation;
+        if (pseudo || root->usesMicrocodeService()) m.flags|=kFrontendMicrocode;
+        if (pseudo) {
+            m.flags|=kFrontendPseudo;
+            const uint64_t micro_pc=inst->pcState().microPC();
+            m.code_identity=frontend_hash(kFrontendHashSeed,&micro_pc,sizeof(micro_pc));
+        } else {
+            if (!pc.size() || pc.size()>15 || pc.functionalByteCount()!=pc.size())
+                throw std::runtime_error("retired frontend lacks exact decoder instruction bytes");
+            m.instruction_size=pc.size(); m.bytes=pc.functionalBytes();
+            const auto context=pc.functionalDecoderContext();
+            m.code_identity=frontend_hash(kFrontendHashSeed,&context,sizeof(context));
+            m.code_identity=frontend_hash(m.code_identity,m.bytes.data(),m.instruction_size);
+        }
+        m.semantic_identity=kFrontendHashSeed;
+        fst_frontend_started_=first; fst_frontend_root_=root.get();
+        fst_frontend_thread_=thread; fst_frontend_open_=true;
+    }
+    auto& m=fst_frontend_pending_;
+    // Never use disassembly as identity: x86 operand formatting has scalar
+    // width assertions that do not support every valid SIMD memory operation.
+    // Exact code/context identity plus ordered static UOP/register facts retain
+    // functional distinctions without formatting operands or reading values.
+    const auto name=si->getName();
+    const uint64_t semantic_fields[]={2, m.code_identity,
+        uint64_t(si->opClass()),uint64_t(inst->pcState().microPC()),
+        uint64_t(si->numSrcRegs()),uint64_t(si->numDestRegs()),uint64_t(name.size()),
+        uint64_t(si->isMicroFusedMemory()),uint64_t(si->isStackRegAllocation()),
+        uint64_t(si->isControl()),uint64_t(si->isCondCtrl()),uint64_t(si->isIndirectCtrl()),
+        uint64_t(si->isCall()),uint64_t(si->isReturn()),uint64_t(si->isLoad()),
+        uint64_t(si->isStore()),uint64_t(si->isAtomic()),uint64_t(si->isSerializing()),
+        uint64_t(si->isMicroop()),uint64_t(si->isFirstMicroop()),uint64_t(si->isLastMicroop())};
+    m.semantic_identity=frontend_hash(m.semantic_identity,semantic_fields,sizeof(semantic_fields));
+    m.semantic_identity=frontend_hash(m.semantic_identity,name.data(),name.size());
+    for (size_t index=0;index<si->numSrcRegs();++index) {
+        const auto& reg=si->srcRegIdx(index);
+        const uint64_t fields[]={0,uint64_t(index),uint64_t(reg.classValue()),uint64_t(reg.index())};
+        m.semantic_identity=frontend_hash(m.semantic_identity,fields,sizeof(fields));
+    }
+    for (size_t index=0;index<si->numDestRegs();++index) {
+        const auto& reg=si->destRegIdx(index);
+        const uint64_t fields[]={1,uint64_t(index),uint64_t(reg.classValue()),uint64_t(reg.index())};
+        m.semantic_identity=frontend_hash(m.semantic_identity,fields,sizeof(fields));
+    }
+    if (si->isControl() && !si->isCondCtrl()) m.flags|=kFrontendUnconditionalBranch;
+    if (si->isControl() && si->isMicroop() && !si->isLastMicroop())
+        m.flags&=~kFrontendDsbEligible;
+    if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
+    ++m.observed_uops; m.end_record=fst_record_count_+1;
+    fst_frontend_->observe_record(record);
+    if (!si->isMicroop() || si->isLastMicroop()) flushFstFrontend(true);
 }
 
 void
@@ -6657,6 +6779,10 @@ TaoTrace::finalizeFst()
     writeFstMemoryRequestHeader(true);
     if (fst_translations_)
         fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
+    if (fst_frontend_) {
+        flushFstFrontend(false);
+        fst_frontend_->finish(fst_record_count_);
+    }
     fst_finalized_ = true;
     writeFstHeader();
     writeFstVirtualPageMap();

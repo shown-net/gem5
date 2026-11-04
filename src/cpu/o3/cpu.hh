@@ -690,7 +690,7 @@ class CPU : public BaseCPU
     struct InstRetiredStats : public statistics::Group
     {
         explicit InstRetiredStats(CPU *cpu);
-        statistics::Scalar ANY;
+        statistics::Scalar ANY, MACRO_FUSED;
     } instRetiredStats;
 
     struct UopsRetiredStats : public statistics::Group

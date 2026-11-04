@@ -58,19 +58,12 @@ from m5.SimObject import *
 
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
-    enableCalibrationTMA = Param.Bool(False, "Enable single-thread Marker TMA accounting")
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/dyn_inst.hh"
     executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
     resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
     zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
     frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
-    frontendDirectMultiTaken = Param.Bool(
-        False, "Diagnostic: continue across ready direct JMP fetch targets"
-    )
-    bacDirectChainZeroLatency = Param.Bool(
-        False, "Diagnostic: chain zero-latency direct JMP predictions"
-    )
     intALU = Param.IntExecutionResource(NULL, "ALU execution family")
     intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
     intSHFT = Param.IntExecutionResource(NULL, "Shift/carry execution family")
@@ -147,10 +140,6 @@ class BaseO3CPU(BaseCPU):
     )
     dispatchWidth = Param.Unsigned(8, "Dispatch width")
     issueWidth = Param.Unsigned(8, "Issue width")
-    directJumpPortless = Param.Bool(
-        False,
-        "Diagnostic: issue direct unconditional non-call jumps without an execution port",
-    )
     wbWidth = Param.Unsigned(8, "Writeback width")
 
     iewToCommitDelay = Param.Cycles(

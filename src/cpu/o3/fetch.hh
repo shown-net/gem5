@@ -414,7 +414,6 @@ class Fetch
     /** Pointer to the O3CPU. */
     CPU *cpu;
     FrontendCoordinator *frontend;
-    const bool frontendDirectMultiTaken;
 
     /** Time buffer interface. */
     TimeBuffer<TimeStruct> *timeBuffer;

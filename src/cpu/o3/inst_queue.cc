@@ -207,7 +207,12 @@ IQUnit::numFreeEntries(const DynInstPtr &inst) const
 bool
 IQUnit::allows(const DynInstPtr &inst) const
 {
-    const OpClass op_class = inst->opClass();
+    return allows(inst->opClass());
+}
+
+bool
+IQUnit::allows(OpClass op_class) const
+{
     const auto contains = [op_class](const auto &items) {
         return std::find(items.begin(), items.end(), op_class) != items.end();
     };
@@ -252,7 +257,6 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
       iqs(params.instQueues),
       numThreads(params.numThreads),
       totalWidth(params.issueWidth),
-      directJumpPortless(params.directJumpPortless),
       commitToIEWDelay(params.commitToIEWDelay),
       iqStats(cpu, totalWidth),
       iqIOStats(cpu)
@@ -319,8 +323,6 @@ InstructionQueue::IQStats::IQStats(CPU *cpu, const unsigned &total_width)
                "Number of float instructions issued"),
       ADD_STAT(branchInstsIssued, statistics::units::Count::get(),
                "Number of branch instructions issued"),
-      ADD_STAT(directJumpPortlessIssued, statistics::units::Count::get(),
-               "Direct jumps issued without an execution-port grant"),
       ADD_STAT(memInstsIssued, statistics::units::Count::get(),
                "Number of memory instructions issued"),
       ADD_STAT(miscInstsIssued, statistics::units::Count::get(),
@@ -963,17 +965,7 @@ InstructionQueue::scheduleReadyInsts()
         IQUnit *iq = issuing_inst->iq;
         assert(iq);
         auto fu_pool = iq->fuPool();
-        // Diagnostic only: keep normal IQ, issue, execution and recovery
-        // semantics while removing the execution-port grant for simple direct jumps.
-        const bool portless_jump = directJumpPortless &&
-            issuing_inst->isDirectCtrl() && issuing_inst->isUncondCtrl() &&
-            !issuing_inst->isCall() && !issuing_inst->isReturn() &&
-            !issuing_inst->staticInst->isMicrocodeControl() &&
-            // x86 Jmprel reads the CS effective-base misc register. IQ
-            // readiness and functional execution still process that source.
-            issuing_inst->numSrcRegs() <= 1 && issuing_inst->numDestRegs() == 0;
-        const bool managed = !portless_jump &&
-            fu_pool->usesIntegerResources(issuing_inst);
+        const bool managed = fu_pool->usesIntegerResources(issuing_inst);
         bool path_blocked = false;
         if (!managed && cpu->resultForwarding) {
             auto pathAvailable = [this](const DynInstPtr &inst) {
@@ -997,8 +989,7 @@ InstructionQueue::scheduleReadyInsts()
             }
             iqIOStats.intAluAccesses++;
         }
-        if (op_class != No_OpClass && !managed && !path_blocked &&
-            !portless_jump) {
+        if (op_class != No_OpClass && !managed && !path_blocked) {
             idx = fu_pool->getUnit(op_class, cpu->curCycle(),
                                    issuing_inst->isStore() &&
                                    !issuing_inst->isStoreAddress(),
@@ -1078,8 +1069,6 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
-            if (portless_jump)
-                ++iqStats.directJumpPortlessIssued;
             ++total_issued;
 
 #if TRACING_ON
@@ -1271,8 +1260,7 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst)
         // Mark the scoreboard as having that register ready.
         regScoreboard[dest_reg->flatIndex()] = true;
     }
-    if (completed_inst->opClass() == FloatAddOp && cpu->resultForwarding &&
-        cpu->resultForwarding->tracksFastAdder())
+    if (completed_inst->opClass() == FloatAddOp && cpu->resultForwarding)
         cpu->resultForwarding->release(completed_inst);
     return dependents;
 }

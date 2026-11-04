@@ -33,6 +33,7 @@
 #include "cpu/o3/probe/perf_retirement.hh"
 #include "lru_banked.hh"
 #include "fst_dynamic_translation_writer.hh"
+#include "retired_frontend_facts.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
 #include "params/TaoTrace.hh"
@@ -45,6 +46,7 @@
 namespace gem5
 {
 class ThreadContext;
+class StaticInst;
 
 namespace o3
 {
@@ -523,6 +525,13 @@ private:
     uint64_t fst_retirement_rows_ = 0;
     void noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
 
+    std::unique_ptr<fastsim::fst::RetiredFrontendWriter> fst_frontend_;
+    fastsim::fst::RetiredFrontendMacro fst_frontend_pending_{};
+    const StaticInst* fst_frontend_root_ = nullptr;
+    uint32_t fst_frontend_thread_ = 0;
+    bool fst_frontend_open_ = false, fst_frontend_started_ = false;
+    void observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_t asid);
+    void flushFstFrontend(bool complete);
     std::string fst_path_;
     int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
     uint64_t    fst_record_count_ = 0;  // header.record_count
@@ -626,6 +635,7 @@ private:
     bool functional_user_only_ = false;
     bool functional_include_kernel_ = false;
     bool functional_syscall_microops_ = false;
+    bool functional_frontend_ = false;
     bool functional_warmup_ = false;
     uint64_t functional_user_target_ = 0;
     uint64_t functional_sync_marker_pc_ = 0;

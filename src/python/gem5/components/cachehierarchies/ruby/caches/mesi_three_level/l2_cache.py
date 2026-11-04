@@ -88,8 +88,9 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
         # In stdlib terms, they are L2 cache request latency, L2 response
         # latency, and to L3 cache latency respectively.
         self.l1_request_latency = 2
-        self.l1_response_latency = 2
+        self.l1_response_latency = 9
         self.to_l2_latency = 1
+        self.number_of_TBEs = 256
 
         self.version = self.versionCount()
         self.connectQueues(network)

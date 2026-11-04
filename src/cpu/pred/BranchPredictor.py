@@ -180,13 +180,6 @@ class MultiLevelBTB(BranchTargetBuffer):
     )
 
 
-class BranchPathHistory(SimObject):
-    type = "BranchPathHistory"
-    cxx_class = "gem5::branch_prediction::BranchPathHistory"
-    cxx_header = "cpu/pred/path_predictors.hh"
-    numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
-
-
 class ConditionalPredictor(SimObject):
     type = "ConditionalPredictor"
     cxx_class = "gem5::branch_prediction::ConditionalPredictor"
@@ -201,13 +194,6 @@ class ConditionalPredictor(SimObject):
         Parent.speculativeHistUpdate,
         "Use speculative update for the conditional predictor",
     )
-
-
-class PathTAGE(ConditionalPredictor):
-    type = "PathTAGE"
-    cxx_class = "gem5::branch_prediction::PathTAGE"
-    cxx_header = "cpu/pred/path_predictors.hh"
-    pathHistory = Param.BranchPathHistory("Shared speculative path history")
 
 
 class IndirectPredictor(SimObject):
@@ -243,13 +229,6 @@ class SimpleIndirectPredictor(IndirectPredictor):
     instShiftAmt = Param.Unsigned(
         Parent.instShiftAmt, "Number of bits to shift instructions by"
     )
-
-
-class PathIndirectPredictor(IndirectPredictor):
-    type = "PathIndirectPredictor"
-    cxx_class = "gem5::branch_prediction::PathIndirectPredictor"
-    cxx_header = "cpu/pred/path_predictors.hh"
-    pathHistory = Param.BranchPathHistory("Shared speculative path history")
 
 
 class BranchPredictor(SimObject):
@@ -313,19 +292,6 @@ class BranchPredictor(SimObject):
         "instead of direction history from all branches. Widely implemented "
         "in modern server CPUs: https://ieeexplore.ieee.org/document/9246215",
     )
-
-
-class PathHistoryBranchPredictor(BranchPredictor):
-    """Candidate branch predictor with one shared logical path history."""
-    sharedHistory = BranchPathHistory()
-    conditionalBranchPred = PathTAGE(pathHistory=Parent.sharedHistory)
-    indirectBranchPred = PathIndirectPredictor(pathHistory=Parent.sharedHistory)
-    btb = MultiLevelBTB()
-    requiresBTBHit = True
-
-
-class PathHistoryNoReturnFallback(PathHistoryBranchPredictor):
-    useReturnFallback = False
 
 
 class LocalBP(ConditionalPredictor):

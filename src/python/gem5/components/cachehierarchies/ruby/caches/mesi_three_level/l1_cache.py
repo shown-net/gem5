@@ -75,6 +75,7 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         self.Dcache = RubyCache(
             size=l1d_size,
             assoc=l1d_assoc,
+            dataAccessLatency=3,
             fill_capacity=16,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
@@ -89,6 +90,7 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         self.enable_prefetch = True
         self.request_latency = 2
         self.response_latency = 2
+        self.number_of_TBEs = 256
 
         self.version = self.versionCount()
         self.connectQueues(network)
@@ -108,11 +110,6 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         # In stdlib terms, they are bufferToL2 and bufferFromL2 respectively.
         # These buffers are connections between L1 cache and L2 cache.
         # Later on, we'll need to connect those buffers to L2.
-        # This workspace historically changed both local buffers from the
-        # upstream ordered default after a strict-FIFO arrival-time panic.
-        # Address blocking alone does not establish message ordering across
-        # the two controllers. Local WriteBack transition panics have since
-        # been observed; their cause and the safety of this setting are not
-        # yet established. Keep both settings available for controlled study.
-        self.bufferToL1 = MessageBuffer(ordered=False)
-        self.bufferFromL1 = MessageBuffer(ordered=False)
+        # Delay overtaking enqueues while preserving the local FIFO contract.
+        self.bufferToL1 = MessageBuffer(ordered=True, delay_to_preserve_order=True)
+        self.bufferFromL1 = MessageBuffer(ordered=True, delay_to_preserve_order=True)

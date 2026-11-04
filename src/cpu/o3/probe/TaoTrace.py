@@ -100,6 +100,9 @@ class TaoTrace(ProbeListenerObject):
         "Retain every committed x86 syscall micro-op and annotate its entry "
         "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
         "preserves partial macros at the exact common cut.")
+    functional_frontend = Param.Bool(False,
+        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
+        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
     functional_warmup = Param.Bool(False,
         "Capture CPL3 records before traceMeasurementBegin as a functional "
         "warmup prefix. The functional user target then counts only records "

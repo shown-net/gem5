@@ -105,7 +105,6 @@ Sequencer::Sequencer(const Params &p)
     m_outstanding_count = 0;
     m_store_prepare_outstanding = 0;
     m_maxStorePrepareOutstanding = p.max_store_prepare_outstanding;
-    m_parkOrderedStores = p.park_ordered_stores;
 
     m_ruby_system = p.ruby_system;
 
@@ -593,25 +592,19 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
         if (!isOrderedStoreReady(seq_req.pkt->req)) {
             // An older unrelated request can have caused this line's
             // callback before a later marked store reaches the global head.
-            // Keep it in the request table; the optional parked path reissues
+            // Keep it in the request table; the parked path reissues
             // it through L0 only once it becomes the global head.
             ++orderedStoreStats.retries;
-            if (m_parkOrderedStores) {
-                panic_if(m_orderedStores.empty(),
-                         "Ordered store callback has no global head");
-                if (m_orderedStores.front() != seq_req.pkt->req.get()) {
-                    const bool inserted =
-                        m_parkedOrderedLines.insert(address).second;
-                    panic_if(!inserted, "Duplicate parked ordered line callback");
-                    ++orderedStoreStats.parked;
-                } else {
-                    // A different line became visible this cycle. There is
-                    // no predecessor left to wake us; retry on a later cycle.
-                    ++orderedStoreStats.headRateRetries;
-                    issueRequest(seq_req.pkt, seq_req.m_second_type,
-                                 curCycle() - seq_req.issue_time);
-                }
+            panic_if(m_orderedStores.empty(),
+                     "Ordered store callback has no global head");
+            if (m_orderedStores.front() != seq_req.pkt->req.get()) {
+                const bool inserted =
+                    m_parkedOrderedLines.insert(address).second;
+                panic_if(!inserted, "Duplicate parked ordered line callback");
+                ++orderedStoreStats.parked;
             } else {
+                // A different line became visible this cycle. Retry later.
+                ++orderedStoreStats.headRateRetries;
                 issueRequest(seq_req.pkt, seq_req.m_second_type,
                              curCycle() - seq_req.issue_time);
             }
@@ -705,8 +698,7 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     if (seq_req_list.empty()) {
         m_RequestTable.erase(address);
     }
-    if (m_parkOrderedStores)
-        wakeParkedOrderedHead();
+    wakeParkedOrderedHead();
     // The first request may have been deferred to preserve TSO order. In
     // that case no data was written, so the controller must not mark a
     // clean line dirty or refresh replacement state for this action.

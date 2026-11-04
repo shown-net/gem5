@@ -38,6 +38,7 @@
 #ifndef __ARCH_X86_PCSTATE_HH__
 #define __ARCH_X86_PCSTATE_HH__
 
+#include <array>
 #include "arch/generic/pcstate.hh"
 #include "sim/serialize.hh"
 
@@ -52,7 +53,10 @@ class PCState : public GenericISA::UPCState<8>
   protected:
     using Base = GenericISA::UPCState<8>;
 
-    uint8_t _size;
+    uint8_t _size = 0;
+    std::array<uint8_t,15> _functionalBytes{};
+    uint8_t _functionalByteCount = 0;
+    uint64_t _functionalDecoderContext = 0;
 
   public:
     PCStateBase *clone() const override { return new PCState(*this); }
@@ -63,6 +67,9 @@ class PCState : public GenericISA::UPCState<8>
         Base::update(other);
         auto &pcstate = other.as<PCState>();
         _size = pcstate._size;
+        _functionalBytes = pcstate._functionalBytes;
+        _functionalByteCount = pcstate._functionalByteCount;
+        _functionalDecoderContext = pcstate._functionalDecoderContext;
     }
 
     void
@@ -70,9 +77,13 @@ class PCState : public GenericISA::UPCState<8>
     {
         Base::set(val);
         _size = 0;
+        _functionalByteCount = 0;
     }
 
-    PCState(const PCState &other) : Base(other), _size(other._size) {}
+    PCState(const PCState &other) : Base(other), _size(other._size),
+        _functionalBytes(other._functionalBytes),
+        _functionalByteCount(other._functionalByteCount),
+        _functionalDecoderContext(other._functionalDecoderContext) {}
     PCState &operator=(const PCState &other) = default;
     PCState() {}
     explicit PCState(Addr val) { set(val); }
@@ -82,10 +93,17 @@ class PCState : public GenericISA::UPCState<8>
     {
         Base::setNPC(val);
         _size = 0;
+        _functionalByteCount = 0;
     }
 
     uint8_t size() const { return _size; }
-    void size(uint8_t newSize) { _size = newSize; }
+    void size(uint8_t newSize) { _size = newSize; if (!newSize) _functionalByteCount=0; }
+    const std::array<uint8_t,15>& functionalBytes() const { return _functionalBytes; }
+    uint8_t functionalByteCount() const { return _functionalByteCount; }
+    uint64_t functionalDecoderContext() const { return _functionalDecoderContext; }
+    void functionalBytes(const std::array<uint8_t,15>& bytes, uint8_t count, uint64_t context) {
+        _functionalBytes=bytes; _functionalByteCount=count; _functionalDecoderContext=context;
+    }
 
     bool
     branching() const override
@@ -99,6 +117,7 @@ class PCState : public GenericISA::UPCState<8>
     {
         Base::advance();
         _size = 0;
+        _functionalByteCount = 0;
     }
 
     void
@@ -106,6 +125,7 @@ class PCState : public GenericISA::UPCState<8>
     {
         Base::uEnd();
         _size = 0;
+        _functionalByteCount = 0;
     }
 
     void
@@ -120,6 +140,8 @@ class PCState : public GenericISA::UPCState<8>
     {
         Base::unserialize(cp);
         UNSERIALIZE_SCALAR(_size);
+        // Reconstructed by decoding; old checkpoints carry no byte witness.
+        _functionalByteCount = 0;
     }
 };
 

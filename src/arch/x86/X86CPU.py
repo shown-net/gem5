@@ -28,6 +28,7 @@ from m5.objects.BaseMinorCPU import BaseMinorCPU
 from m5.objects.BaseNonCachingSimpleCPU import BaseNonCachingSimpleCPU
 from m5.objects.BaseO3CPU import BaseO3CPU
 from m5.objects.BaseTimingSimpleCPU import BaseTimingSimpleCPU
+from m5.objects.BranchPredictor import BranchPredictor, MultiLevelBTB, TournamentBP
 from m5.objects.FuncUnit import *
 from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
@@ -111,6 +112,67 @@ class DefaultX86FUPool(FUPool):
     ]
 
 
+def spr_fu_pool():
+    """One shared twelve-port pool, owned and cloned with each SPR core."""
+    specs = {}
+    for unit in DefaultX86FUPool().FUList:
+        for op in unit.opList:
+            specs.setdefault(str(op.opClass), op)
+    reads = {str(op.opClass) for op in ReadPort().opList}
+    writes = {str(op.opClass) for op in WritePort().opList}
+    ports = [[] for _ in range(12)]
+    latencies = {
+        "FloatAdd": 2, "FloatMult": 4, "FloatDiv": 14, "FloatMisc": 1,
+        "SimdAlu": 1, "SimdAdd": 1, "SimdMisc": 1, "SimdCmp": 1,
+        "SimdShift": 1, "SimdMult": 3, "SimdFloatAdd": 2,
+        "SimdFloatMult": 4, "SimdFloatDiv": 11,
+    }
+    for name, op in specs.items():
+        if name == "X86StoreAddress":
+            indices = (7, 8)
+        elif name == "X86StoreData":
+            indices = (4, 9)
+        elif name in reads:
+            indices = (2, 3, 10)
+        elif name in writes:
+            indices = (7, 8)
+        elif name == "IntAlu":
+            indices = (0, 1, 5, 6, 11)
+        elif name in {"IntMult", "FloatAdd", "SimdFloatAdd", "SimdMisc"}:
+            indices = (1, 5)
+        elif name == "IntDiv":
+            indices = (1,)
+        elif name in {"FloatMult", "SimdFloatMult", "SimdCmp", "SimdShift"}:
+            indices = (0, 1)
+        elif name in {"SimdPack", "SimdInsert"}:
+            indices = (5,)
+        elif (name in {"SimdExtract", "System", "SimdPredAlu"}
+              or "Div" in name or "Sqrt" in name):
+            indices = (0,)
+        else:
+            indices = (0, 1, 5)
+        for index in indices:
+            desc = OpDesc(
+                opClass=op.opClass, opLat=latencies.get(name, op.opLat),
+                pipelined=True if name in {"FloatDiv", "SimdFloatDiv"}
+                else op.pipelined,
+            )
+            if name in {"FloatDiv", "SimdFloatDiv"}:
+                desc.issueLat = 4 if name == "FloatDiv" else 3
+            ports[index].append(desc)
+    return FUPool(
+        FUList=[FUDesc(opList=ops, count=1) for ops in ports],
+        storeDataPorts=[4, 9], branchPorts=[0, 6],
+    )
+
+
+_spr_mem_classes = sorted(
+    {str(op.opClass) for op in ReadPort().opList}
+    | {str(op.opClass) for op in WritePort().opList}
+    | {"X86StoreAddress"}
+)
+
+
 def x86_o3_mmu():
     """Default O3 instruction translation and shared second-level proxy."""
     mmu = X86MMU()
@@ -118,6 +180,10 @@ def x86_o3_mmu():
     mmu.itb.size = 256
     mmu.itb.itlb_4k_ways = 8
     mmu.itb.next_level = mmu.stlb
+    mmu.dtb.size = 96
+    mmu.dtb.dtlb_4k_ways = 6
+    mmu.dtb.next_level_hit_latency = 6
+    mmu.dtb.walker.max_active_walks = 4
     mmu.dtb.next_level = mmu.stlb
     return mmu
 
@@ -125,6 +191,28 @@ def x86_o3_mmu():
 class X86O3CPU(BaseO3CPU, X86CPU):
     mmu = x86_o3_mmu()
     needsTSO = True
+    fetchWidth = 8
+    fetchBufferSize = 64
+    fetchQueueSize = 144
+    decodeWidth = 8
+    renameWidth = 6
+    dispatchWidth = 6
+    issueWidth = 12
+    wbWidth = 12
+    commitWidth = 8
+    numROBEntries = 512
+    LQEntries = 240
+    SQEntries = 112
+    cacheLoadPorts = 3
+    cacheStorePorts = 2
+    numPhysIntRegs = 288
+    numPhysFloatRegs = 256
+    sprL1LoadBankConflicts = True
+    sprStoreBuffer = True
+    sprEarlyStorePrepare = True
+    branchPred = BranchPredictor(
+        conditionalBranchPred=TournamentBP(), btb=MultiLevelBTB(),
+    )
 
     # Development measurements always use the implemented integer structure.
     # SimObject cloning preserves shared port references within each core.
@@ -150,11 +238,20 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     # never be the bottleneck here.
     numPhysCCRegs = Self.numPhysIntRegs * 5
 
-    # DIV and IDIV instructions in x86 are implemented using a loop which
-    # issues division microops.  The latency of these microops should really be
-    # one (or a small number) cycle each since each of these computes one bit
-    # of the quotient.
-    instQueues = IQUnit(fuPool=DefaultX86FUPool())
+    # EU 128 is the chosen remainder of the 248-entry model budget.
+    # These named children share one pool within a core, never across cores.
+    sprFUPool = spr_fu_pool()
+    executionIQ = IQUnit(
+        numEntries=128, fuPool=sprFUPool,
+        excludedOpClasses=[*_spr_mem_classes, "X86StoreData"],
+    )
+    memoryIQ = IQUnit(
+        numEntries=72, fuPool=sprFUPool, allowedOpClasses=_spr_mem_classes,
+    )
+    storeDataIQ = IQUnit(
+        numEntries=48, fuPool=sprFUPool, allowedOpClasses=["X86StoreData"],
+    )
+    instQueues = [executionIQ, memoryIQ, storeDataIQ]
 
 
 class X86MinorCPU(BaseMinorCPU, X86CPU):

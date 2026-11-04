@@ -104,7 +104,6 @@ class ResultForwarding : public SimObject
     struct Waiter { DynInstPtr inst; Tick when; };
     std::unordered_map<uint64_t, Waiter> waiters;
     const std::vector<ResultPathRule *> paths;
-    const bool fpFastAdderBypass;
     CPU *cpu = nullptr;
     EventFunctionWrapper wakeEvent;
     struct Stats : statistics::Group
@@ -121,7 +120,6 @@ class ResultForwarding : public SimObject
   public:
     ResultForwarding(const ResultForwardingParams &p);
     void bindCPU(CPU *owner);
-    bool tracksFastAdder() const { return fpFastAdderBypass; }
     void track(const DynInstPtr &inst, bool managed);
     Reference source(PhysRegIdPtr reg) const;
     bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;

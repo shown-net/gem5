@@ -129,7 +129,9 @@ void CPU::recordMemoryRetirement(const DynInstPtr &inst)
 CPU::InstRetiredStats::InstRetiredStats(CPU *cpu)
     : statistics::Group(cpu, "INST_RETIRED"),
       ADD_STAT(ANY, statistics::units::Count::get(),
-               "Retired architectural instructions, including NOPs, across this O3 core")
+               "Retired architectural instructions, including NOPs, across this O3 core"),
+      ADD_STAT(MACRO_FUSED, statistics::units::Count::get(),
+               "Retired flag-producer/branch allocation groups, counted at the architectural branch")
 {}
 
 CPU::BranchInstStats::BranchInstStats(CPU *cpu)
@@ -161,6 +163,9 @@ CPU::recordBranchRetirement(const DynInstPtr &inst)
         !inst->staticInst->isArchitecturalBranch()) return;
     const auto &op = inst->staticInst;
     ++branchInstStats.ALL_BRANCHES;
+    const auto &group = inst->allocationGroup;
+    if (group && group->branchProducer && group->branch == inst->seqNum)
+        ++instRetiredStats.MACRO_FUSED;
     if (op->isArchitecturalConditionalBranch()) ++branchInstStats.COND;
     if (op->isNearIndirectBranch()) ++branchInstStats.INDIRECT;
     if (op->isRasReturn()) ++branchInstStats.NEAR_RETURN;

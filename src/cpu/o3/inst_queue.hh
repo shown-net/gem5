@@ -107,6 +107,7 @@ class IQUnit : public SimObject
 
     unsigned numFreeEntries(const DynInstPtr &inst) const;
     bool allows(const DynInstPtr &inst) const;
+    bool allows(OpClass op_class) const;
 
     /** Returns the number of used entries for a thread. */
     unsigned
@@ -517,7 +518,6 @@ class InstructionQueue
 
     /** The total number of instructions that can be issued in one cycle. */
     unsigned totalWidth;
-    const bool directJumpPortless;
 
     /** The number of physical registers in the CPU. */
     unsigned numPhysRegs;
@@ -576,7 +576,6 @@ class InstructionQueue
         statistics::Scalar floatInstsIssued;
         /** Stat for number of branch instructions issued. */
         statistics::Scalar branchInstsIssued;
-        statistics::Scalar directJumpPortlessIssued;
         /** Stat for number of memory instructions issued. */
         statistics::Scalar memInstsIssued;
         /** Stat for number of miscellaneous instructions issued. */

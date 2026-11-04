@@ -8,6 +8,7 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "debug/Fetch.hh"
+#include "params/BaseO3CPU.hh"
 
 namespace gem5::o3
 {
@@ -161,6 +162,8 @@ Fetch::fetchFrontend(bool &status_change)
                 root = cached->macroop;
                 auto &xpc = at.as<X86ISA::PCState>();
                 xpc.size(cached->bytes);
+                xpc.functionalBytes(cached->functionalBytes,cached->functionalByteCount,
+                                    cached->functionalDecoderContext);
                 xpc.npc(xpc.pc() + cached->bytes);
                 offset = 0;
                 dec->reset();
@@ -190,7 +193,10 @@ Fetch::fetchFrontend(bool &status_change)
                     if (frontend->physicalBlocks(at.instAddr(), bytes, blocks)) {
                         expansionTemplate = FrontendTemplate{
                             frontend->identity(at.instAddr()), root, {},
-                            bytes, std::move(blocks), 0, sharesAllocation(root)};
+                            bytes, std::move(blocks), 0, sharesAllocation(root),
+                            at.as<X86ISA::PCState>().functionalBytes(),
+                            at.as<X86ISA::PCState>().functionalByteCount(),
+                            at.as<X86ISA::PCState>().functionalDecoderContext()};
                     }
                 }
                 decodeCanReuse = true;
@@ -215,10 +221,16 @@ Fetch::fetchFrontend(bool &status_change)
             !memoryGroup && at.microPC() != 0) {
             // A precise replay may arrive at a lowered internal operation.
             // Shared units are assembled again from the architectural start.
-            const unsigned bytes = at.as<X86ISA::PCState>().size();
+            // Rewind the same immutable macro, preserving its decoded code
+            // witness while set() resets the internal micro-PC state.
+            const auto decoded = at.as<X86ISA::PCState>();
             at.set(at.instAddr());
-            at.as<X86ISA::PCState>().size(bytes);
-            at.as<X86ISA::PCState>().npc(at.instAddr() + bytes);
+            auto& replay = at.as<X86ISA::PCState>();
+            replay.size(decoded.size());
+            replay.npc(at.instAddr() + decoded.size());
+            replay.functionalBytes(decoded.functionalBytes(),
+                                   decoded.functionalByteCount(),
+                                   decoded.functionalDecoderContext());
         }
         if (sharesAllocation(current_macro) &&
             at.microPC() == 0 &&
@@ -246,6 +258,30 @@ Fetch::fetchFrontend(bool &status_change)
                 }
                 for (unsigned m = 0; m < current_macro->functionalMicroops(); ++m)
                     countGroupResources(memoryGroup, current_macro->fetchMicroop(m));
+                if (!memoryGroup->independentIQEntries &&
+                    !memoryGroup->independentBackendEntries) {
+                    // Share one scheduler reservation only when one configured
+                    // IQ accepts every lowered member of the fused operation.
+                    const auto &iqs = static_cast<const BaseO3CPUParams &>(
+                        cpu->params()).instQueues;
+                    bool compatible = false;
+                    for (auto *iq : iqs) {
+                        bool accepts_all = true;
+                        for (unsigned m = 0;
+                             m < current_macro->functionalMicroops(); ++m) {
+                            if (!iq->allows(
+                                    current_macro->fetchMicroop(m)->opClass())) {
+                                accepts_all = false;
+                                break;
+                            }
+                        }
+                        if (accepts_all) {
+                            compatible = true;
+                            break;
+                        }
+                    }
+                    memoryGroup->independentIQEntries = !compatible;
+                }
             }
             record->allocationGroup = memoryGroup;
         }
@@ -262,16 +298,6 @@ Fetch::fetchFrontend(bool &status_change)
                                     *record->predictedPC);
         const bool target_exit = curFT && curFT->isExitInst(at.instAddr()) &&
             (!op->isMicroop() || op->isLastMicroop());
-        // This optional experiment only follows a ready, predicted direct
-        // unconditional JMP within a DSB batch. The next FT and template
-        // are checked again on the next iteration; all other branches retain
-        // the existing end-of-batch behavior.
-        const bool continueDirect = frontendDirectMultiTaken &&
-            decoupledFrontEnd && source == FrontendSource::Dsb &&
-            target_exit && supplied_target && record->prediction.taken &&
-            op->isDirectCtrl() && op->isUncondCtrl() && !op->isCall() &&
-            !op->isReturn() && !op->isMicrocodeControl() &&
-            (!op->isMicroop() || (op->isFirstMicroop() && op->isLastMicroop()));
         if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
             bac->discardNonBranchTarget(tid, at.instAddr());
         stop = at.branching() || record->prediction.taken;
@@ -298,8 +324,6 @@ Fetch::fetchFrontend(bool &status_change)
                 reportTargetBoundary("history");
                 bacResteer(at, tid);
                 stop = true;
-            } else if (continueDirect) {
-                stop = false;
             }
             curFT = nullptr;
         }

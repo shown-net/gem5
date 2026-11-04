@@ -119,7 +119,6 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
     : fetchPolicy(params.smtFetchPolicy),
       cpu(_cpu),
       frontend(params.frontend),
-      frontendDirectMultiTaken(params.frontendDirectMultiTaken),
       bac(nullptr),
       ftq(nullptr),
       decoupledFrontEnd(params.decoupledFrontEnd),

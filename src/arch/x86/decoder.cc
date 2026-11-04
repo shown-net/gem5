@@ -666,7 +666,23 @@ Decoder::decode(PCStateBase &next_pc)
     if (!instDone)
         return NULL;
     instDone = false;
-    updateNPC(next_pc.as<PCState>());
+    auto& functionalPC = next_pc.as<PCState>();
+    updateNPC(functionalPC);
+    // Capture the exact bytes delivered to this decoder invocation, before
+    // decode-cache masks alter chunks. This is functional code identity only.
+    std::array<uint8_t,15> functionalBytes{};
+    const auto functionalSize = functionalPC.size();
+    const Addr firstChunk = basePC - (instBytes.chunks.size()-1)*sizeof(MachInst);
+    const Addr firstByte = origPC-firstChunk;
+    if (functionalSize && functionalSize<=functionalBytes.size() &&
+        firstByte+functionalSize<=instBytes.chunks.size()*sizeof(MachInst)) {
+        for(unsigned i=0;i<functionalSize;++i) {
+            const auto position=firstByte+i;
+            functionalBytes[i]=uint8_t(instBytes.chunks[position/sizeof(MachInst)] >>
+                                      ((position%sizeof(MachInst))*8));
+        }
+        functionalPC.functionalBytes(functionalBytes,functionalSize,frontendContext());
+    } else functionalPC.functionalBytes(functionalBytes,0,frontendContext());
 
     StaticInstPtr &si = instBytes.si;
     if (si)

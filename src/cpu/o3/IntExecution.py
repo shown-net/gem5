@@ -55,6 +55,3 @@ class ResultForwarding(SimObject):
     cxx_class = "gem5::o3::ResultForwarding"
     cxx_header = "cpu/o3/int_execution.hh"
     paths = VectorParam.ResultPathRule([], "Explicit producer/result/consumer paths")
-    fpFastAdderBypass = Param.Bool(
-        False, "Delay non-add consumers of a completed FloatAdd by one cycle"
-    )

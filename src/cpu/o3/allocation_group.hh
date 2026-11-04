@@ -22,8 +22,8 @@ struct AllocationGroup
     unsigned loadMembers = 0;
     // Frontend/retirement sharing need not imply shared ROB or IQ entries.
     bool independentBackendEntries = false;
-    // A split store may share retirement/ROB accounting while its address and
-    // data members consume and release independent scheduler entries.
+    // Split stores and fused operations spanning IQ filters may share
+    // retirement/ROB accounting while consuming independent scheduler entries.
     bool independentIQEntries = false;
     unsigned iqMembers = 0, robMembers = 0;
     IQUnit *iq = nullptr;
