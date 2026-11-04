@@ -188,6 +188,7 @@ bool RubyPort::MemRequestPort::recvTimingResp(PacketPtr pkt)
     // got a response from a device
     assert(pkt->isResponse());
     assert(!pkt->htmTransactionFailedInCache());
+    TaoTraceNativeAccessRegistry::noteBypassResponse(pkt->req);
 
     // First we must retrieve the request port from the sender State
     RubyPort::SenderState *senderState =
@@ -300,6 +301,7 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
 
             // send next cycle
             RubySystem *rs = owner.m_ruby_system;
+            TaoTraceNativeAccessRegistry::noteBypassAccepted(pkt->req);
             owner.memRequestPort.schedTimingReq(pkt,
                 curTick() + rs->clockPeriod());
             return true;

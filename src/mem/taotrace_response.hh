@@ -32,6 +32,7 @@ enum class TaoTraceNativeTerminalReason : uint32_t
     PrefetchSkipped = 1u << 6,
     StoreOverwriteElided = 1u << 7,
     StoreBufferCombined = 1u << 8,
+    DeviceBypassComplete = 1u << 9,
 };
 
 enum class TaoTraceNativeCacheOutcome : uint32_t
@@ -99,10 +100,37 @@ taoTraceNativeReasonMask(TaoTraceNativeTerminalReason reason)
     return static_cast<uint32_t>(reason);
 }
 
+// Device service is independent of Ruby. A fragment response cannot close the
+// main request; an empty closed request is not evidence of any service.
+template <class Facts>
+inline bool taoTraceNativeLifecycleResolved(const Facts &facts)
+{
+    if (facts.bypassProtocolErrors || facts.responses != facts.admissions ||
+        facts.bypassResponses != facts.bypassAccepted) return false;
+    const bool has_service = facts.admissions || facts.bypassAccepted;
+    return has_service ? facts.issuanceClosed : facts.terminalNoRuby;
+}
+
+template <class Facts>
+inline void taoTraceNativeRefreshBypassTerminal(Facts &facts)
+{
+    const uint32_t reason = taoTraceNativeReasonMask(
+        TaoTraceNativeTerminalReason::DeviceBypassComplete);
+    facts.terminalReasonMask &= ~reason;
+    if (facts.issuanceClosed && !facts.admissions && facts.bypassAccepted &&
+        facts.bypassResponses == facts.bypassAccepted &&
+        !facts.bypassProtocolErrors) facts.terminalReasonMask |= reason;
+    facts.terminalNoRuby = facts.terminalReasonMask != 0 &&
+        !(facts.admissions && facts.bypassAccepted);
+}
+
 class TaoTraceRubyResponseExtension
     : public Extension<Request, TaoTraceRubyResponseExtension>
 {
   public:
+    uint32_t bypassAccepted = 0;
+    uint32_t bypassResponses = 0;
+    uint32_t bypassProtocolErrors = 0;
     uint32_t admissions = 0;
     uint32_t aliasedAdmissions = 0;
     uint32_t hierarchyRequests = 0;
@@ -121,12 +149,20 @@ class TaoTraceRubyResponseExtension
     bool terminalNoRuby = false;
     uint32_t terminalReasonMask = 0;
     TaoTraceNativeHierarchyFacts hierarchy;
+    // Bound only at the physical device-route acceptance; clones retain the
+    // identity. Aggregate split ledgers merge only equal identities.
+    bool bypassIdentityKnown = false;
+    uint32_t bypassContext = 0;
+    uint64_t bypassSequence = 0;
+
+    bool resolved() const { return taoTraceNativeLifecycleResolved(*this); }
 
     void
     admit(bool aliased)
     {
         const uint64_t tick = uint64_t(curTick());
         ++admissions;
+        taoTraceNativeRefreshBypassTerminal(*this);
         if (aliased) ++aliasedAdmissions;
         if (!hasAdmissionTick) {
             hasAdmissionTick = true;
@@ -161,6 +197,17 @@ class TaoTraceRubyResponseExtension
     void
     merge(const TaoTraceRubyResponseExtension &other)
     {
+        if (other.bypassIdentityKnown) {
+            if (bypassIdentityKnown &&
+                (bypassContext != other.bypassContext ||
+                 bypassSequence != other.bypassSequence)) ++bypassProtocolErrors;
+            bypassIdentityKnown = true;
+            bypassContext = other.bypassContext;
+            bypassSequence = other.bypassSequence;
+        }
+        bypassAccepted += other.bypassAccepted;
+        bypassResponses += other.bypassResponses;
+        bypassProtocolErrors += other.bypassProtocolErrors;
         admissions += other.admissions;
         aliasedAdmissions += other.aliasedAdmissions;
         hierarchyRequests += other.hierarchyRequests;
@@ -191,6 +238,7 @@ class TaoTraceRubyResponseExtension
         terminalNoRuby = terminalNoRuby || other.terminalNoRuby;
         terminalReasonMask |= other.terminalReasonMask;
         hierarchy.merge(other.hierarchy);
+        taoTraceNativeRefreshBypassTerminal(*this);
     }
 
     std::unique_ptr<ExtensionBase>
@@ -219,6 +267,9 @@ class TaoTraceNativeAccessRegistry
         bool found = false;
         bool committed = false;
         bool squashed = false;
+        uint32_t bypassAccepted = 0;
+        uint32_t bypassResponses = 0;
+        uint32_t bypassProtocolErrors = 0;
         uint32_t admissions = 0;
         uint32_t aliasedAdmissions = 0;
         uint32_t hierarchyRequests = 0;
@@ -241,8 +292,19 @@ class TaoTraceNativeAccessRegistry
         bool
         resolved() const
         {
-            return found && responses == admissions &&
-                (issuanceClosed || terminalNoRuby);
+            return found && taoTraceNativeLifecycleResolved(*this);
+        }
+
+        // Squash abandons the unissued tail of a split request, so normal
+        // main issuance closure may never occur. This is storage reclamation
+        // only, never a terminal/scored lifecycle. Keep all accepted service
+        // and its already-enqueued SLICC L1 callback alive until they drain.
+        bool
+        abandonedServiceDrained() const
+        {
+            return found && squashed && !bypassProtocolErrors &&
+                responses == admissions && bypassResponses == bypassAccepted &&
+                hierarchy.accesses[0] == hierarchyRequests;
         }
     };
 
@@ -302,6 +364,60 @@ class TaoTraceNativeAccessRegistry
     }
 
     static void
+    noteBypassAccepted(const RequestPtr &req)
+    {
+        uint32_t context = 0;
+        uint64_t sequence = 0;
+        if (!identity(req, context, sequence)) return;
+        auto extension = ensureExtension(req);
+        const auto observed = snapshot(context, sequence);
+        const bool invalid = extension->bypassAccepted != 0 ||
+            extension->bypassResponses != 0 || extension->issuanceClosed ||
+            observed.issuanceClosed;
+        if (invalid) ++extension->bypassProtocolErrors;
+        else {
+            extension->bypassIdentityKnown = true;
+            extension->bypassContext = context;
+            extension->bypassSequence = sequence;
+            ++extension->bypassAccepted;
+        }
+        taoTraceNativeRefreshBypassTerminal(*extension);
+        if (!shouldAdmit(context, sequence)) return;
+        auto &facts = records_[context][sequence];
+        facts.found = true;
+        if (invalid) ++facts.bypassProtocolErrors;
+        else ++facts.bypassAccepted;
+        taoTraceNativeRefreshBypassTerminal(facts);
+    }
+
+    static void
+    noteBypassResponse(const RequestPtr &req)
+    {
+        uint32_t context = 0;
+        uint64_t sequence = 0;
+        if (!identity(req, context, sequence)) return;
+        auto extension = ensureExtension(req);
+        const bool invalid = !extension->bypassIdentityKnown ||
+            extension->bypassContext != context ||
+            extension->bypassSequence != sequence ||
+            extension->bypassAccepted != 1 || extension->bypassResponses != 0;
+        if (invalid) ++extension->bypassProtocolErrors;
+        else ++extension->bypassResponses;
+        taoTraceNativeRefreshBypassTerminal(*extension);
+        if (!shouldTrack(context, sequence)) return;
+        auto &facts = records_[context][sequence];
+        facts.found = true;
+        if (invalid) ++facts.bypassProtocolErrors;
+        else ++facts.bypassResponses;
+        taoTraceNativeRefreshBypassTerminal(facts);
+        if (facts.abandonedServiceDrained() ||
+            (facts.committed && retirement_contexts_.count(context) &&
+             !traceOwnsContext(context) && facts.resolved())) {
+            erase(context, sequence);
+        }
+    }
+
+    static void
     noteAdmission(const RequestPtr &req, bool aliased)
     {
         auto extension = ensureExtension(req);
@@ -316,6 +432,7 @@ class TaoTraceNativeAccessRegistry
         facts.found = true;
         const uint64_t tick = uint64_t(curTick());
         ++facts.admissions;
+        taoTraceNativeRefreshBypassTerminal(facts);
         if (aliased) ++facts.aliasedAdmissions;
         if (!facts.hasAdmissionTick) {
             facts.hasAdmissionTick = true;
@@ -360,9 +477,9 @@ class TaoTraceNativeAccessRegistry
         }
         facts.hasResponseTick = true;
         facts.lastResponseTick = std::max(facts.lastResponseTick, tick);
-        if ((facts.squashed ||
-             (facts.committed && retirement_contexts_.count(context_id) &&
-              !traceOwnsContext(context_id))) && facts.resolved()) {
+        if (facts.abandonedServiceDrained() ||
+            (facts.committed && retirement_contexts_.count(context_id) &&
+             !traceOwnsContext(context_id) && facts.resolved())) {
             erase(context_id, seq_num);
         }
     }
@@ -412,8 +529,14 @@ class TaoTraceNativeAccessRegistry
     noteIssuanceClosed(const RequestPtr &req)
     {
         auto extension = ensureExtension(req);
-        if (extension) extension->issuanceClosed = true;
-        mutate(req, [](Snapshot &facts) { facts.issuanceClosed = true; });
+        if (extension) {
+            extension->issuanceClosed = true;
+            taoTraceNativeRefreshBypassTerminal(*extension);
+        }
+        mutate(req, [](Snapshot &facts) {
+            facts.issuanceClosed = true;
+            taoTraceNativeRefreshBypassTerminal(facts);
+        });
     }
 
     static void
@@ -423,10 +546,12 @@ class TaoTraceNativeAccessRegistry
         if (extension) {
             extension->terminalNoRuby = true;
             extension->terminalReasonMask |= taoTraceNativeReasonMask(reason);
+            taoTraceNativeRefreshBypassTerminal(*extension);
         }
         mutate(req, [reason](Snapshot &facts) {
             facts.terminalNoRuby = true;
             facts.terminalReasonMask |= taoTraceNativeReasonMask(reason);
+            taoTraceNativeRefreshBypassTerminal(facts);
         });
     }
 
@@ -446,7 +571,7 @@ class TaoTraceNativeAccessRegistry
         auto entry = context->second.find(seq_num);
         if (entry == context->second.end()) return;
         entry->second.squashed = true;
-        if (entry->second.resolved()) erase(context_id, seq_num);
+        if (entry->second.abandonedServiceDrained()) erase(context_id, seq_num);
     }
 
     static void
@@ -505,20 +630,27 @@ class TaoTraceNativeAccessRegistry
         // access) before the process-wide measurement marker, remain in a
         // different core's ROB, and retire just after the marker.  The
         // Request extension is the authoritative finite lifecycle ledger for
-        // that exact boundary case.  Import only a complete extension and
-        // only when registry tracking has no admission, so normal measured
-        // requests cannot be counted twice.
-        const bool complete = extension.terminalNoRuby ||
-            (extension.issuanceClosed &&
-             extension.responses == extension.admissions &&
-             extension.responses != 0);
-        if (!complete) return;
+        // that exact boundary case. Import only a complete, identity-matched
+        // extension to replace a missing/partial prefix. A resolved registry
+        // is already authoritative and must not be counted twice.
+        if (!extension.resolved() ||
+            (extension.bypassAccepted &&
+             (!extension.bypassIdentityKnown ||
+              extension.bypassContext != context_id ||
+              extension.bypassSequence != seq_num)) ||
+            !shouldTrack(context_id, seq_num)) return;
         auto &facts = records_[context_id][seq_num];
         facts.found = true;
-        if (facts.admissions != 0 || facts.responses != 0 ||
-            facts.terminalNoRuby) {
-            return;
-        }
+        // A measured prefix can already contain responses. Replace its
+        // lifecycle, never add it again; keep independent SLICC observations.
+        if (facts.resolved() || facts.bypassProtocolErrors ||
+            facts.admissions > extension.admissions ||
+            facts.responses > extension.responses ||
+            facts.bypassAccepted > extension.bypassAccepted ||
+            facts.bypassResponses > extension.bypassResponses) return;
+        facts.bypassAccepted = extension.bypassAccepted;
+        facts.bypassResponses = extension.bypassResponses;
+        facts.bypassProtocolErrors = extension.bypassProtocolErrors;
         facts.admissions = extension.admissions;
         facts.aliasedAdmissions = extension.aliasedAdmissions;
         facts.hierarchyRequests = extension.hierarchyRequests;
@@ -536,7 +668,10 @@ class TaoTraceNativeAccessRegistry
         facts.issuanceClosed = extension.issuanceClosed;
         facts.terminalNoRuby = extension.terminalNoRuby;
         facts.terminalReasonMask = extension.terminalReasonMask;
-        facts.hierarchy = extension.hierarchy;
+        if (facts.hierarchy.accesses == std::array<uint32_t, 3>{} &&
+            !facts.hierarchy.uniqueFills && !facts.hierarchy.rubyMemoryFetches &&
+            !facts.hierarchy.memoryReadTransactions)
+            facts.hierarchy = extension.hierarchy;
     }
 
     static void
@@ -547,6 +682,7 @@ class TaoTraceNativeAccessRegistry
         facts.found = true;
         facts.terminalNoRuby = true;
         facts.terminalReasonMask |= taoTraceNativeReasonMask(reason);
+        taoTraceNativeRefreshBypassTerminal(facts);
     }
 
     static Snapshot
@@ -646,7 +782,7 @@ class TaoTraceNativeAccessRegistry
         auto &facts = records_[context_id][seq_num];
         facts.found = true;
         callback(facts);
-        if (facts.squashed && facts.resolved()) {
+        if (facts.abandonedServiceDrained()) {
             erase(context_id, seq_num);
         }
     }

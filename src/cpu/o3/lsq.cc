@@ -1251,8 +1251,8 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
         // response facts from every physical fragment onto its Request so the
         // O3 completion observer sees the complete line population.
         auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
-        // sendPacketToCache() closes issuance on _mainReq before any fragment
-        // can respond.  Preserve that identity-wide state when replacing the
+        // sendPacketToCache() closes issuance only after all fragments have
+        // been accepted. Preserve that identity-wide state when replacing the
         // main extension with the fragment aggregate; otherwise a completed
         // split access has admissions == responses but appears permanently
         // open when it is imported at a measurement/target boundary.
@@ -1265,7 +1265,8 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
                 request->getExtension<TaoTraceRubyResponseExtension>();
             if (fragment) aggregate->merge(*fragment);
         }
-        if (aggregate->responses != 0 || aggregate->terminalNoRuby ||
+        if (aggregate->responses != 0 || aggregate->bypassAccepted != 0 ||
+            aggregate->terminalNoRuby ||
             aggregate->issuanceClosed) {
             _mainReq->setExtension(aggregate);
         }

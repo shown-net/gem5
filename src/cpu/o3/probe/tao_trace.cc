@@ -1111,11 +1111,12 @@ TaoTrace::openOutput()
                 warn("TaoTrace: failed to open %s", path);
             } else {
             std::fprintf(out_native_response_diag_,
-                "{\"schema\":\"taotrace-native-response-v7\","
+                "{\"schema\":\"taotrace-native-response-v8\","
                 "\"record\":\"metadata\",\"oracle_only\":true,"
                 "\"fst_input\":false,\"lifecycle_join\":"
                 "\"context-id-inst-seq-num\","
                 "\"target_stop\":\"committed-native-drain\","
+                "\"bypass_semantics\":\"ruby-port-device-route-acceptance-and-response\","
                 "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
                 "\"hierarchy_identity_transport\":"
                 "\"context-id-inst-seq-num-no-request-retention\","
@@ -2497,6 +2498,11 @@ TaoTrace::NativeScopeAggregate::merge(const NativeScopeAggregate &other)
     ruby_hierarchy_request_fragments +=
         other.ruby_hierarchy_request_fragments;
     ruby_response_fragments += other.ruby_response_fragments;
+    bypass_accepted_fragments += other.bypass_accepted_fragments;
+    bypass_response_fragments += other.bypass_response_fragments;
+    bypass_protocol_errors += other.bypass_protocol_errors;
+    device_bypass_uops += other.device_bypass_uops;
+    mixed_bypass_uops += other.mixed_bypass_uops;
     sequencer_coalesced_fragments +=
         other.sequencer_coalesced_fragments;
     no_ruby_uops += other.no_ruby_uops;
@@ -2560,6 +2566,11 @@ TaoTrace::accountNativeResolved(
         scope.ruby_aliased_admission_fragments += native.aliasedAdmissions;
         scope.ruby_hierarchy_request_fragments += native.hierarchyRequests;
         scope.ruby_response_fragments += native.responses;
+        scope.bypass_accepted_fragments += native.bypassAccepted;
+        scope.bypass_response_fragments += native.bypassResponses;
+        scope.bypass_protocol_errors += native.bypassProtocolErrors;
+        scope.device_bypass_uops += native.bypassAccepted && !native.admissions;
+        scope.mixed_bypass_uops += native.bypassAccepted && native.admissions;
         scope.sequencer_coalesced_fragments += native.coalesced;
         scope.no_ruby_uops += native.responses == 0;
         scope.native_outcome_uops += native.responses != 0;
@@ -2767,6 +2778,9 @@ TaoTrace::writeNativeResponseCommit(
         "\"native_hierarchy_request_count\":%u,"
         "\"native_issuance_closed\":%s,\"native_terminal_no_ruby\":%s,"
         "\"native_terminal_reason_mask\":%u,"
+        "\"native_bypass_accepted\":%u,"
+        "\"native_bypass_responses\":%u,"
+        "\"native_bypass_protocol_errors\":%u,"
         "\"native_response_count\":%u,"
         "\"native_external_hits\":%u,\"native_external_misses\":%u,"
         "\"native_coalesced\":%u,\"native_responder_machine_mask\":%lu,"
@@ -2783,7 +2797,8 @@ TaoTrace::writeNativeResponseCommit(
         native.hierarchyRequests,
         native.issuanceClosed ? "true" : "false",
         native.terminalNoRuby ? "true" : "false",
-        native.terminalReasonMask, native.responses,
+        native.terminalReasonMask, native.bypassAccepted,
+        native.bypassResponses, native.bypassProtocolErrors, native.responses,
         native.externalHits, native.externalMisses, native.coalesced,
         (unsigned long)native.responderMachineMask,
         native.responderMachineUnknown,
@@ -2854,6 +2869,9 @@ TaoTrace::refreshNativeResponsePending()
             "\"native_issuance_closed\":%s,"
             "\"native_terminal_no_ruby\":%s,"
             "\"native_terminal_reason_mask\":%u,"
+            "\"native_bypass_accepted\":%u,"
+            "\"native_bypass_responses\":%u,"
+            "\"native_bypass_protocol_errors\":%u,"
             "\"native_response_count\":%u,"
             "\"native_external_hits\":%u,"
             "\"native_external_misses\":%u,"
@@ -2875,7 +2893,8 @@ TaoTrace::refreshNativeResponsePending()
             native.hierarchyRequests,
             native.issuanceClosed ? "true" : "false",
             native.terminalNoRuby ? "true" : "false",
-            native.terminalReasonMask, native.responses,
+            native.terminalReasonMask, native.bypassAccepted,
+            native.bypassResponses, native.bypassProtocolErrors, native.responses,
             native.externalHits, native.externalMisses, native.coalesced,
             (unsigned long)native.responderMachineMask,
             native.responderMachineUnknown,
@@ -3031,6 +3050,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
             "\"ruby_aliased_admission_fragments\":%lu,"
             "\"ruby_hierarchy_request_fragments\":%lu,"
             "\"ruby_response_fragments\":%lu,"
+            "\"bypass_accepted_fragments\":%lu,"
+            "\"bypass_response_fragments\":%lu,"
+            "\"bypass_protocol_errors\":%lu,"
+            "\"device_bypass_uops\":%lu,"
+            "\"mixed_bypass_uops\":%lu,"
             "\"sequencer_coalesced_fragments\":%lu,"
             "\"no_ruby_uops\":%lu,"
             "\"hierarchy_complete_uops\":%lu,"
@@ -3042,6 +3066,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
             (unsigned long)population.ruby_aliased_admission_fragments,
             (unsigned long)population.ruby_hierarchy_request_fragments,
             (unsigned long)population.ruby_response_fragments,
+            (unsigned long)population.bypass_accepted_fragments,
+            (unsigned long)population.bypass_response_fragments,
+            (unsigned long)population.bypass_protocol_errors,
+            (unsigned long)population.device_bypass_uops,
+            (unsigned long)population.mixed_bypass_uops,
             (unsigned long)population.sequencer_coalesced_fragments,
             (unsigned long)population.no_ruby_uops,
             (unsigned long)population.hierarchy_complete_uops,
@@ -3057,9 +3086,10 @@ TaoTrace::finalizeNativeResponseDiagnostic()
         "{\"schema\":\"taotrace-native-summary-v1\","
         "\"record\":\"summary\",\"oracle_only\":true,"
         "\"fst_input\":false,\"core_id\":%u,"
-        "\"source_sideband_schema\":\"taotrace-native-response-v7\","
+        "\"source_sideband_schema\":\"taotrace-native-response-v8\","
         "\"lifecycle_join\":\"context-id-inst-seq-num\","
         "\"target_stop\":\"committed-native-drain\","
+        "\"bypass_semantics\":\"ruby-port-device-route-acceptance-and-response\","
         "\"hierarchy_source\":\"ruby-slicc-controller-actions\","
         "\"hierarchy_identity_transport\":"
         "\"context-id-inst-seq-num-no-request-retention\","
@@ -3083,6 +3113,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
         "\"native_admission_fragments\":%lu,"
         "\"native_hierarchy_request_fragments\":%lu,"
         "\"native_response_fragments\":%lu,"
+        "\"native_bypass_accepted_fragments\":%lu,"
+        "\"native_bypass_response_fragments\":%lu,"
+        "\"native_bypass_protocol_errors\":%lu,"
+        "\"native_device_bypass_uops\":%lu,"
+        "\"native_mixed_bypass_uops\":%lu,"
         "\"native_external_hit_fragments\":%lu,"
         "\"native_external_miss_fragments\":%lu,"
         "\"native_coalesced_fragments\":%lu,"
@@ -3106,6 +3141,11 @@ TaoTrace::finalizeNativeResponseDiagnostic()
         (unsigned long)total.ruby_admission_fragments,
         (unsigned long)total.ruby_hierarchy_request_fragments,
         (unsigned long)total.ruby_response_fragments,
+        (unsigned long)total.bypass_accepted_fragments,
+        (unsigned long)total.bypass_response_fragments,
+        (unsigned long)total.bypass_protocol_errors,
+        (unsigned long)total.device_bypass_uops,
+        (unsigned long)total.mixed_bypass_uops,
         (unsigned long)total.native_external_hit_fragments,
         (unsigned long)total.native_external_miss_fragments,
         (unsigned long)total.sequencer_coalesced_fragments,
@@ -3134,7 +3174,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
     static constexpr const char *reason_names[] = {
         "predicated_off", "no_request", "store_forward", "local_access",
         "failed_store_conditional", "zero_size", "prefetch_skipped",
-        "store_overwrite_elided", "store_buffer_combined"};
+        "store_overwrite_elided", "store_buffer_combined",
+        "device_bypass_complete"};
     std::fputs(",\"terminal_reason_counts\":{", summary);
     bool first_reason = true;
     for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
@@ -3346,7 +3387,9 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
     const uint32_t forward = taoTraceNativeReasonMask(
         TaoTraceNativeTerminalReason::StoreForward);
     facts.store_forward = bool(native.terminalReasonMask & forward);
-    facts.other_terminal = bool(native.terminalReasonMask & ~forward);
+    // Mixed device/RAM service lacks an all-cache retired-load proof.
+    facts.other_terminal = bool(native.terminalReasonMask & ~forward) ||
+        native.bypassAccepted != 0;
     facts.terminal_reason_mask = native.terminalReasonMask;
     facts.admissions = native.admissions;
     facts.responses = native.responses;
@@ -3504,8 +3547,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
             const auto request=inst->savedRequest->mainReq();
             const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
             if(ext) {
-                const bool resolved=ext->responses==ext->admissions &&
-                    (ext->issuanceClosed||ext->terminalNoRuby);
+                const bool resolved=ext->resolved();
                 const auto f=perfRetirementNativeFacts(*ext,resolved);
                 llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
                     {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
@@ -3521,8 +3563,7 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
         const auto request = inst->savedRequest->mainReq();
         const auto extension = request
             ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
-        if (extension && extension->responses == extension->admissions &&
-            (extension->issuanceClosed || extension->terminalNoRuby)) {
+        if (extension && extension->resolved()) {
             perf_retirement_.resolveNative(member.context,member.sequence,
                 perfRetirementNativeFacts(*extension,true));
         }
@@ -3841,6 +3882,11 @@ TaoTrace::finalizeTaskPmu()
              << ",\"ruby_aliased_admission_fragments\":" << pop.ruby_aliased_admission_fragments
              << ",\"ruby_hierarchy_request_fragments\":" << pop.ruby_hierarchy_request_fragments
              << ",\"ruby_response_fragments\":" << pop.ruby_response_fragments
+             << ",\"bypass_accepted_fragments\":" << pop.bypass_accepted_fragments
+             << ",\"bypass_response_fragments\":" << pop.bypass_response_fragments
+             << ",\"bypass_protocol_errors\":" << pop.bypass_protocol_errors
+             << ",\"device_bypass_uops\":" << pop.device_bypass_uops
+             << ",\"mixed_bypass_uops\":" << pop.mixed_bypass_uops
              << ",\"sequencer_coalesced_fragments\":" << pop.sequencer_coalesced_fragments
              << ",\"no_ruby_uops\":" << pop.no_ruby_uops
              << ",\"native_outcome_uops\":" << pop.native_outcome_uops

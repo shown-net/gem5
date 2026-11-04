@@ -852,6 +852,11 @@ private:
         uint64_t ruby_aliased_admission_fragments = 0;
         uint64_t ruby_hierarchy_request_fragments = 0;
         uint64_t ruby_response_fragments = 0;
+        uint64_t bypass_accepted_fragments = 0;
+        uint64_t bypass_response_fragments = 0;
+        uint64_t bypass_protocol_errors = 0;
+        uint64_t device_bypass_uops = 0;
+        uint64_t mixed_bypass_uops = 0;
         uint64_t sequencer_coalesced_fragments = 0;
         uint64_t no_ruby_uops = 0;
         uint64_t native_outcome_uops = 0;
@@ -1036,7 +1041,7 @@ private:
         native_diag_by_scope_{};
     std::array<std::array<uint64_t, 2>, 5>
         native_diag_proxy_confusion_{};
-    std::array<uint64_t, 9> native_diag_terminal_reason_counts_{};
+    std::array<uint64_t, 10> native_diag_terminal_reason_counts_{};
     std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
     uint64_t native_diag_anomaly_samples_dropped_ = 0;
     bool native_diag_finalized_ = false;

@@ -436,6 +436,10 @@ class LSQ
         noteNativeTerminal(TaoTraceNativeTerminalReason reason)
         {
             if (!_reqs.empty()) {
+                // This explicit LSQ terminal proves no further main-request
+                // fragments will be issued. Earlier accepted service still
+                // drains through the independent lifecycle counters.
+                TaoTraceNativeAccessRegistry::noteIssuanceClosed(mainReq());
                 TaoTraceNativeAccessRegistry::noteTerminal(mainReq(), reason);
             }
         }
