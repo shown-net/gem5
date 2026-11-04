@@ -21,6 +21,8 @@ def parse_args(argv=None):
                    help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
     p.add_argument("--functional-instruction-translations", action="store_true",
                    help="observe retired instruction translation provenance; no MMU-control qualification")
+    p.add_argument("--functional-core-facts", action="store_true",
+                   help="observe versioned architectural core facts; no native source/rename decisions")
     p.add_argument("--thread-state", action="store_true")
     p.add_argument("--task-clock", action="store_true", help="observe independent native BaseCPU task cycles; requires --thread-state and a --task-clock scheduler profile")
     p.add_argument("--scheduler-profile", type=Path)
@@ -157,6 +159,7 @@ def trace_options(args, trace_dir, profile_path, identity, thread_params=None):
         functional_task_clock=args.task_clock,
         functional_instruction_translations=args.functional_instruction_translations,
         functional_translation_origins=args.functional_translation_origins,
+        functional_core_facts=getattr(args, "functional_core_facts", False),
         functional_warmup=True, functional_user_target=args.functional_user_target,
         functional_sync_marker_pc=identity.get("marker_pc", 0),
         functional_sync_initial_context=args.sync_initial_context,
@@ -167,6 +170,52 @@ def trace_options(args, trace_dir, profile_path, identity, thread_params=None):
 def attach_traces(cpus, trace_class, options):
     for cpu in cpus:
         cpu.tao_trace = trace_class(manager=cpu, **options)
+
+
+def native_core_profile(cpu):
+    """Immutable SimObject configuration; runtime ISA sizes come from .core.gz.
+
+    This exporter runs before C++ instantiation. Missing values stay unknown;
+    physical counts must not be interpreted as initial free-list capacity.
+    """
+    def numeric(owner, name, path):
+        if owner is None or not hasattr(owner, name):
+            return None
+        try:
+            value = getattr(owner, name)
+            # BaseProxy.unproxy resolves Self/Parent relative to the owning
+            # SimObject. Keep the result local: unproxyParams would write it
+            # back into the native object's parameter dictionary.
+            resolve = getattr(value, "unproxy", None)
+            if callable(resolve):
+                value = resolve(owner)
+            return int(value)
+        except Exception as error:
+            raise ValueError("cannot resolve native core profile parameter " + path) from error
+
+    names = {"Int": "numPhysIntRegs", "Float": "numPhysFloatRegs",
+             "Vec": "numPhysVecRegs", "VecPred": "numPhysVecPredRegs",
+             "Mat": "numPhysMatRegs", "CC": "numPhysCCRegs"}
+    result = {"physical_registers": {
+        cls: numeric(cpu, name, "cpu." + name)
+        for cls, name in names.items()},
+        "numThreads": numeric(cpu, "numThreads", "cpu.numThreads"),
+        "architectural_registers": None,
+        "architectural_register_source": "instantiated-ISA-core-companion-v1",
+        "register_layout": 1, "decoder_layout": 1, "frontend": None}
+    frontend = getattr(cpu, "frontend", None)
+    if frontend is not None:
+        groups = {"instructionBytes": ("bufferBytes", "bytesPerCycle"),
+                  "idq": ("capacity",),
+                  "mite": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency"),
+                  "dsb": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency",
+                          "numSets", "associativity", "opsPerEntry"),
+                  "ms": ("instructionsPerBatch", "opsPerCycle", "batchOps", "latency")}
+        result["frontend"] = {group: {name: numeric(getattr(frontend, group, None), name,
+                                                  "frontend." + group + "." + name)
+                                      for name in fields} for group, fields in groups.items()}
+        result["frontend"]["dsbToMiteDelay"] = numeric(frontend, "dsbToMiteDelay", "frontend.dsbToMiteDelay")
+    return result
 
 
 def native_profile(cpu, cache, memory, num_cores):
@@ -222,6 +271,7 @@ def native_profile(cpu, cache, memory, num_cores):
             "fetchWidth", "decodeWidth", "renameWidth", "dispatchWidth", "issueWidth",
             "wbWidth", "commitWidth", "numROBEntries", "LQEntries", "SQEntries")}
     profile["native_cpu"]["iq_entries"] = [int(iq.numEntries) for iq in cpu.instQueues]
+    profile["native_cpu"].update(native_core_profile(cpu))
     return profile
 
 

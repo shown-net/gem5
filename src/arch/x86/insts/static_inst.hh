@@ -165,6 +165,44 @@ class X86StaticInst : public StaticInst
             machInst.rex.w && machInst.mode.submode == SixtyFourBitMode;
     }
 
+    // Pure observer facts, deliberately separate from the native predicate
+    // below. Parity tests cover every opcode/group/Jcc combination.
+    bool coreFusionFactsKnown() const override { return true; }
+    unsigned coreFusionProducerFamily() const override
+    {
+        if (machInst.opcode.type != OneByteOpcode) return 0;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (opcode == 0x01 || opcode == 0x03 || opcode == 0x05 ||
+            opcode == 0x29 || opcode == 0x2b || opcode == 0x2d ||
+            opcode == 0x39 || opcode == 0x3b || opcode == 0x3d)
+            return 1;
+        if (opcode == 0x21 || opcode == 0x23 || opcode == 0x25 ||
+            opcode == 0x85 || opcode == 0xa9 ||
+            (opcode == 0xf7 && machInst.modRM.reg == 0))
+            return 2;
+        if (opcode == 0xff && machInst.modRM.reg <= 1) return 3;
+        if (opcode == 0x81 || opcode == 0x83) {
+            const auto group = unsigned(machInst.modRM.reg);
+            if (group == 0 || group == 5 || group == 7) return 1;
+            if (group == 4) return 2;
+        }
+        return 0;
+    }
+    unsigned coreFusionAllowedJccMask() const override
+    {
+        const unsigned masks[] = {0, 0xf0fc, 0xffff, 0xf030};
+        return masks[coreFusionProducerFamily()];
+    }
+    unsigned coreFusionJccCondition() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (machInst.opcode.type == OneByteOpcode && opcode >= 0x70 && opcode <= 0x7f)
+            return opcode & 15;
+        if (machInst.opcode.type == TwoByteOpcode && opcode >= 0x80 && opcode <= 0x8f)
+            return opcode & 15;
+        return 255;
+    }
+
     bool canMacroFuseWith(const StaticInst &next) const override
     {
         const auto *branch = dynamic_cast<const X86StaticInst *>(&next);

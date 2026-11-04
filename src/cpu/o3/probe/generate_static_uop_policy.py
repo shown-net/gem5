@@ -2,9 +2,17 @@
 import hashlib
 from pathlib import Path
 
+CORE_FUNCTIONAL_FACTS_VERSION = 1
+STATIC_ORDERING_MAP_VERSION = 1
+
 POLICY_FILES = (
     'src/cpu/o3/probe/generate_static_uop_policy.py',
     'src/cpu/o3/probe/fst_static_uops.hh',
+    'src/cpu/o3/probe/fst_core_functional_facts.hh',
+    'src/cpu/o3/core_functional_facts.hh',
+    'src/cpu/o3/rename.cc',
+    'src/cpu/o3/Frontend.py', 'src/cpu/o3/BaseO3CPU.py',
+    'src/arch/x86/x86_traits.hh',
     'src/cpu/o3/probe/retired_frontend_facts.hh',
     'src/cpu/o3/probe/TaoTrace.py',
     'src/cpu/o3/probe/SConscript',
@@ -16,7 +24,7 @@ POLICY_FILES = (
     'src/arch/x86/pcstate.hh',
     'src/arch/generic/pcstate.hh', 'src/arch/generic/decoder.hh',
     'src/cpu/o3/dyn_inst.cc', 'src/base/extensible.hh',
-    'src/arch/x86/isa.cc', 'src/arch/x86/mmu.hh',
+    'src/arch/x86/isa.cc', 'src/arch/x86/isa.hh', 'src/arch/generic/isa.hh', 'src/arch/x86/mmu.hh',
     'src/arch/x86/decoder.cc', 'src/arch/x86/decoder.hh',
     'src/cpu/o3/fetch.cc', 'src/cpu/o3/fetch.hh',
     'src/cpu/o3/frontend.cc', 'src/cpu/o3/frontend.hh',

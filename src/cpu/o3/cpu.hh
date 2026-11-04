@@ -104,6 +104,8 @@ class CPU : public BaseCPU
     bool markerObservation = false;
     // Enabled by the observer constructor before the first Execute request.
     bool instructionTranslationObservation = false;
+    // Pure architectural snapshots; never enables marker/fusion behavior.
+    bool coreFunctionalObservation = false;
     const bool tmaEnabled;
     FrontendCoordinator *frontend = nullptr;
     ResultForwarding *resultForwarding = nullptr;

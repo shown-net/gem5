@@ -7,6 +7,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/allocation_group.hh"
+#include "cpu/o3/core_functional_facts.hh"
 #include "cpu/static_inst.hh"
 #include "sim/faults.hh"
 #include "sim/insttracer.hh"
@@ -39,6 +40,7 @@ struct FrontendRecord
     Tick fetchedAt;
     bool fromUser = false;
     uint64_t addressSpace = 0;
+    std::unique_ptr<CoreFunctionalContext> coreFunctionalContext;
     bool notAnInstruction = false;
     Fault fault = NoFault;
     std::unique_ptr<trace::InstRecord> traceData;

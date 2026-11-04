@@ -857,9 +857,15 @@ Rename::renameInsts(ThreadID tid)
             serializeAfter(insts_to_rename, tid);
         }
 
+        if (cpu->coreFunctionalObservation && !inst->coreFunctionalFacts) {
+            inst->coreFunctionalFacts = std::make_unique<CoreFunctionalSnapshot>(
+                inst->numSrcRegs(), inst->numDestRegs());
+        }
         renameSrcRegs(inst, inst->threadNumber);
 
         renameDestRegs(inst, inst->threadNumber);
+        if (inst->coreFunctionalFacts)
+            inst->coreFunctionalFacts->completeNormalization();
         if (inst->eliminatedMove) {
             inst->setExecuted();
             inst->setResultsWoken();
@@ -1198,6 +1204,8 @@ Rename::renameSrcRegs(const DynInstPtr &inst, ThreadID tid)
     for (int src_idx = 0; src_idx < num_src_regs; src_idx++) {
         const RegId& src_reg = inst->srcRegIdx(src_idx);
         const RegId flat_reg = src_reg.flatten(*isa);
+        if (inst->coreFunctionalFacts)
+            inst->coreFunctionalFacts->observeSource(src_idx, src_reg, flat_reg);
         PhysRegIdPtr renamed_reg;
 
         renamed_reg = map->lookup(flat_reg);
@@ -1273,6 +1281,9 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
 
         RegId flat_dest_regid = dest_reg.flatten(*isa);
         flat_dest_regid.setNumPinnedWrites(dest_reg.getNumPinnedWrites());
+        if (inst->coreFunctionalFacts)
+            inst->coreFunctionalFacts->observeDestination(
+                dest_idx, dest_reg, flat_dest_regid);
 
         if (inst->eliminatedMove) {
             auto source = inst->renamedSrcIdx(

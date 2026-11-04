@@ -33,6 +33,7 @@
 #include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/probe/perf_retirement.hh"
 #include "cpu/o3/probe/fst_static_uops.hh"
+#include "cpu/o3/probe/fst_core_functional_facts.hh"
 #include "cpu/o3/probe/native_task_clock.hh"
 #include "lru_banked.hh"
 #include "fst_dynamic_translation_writer.hh"
@@ -527,6 +528,7 @@ private:
     std::FILE *out_fst_memory_requests_ = nullptr;
     std::FILE *out_fst_store_requests_ = nullptr;
     std::unique_ptr<fastsim::fst::StaticUopWriter> fst_static_uops_;
+    std::unique_ptr<fastsim::fst::CoreFunctionalWriter> fst_core_functional_;
     // Native identities are internal joining keys only, never trace outputs.
     std::unordered_map<uint64_t,uint64_t> fst_pending_store_groups_;
     uint64_t fst_next_store_group_ = 0;
@@ -658,6 +660,7 @@ private:
     bool functional_include_kernel_ = false;
     bool functional_syscall_microops_ = false;
     bool functional_frontend_ = false;
+    bool functional_core_facts_ = false;
     bool functional_instruction_translations_ = false;
     bool functional_translation_origins_ = false;
     bool functional_retirement_ = false;

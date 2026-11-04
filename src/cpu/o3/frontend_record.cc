@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "cpu/o3/frontend_record.hh"
+#include "arch/x86/pcstate.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -17,6 +18,16 @@ FrontendRecord::FrontendRecord(CPU *cpu, ThreadID tid,
         fromUser = cpu->inUserMode(tid);
         addressSpace = cpu->tcBase(tid)->readMiscRegNoEffect(
             X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+    }
+    if (cpu->coreFunctionalObservation) {
+        coreFunctionalContext = std::make_unique<CoreFunctionalContext>();
+        auto &context = *coreFunctionalContext;
+        context.observeDecoder(at.as<X86ISA::PCState>());
+        context.addressSpace = cpu->tcBase(tid)->readMiscRegNoEffect(
+            X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+        context.fromUser = cpu->inUserMode(tid);
+        context.frontendKnown = true;
+        context.origin = fastsim::fst::CoreFrontendOrigin::ObserverRecord;
     }
 #if TRACING_ON
     if (trace)
@@ -38,6 +49,11 @@ FrontendRecord::materialize(CPU *cpu)
     inst->setPredTaken(prediction.taken);
     inst->fetchedFromUser = fromUser;
     inst->fetchedAddressSpaceId = addressSpace;
+    if (coreFunctionalContext) {
+        inst->coreFunctionalFacts = std::make_unique<CoreFunctionalSnapshot>(
+            inst->numSrcRegs(), inst->numDestRegs());
+        inst->coreFunctionalFacts->context = *coreFunctionalContext;
+    }
     inst->pendingFrontendAcceptance = true;
     inst->allocationGroup = allocationGroup;
     inst->fetchTick = fetchedAt;

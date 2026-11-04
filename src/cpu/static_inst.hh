@@ -98,6 +98,11 @@ class StaticInst : public RefCounted, public StaticInstFlags
     void clearIntExecution() { intExecutionInfo = {}; }
     virtual bool usesMicrocodeService() const { return false; }
     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
+    // Observer-only decoded predicates. Native acceptance does not call these.
+    virtual bool coreFusionFactsKnown() const { return false; }
+    virtual unsigned coreFusionProducerFamily() const { return 0; }
+    virtual unsigned coreFusionAllowedJccMask() const { return 0; }
+    virtual unsigned coreFusionJccCondition() const { return 255; }
     ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
     bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
     virtual RegVal zeroIdiomResult(RegIndex destination) const { return 0; }

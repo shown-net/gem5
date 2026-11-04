@@ -107,6 +107,9 @@ class TaoTrace(ProbeListenerObject):
     functional_frontend = Param.Bool(False,
         "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
         "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
+    functional_core_facts = Param.Bool(False,
+        "Observe pure decoded/architectural core facts in .core.gz v1 from startup. "
+        "Requires complete FS O3 retired frontend capture; no native source/fusion/rename decisions.")
     functional_translation_origins = Param.Bool(False,
         "Preserve data translation origins separately from retirement ASID in policy-bound .xlat.gz v3. "
         "Requires complete FS O3 retired functional source mode; observation only, no target MMU changes.")

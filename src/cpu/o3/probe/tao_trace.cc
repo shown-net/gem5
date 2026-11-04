@@ -71,6 +71,20 @@ namespace gem5
 namespace o3
 {
 
+// Core functional register layout source binding (also compiled in the
+// actual-header regression without instantiating a CPU or linking gem5).
+static_assert(IntRegClass==0 && FloatRegClass==1 && VecRegClass==2 &&
+              VecElemClass==3 && VecPredRegClass==4 && MatRegClass==5 &&
+              CCRegClass==6 && MiscRegClass==7 && InvalidRegClass==-1,
+              "core functional register layout 1 class ordering changed");
+static_assert(X86ISA::flatIntRegClass.numRegs()==fastsim::fst::kCoreX86RegistersV1[0] &&
+              X86ISA::flatFloatRegClass.numRegs()==fastsim::fst::kCoreX86RegistersV1[1] &&
+              X86ISA::ccRegClass.numRegs()==fastsim::fst::kCoreX86RegistersV1[6],
+              "core functional register layout 1 differs from native x86 classes");
+static_assert(X86ISA::IntFoldBit==fastsim::fst::kCoreX86IntFoldBitV1,
+              "core functional register layout 1 integer normalization changed");
+// End core functional register layout source binding.
+
 std::FILE *TaoTrace::global_functional_sync_observation_ = nullptr;
 uint64_t TaoTrace::global_functional_sync_sequence_ = 0;
 std::FILE *TaoTrace::global_thread_state_observation_ = nullptr;
@@ -370,6 +384,9 @@ enum FstStaticFlag : uint16_t {
     kFstStaticReturn = 1u << 4,
     kFstStaticDirectTargetValid = 1u << 5,
     kFstStaticMemory = 1u << 6,
+    kFstStaticReadBarrier = 1u << 7,
+    kFstStaticWriteBarrier = 1u << 8,
+    kFstStaticLockedRmw = 1u << 9,
 };
 
 struct FstInstructionMapHeaderV2 {
@@ -703,6 +720,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_include_kernel_(params.functional_include_kernel),
       functional_syscall_microops_(params.functional_syscall_microops),
       functional_frontend_(params.functional_frontend),
+      functional_core_facts_(params.functional_core_facts),
       functional_instruction_translations_(params.functional_instruction_translations),
       functional_translation_origins_(params.functional_translation_origins),
       functional_retirement_(params.functional_retirement),
@@ -817,6 +835,14 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
         (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
          !functional_asid_static_map_ || functional_user_only_))
         throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
+    if (functional_core_facts_) {
+        if (!FullSystem || !task_clock_cpu_ || !functional_frontend_ ||
+            !functional_retirement_ || !functional_asid_static_map_ || functional_user_only_)
+            throw std::runtime_error("core functional facts require complete FS O3 retired frontend source mode");
+        // Observer-only startup snapshots. Never enable markerObservation or
+        // change the existing native frontend/fusion fields or parameters.
+        task_clock_cpu_->coreFunctionalObservation = true;
+    }
     if (functional_instruction_translations_) {
         if (!functional_frontend_ || !task_clock_cpu_ || !FullSystem)
             throw std::runtime_error("instruction translation observation requires FS O3 retired frontend capture");
@@ -1003,6 +1029,22 @@ TaoTrace::openOutput()
                     fst_path_+".uops.gz", static_cast<uint32_t>(fst_core_id_),
                     fastsim::fst::kStaticUopPolicySha256);
                 fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
+                if (functional_core_facts_) {
+                    fastsim::fst::CoreFunctionalHeader header;
+                    header.core_id = static_cast<uint32_t>(fst_core_id_);
+                    header.policy_sha256 = fastsim::fst::kStaticUopPolicySha256;
+                    const auto &classes = task_clock_cpu_->tcBase(0)->getIsaPtr()->regClasses();
+                    if (classes.size() != header.architectural_registers.size())
+                        throw std::runtime_error("core functional ISA register layout mismatch");
+                    for (unsigned i=0; i<classes.size(); ++i) {
+                        if (classes[i]->type()!=static_cast<RegClassType>(i) || classes[i]->numRegs()>UINT32_MAX)
+                            throw std::runtime_error("core functional ISA register layout out of range");
+                        header.architectural_registers[i]=static_cast<uint32_t>(classes[i]->numRegs());
+                    }
+                    fst_core_functional_ = std::make_unique<fastsim::fst::CoreFunctionalWriter>(
+                        fst_path_+".core.gz", header);
+                    fst_feature_flags_ |= fastsim::fst::kCoreFunctionalFacts;
+                }
                 if (FullSystem) {
                     fst_translations_ = std::make_unique<fastsim::fst::DynamicTranslationWriter>(
                         fst_path_ + ".xlat.gz", static_cast<uint32_t>(fst_core_id_),
@@ -6402,6 +6444,7 @@ TaoTrace::flushFstFrontend(bool complete)
     if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
     else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
     fst_frontend_->append(fst_frontend_pending_);
+    if (fst_core_functional_) fst_core_functional_->append_macro(fst_frontend_pending_);
     if (fst_instruction_translations_) {
         fst_instruction_translations_->append(fst_frontend_pending_,*fst_instruction_pending_);
         fst_instruction_pending_.reset();
@@ -6529,6 +6572,14 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
         m.flags&=~kFrontendDsbEligible;
     if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
     ++m.observed_uops; m.end_record=fst_record_count_+1;
+    if (fst_core_functional_) {
+        auto facts=collectCoreFunctionalFacts(*si,*root,inst->coreFunctionalFacts.get(),pseudo);
+        facts.row.record_ordinal=fst_record_count_;
+        facts.row.macro_begin=m.begin_record;facts.row.pc=m.pc;
+        facts.row.code_identity=m.code_identity;facts.row.semantic_prefix_identity=m.semantic_identity;
+        facts.row.micro_pc=inst->pcState().microPC();
+        fst_core_functional_->observe(record,facts.row,facts.operands);
+    }
     fst_frontend_->observe_record(record);
     if (fst_instruction_translations_) fst_instruction_translations_->observe_record(record);
     if (!si->isMicroop() || si->isLastMicroop()) flushFstFrontend(true);
@@ -6919,6 +6970,10 @@ TaoTrace::observeFstStaticInstruction(
     add_flag(kFstStaticReturn, si->isReturn());
     add_flag(kFstStaticMemory,
              si->isLoad() || si->isStore() || si->isAtomic());
+    add_flag(kFstStaticReadBarrier, si->isReadBarrier());
+    add_flag(kFstStaticWriteBarrier, si->isWriteBarrier());
+    const auto root = inst->macroop ? inst->macroop : si;
+    add_flag(kFstStaticLockedRmw, root->isArchitecturalLockedMemory());
     if (si->isDirectCtrl()) {
         // The DynInst PCState at commit contains the resolved dynamic NPC.
         // X86MicroopBase::branchTarget adds its displacement to NPC, so feed
@@ -6945,6 +7000,14 @@ TaoTrace::observeFstStaticInstruction(
     }
 
     if (!completes_instruction) return;
+    const auto locked_ordering = kFstStaticMemory | kFstStaticReadBarrier | kFstStaticWriteBarrier;
+    if ((pending.flags & kFstStaticLockedRmw) &&
+        (pending.flags & locked_ordering) != locked_ordering) {
+        // A static map row claims the whole macro. Missing native static
+        // fence members cannot be repaired by inventing barrier predicates.
+        suppress_static_pc(key);
+        return;
+    }
     FstStaticInstruction completed;
     completed.pc = pending.pc;
     completed.fallthrough_pc = pending.fallthrough_pc;
@@ -7216,6 +7279,7 @@ TaoTrace::finalizeFst()
     if (fst_frontend_) {
         flushFstFrontend(false);
         fst_frontend_->finish(fst_record_count_);
+        if (fst_core_functional_) fst_core_functional_->finish(fst_record_count_);
         if (fst_instruction_translations_) fst_instruction_translations_->finish(fst_record_count_);
     }
     fst_finalized_ = true;

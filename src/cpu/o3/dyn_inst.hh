@@ -58,6 +58,7 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/allocation_group.hh"
+#include "cpu/o3/core_functional_facts.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/int_execution.hh"
 #include "cpu/o3/lsq_unit.hh"
@@ -156,6 +157,9 @@ class DynInst : public ExecContext, public RefCounted
 
     /** The StaticInst used by this BaseDynInst. */
     const StaticInstPtr staticInst;
+
+    // Optional observer facts owned by this instruction, discarded on squash.
+    std::unique_ptr<CoreFunctionalSnapshot> coreFunctionalFacts;
 
     /** Pointer to the Impl's CPU object. */
     CPU *cpu = nullptr;
