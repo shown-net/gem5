@@ -21,6 +21,8 @@ def parse_args(argv=None):
                    help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
     p.add_argument("--functional-instruction-translations", action="store_true",
                    help="observe retired instruction translation provenance; no MMU-control qualification")
+    p.add_argument("--functional-mmu-controls", action="store_true",
+                   help="Collect pure functional logical MMU controls (default off)")
     p.add_argument("--functional-core-facts", action="store_true",
                    help="observe versioned architectural core facts; no native source/rename decisions")
     p.add_argument("--thread-state", action="store_true")
@@ -160,6 +162,7 @@ def trace_options(args, trace_dir, profile_path, identity, thread_params=None):
         functional_instruction_translations=args.functional_instruction_translations,
         functional_translation_origins=args.functional_translation_origins,
         functional_core_facts=getattr(args, "functional_core_facts", False),
+        functional_mmu_controls=getattr(args, "functional_mmu_controls", False),
         functional_warmup=True, functional_user_target=args.functional_user_target,
         functional_sync_marker_pc=identity.get("marker_pc", 0),
         functional_sync_initial_context=args.sync_initial_context,

@@ -35,6 +35,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/x86/tlb.hh"
 
 #include <cstring>
@@ -219,9 +220,13 @@ TLB::lookup(Addr va, bool update_lru)
 void
 TLB::flushAll()
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushAll, 0, 0, true);
     ++invalidationGeneration;
     if (codeInvalidation) codeInvalidation();
-    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushAll();
+    if (nextLevel()) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
+        static_cast<TLB *>(nextLevel())->flushAll();
+    }
     DPRINTF(TLB, "Invalidating all entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle) {
@@ -241,9 +246,13 @@ TLB::setConfigAddress(uint32_t addr)
 void
 TLB::flushNonGlobal()
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal, 0, 0, true);
     ++invalidationGeneration;
     if (codeInvalidation) codeInvalidation();
-    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushNonGlobal();
+    if (nextLevel()) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
+        static_cast<TLB *>(nextLevel())->flushNonGlobal();
+    }
     DPRINTF(TLB, "Invalidating all non global entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle && !tlb[i].global) {
@@ -257,9 +266,13 @@ TLB::flushNonGlobal()
 void
 TLB::demapPage(Addr va, uint64_t asn)
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, va, asn, true);
     ++invalidationGeneration;
     if (codeInvalidation) codeInvalidation();
-    if (nextLevel()) static_cast<TLB *>(nextLevel())->demapPage(va, asn);
+    if (nextLevel()) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
+        static_cast<TLB *>(nextLevel())->demapPage(va, asn);
+    }
     TlbEntry *entry = trie.lookup(va);
     if (entry) {
         trie.remove(entry->trieHandle);
@@ -809,6 +822,7 @@ TLB::serialize(CheckpointOut &cp) const
 void
 TLB::unserialize(CheckpointIn &cp)
 {
+    functional_mmu::lifecycle(this);
     // Do not allow to restore with a smaller tlb.
     uint32_t _size;
     UNSERIALIZE_SCALAR(_size);

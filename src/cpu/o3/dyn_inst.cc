@@ -198,6 +198,7 @@ DynInst::operator delete(void *ptr)
 
 DynInst::~DynInst()
 {
+    if (thread) functional_mmu::destroy(tcBase(), seqNum, mmuControlGeneration);
     /*
      * The buffer this DynInst occupies also holds some of the structures it
      * points to. We need to call their destructors manually to make sure that

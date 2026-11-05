@@ -38,6 +38,7 @@
 #ifndef __ARCH_X86_MMU_HH__
 #define __ARCH_X86_MMU_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/generic/mmu.hh"
 #include "arch/x86/page_size.hh"
 #include "arch/x86/tlb.hh"
@@ -62,8 +63,11 @@ class MMU : public BaseMMU
     void
     flushNonGlobal()
     {
-        static_cast<TLB*>(itb)->flushNonGlobal();
-        static_cast<TLB*>(dtb)->flushNonGlobal();
+        functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal);
+        { functional_mmu::EdgeScope mmu_edge(mmu_command, this, itb);
+          static_cast<TLB*>(itb)->flushNonGlobal(); }
+        { functional_mmu::EdgeScope mmu_edge(mmu_command, this, dtb);
+          static_cast<TLB*>(dtb)->flushNonGlobal(); }
     }
 
     Walker*

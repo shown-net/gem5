@@ -42,6 +42,7 @@
 #ifndef __CPU_O3_DYN_INST_HH__
 #define __CPU_O3_DYN_INST_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -168,6 +169,7 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Pointer to the thread state. */
     ThreadState *thread = nullptr;
+    std::uint32_t mmuControlGeneration = 0;
 
     /** The kind of fault this instruction has generated. */
     Fault fault = NoFault;
@@ -459,6 +461,7 @@ class DynInst : public ExecContext, public RefCounted
     void
     demapPage(Addr vaddr, uint64_t asn) override
     {
+        functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Immediate, mmuControlGeneration);
         cpu->demapPage(vaddr, asn);
     }
 
@@ -1060,7 +1063,10 @@ class DynInst : public ExecContext, public RefCounted
     void setTid(ThreadID tid) { threadNumber = tid; }
 
     /** Sets the pointer to the thread state. */
-    void setThreadState(ThreadState *state) { thread = state; }
+    void setThreadState(ThreadState *state) {
+        thread = state;
+        mmuControlGeneration = thread ? functional_mmu::generation(thread->getTC()) : 0;
+    }
 
     /** Returns the thread context. */
     gem5::ThreadContext *tcBase() const override { return thread->getTC(); }
@@ -1205,6 +1211,7 @@ class DynInst : public ExecContext, public RefCounted
             thread->noSquashFromTC = true;
 
             /** Update the architectural state with the new value */
+            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Immediate, mmuControlGeneration);
             cpu->setMiscReg(reg.index(), val, threadNumber);
 
             thread->noSquashFromTC = no_squash_from_TC;
@@ -1222,9 +1229,11 @@ class DynInst : public ExecContext, public RefCounted
         bool no_squash_from_TC = thread->noSquashFromTC;
         thread->noSquashFromTC = true;
 
-        for (int i = 0; i < _destMiscRegIdx.size(); i++)
+        for (int i = 0; i < _destMiscRegIdx.size(); i++) {
+            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Deferred, mmuControlGeneration);
             cpu->setMiscReg(
                 _destMiscRegIdx[i], _destMiscRegVal[i], threadNumber);
+        }
 
         thread->noSquashFromTC = no_squash_from_TC;
     }

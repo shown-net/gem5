@@ -17,6 +17,7 @@
 #ifndef __CPU_O3_PROBE_TAO_TRACE_HH__
 #define __CPU_O3_PROBE_TAO_TRACE_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -220,6 +221,7 @@ class TaoTrace : public ProbeListenerObject
     void onRename(const DynInstPtr &dynInst);
     void onDispatch(const DynInstPtr &dynInst);
     void onCommit(const DynInstPtr &dynInst);
+    void onCommitMiscRegsApplied(const DynInstPtr &dynInst);
     void onPreCommit(const DynInstPtr &dynInst);
     void onCommitStall(const DynInstPtr &dynInst);
     void onSquash(const DynInstPtr &dynInst);
@@ -661,6 +663,8 @@ private:
     bool functional_syscall_microops_ = false;
     bool functional_frontend_ = false;
     bool functional_core_facts_ = false;
+    bool functional_mmu_controls_ = false;
+    std::unique_ptr<functional_mmu::Observer> fst_mmu_controls_;
     bool functional_instruction_translations_ = false;
     bool functional_translation_origins_ = false;
     bool functional_retirement_ = false;

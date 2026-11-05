@@ -162,6 +162,8 @@ Commit::regProbePoints()
             cpu->getProbeManager(), "PreCommit");
     ppCommit = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "Commit");
+    ppCommitMiscRegsApplied = new ProbePointArg<DynInstPtr>(
+        cpu->getProbeManager(), "CommitMiscRegsApplied");
     ppCommitStall = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "CommitStall");
     ppSquash = new ProbePointArg<DynInstPtr>(
@@ -1109,6 +1111,7 @@ Commit::commitInsts()
 
                 // Updates misc. registers.
                 head_inst->updateMiscRegs();
+                ppCommitMiscRegsApplied->notify(head_inst);
 
                 // Check instruction execution if it successfully commits and
                 // is not carrying a fault.

@@ -2,10 +2,43 @@
 import hashlib
 from pathlib import Path
 
+LOGICAL_MMU_CONTROLS_VERSION = 1
 CORE_FUNCTIONAL_FACTS_VERSION = 1
 STATIC_ORDERING_MAP_VERSION = 1
 
 POLICY_FILES = (
+    'taogen/shared/fst_mmu_controls.hh',
+    'src/mem/functional_mmu_controls.hh',
+    'src/arch/generic/mmu.cc',
+    'src/arch/generic/mmu.hh',
+    'src/arch/generic/tlb.hh',
+    'src/arch/x86/faults.cc',
+    'src/arch/x86/faults.hh',
+    'src/arch/x86/kvm/x86_cpu.cc',
+    'src/arch/x86/kvm/x86_cpu.hh',
+    'src/cpu/base.cc',
+    'src/cpu/base.hh',
+    'src/cpu/BaseCPU.py',
+    'src/cpu/thread_context.cc',
+    'src/cpu/thread_context.hh',
+    'src/cpu/exec_context.hh',
+    'src/cpu/reg_class.cc',
+    'src/cpu/o3/cpu.cc',
+    'src/cpu/o3/commit.cc',
+    'src/cpu/o3/commit.hh',
+    'src/cpu/o3/thread_context.cc',
+    'src/cpu/o3/thread_context.hh',
+    'src/cpu/o3/thread_state.cc',
+    'src/cpu/o3/thread_state.hh',
+    'src/cpu/kvm/base.cc',
+    'src/cpu/kvm/base.hh',
+    'src/sim/mem_state.cc',
+    'configs/fastsim/fs_capture.py',
+    'src/arch/generic/BaseMMU.py',
+    'src/arch/generic/BaseTLB.py',
+    'src/arch/x86/X86MMU.py',
+    'src/arch/x86/X86TLB.py',
+
     'src/cpu/o3/probe/generate_static_uop_policy.py',
     'src/cpu/o3/probe/fst_static_uops.hh',
     'src/cpu/o3/probe/fst_core_functional_facts.hh',

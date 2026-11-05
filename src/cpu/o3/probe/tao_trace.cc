@@ -721,6 +721,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_syscall_microops_(params.functional_syscall_microops),
       functional_frontend_(params.functional_frontend),
       functional_core_facts_(params.functional_core_facts),
+      functional_mmu_controls_(params.functional_mmu_controls),
       functional_instruction_translations_(params.functional_instruction_translations),
       functional_translation_origins_(params.functional_translation_origins),
       functional_retirement_(params.functional_retirement),
@@ -835,6 +836,11 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
         (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
          !functional_asid_static_map_ || functional_user_only_))
         throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
+    if (functional_mmu_controls_ && (!FullSystem || !task_clock_cpu_ ||
+        task_clock_cpu_->numContexts() != 1 ||
+        !functional_frontend_ || !functional_retirement_ || !functional_asid_static_map_ ||
+        functional_user_only_ || !functional_syscall_microops_))
+        throw std::runtime_error("MMU controls require complete FS O3 retired raw frontend input");
     if (functional_core_facts_) {
         if (!FullSystem || !task_clock_cpu_ || !functional_frontend_ ||
             !functional_retirement_ || !functional_asid_static_map_ || functional_user_only_)
@@ -854,7 +860,8 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     openFunctionalSync();
     openThreadState();
     if (functionalTraceEnabled()) {
-        registerExitCallback([this]() { writeFunctionalBoundary(); });
+        registerExitCallback([this]() { writeFunctionalBoundary();
+            if (fst_mmu_controls_) fst_mmu_controls_->forceClose(); });
     }
 }
 
@@ -908,6 +915,7 @@ TaoTrace::~TaoTrace()
         std::fclose(out_fst_);
         out_fst_ = nullptr;
     }
+    if (fst_mmu_controls_) fst_mmu_controls_->forceClose();
     if (out_fst_dependencies_) {
         std::fclose(out_fst_dependencies_);
         out_fst_dependencies_ = nullptr;
@@ -1029,6 +1037,24 @@ TaoTrace::openOutput()
                     fst_path_+".uops.gz", static_cast<uint32_t>(fst_core_id_),
                     fastsim::fst::kStaticUopPolicySha256);
                 fst_feature_flags_ |= fastsim::fst::kStaticUopFacts;
+                if (functional_mmu_controls_) {
+                    auto *tc = task_clock_cpu_->tcBase(0);
+                    fst_mmu_controls_ = std::make_unique<functional_mmu::Observer>(fst_core_id_, [tc] {
+                        return fastsim::fst::mmuctl::State{
+                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr0),
+                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3),
+                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr4),
+                            tc->readMiscRegNoEffect(X86ISA::misc_reg::Efer)};
+                    });
+                    fst_mmu_controls_->registerEndpoint(tc, fastsim::fst::mmuctl::Domain::Unknown);
+                    fst_mmu_controls_->registerEndpoint(tc->getIsaPtr(), fastsim::fst::mmuctl::Domain::Unknown);
+                    tc->getMMUPtr()->registerFunctionalMmuControls(*fst_mmu_controls_);
+                    fastsim::fst::mmuctl::Header header;
+                    header.policy = fastsim::fst::kStaticUopPolicySha256;
+                    header.coverage = fastsim::fst::mmuctl::RequiredCoverage;
+                    fst_mmu_controls_->attach(fst_path_+".mmuctl.gz", header);
+                    fst_feature_flags_ |= fastsim::fst::kLogicalMmuControls;
+                }
                 if (functional_core_facts_) {
                     fastsim::fst::CoreFunctionalHeader header;
                     header.core_id = static_cast<uint32_t>(fst_core_id_);
@@ -1527,6 +1553,8 @@ TaoTrace::regProbeListeners()
     connectListener<DynInstListener>(this, "Dispatch",    &TaoTrace::onDispatch);
     connectListener<DynInstListener>(this, "PreCommit",   &TaoTrace::onPreCommit);
     connectListener<DynInstListener>(this, "Commit",      &TaoTrace::onCommit);
+    if (fst_mmu_controls_)
+        connectListener<DynInstListener>(this, "CommitMiscRegsApplied", &TaoTrace::onCommitMiscRegsApplied);
     connectListener<DynInstListener>(this, "CommitStall", &TaoTrace::onCommitStall);
     connectListener<DynInstListener>(this, "Squash",      &TaoTrace::onSquash);
     connectListener<DynInstListener>(this, "Execute",     &TaoTrace::onExecute);
@@ -2139,6 +2167,10 @@ TaoTrace::emitFunctionalSyscallMarker(
         if (!functional_syscall_microops_) {
             if (std::fwrite(&record, sizeof(record), 1, out_fst_) != 1)
                 throw std::runtime_error("TaoTrace failed to write FST syscall");
+            if (fst_mmu_controls_) {
+                fst_mmu_controls_->fail(fastsim::fst::mmuctl::Reason::EffectOrderUnsupported);
+                fst_mmu_controls_->bind(inst->seqNum, fst_record_count_, &record, inst->mmuControlGeneration);
+            }
             noteFstMemoryRequest(inst, &record, false, 0);
             if (fst_static_uops_) fst_static_uops_->observe(&record,{},{});
             ++fst_record_count_;
@@ -2361,6 +2393,11 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
             perf_cache_native::observer().close(context_id,functional_common_end_tick_);
             TaoTraceFrontendRegistry::disableContext(uint32_t(context_id));
         }
+        // Freeze the logical control interval at the same retained-stream cut.
+        // Already-bound members may still deliver their post-update metadata;
+        // subsequent native drain execution is outside this companion.
+        if (trace->fst_mmu_controls_)
+            trace->fst_mmu_controls_->close(trace->fst_record_count_);
         trace->closeTaskClock();
         trace->finalizeCplMeasurement();
     }
@@ -6324,6 +6361,7 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
         }
         if (std::fwrite(&rec, sizeof(rec), 1, out_fst_) != 1)
             throw std::runtime_error("TaoTrace failed writing functional FST record");
+        if (fst_mmu_controls_) fst_mmu_controls_->bind(inst->seqNum, fst_record_count_, &rec, inst->mmuControlGeneration);
         if (fst_frontend_) observeFstFrontend(inst, &rec, address_space_id);
         // memReqFlags are the functional request flags captured by LSQ
         // translation. NO_ACCESS retains address translation/faults and the SQ
@@ -7273,6 +7311,7 @@ TaoTrace::finalizeFst()
     }
     writeFstDependencyHeader();
     writeFstMemoryRequestHeader(true);
+    if (fst_mmu_controls_) fst_mmu_controls_->close(fst_record_count_);
     if (fst_static_uops_) fst_static_uops_->finish(fst_record_count_);
     if (fst_translations_)
         fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
@@ -8827,6 +8866,12 @@ TaoTrace::finalizeThreadState()
     time_file << "}\n";
     time_file.close();
     if (!time_file) throw std::runtime_error("failed writing thread-state time accounting oracle");
+}
+
+void
+TaoTrace::onCommitMiscRegsApplied(const DynInstPtr &inst)
+{
+    if (fst_mmu_controls_) fst_mmu_controls_->seal(inst->seqNum, inst->mmuControlGeneration);
 }
 
 void

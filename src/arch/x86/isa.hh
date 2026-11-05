@@ -29,6 +29,7 @@
 #ifndef __ARCH_X86_ISA_HH__
 #define __ARCH_X86_ISA_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <iostream>
 #include <string>
 
@@ -72,6 +73,7 @@ class ISA : public BaseISA
     using Params = X86ISAParams;
 
     ISA(const Params &p);
+    ~ISA() override { functional_mmu::unregisterEndpoint(this); }
 
     RegVal readMiscRegNoEffect(RegIndex idx) const override;
     RegVal readMiscReg(RegIndex idx) override;

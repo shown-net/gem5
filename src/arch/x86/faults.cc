@@ -38,6 +38,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/x86/faults.hh"
 
 #include "arch/x86/generated/decoder.hh"
@@ -136,6 +137,7 @@ InvalidOpcode::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 void
 PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    functional_mmu::CauseScope mmu_cause(fastsim::fst::mmuctl::Reason::UnboundPageFault);
     if (FullSystem) {
         // Invalidate any matching TLB entries before handling the page fault.
         tc->getMMUPtr()->demapPage(addr, 0);

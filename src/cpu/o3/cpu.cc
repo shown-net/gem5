@@ -41,6 +41,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "cpu/o3/cpu.hh"
 
 #include "cpu/activity.hh"
@@ -464,6 +465,7 @@ void
 CPU::startup()
 {
     BaseCPU::startup();
+    for (auto *tc : threadContexts) functional_mmu::resume(tc);
 
     bac.startupStage();
     fetch.startupStage();
@@ -896,6 +898,7 @@ CPU::drainResume()
     DPRINTF(Drain, "Resuming...\n");
     verifyMemoryMode();
 
+    for (auto *tc : threadContexts) functional_mmu::resume(tc);
     bac.drainResume();
     fetch.drainResume();
     commit.drainResume();
@@ -937,6 +940,7 @@ CPU::switchOut()
 void
 CPU::takeOverFrom(BaseCPU *oldCPU)
 {
+    for (auto *tc : threadContexts) functional_mmu::lifecycle(tc);
     BaseCPU::takeOverFrom(oldCPU);
 
     bac.takeOverFrom();
@@ -945,6 +949,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
     rename.takeOverFrom();
     iew.takeOverFrom();
     commit.takeOverFrom();
+    for (auto *tc : threadContexts) functional_mmu::resume(tc);
 
     assert(!tickEvent.scheduled());
 

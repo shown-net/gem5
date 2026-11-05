@@ -26,6 +26,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/x86/isa.hh"
 
 #include "arch/x86/decoder.hh"
@@ -112,6 +113,7 @@ ISA::updateHandyM5Reg(Efer efer, CR0 cr0,
 void
 ISA::clear()
 {
+    functional_mmu::lifecycle(this);
     // Blank everything. 0 might not be an appropriate value for some things,
     // but it is for most.
     memset(regVal, 0, misc_reg::NumRegs * sizeof(RegVal));
@@ -262,6 +264,18 @@ ISA::readMiscReg(RegIndex idx)
 void
 ISA::setMiscRegNoEffect(RegIndex idx, RegVal val)
 {
+    const auto mmu_reg = idx == misc_reg::Cr0 ? 0 : idx == misc_reg::Cr3 ? 1 :
+        idx == misc_reg::Cr4 ? 2 : idx == misc_reg::Efer ? 3 : 4;
+    std::unique_ptr<functional_mmu::WriteScope> mmu_write;
+    if (mmu_reg < 4 && functional_mmu::endpoint(this).observer)
+        mmu_write = std::make_unique<functional_mmu::WriteScope>(this,
+            fastsim::fst::mmuctl::Register(mmu_reg), val,
+            fastsim::fst::mmuctl::Mode::NoEffect, [this] {
+                return fastsim::fst::mmuctl::State{readMiscRegNoEffect(misc_reg::Cr0),
+                    readMiscRegNoEffect(misc_reg::Cr3), readMiscRegNoEffect(misc_reg::Cr4),
+                    readMiscRegNoEffect(misc_reg::Efer)};
+            });
+
     // Make sure we're not dealing with an illegal control register.
     // Instructions should filter out these indexes, and nothing else should
     // attempt to write to them directly.
@@ -304,6 +318,18 @@ ISA::setMiscRegNoEffect(RegIndex idx, RegVal val)
 void
 ISA::setMiscReg(RegIndex idx, RegVal val)
 {
+    const auto mmu_reg = idx == misc_reg::Cr0 ? 0 : idx == misc_reg::Cr3 ? 1 :
+        idx == misc_reg::Cr4 ? 2 : idx == misc_reg::Efer ? 3 : 4;
+    std::unique_ptr<functional_mmu::WriteScope> mmu_write;
+    if (mmu_reg < 4 && functional_mmu::endpoint(this).observer)
+        mmu_write = std::make_unique<functional_mmu::WriteScope>(this,
+            fastsim::fst::mmuctl::Register(mmu_reg), val,
+            fastsim::fst::mmuctl::Mode::WithEffect, [this] {
+                return fastsim::fst::mmuctl::State{readMiscRegNoEffect(misc_reg::Cr0),
+                    readMiscRegNoEffect(misc_reg::Cr3), readMiscRegNoEffect(misc_reg::Cr4),
+                    readMiscRegNoEffect(misc_reg::Efer)};
+            });
+
     RegVal newVal = val;
     switch (idx) {
       case misc_reg::Cr0:
@@ -499,6 +525,7 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
       default:
         break;
     }
+    functional_mmu::StoragePermit mmu_storage(this, fastsim::fst::mmuctl::Register(mmu_reg));
     setMiscRegNoEffect(idx, newVal);
 }
 
@@ -513,6 +540,7 @@ ISA::serialize(CheckpointOut &cp) const
 void
 ISA::unserialize(CheckpointIn &cp)
 {
+    functional_mmu::lifecycle(this);
     UNSERIALIZE_ARRAY(regVal, misc_reg::NumRegs);
     updateHandyM5Reg(regVal[misc_reg::Efer],
                      regVal[misc_reg::Cr0],
