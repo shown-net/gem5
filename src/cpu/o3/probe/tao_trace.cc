@@ -13,6 +13,7 @@
 #include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/probe/calibration_marker.hh"
 #include "cpu/o3/probe/fixed_work_marker.hh"
+#include "cpu/o3/probe/functional_syscall_isolation.hh"
 #include "cpu/o3/probe/fst_dependencies.hh"
 #include "cpu/o3/probe/fst_memory_requests.hh"
 #include "cpu/o3/probe/fst_store_requests.hh"
@@ -6426,29 +6427,30 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
                 }
                 operands.push_back(operand);
             }
-            // The grouping reflects static split members sharing one SQ entry,
-            // not observed execute/retire time. The opaque joining keys stay here.
-            if (perf_retirement_.lastPreciseFaultAbandonment()) {
+            const bool abandoned = functional_retirement_
+                ? functional_retirement_ledger_.lastPreciseFaultAbandonment()
+                : perf_retirement_.lastPreciseFaultAbandonment();
+            if (abandoned) {
                 facts.flags |= kStaticAbandonStoreGroups;
-                fst_pending_store_groups_.clear();
             }
+            bool pair_shape = false;
+            if ((inst->isStoreAddress() || inst->isStoreData()) && inst->macroop &&
+                inst->macroop->functionalMicroops() == 2) {
+                const auto a = inst->macroop->fetchMicroop(0);
+                const auto d = inst->macroop->fetchMicroop(1);
+                pair_shape = a && d && a->isStoreAddress() && d->isStoreData() &&
+                    ((micro_pc == 0 && a.get() == si.get()) ||
+                     (micro_pc == 1 && d.get() == si.get()));
+            }
+            const auto role = inst->isStoreAddress() ? functional_fst::StoreRole::Address :
+                inst->isStoreData() ? functional_fst::StoreRole::Data : functional_fst::StoreRole::Other;
+            const auto group = fst_store_pairer_.observe(fst_record_count_, getTraceThreadId(inst),
+                address_space_id, macro_pc, micro_pc, role, pair_shape, abandoned);
             if (inst->isStoreAddress() || inst->isStoreData()) {
                 facts.store_role=inst->isStoreAddress()?StaticStoreRole::Address:StaticStoreRole::Data;
-                auto pending=fst_pending_store_groups_.find(inst->seqNum);
-                if (pending!=fst_pending_store_groups_.end()) {
-                    facts.store_group=pending->second;
-                    fst_pending_store_groups_.erase(pending);
+                if (group) {
+                    facts.store_group=group;
                     facts.flags |= kStaticStorePairKnown;
-                } else if (inst->sqIt.dereferenceable()) {
-                    const auto &entry=*inst->sqIt;
-                    const auto &address=entry.instruction();
-                    const auto &data=entry.dataInstruction();
-                    if (address && data && (address.get()==inst.get() || data.get()==inst.get())) {
-                        facts.store_group=++fst_next_store_group_;
-                        facts.flags |= kStaticStorePairKnown;
-                        const auto other=address.get()==inst.get()?data:address;
-                        fst_pending_store_groups_.emplace(other->seqNum,facts.store_group);
-                    }
                 }
             } else if (inst->isStore()) facts.store_role=StaticStoreRole::Unified;
             if (facts.store_role!=StaticStoreRole::None && ns<=64) {
@@ -7329,6 +7331,7 @@ TaoTrace::finalizeFst()
         row.valid_fields = source.valid_fields;
         row.argument_count = source.argument_count;
         row.flags = source.flags;
+        functional_fst::clearNativeSyscallTimes(row);
         if (std::fwrite(&row, sizeof(row), 1, out_fst_) != 1) {
             throw std::runtime_error(
                 "TaoTrace failed to write FST syscall metadata");

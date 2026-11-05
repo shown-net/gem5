@@ -47,6 +47,8 @@ POLICY_FILES = (
     'src/arch/x86/X86TLB.py',
 
     'src/cpu/o3/probe/generate_static_uop_policy.py',
+    'src/cpu/o3/probe/functional_store_pair.hh',
+    'src/cpu/o3/probe/functional_syscall_isolation.hh',
     'src/cpu/o3/probe/fst_static_uops.hh',
     'src/cpu/o3/probe/fst_core_functional_facts.hh',
     'src/cpu/o3/core_functional_facts.hh',

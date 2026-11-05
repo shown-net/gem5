@@ -41,6 +41,7 @@
  */
 
 #include "cpu/o3/fetch.hh"
+#include "arch/x86/pcstate.hh"
 #include "arch/x86/regs/misc.hh"
 
 #include <algorithm>
