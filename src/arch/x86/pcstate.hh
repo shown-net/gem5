@@ -39,6 +39,7 @@
 #define __ARCH_X86_PCSTATE_HH__
 
 #include <array>
+#include "mem/functional_architectural_boundaries.hh"
 #include "fst_instruction_fetch.hh"
 #include "arch/generic/pcstate.hh"
 #include "sim/serialize.hh"
@@ -54,6 +55,8 @@ class PCState : public GenericISA::UPCState<8>
   protected:
     using Base = GenericISA::UPCState<8>;
 
+    functional_arch::BoundaryToken _functionalBoundary;
+    functional_arch::MacroOrigin _functionalMacroOrigin;
     uint8_t _size = 0;
     std::array<uint8_t,15> _functionalBytes{};
     uint8_t _functionalByteCount = 0;
@@ -68,6 +71,8 @@ class PCState : public GenericISA::UPCState<8>
     {
         Base::update(other);
         auto &pcstate = other.as<PCState>();
+        _functionalBoundary=pcstate._functionalBoundary;
+        _functionalMacroOrigin=pcstate._functionalMacroOrigin;
         _size = pcstate._size;
         _functionalBytes = pcstate._functionalBytes;
         _functionalByteCount = pcstate._functionalByteCount;
@@ -79,12 +84,14 @@ class PCState : public GenericISA::UPCState<8>
     set(Addr val) override
     {
         Base::set(val);
+        _functionalBoundary={};_functionalMacroOrigin={};
         _size = 0;
         _functionalByteCount = 0;
         _instructionTranslation.reset();
     }
 
-    PCState(const PCState &other) : Base(other), _size(other._size),
+    PCState(const PCState &other) : Base(other), _functionalBoundary(other._functionalBoundary),
+        _functionalMacroOrigin(other._functionalMacroOrigin), _size(other._size),
         _functionalBytes(other._functionalBytes),
         _functionalByteCount(other._functionalByteCount),
         _functionalDecoderContext(other._functionalDecoderContext),
@@ -102,6 +109,11 @@ class PCState : public GenericISA::UPCState<8>
         _instructionTranslation.reset();
     }
 
+    const auto& functionalBoundary()const{return _functionalBoundary;}
+    void functionalBoundary(functional_arch::BoundaryToken token){_functionalBoundary=token;}
+    const auto& functionalMacroOrigin()const{return _functionalMacroOrigin;}
+    void functionalMacroOrigin(functional_arch::MacroOrigin origin){_functionalMacroOrigin=origin;}
+    void uReset(){Base::uReset();_functionalBoundary={};_functionalMacroOrigin={};}
     uint8_t size() const { return _size; }
     void size(uint8_t newSize) { _size = newSize; if (!newSize) { _functionalByteCount=0; _instructionTranslation.reset(); } }
     const std::array<uint8_t,15>& functionalBytes() const { return _functionalBytes; }
@@ -128,6 +140,7 @@ class PCState : public GenericISA::UPCState<8>
     advance() override
     {
         Base::advance();
+        _functionalBoundary={};_functionalMacroOrigin={};
         _size = 0;
         _functionalByteCount = 0;
         _instructionTranslation.reset();
@@ -137,6 +150,7 @@ class PCState : public GenericISA::UPCState<8>
     uEnd()
     {
         Base::uEnd();
+        _functionalBoundary={};_functionalMacroOrigin={};
         _size = 0;
         _functionalByteCount = 0;
         _instructionTranslation.reset();
@@ -153,6 +167,7 @@ class PCState : public GenericISA::UPCState<8>
     unserialize(CheckpointIn &cp) override
     {
         Base::unserialize(cp);
+        _functionalBoundary={};_functionalMacroOrigin={};
         UNSERIALIZE_SCALAR(_size);
         // Reconstructed by decoding; old checkpoints carry no byte witness.
         _functionalByteCount = 0;

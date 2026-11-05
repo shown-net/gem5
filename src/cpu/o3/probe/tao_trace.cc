@@ -722,6 +722,7 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
       functional_frontend_(params.functional_frontend),
       functional_core_facts_(params.functional_core_facts),
       functional_mmu_controls_(params.functional_mmu_controls),
+      functional_architectural_boundaries_(params.functional_architectural_boundaries),
       functional_instruction_translations_(params.functional_instruction_translations),
       functional_translation_origins_(params.functional_translation_origins),
       functional_retirement_(params.functional_retirement),
@@ -836,6 +837,8 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
         (!FullSystem || !task_clock_cpu_ || !functional_frontend_ || !functional_retirement_ ||
          !functional_asid_static_map_ || functional_user_only_))
         throw std::runtime_error("data translation origins require complete FS O3 retired functional source mode");
+    if(functional_architectural_boundaries_ && (!functional_mmu_controls_ || !functional_core_facts_ || !functional_retirement_ || !functional_frontend_ || !functional_syscall_microops_))
+        throw std::runtime_error("architectural boundaries require controls/core/raw retirement/frontend facts");
     if (functional_mmu_controls_ && (!FullSystem || !task_clock_cpu_ ||
         task_clock_cpu_->numContexts() != 1 ||
         !functional_frontend_ || !functional_retirement_ || !functional_asid_static_map_ ||
@@ -861,7 +864,8 @@ TaoTrace::TaoTrace(const TaoTraceParams &params)
     openThreadState();
     if (functionalTraceEnabled()) {
         registerExitCallback([this]() { writeFunctionalBoundary();
-            if (fst_mmu_controls_) fst_mmu_controls_->forceClose(); });
+            if (fst_architectural_boundaries_) fst_architectural_boundaries_->forceClose();
+    else if (fst_mmu_controls_) fst_mmu_controls_->forceClose(); });
     }
 }
 
@@ -915,7 +919,8 @@ TaoTrace::~TaoTrace()
         std::fclose(out_fst_);
         out_fst_ = nullptr;
     }
-    if (fst_mmu_controls_) fst_mmu_controls_->forceClose();
+    if (fst_architectural_boundaries_) fst_architectural_boundaries_->forceClose();
+    else if (fst_mmu_controls_) fst_mmu_controls_->forceClose();
     if (out_fst_dependencies_) {
         std::fclose(out_fst_dependencies_);
         out_fst_dependencies_ = nullptr;
@@ -1052,11 +1057,17 @@ TaoTrace::openOutput()
                     fastsim::fst::mmuctl::Header header;
                     header.policy = fastsim::fst::kStaticUopPolicySha256;
                     header.coverage = fastsim::fst::mmuctl::RequiredCoverage;
-                    fst_mmu_controls_->attach(fst_path_+".mmuctl.gz", header);
+                    if(functional_architectural_boundaries_) {
+                        fst_architectural_boundaries_=std::make_unique<functional_arch::Observer>(tc->contextId(),tc,*fst_mmu_controls_,[tc]{return fastsim::fst::mmuctl::State{tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr0),tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3),tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr4),tc->readMiscRegNoEffect(X86ISA::misc_reg::Efer)};},[tc]{return tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr2);});
+                        fastsim::fst::archb::Header boundary;boundary.context=tc->contextId();boundary.core=fst_core_id_;boundary.policy=header.policy;boundary.coverage=255;
+                        fst_architectural_boundaries_->attach(fst_path_,boundary);
+                        fst_feature_flags_|=fastsim::fst::kArchitecturalBoundaryBundle;
+                    } else fst_mmu_controls_->attach(fst_path_+".mmuctl.gz", header);
                     fst_feature_flags_ |= fastsim::fst::kLogicalMmuControls;
                 }
                 if (functional_core_facts_) {
                     fastsim::fst::CoreFunctionalHeader header;
+                    if(functional_architectural_boundaries_){header.version=2;header.header_size=128;header.magic[6]='2';}
                     header.core_id = static_cast<uint32_t>(fst_core_id_);
                     header.policy_sha256 = fastsim::fst::kStaticUopPolicySha256;
                     const auto &classes = task_clock_cpu_->tcBase(0)->getIsaPtr()->regClasses();
@@ -1555,6 +1566,7 @@ TaoTrace::regProbeListeners()
     connectListener<DynInstListener>(this, "Commit",      &TaoTrace::onCommit);
     if (fst_mmu_controls_)
         connectListener<DynInstListener>(this, "CommitMiscRegsApplied", &TaoTrace::onCommitMiscRegsApplied);
+    if(fst_architectural_boundaries_)connectListener<DynInstListener>(this,"CommitPCAdvanced",&TaoTrace::onCommitPCAdvanced);
     connectListener<DynInstListener>(this, "CommitStall", &TaoTrace::onCommitStall);
     connectListener<DynInstListener>(this, "Squash",      &TaoTrace::onSquash);
     connectListener<DynInstListener>(this, "Execute",     &TaoTrace::onExecute);
@@ -2396,7 +2408,8 @@ TaoTrace::noteFunctionalRecordEmitted(bool completes_instruction,
         // Freeze the logical control interval at the same retained-stream cut.
         // Already-bound members may still deliver their post-update metadata;
         // subsequent native drain execution is outside this companion.
-        if (trace->fst_mmu_controls_)
+        if(trace->fst_architectural_boundaries_)trace->fst_architectural_boundaries_->closeAdmission();
+        else if (trace->fst_mmu_controls_)
             trace->fst_mmu_controls_->close(trace->fst_record_count_);
         trace->closeTaskClock();
         trace->finalizeCplMeasurement();
@@ -6482,6 +6495,7 @@ TaoTrace::flushFstFrontend(bool complete)
     if (complete && fst_frontend_started_) fst_frontend_pending_.flags |= kFrontendComplete;
     else fst_frontend_pending_.flags &= ~kFrontendDsbEligible;
     fst_frontend_->append(fst_frontend_pending_);
+    if(fst_architectural_boundaries_)fst_architectural_boundaries_->macroSpan(fst_frontend_pending_,bool(fst_frontend_pending_.flags & fastsim::fst::kFrontendComplete));
     if (fst_core_functional_) fst_core_functional_->append_macro(fst_frontend_pending_);
     if (fst_instruction_translations_) {
         fst_instruction_translations_->append(fst_frontend_pending_,*fst_instruction_pending_);
@@ -6525,7 +6539,7 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
         (!pseudo && root.get()!=fst_frontend_root_) ||
         pseudo!=bool(fst_frontend_pending_.flags&kFrontendPseudo))) flushFstFrontend(false);
     if (!fst_frontend_open_) {
-        if (pseudo && !hardware_entry)
+        if (pseudo && !hardware_entry && !fst_architectural_boundaries_)
             throw std::runtime_error("retired frontend pseudo stream lacks a known hardware-entry origin");
         auto& m=fst_frontend_pending_; m=RetiredFrontendMacro{};
         m.begin_record=fst_record_count_; m.end_record=fst_record_count_;
@@ -6610,12 +6624,26 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
         m.flags&=~kFrontendDsbEligible;
     if (m.observed_uops==UINT32_MAX) throw std::runtime_error("retired frontend macro exceeds span width");
     ++m.observed_uops; m.end_record=fst_record_count_+1;
+    if(fst_architectural_boundaries_){
+        fst_architectural_boundaries_->successfulHot(inst->seqNum,record,fst_record_count_,m.begin_record,inst->functionalMacroOrigin,!si->isMicroop()||si->isLastMicroop(),inst->functionalBoundary,inst->pcState().microPC(),si->functionalRomKind(),pseudo&&first,pseudo);
+    }
     if (fst_core_functional_) {
         auto facts=collectCoreFunctionalFacts(*si,*root,inst->coreFunctionalFacts.get(),pseudo);
         facts.row.record_ordinal=fst_record_count_;
         facts.row.macro_begin=m.begin_record;facts.row.pc=m.pc;
         facts.row.code_identity=m.code_identity;facts.row.semantic_prefix_identity=m.semantic_identity;
         facts.row.micro_pc=inst->pcState().microPC();
+        if(fst_architectural_boundaries_){
+            core_v2::Extension extension;
+            if(pseudo && fst_architectural_boundaries_->qualified(inst->functionalBoundary)){
+                extension.not_applicable_flags=21;extension.semantic_origin=core_v2::Origin::HardwareEntryRom;extension.allocation_policy=core_v2::AllocationPolicy::IndependentRomMember;extension.rom_kind=core_v2::RomKind(si->functionalRomKind());extension.extension_known=7;extension.boundary_event=inst->functionalBoundary.event();extension.boundary_context=inst->functionalBoundary.context();extension.boundary_generation=inst->functionalBoundary.generation();
+            }else if(pseudo){extension.semantic_origin=core_v2::Origin::UnsupportedRom;
+                if(fst_architectural_boundaries_->bound(inst->functionalBoundary)){extension.extension_known=4;extension.boundary_event=inst->functionalBoundary.event();extension.boundary_context=inst->functionalBoundary.context();extension.boundary_generation=inst->functionalBoundary.generation();if(si->functionalRomKind()){extension.rom_kind=core_v2::RomKind(si->functionalRomKind());extension.extension_known|=2;}}
+            }
+            else {extension.semantic_origin=core_v2::Origin::DecodedRoot;extension.allocation_policy=core_v2::AllocationPolicy::DecodedRootRules;extension.extension_known=1;}
+            core_v2::set_extension(facts.row,extension);
+            fst_architectural_boundaries_->coreFactsUnknown(core_v2::unknown_applicable(facts.row));
+        }
         fst_core_functional_->observe(record,facts.row,facts.operands);
     }
     fst_frontend_->observe_record(record);
@@ -7311,7 +7339,8 @@ TaoTrace::finalizeFst()
     }
     writeFstDependencyHeader();
     writeFstMemoryRequestHeader(true);
-    if (fst_mmu_controls_) fst_mmu_controls_->close(fst_record_count_);
+    if(fst_architectural_boundaries_)fst_architectural_boundaries_->closeAdmission();
+    else if (fst_mmu_controls_) fst_mmu_controls_->close(fst_record_count_);
     if (fst_static_uops_) fst_static_uops_->finish(fst_record_count_);
     if (fst_translations_)
         fst_translations_->finish(fst_record_count_, fst_memory_request_hash_);
@@ -8872,11 +8901,30 @@ void
 TaoTrace::onCommitMiscRegsApplied(const DynInstPtr &inst)
 {
     if (fst_mmu_controls_) fst_mmu_controls_->seal(inst->seqNum, inst->mmuControlGeneration);
+    if(fst_architectural_boundaries_)fst_architectural_boundaries_->postUpdateSeal(inst->seqNum);
+}
+
+void
+TaoTrace::armArchitecturalBoundaryEpoch()
+{
+    if(!fst_architectural_boundaries_ || fst_architectural_boundaries_->finished())return;
+    if(!functionalCaptureActive())fst_architectural_boundaries_->lifecycle();
+    const auto& pc=task_clock_cpu_->pcState(0);
+    fst_architectural_boundaries_->arm(pc.instAddr(),pc.microPC());
+}
+
+void
+TaoTrace::onCommitPCAdvanced(const DynInstPtr& inst)
+{
+    if(!fst_architectural_boundaries_ || fst_architectural_boundaries_->finished())return;
+    const auto& pc=task_clock_cpu_->pcState(inst->threadNumber).as<X86ISA::PCState>();
+    fst_architectural_boundaries_->postAdvance(inst->seqNum,pc.microPC(),pc.functionalBoundary());
 }
 
 void
 TaoTrace::onCommit(const DynInstPtr &inst)
 {
+    functional_arch::CommitClassification architectural_classification(fst_architectural_boundaries_.get());
     eraseWrongPathCommitted(inst);
     if (functional_warmup_ && !functional_measurement_started_ &&
         premeasurement_page_fault_pending_ && isUserInstruction(inst)) {

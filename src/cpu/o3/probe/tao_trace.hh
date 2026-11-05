@@ -18,6 +18,7 @@
 #define __CPU_O3_PROBE_TAO_TRACE_HH__
 
 #include "mem/functional_mmu_controls.hh"
+#include "mem/functional_architectural_boundaries.hh"
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -222,6 +223,7 @@ class TaoTrace : public ProbeListenerObject
     void onDispatch(const DynInstPtr &dynInst);
     void onCommit(const DynInstPtr &dynInst);
     void onCommitMiscRegsApplied(const DynInstPtr &dynInst);
+    void onCommitPCAdvanced(const DynInstPtr &dynInst);
     void onPreCommit(const DynInstPtr &dynInst);
     void onCommitStall(const DynInstPtr &dynInst);
     void onSquash(const DynInstPtr &dynInst);
@@ -354,6 +356,7 @@ public:
     void resumeFixedWorkHandoff();
     static void traceMarkerHandoff(gem5::ThreadContext *tc);
     static void traceMeasurementBegin();
+    void armArchitecturalBoundaryEpoch();
     void startFunctionalMeasurement() { traceMeasurementBegin(); }
     bool functionalMeasurementStarted() const
     {
@@ -664,6 +667,8 @@ private:
     bool functional_frontend_ = false;
     bool functional_core_facts_ = false;
     bool functional_mmu_controls_ = false;
+    bool functional_architectural_boundaries_ = false;
+    std::unique_ptr<functional_arch::Observer> fst_architectural_boundaries_;
     std::unique_ptr<functional_mmu::Observer> fst_mmu_controls_;
     bool functional_instruction_translations_ = false;
     bool functional_translation_origins_ = false;

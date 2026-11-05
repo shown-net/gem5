@@ -71,7 +71,9 @@ static_assert(X86ISA::misc_reg::NumRegs == X86ISA::miscRegClass.numRegs());
         parent = (ROOT.parent / 'include/fastsim/fst_core_functional_facts.hpp').read_text()
         native = (ROOT / 'src/cpu/o3/probe/fst_core_functional_facts.hh').read_text()
         self.assertEqual(parent.replace('"fastsim/retired_frontend_facts.hpp"',
-                                       '"retired_frontend_facts.hh"'), native)
+                                       '"retired_frontend_facts.hh"').replace(
+                                           '"fastsim/fst_mmu_controls.hpp"',
+                                           '"../../../../taogen/shared/fst_mmu_controls.hh"'), native)
 
     def test_literal_frontend_observation_does_not_enable_native_predicate_fields(self):
         text = (ROOT / 'src/cpu/o3/frontend_record.cc').read_text()

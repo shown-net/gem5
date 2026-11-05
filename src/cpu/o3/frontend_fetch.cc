@@ -206,6 +206,9 @@ Fetch::fetchFrontend(bool &status_change)
                 }
                 decodeCanReuse = true;
             }
+            if(auto* observer=functional_arch::observer(cpu->tcBase(tid)))
+                if(!at.as<X86ISA::PCState>().functionalMacroOrigin().valid())
+                at.as<X86ISA::PCState>().functionalMacroOrigin(observer->newMacroOrigin());
             ++accepted_instructions;
             ++cpu->fetchStats[tid]->numInsts;
             const bool microcoded = root->usesMicrocodeService();
@@ -237,6 +240,8 @@ Fetch::fetchFrontend(bool &status_change)
                                    decoded.functionalByteCount(),
                                    decoded.functionalDecoderContext());
             replay.instructionTranslation(decoded.instructionTranslation());
+            replay.functionalMacroOrigin(decoded.functionalMacroOrigin());
+            replay.functionalBoundary(decoded.functionalBoundary());
         }
         if (sharesAllocation(current_macro) &&
             at.microPC() == 0 &&

@@ -44,6 +44,8 @@ FrontendRecord::materialize(CPU *cpu)
     arrays.numDests = instruction->numDestRegs();
     DynInstPtr inst = new (arrays) DynInst(
         arrays, instruction, macroop, *pc, *predictedPC, sequence, cpu);
+    inst->functionalBoundary=pc->as<X86ISA::PCState>().functionalBoundary();
+    inst->functionalMacroOrigin=pc->as<X86ISA::PCState>().functionalMacroOrigin();
     inst->setTid(thread);
     inst->setThreadState(cpu->thread[thread]);
     inst->setPredTaken(prediction.taken);

@@ -16,7 +16,8 @@ class TaoTrace(ProbeListenerObject):
     cxx_class = "gem5::o3::TaoTrace"
     cxx_header = "cpu/o3/probe/tao_trace.hh"
 
-    cxx_exports = [PyBindMethod("startFunctionalMeasurement"),
+    cxx_exports = [PyBindMethod("armArchitecturalBoundaryEpoch"),
+                   PyBindMethod("startFunctionalMeasurement"),
                    PyBindMethod("functionalMeasurementStarted"),
                    PyBindMethod("startMarkerCapture"),
                    PyBindMethod("selectMarkerWindow"),
@@ -107,6 +108,8 @@ class TaoTrace(ProbeListenerObject):
     functional_frontend = Param.Bool(False,
         "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
         "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
+    functional_architectural_boundaries = Param.Bool(False,
+        "Observe accepted functional boundary lineage with controls/core v2; default off")
     functional_mmu_controls = Param.Bool(False,
         "Observe pure functional logical MMU controls; no model timing")
     functional_core_facts = Param.Bool(False,

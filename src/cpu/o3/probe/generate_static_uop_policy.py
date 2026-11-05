@@ -5,8 +5,15 @@ from pathlib import Path
 LOGICAL_MMU_CONTROLS_VERSION = 1
 CORE_FUNCTIONAL_FACTS_VERSION = 1
 STATIC_ORDERING_MAP_VERSION = 1
+ARCHITECTURAL_BOUNDARY_VERSION = 1
+ARCHITECTURAL_CORE_FACTS_VERSION = 2
+ARCHITECTURAL_MMU_CONTROLS_VERSION = 2
 
 POLICY_FILES = (
+    'taogen/shared/fst_architectural_boundaries.hh',
+    'taogen/shared/fst_mmu_controls_v2.hh',
+    'src/mem/functional_architectural_boundaries.hh',
+    'src/sim/faults.hh',
     'taogen/shared/fst_mmu_controls.hh',
     'src/mem/functional_mmu_controls.hh',
     'src/arch/generic/mmu.cc',

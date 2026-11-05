@@ -49,6 +49,7 @@ def template BrDeclare {{
             %(constructor)s;
         }
 
+        uint8_t functionalRomKind() const override { return %(functional_rom_kind)s; }
         Fault execute(ExecContext *, trace::InstRecord *) const override;
 
         std::unique_ptr<PCStateBase>
@@ -84,6 +85,7 @@ def template EretDeclare {{
             %(constructor)s;
         }
 
+        uint8_t functionalRomKind() const override { return %(functional_rom_kind)s; }
         Fault execute(ExecContext *, trace::InstRecord *) const override;
     };
 }};
@@ -169,11 +171,13 @@ let {{
                  "cond_test": cond},
                  flags)
         exec_output += SeqOpExecute.subst(iop)
+        iop.functional_rom_kind = 3 if suffix else 2
         header_output += BrDeclare.subst(iop)
 
         iop = InstObjParams("eret", "Eret" + suffix,
                 "X86ISA::InstOperands<X86ISA::MicroCondBase>",
                 {"code": "", "else_code": "", "cond_test": cond}, flags)
         exec_output += SeqOpExecute.subst(iop)
+        iop.functional_rom_kind = 5 if suffix else 4
         header_output += EretDeclare.subst(iop)
 }};

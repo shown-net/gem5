@@ -65,6 +65,9 @@ def main():
             from m5.objects import Root
             enterSingleEventQueueMode()
             Root.getInstance().sim_quantum = 0
+            if args.functional_architectural_boundaries:
+                for cpu in traced:
+                    cpu.tao_trace.armArchitecturalBoundaryEpoch()
 
         def _pre_instantiate(self, root):
             super()._pre_instantiate(root)

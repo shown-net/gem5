@@ -164,6 +164,7 @@ Commit::regProbePoints()
             cpu->getProbeManager(), "Commit");
     ppCommitMiscRegsApplied = new ProbePointArg<DynInstPtr>(
         cpu->getProbeManager(), "CommitMiscRegsApplied");
+    ppCommitPCAdvanced = new ProbePointArg<DynInstPtr>(cpu->getProbeManager(), "CommitPCAdvanced");
     ppCommitStall = new ProbePointArg<DynInstPtr>(
             cpu->getProbeManager(), "CommitStall");
     ppSquash = new ProbePointArg<DynInstPtr>(
@@ -713,7 +714,11 @@ Commit::handleInterrupt()
             uint32_t(cpu->cpuId()), 0, accepted_interrupt,
             KernelEntrySource::ExternalInterrupt, curTick(),
             cpu->clockPeriod(), cpu->inUserMode(0)});
+        auto* arch_observer=functional_arch::observer(cpu->tcBase(0));
+        const auto arch_facts=arch_observer&&arch_observer->accepting()?accepted_interrupt->functionalBoundaryFacts(cpu->tcBase(0)):functional_arch::AcceptedFacts{};
+        auto arch_scope=arch_observer?arch_observer->beginAccepted(accepted_interrupt.get(),arch_facts,{}):functional_arch::AcceptedInvocationScope{};
         cpu->processInterrupts(accepted_interrupt);
+        arch_scope.seal();
 
         thread[0]->noSquashFromTC = false;
 
@@ -1122,6 +1127,7 @@ Commit::commitInsts()
                 cpu->traceFunctions(pc[tid]->instAddr());
 
                 head_inst->staticInst->advancePC(*pc[tid]);
+                ppCommitPCAdvanced->notify(head_inst);
 
                 // Keep track of the last sequence number commited
                 lastCommitedSeqNum[tid] = head_inst->seqNum;
@@ -1310,9 +1316,15 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
             KernelEntrySource::SynchronousFault, curTick(),
             cpu->clockPeriod(), cpu->inUserMode(tid),
             uint32_t(cpu->tcBase(tid)->contextId()),head_inst->pcState().instAddr()});
+        auto* arch_observer=functional_arch::observer(cpu->tcBase(tid));
+        auto arch_facts=arch_observer&&arch_observer->accepting()?inst_fault->functionalBoundaryFacts(cpu->tcBase(tid)):functional_arch::AcceptedFacts{};
+        arch_facts.pc_known=true;arch_facts.pc=head_inst->pcState().instAddr();arch_facts.micro_pc=head_inst->pcState().microPC();
+        arch_facts.carrier=head_inst->notAnInst()?1:0;
+        auto arch_scope=arch_observer?arch_observer->beginAccepted(inst_fault.get(),arch_facts,head_inst->functionalMacroOrigin):functional_arch::AcceptedInvocationScope{};
         cpu->trap(inst_fault, tid,
                   head_inst->notAnInst() ? nullStaticInstPtr :
                       head_inst->staticInst);
+        arch_scope.seal();
 
         // Exit state update mode to avoid accidental updating.
         thread[tid]->noSquashFromTC = false;

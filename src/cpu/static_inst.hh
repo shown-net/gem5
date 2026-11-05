@@ -326,6 +326,8 @@ class StaticInst : public RefCounted, public StaticInstFlags
     {}
 
   public:
+    virtual uint8_t functionalRomKind() const { return 0; }
+
     virtual ~StaticInst() {};
 
     virtual Fault execute(ExecContext *xc,

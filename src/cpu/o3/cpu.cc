@@ -386,6 +386,7 @@ CPU::CPUStats::CPUStats(CPU *cpu)
 void
 CPU::tick()
 {
+    for(auto* tc:threadContexts)if(auto* o=functional_arch::observer(tc))o->executed();
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
@@ -940,7 +941,7 @@ CPU::switchOut()
 void
 CPU::takeOverFrom(BaseCPU *oldCPU)
 {
-    for (auto *tc : threadContexts) functional_mmu::lifecycle(tc);
+    for (auto *tc : threadContexts) {functional_mmu::lifecycle(tc);if(auto* o=functional_arch::observer(tc))o->lifecycle();}
     BaseCPU::takeOverFrom(oldCPU);
 
     bac.takeOverFrom();
@@ -959,6 +960,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
 
     lastRunningCycle = curCycle();
     _status = Idle;
+    for(auto* tc:threadContexts)if(auto* o=functional_arch::observer(tc))o->completedTakeover();
 }
 
 void

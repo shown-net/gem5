@@ -161,6 +161,8 @@ class DynInst : public ExecContext, public RefCounted
 
     // Optional observer facts owned by this instruction, discarded on squash.
     std::unique_ptr<CoreFunctionalSnapshot> coreFunctionalFacts;
+    functional_arch::BoundaryToken functionalBoundary;
+    functional_arch::MacroOrigin functionalMacroOrigin;
 
     /** Pointer to the Impl's CPU object. */
     CPU *cpu = nullptr;

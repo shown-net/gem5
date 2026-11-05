@@ -1184,6 +1184,8 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     // Create a new DynInst from the instruction fetched.
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
+    instruction->functionalBoundary=this_pc.as<X86ISA::PCState>().functionalBoundary();
+    instruction->functionalMacroOrigin=this_pc.as<X86ISA::PCState>().functionalMacroOrigin();
     instruction->setTid(tid);
     if (cpu->markerObservation) {
         instruction->fetchedFromUser = cpu->inUserMode(tid);
@@ -1423,6 +1425,9 @@ Fetch::fetch(bool &status_change)
             if (!(curMacroop || inRom)) {
                 if (dec_ptr->instReady()) {
                     staticInst = dec_ptr->decode(this_pc);
+                    if(auto* observer=functional_arch::observer(cpu->tcBase(tid)))
+                        if(!this_pc.as<X86ISA::PCState>().functionalMacroOrigin().valid())
+                this_pc.as<X86ISA::PCState>().functionalMacroOrigin(observer->newMacroOrigin());
 
                     // Increment stat of fetched instructions.
                     cpu->fetchStats[tid]->numInsts++;

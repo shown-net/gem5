@@ -21,6 +21,8 @@ def parse_args(argv=None):
                    help="preserve frozen data translation origins and explicit retirement binding; no MMU-control qualification")
     p.add_argument("--functional-instruction-translations", action="store_true",
                    help="observe retired instruction translation provenance; no MMU-control qualification")
+    p.add_argument("--functional-architectural-boundaries", action="store_true",
+                   help="collect accepted functional boundary bundle; requires controls and core facts")
     p.add_argument("--functional-mmu-controls", action="store_true",
                    help="Collect pure functional logical MMU controls (default off)")
     p.add_argument("--functional-core-facts", action="store_true",
@@ -71,6 +73,8 @@ def parse_args(argv=None):
 
 
 def validate_options(args):
+    if getattr(args, "functional_architectural_boundaries", False) and not (args.functional_mmu_controls and args.functional_core_facts):
+        raise ValueError("architectural boundaries require --functional-mmu-controls and --functional-core-facts")
     if args.omp_threads <= 0 or args.extra_cores < 0:
         raise ValueError("participant count must be positive and spare count nonnegative")
     if args.functional_user_target <= 0 or args.warmup_insts < 0 or args.max_ticks < 0:
@@ -163,6 +167,7 @@ def trace_options(args, trace_dir, profile_path, identity, thread_params=None):
         functional_translation_origins=args.functional_translation_origins,
         functional_core_facts=getattr(args, "functional_core_facts", False),
         functional_mmu_controls=getattr(args, "functional_mmu_controls", False),
+        functional_architectural_boundaries=getattr(args, "functional_architectural_boundaries", False),
         functional_warmup=True, functional_user_target=args.functional_user_target,
         functional_sync_marker_pc=identity.get("marker_pc", 0),
         functional_sync_initial_context=args.sync_initial_context,

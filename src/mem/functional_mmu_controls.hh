@@ -40,7 +40,7 @@ struct Payload {
     std::vector<Operation> ops;
     Member member;
     Reason cause = Reason::UnboundExternal;
-    bool bound = false, sealed = false, unsupported = false, discarded = false;
+    bool bound = false, sealed = false, unsupported = false, discarded = false, boundary = false;
 };
 // Intrusive links live on the existing native call stack. No event history or
 // DynInst lifetime is retained merely to observe a scope crossing the cutoff.
@@ -68,17 +68,36 @@ struct OwnerScope {
 struct CauseScope {
     Reason cause;
     CauseScope *previous;
+    const void *actual_fault=nullptr,*thread_context=nullptr;
     inline static thread_local CauseScope *active = nullptr;
-    explicit CauseScope(Reason r) : cause(r), previous(active) { active = this; }
+    explicit CauseScope(Reason r,const void* fault=nullptr,const void* tc=nullptr) : cause(r), previous(active),actual_fault(fault),thread_context(tc) { active = this; }
     CauseScope(const CauseScope &) = delete;
     CauseScope &operator=(const CauseScope &) = delete;
     ~CauseScope() { active = previous; }
+};
+// A capability is valid only for the synchronous accepted object and exact TC.
+// It does not change default CauseScope precedence or grant generic PF ownership.
+struct BoundaryScope {
+ Observer* observer=nullptr;const void* fault=nullptr;const void* tc=nullptr;
+ std::shared_ptr<Payload> payload;bool page_fault=false;BoundaryScope* previous=nullptr;
+ inline static thread_local BoundaryScope* active=nullptr;
+ BoundaryScope(Observer&,const void*,const void*,std::uint64_t,bool,bool=true);
+ ~BoundaryScope();BoundaryScope(const BoundaryScope&)=delete;BoundaryScope& operator=(const BoundaryScope&)=delete;
+};
+inline bool causeBlocksOwnership(){const auto* c=CauseScope::active;if(!c)return false;const auto* b=BoundaryScope::active;return !(b && b->payload && !b->previous && b->page_fault && !c->previous && c->cause==Reason::UnboundPageFault && c->actual_fault==b->fault && c->thread_context==b->tc);}
+struct BoundaryCallbacks {
+ std::function<void(const Payload&)> retained;
+ std::function<void(const Payload&,Reason)> diagnostic;
+ std::function<void(const Footer&)> finished;
 };
 class Observer {
     std::uint32_t context_, generation_ = 0, max_owners_ = 4096, max_ops_ = 256, max_details_ = 256,
                             last_generation_ = 0;
     std::function<State()> read_;
     std::unique_ptr<Writer> writer_;
+    std::unique_ptr<BoundaryCallbacks> boundary_callbacks_;
+    std::shared_ptr<Payload> boundary_payload_;
+    bool hold_boundary_close_=false,last_boundary_owner_=false;
     std::map<OwnerKey, std::shared_ptr<Payload>> owners_;
     std::map<std::uint64_t, std::shared_ptr<Payload>> pending_;
     std::set<std::pair<const void *, const void *>> edges_;
@@ -115,6 +134,7 @@ class Observer {
                 add(footer_.total_commands, p->commands);
             }
             p->member.count = p->ops.size();
+            if(boundary_callbacks_)boundary_callbacks_->retained(*p);
             if (writer_)
                 writer_->member(p->member, p->ops);
             ++next_emit_;
@@ -122,7 +142,7 @@ class Observer {
             owners_.erase({p->generation, p->owner});
             pending_.erase(pending_.begin());
         }
-        if (closing_ && pending_.empty())
+        if (closing_ && pending_.empty() && !hold_boundary_close_)
             finish();
     }
     void abandonPending() {
@@ -132,6 +152,7 @@ class Observer {
             diagnostic(p, Reason::UnsealedOwner);
             p->member.status = Unsupported;
             p->member.count = 0;
+            if(boundary_callbacks_)boundary_callbacks_->retained(*p);
             if (writer_)
                 writer_->member(p->member, {});
             owners_.erase({p->generation, p->owner});
@@ -169,6 +190,7 @@ class Observer {
             footer_.sealed == footer_.hot && !footer_.pending &&
             std::all_of(footer_.reasons.begin(), footer_.reasons.end(), [](auto v) { return !v; }))
             footer_.status |= Complete;
+        if(boundary_callbacks_)boundary_callbacks_->finished(footer_);
         if (writer_)
             writer_->finish(footer_);
         finished_ = true;
@@ -202,6 +224,13 @@ class Observer {
         h.max_diagnostics = max_details_;
         writer_ = std::make_unique<Writer>(path, h);
     }
+    void configureBoundaries(BoundaryCallbacks callbacks){check(!writer_&&!started_&&!boundary_callbacks_,"boundary controls configuration");boundary_callbacks_=std::make_unique<BoundaryCallbacks>(std::move(callbacks));hold_boundary_close_=true;}
+    bool armBoundaryEpoch(const State& state){if(finished_||closing_||!boundary_callbacks_||started_)return false;bool clear=owners_.empty()&&!active_scopes_&&!boundary_payload_&&resumed_;started_=true;mirror_=state;baseline_.state=state;baseline_.known=15;baseline_.generation=generation_;baseline_.cut=clear?1:0;if(!clear)fail(Reason::InitialCutUnknown);return clear;}
+    std::shared_ptr<Payload> beginBoundary(std::uint64_t event){if(finished_||closing_||!boundary_callbacks_||!started_)return {};if(boundary_payload_){fail(Reason::EffectOrderUnsupported);return {};}auto p=std::make_shared<Payload>();p->boundary=true;p->owner=event;p->generation=generation_;p->pre=mirror_;boundary_payload_=p;return p;}
+    void endBoundary(const std::shared_ptr<Payload>& p){if(finished_||!p||boundary_payload_!=p)return;if(p->first && p->first<last_emitted_ticket_){p->unsupported=true;fail(Reason::EffectOrderUnsupported);}p->sealed=true;boundary_payload_.reset();}
+    bool boundMetadataPending()const{return !pending_.empty();}
+    void boundaryPlaced(std::uint64_t first,std::uint64_t last){if(finished_)return;if(first && first<last_emitted_ticket_)fail(Reason::EffectOrderUnsupported);last_emitted_ticket_=std::max(last_emitted_ticket_,last);}
+    void releaseBoundaryClose(){if(finished_)return;hold_boundary_close_=false;if(closing_&&pending_.empty())finish();}
     void registerEndpoint(const void *p, Domain d) {
         if (finished_)
             return;
@@ -264,7 +293,7 @@ class Observer {
         if (!closing_)
             return true;
         const auto *owner = OwnerScope::active;
-        if (CauseScope::active || !owner || owner->observer != this)
+        if (causeBlocksOwnership() || !owner || owner->observer != this)
             return false;
         const auto found = owners_.find({owner->generation, owner->owner});
         return found != owners_.end() && found->second->bound && !found->second->sealed &&
@@ -287,8 +316,10 @@ class Observer {
     std::shared_ptr<Payload> payload() {
         if (!acceptsEffects())
             return {};
-        auto s = OwnerScope::active;
-        if (CauseScope::active || !s || s->observer != this) {
+        const auto* boundary=BoundaryScope::active;
+        if(boundary && boundary->observer==this && boundary->payload && !causeBlocksOwnership())return boundary->payload;
+        auto s = boundary ? nullptr : OwnerScope::active;
+        if (causeBlocksOwnership() || !s || s->observer != this) {
             if (s && s->observer && s->observer != this)
                 fail(Reason::CrossContextEffect);
             auto p = std::make_shared<Payload>();
@@ -314,6 +345,7 @@ class Observer {
         return p;
     }
     bool owned(const std::shared_ptr<Payload> &p) const {
+        if(p->boundary)return boundary_payload_==p;
         auto i = owners_.find({p->generation, p->owner});
         return i != owners_.end() && i->second == p;
     }
@@ -331,11 +363,12 @@ class Observer {
         if (!p->first)
             p->first = ticket_;
         if (p->last && have_last_ &&
-            (last_owner_ != p->owner || last_generation_ != p->generation)) {
+            (last_owner_ != p->owner || last_generation_ != p->generation || last_boundary_owner_!=p->boundary)) {
             fail(Reason::EffectOrderUnsupported);
             p->unsupported = true;
         }
         p->last = ticket_;
+        last_boundary_owner_=p->boundary;
         last_owner_ = p->owner;
         last_generation_ = p->generation;
         have_last_ = true;
@@ -400,6 +433,7 @@ class Observer {
         d.generation = generation_;
         d.reason = reason;
         d.count = p->ops.size();
+        if(boundary_callbacks_)boundary_callbacks_->diagnostic(*p,reason);
         if (writer_)
             writer_->diagnostic(d, p->ops);
         add(footer_.groups);
@@ -542,6 +576,7 @@ class Observer {
             return;
         check(hot == footer_.hot, "close hot population");
         closing_ = true;
+        if(boundary_payload_ && !boundary_payload_->discarded)discardCrossing(boundary_payload_,Reason::EffectOrderUnsupported);
         for (auto i = owners_.begin(); i != owners_.end();) {
             if (!i->second->bound) {
                 if (i->second->writes || i->second->commands)
@@ -569,12 +604,15 @@ class Observer {
             diagnostic(p, Reason::UnsealedOwner);
             p->member.status = Unsupported;
             p->member.count = 0;
+            if(boundary_callbacks_)boundary_callbacks_->retained(*p);
             if (writer_)
                 writer_->member(p->member, {});
         }
         finish();
     }
 };
+inline BoundaryScope::BoundaryScope(Observer& o,const void* accepted_fault,const void* endpoint,std::uint64_t event,bool pf,bool enabled):observer(&o),fault(accepted_fault),tc(endpoint),page_fault(pf),previous(active){if(!previous&&enabled)payload=o.beginBoundary(event);else if(previous)o.fail(Reason::EffectOrderUnsupported);active=this;}
+inline BoundaryScope::~BoundaryScope(){active=previous;if(observer&&payload)observer->endBoundary(payload);}
 inline std::uint32_t generation(const void *p) {
     auto o = endpoint(p).observer;
     return o ? o->generation() : 0;
@@ -640,9 +678,9 @@ class WriteScope {
         w.before = state;
         w.before_known = 15;
         w.application =
-            OwnerScope::active && OwnerScope::active->observer == observer_ && !CauseScope::active
+            !BoundaryScope::active && OwnerScope::active && OwnerScope::active->observer == observer_ && !causeBlocksOwnership()
                 ? OwnerScope::active->application
-                : Application::External;
+                : (BoundaryScope::active && BoundaryScope::active->observer==observer_ && BoundaryScope::active->payload && !causeBlocksOwnership() ? Application::Immediate : Application::External);
         previous_ = active;
         if (previous_) {
             observer_->fail(Reason::EffectOrderUnsupported);
@@ -731,7 +769,7 @@ class CommandScope {
             observer_->fail(Reason::PropagationUnknown);
         origin_ = true;
         auto w = WriteScope::active;
-        if (w && w->observer() == observer_ && !CauseScope::active) {
+        if (w && w->observer() == observer_ && !causeBlocksOwnership()) {
             payload_ = w->payload();
         } else {
             payload_ = observer_->payload();

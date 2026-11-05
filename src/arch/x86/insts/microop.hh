@@ -135,6 +135,8 @@ class X86MicroopBase : public X86StaticInst
         return ss.str();
     }
 
+    uint8_t functionalRomKind() const override { return 1; }
+
     bool checkCondition(uint64_t flags, int condition) const;
 
     void
