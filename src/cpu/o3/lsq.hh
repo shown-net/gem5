@@ -43,9 +43,13 @@
 #define __CPU_O3_LSQ_HH__
 
 #include <cassert>
+#include <array>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <list>
 #include <map>
+#include <memory>
 #include <queue>
 #include <vector>
 
@@ -80,6 +84,13 @@ class LSQ
     class LSQRequest;
     struct StorePrepareSenderState : public Packet::SenderState
     {
+    };
+    struct StoreBufferSenderState : public Packet::SenderState
+    {
+        StoreBufferSenderState(ThreadID thread, uint64_t entry)
+            : threadId(thread), entryId(entry) {}
+        ThreadID threadId;
+        uint64_t entryId;
     };
 
     /**
@@ -121,6 +132,9 @@ class LSQ
 
             /* Number of retry responses sent */
             statistics::Scalar numSendRetryResp;
+            statistics::Scalar loadCompletionQueued;
+            statistics::Scalar loadCompletionDelivered;
+            statistics::Scalar loadCompletionBlockedCycles;
         } dcachePortStats;
 
       protected:
@@ -575,7 +589,7 @@ class LSQ
         {
             assert(_numOutstandingPackets > 0);
             _numOutstandingPackets--;
-            if (_numOutstandingPackets == 0 && isReleased())
+            if (isReleased() && !isAnyOutstandingRequest())
                 delete this;
         }
 
@@ -736,6 +750,8 @@ class LSQ
     void insertLoad(const DynInstPtr &load_inst);
     /** Inserts a store into the LSQ. */
     void insertStore(const DynInstPtr &store_inst);
+    void insertStoreData(const DynInstPtr &store_inst);
+    Fault writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size);
 
     /** Executes a load. */
     Fault executeLoad(const DynInstPtr &inst);
@@ -909,6 +925,10 @@ class LSQ
     void recvReqRetry();
 
     void completeDataAccess(PacketPtr pkt);
+    bool usesLoadCompletion(const DynInstPtr &inst,
+                            const RequestPtr &request) const;
+    void enqueueLoadCompletion(const DynInstPtr &inst,
+                               std::function<void()> complete);
     /**
      * Handles writing back and completing the load or store that has
      * returned from memory.
@@ -935,9 +955,19 @@ class LSQ
     /** Set D-cache blocked status */
     void cacheBlocked(bool v);
     /** Is any store port available to use? */
-    bool cachePortAvailable(bool is_load) const;
+    bool cachePortAvailable(bool is_load, unsigned bytes = 0) const;
     /** Another store port is in use */
-    void cachePortBusy(bool is_load);
+    void cachePortBusy(bool is_load, unsigned bytes = 0);
+    bool storePreparePortAvailable() const
+    { return usedStorePreparePorts < cacheStorePorts; }
+    void noteStorePreparePort()
+    { assert(storePreparePortAvailable()); ++usedStorePreparePorts; }
+    bool loadBankAvailable(Addr addr) const;
+    void noteLoadBank(Addr addr);
+    std::vector<DynInstPtr> olderStores(const DynInstPtr &load) const;
+    bool memorySpeculationAllowed(const DynInstPtr &load) const;
+    bool hasFastForwardingPrediction(const DynInstPtr &load) const;
+    void clearFastForwarding(ThreadID tid);
 
     RequestPort &getDataPort() { return dcachePort; }
 
@@ -954,6 +984,22 @@ class LSQ
     int cacheLoadPorts;
     /** The number of used cache ports in this cycle by loads. */
     int usedLoadPorts;
+    const bool sprL1WidthService;
+    unsigned usedLoadService = 0;
+    unsigned usedStoreService = 0;
+    // Engineering request limiter for zero-byte ownership hints. These are
+    // not STD/data actions and never consume the L1 store data budget.
+    int usedStorePreparePorts = 0;
+    const bool sprL1LoadBankConflicts;
+    std::array<unsigned, 16> loadBankUses{};
+    const unsigned loadCompletionWidth;
+    struct LoadCompletion {
+        Tick ready;
+        InstSeqNum sequence;
+        DynInstPtr inst;
+        std::function<void()> complete;
+    };
+    std::deque<LoadCompletion> loadCompletions;
 
     /** If the LSQ is currently waiting for stale translations */
     bool waitingForStaleTranslation;

@@ -83,10 +83,17 @@ structure(CoherenceMsg, desc="...", interface="Message") {
   MachineID Dest,        desc="What machine receives this message";
   MessageSizeType MessageSize,  desc="size category of the message";
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+  // Observer-only fill provenance; 0 means unknown. Outcomes use
+  // 0=unknown, 1=hit, 2=miss, 3=not accessed; not per-follower lookups.
+  int ServiceSource, default="0", desc="Actual modeled fill data supplier";
+  int ServiceL2Outcome, default="0", desc="Private L2 outcome of the fill transaction";
+  int ServiceL3Outcome, default="0", desc="LLC outcome of the fill transaction";
   bool Dirty, default="false",  desc="Dirty bit";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
+  bool TrainPrefetch, default="false", desc="Eligible demand access for private L2 prefetch training";
   int FillAuditRole, default="0", desc="Observer-only originating request role";
   Addr PerfTransactionId, default="0", desc="Independent native transaction ID, no retirement gate";
+  RequestPtr NativeRequest, desc="Originating request for cache-source accounting";
   bool TraceValid, default="false", desc="Oracle trace identity is valid";
   int TraceContextId, default="-1", desc="Oracle CPU context identity";
   Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";

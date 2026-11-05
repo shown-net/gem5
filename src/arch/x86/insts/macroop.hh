@@ -104,6 +104,16 @@ class MacroopBase : public X86StaticInst
         return env;
     }
 
+    bool usesMicrocodeService() const override
+    {
+        if (isArchitecturalBranch()) return false;
+        for (uint32_t i = 0; i < numMicroops; ++i)
+            if (microops[i]->isMicrocodeControl()) return true;
+        return false;
+    }
+
+    unsigned functionalMicroops() const override { return numMicroops; }
+
     void size(size_t newSize) override
     {
         for (int i = 0; i < numMicroops; i++) {

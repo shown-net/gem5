@@ -70,6 +70,8 @@ namespace X86ISA
 
         // The beginning of the virtual page this entry maps.
         Addr vaddr;
+        // PCID is separate from the virtual page and its page offset.
+        uint16_t pcid = 0;
         // The size of the page this represents, in address bits.
         unsigned logBytes;
 

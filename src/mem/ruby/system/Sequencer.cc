@@ -41,14 +41,19 @@
 
 #include "mem/ruby/system/Sequencer.hh"
 
+#include <algorithm>
+
 #include "base/logging.hh"
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "debug/LLSC.hh"
 #include "debug/ProtocolTrace.hh"
 #include "debug/RubyHitMiss.hh"
 #include "debug/RubySequencer.hh"
+#include "debug/RubySequencerShared.hh"
 #include "debug/RubyStats.hh"
 #include "mem/packet.hh"
+#include "mem/inst_code.hh"
+#include "mem/tso_ordered_store.hh"
 #include "mem/taotrace_response.hh"
 #include "mem/perf_cache_native.hh"
 #include "mem/llc_fill_audit.hh"
@@ -65,12 +70,116 @@ namespace gem5
 namespace ruby
 {
 
+namespace
+{
+
+bool
+isDemandRead(const SequencerRequest &request)
+{
+    const auto type = request.m_type;
+    const auto *pkt = request.pkt;
+    return (type == RubyRequestType_LD ||
+            type == RubyRequestType_Load_Linked ||
+            type == RubyRequestType_RMW_Read ||
+            type == RubyRequestType_Locked_RMW_Read) &&
+        pkt && pkt->req &&
+        (pkt->req->isPTWalk() ||
+         (!pkt->req->isPrefetch() && !pkt->cmd.isSWPrefetch()));
+}
+
+// Only ordinary, cacheable data reads participate in the independent L1
+// lookup path.  Locked, atomic, instruction and prefetch requests retain
+// the existing line-ordered protocol handling.
+bool
+isIndependentDataRead(const SequencerRequest &request)
+{
+    const auto *pkt = request.pkt;
+    return request.m_type == RubyRequestType_LD && pkt && pkt->req &&
+        !pkt->cmd.isSWPrefetch() && !pkt->req->isPrefetch() &&
+        !pkt->req->isUncacheable() && !pkt->req->isStrictlyOrdered() &&
+        !pkt->req->isLLSC() && !pkt->req->isReadModifyWrite();
+}
+
+// A read-only software prefetch is an ordering-neutral hint: an ordinary
+// demand load may join its fill without waiting for the prefetch clone to
+// complete. Exclusive hints and all write/atomic paths remain barriers.
+bool
+isReadFillShareable(const SequencerRequest &request)
+{
+    if (isIndependentDataRead(request))
+        return true;
+    const auto *pkt = request.pkt;
+    return request.m_type == RubyRequestType_LD && pkt && pkt->req &&
+        pkt->cmd.isSWPrefetch() && !pkt->needsWritable() &&
+        !pkt->req->isUncacheable() && !pkt->req->isStrictlyOrdered() &&
+        !pkt->req->isLLSC() && !pkt->req->isReadModifyWrite();
+}
+
+// An unlocked RMW read requests write permission but still needs its own
+// lookup after an older same-line write changes the DataBlock.  It remains an
+// ordering barrier and must not join the independent read/fill path.
+bool
+isUnlockedRmwRead(const SequencerRequest &request)
+{
+    const auto *pkt = request.pkt;
+    return request.m_type == RubyRequestType_RMW_Read && pkt && pkt->req &&
+        !pkt->req->isUncacheable() && !pkt->req->isStrictlyOrdered();
+}
+
+} // anonymous namespace
+
+Sequencer::OrderedStoreStats::OrderedStoreStats(Sequencer *owner)
+    : statistics::Group(owner, "orderedStore"),
+      ADD_STAT(retries, statistics::units::Count::get(),
+               "Ordered aliased store retries after an older line callback"),
+      ADD_STAT(overlappedCycles, statistics::units::Cycle::get(),
+               "Sum of retry entry cycles overlapped with alias waiting"),
+      ADD_STAT(deferredNoWriteCallbacks, statistics::units::Count::get(),
+               "Write callbacks deferred before completing any store"),
+      ADD_STAT(parked, statistics::units::Count::get(),
+               "Out-of-order store callbacks parked until predecessor completion"),
+      ADD_STAT(woken, statistics::units::Count::get(),
+               "Parked ordered lines reissued through L0 as the new head"),
+      ADD_STAT(headRateRetries, statistics::units::Count::get(),
+               "Head stores retried after the same-cycle visibility limit")
+{}
+
+Sequencer::StorePrepareStats::StorePrepareStats(Sequencer *owner)
+    : statistics::Group(owner, "storePrepare"),
+      ADD_STAT(accepted, statistics::units::Count::get(),
+               "Permission-prepare hints admitted to the Ruby optional queue"),
+      ADD_STAT(dropped, statistics::units::Count::get(),
+               "Permission-prepare hints dropped at the configured bound"),
+      ADD_STAT(completed, statistics::units::Count::get(),
+               "Permission-prepare hints removed from the outstanding budget"),
+      ADD_STAT(outstanding, statistics::units::Count::get(),
+               "Current permission-prepare hints outstanding")
+{
+    outstanding.functor([owner]() { return owner->m_store_prepare_outstanding; });
+}
+
+Sequencer::SaturationStats::SaturationStats(Sequencer *owner)
+    : statistics::Group(owner, "saturation"),
+      ADD_STAT(bufferFullRequests, statistics::units::Count::get(),
+               "Requests rejected by the Sequencer packet limit, including retries"),
+      ADD_STAT(bufferFullCycles, statistics::units::Cycle::get(),
+               "Ruby cycles with at least one packet-limit rejection"),
+      ADD_STAT(demandDataFullRequests, statistics::units::Count::get(),
+               "Demand data requests rejected by the Sequencer packet limit"),
+      ADD_STAT(demandDataFullCycles, statistics::units::Cycle::get(),
+               "Ruby cycles with at least one demand data packet-limit rejection")
+{}
+
 Sequencer::Sequencer(const Params &p)
-    : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
+    : RubyPort(p),
+      orderedStoreStats(this), storePrepareStats(this),
+      saturationStats(this),
+      m_IncompleteTimes(MachineType_NUM),
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
 {
     m_outstanding_count = 0;
     m_store_prepare_outstanding = 0;
+    m_maxStorePrepareOutstanding = p.max_store_prepare_outstanding;
 
     m_ruby_system = p.ruby_system;
 
@@ -279,6 +388,9 @@ Sequencer::functionalWrite(Packet *func_pkt)
 
 void Sequencer::resetStats()
 {
+    orderedStoreStats.resetStats();
+    saturationStats.resetStats();
+    lastBufferFullCycle = lastDemandDataFullCycle = uint64_t(-1);
     m_outstandReqHist.reset();
     m_latencyHist.reset();
     m_hitLatencyHist.reset();
@@ -365,24 +477,27 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     }
 
     Addr line_addr = makeLineAddress(pkt->getAddr());
-    // Check if there is any outstanding request for the same cache line.
-    auto &seq_req_list = m_RequestTable[line_addr];
-
     // For software prefetches, if the same cache line is already requested we
     // can skip emplacing it on the request table, this way we won't need to
     // handle any response at all. Close the native lifecycle at this exact
     // production point instead of reporting a Ruby admission that can never
     // receive a response.
+    auto &seq_req_list = m_RequestTable[line_addr];
     if (pkt->cmd.isSWPrefetch() && seq_req_list.size() > 1) {
         TaoTraceNativeAccessRegistry::noteTerminal(
             pkt->req, TaoTraceNativeTerminalReason::PrefetchSkipped);
         return RequestStatus_PrefetchSkipped;
     }
-
-    // Create a default entry
-    seq_req_list.emplace_back(pkt, primary_type,
-        secondary_type, curCycle());
+    seq_req_list.emplace_back(pkt, primary_type, secondary_type, curCycle());
     m_outstanding_count++;
+    if (auto ordered = pkt->req->getExtension<TSOOrderedStore>()) {
+        fatal_if(m_ruby_system->getProtocolInfo().getName() !=
+                     "MESI_Three_Level",
+                 "ordered TSO stores require MESI_Three_Level Ruby");
+        assert(primary_type == RubyRequestType_ST);
+        ordered->acceptedBySequencer = true;
+        m_orderedStores.push_back(pkt->req.get());
+    }
 
     if (seq_req_list.size() > 1) {
         return RequestStatus_Aliased;
@@ -391,6 +506,94 @@ Sequencer::insertRequest(PacketPtr pkt, RubyRequestType primary_type,
     m_outstandReqHist.sample(m_outstanding_count);
 
     return RequestStatus_Ready;
+}
+
+bool
+Sequencer::hasPendingDemandRead(Addr address) const
+{
+    const auto it = m_RequestTable.find(makeLineAddress(address));
+    return it != m_RequestTable.end() && !it->second.empty() &&
+        isDemandRead(it->second.front());
+}
+
+bool
+Sequencer::tailCanFollow(Addr address) const
+{
+    const auto it = m_RequestTable.find(makeLineAddress(address));
+    if (it == m_RequestTable.end() || it->second.size() < 2) return false;
+    auto request = it->second.begin();
+    ++request;
+    for (; request != it->second.end(); ++request) {
+        if (request->m_type != RubyRequestType_LD &&
+            request->m_type != RubyRequestType_Load_Linked)
+            return false;
+    }
+    return true;
+}
+
+void
+Sequencer::issueReadyLineRequests(Addr address)
+{
+    const auto it = m_RequestTable.find(makeLineAddress(address));
+    if (it == m_RequestTable.end() || it->second.empty())
+        return;
+    auto &requests = it->second;
+    if (isIndependentDataRead(requests.front())) {
+        // Reads before the next ordering barrier can be observed separately
+        // by L1 while sharing the same downstream line transaction.
+        for (auto &request : requests) {
+            if (!isIndependentDataRead(request))
+                break;
+            if (!request.issuedToL1)
+                issueRequest(request.pkt, request.m_second_type);
+        }
+    } else if (!requests.front().issuedToL1 &&
+               !m_parkedOrderedLines.count(makeLineAddress(address))) {
+        issueRequest(requests.front().pkt, requests.front().m_second_type);
+    }
+}
+
+bool
+Sequencer::isOrderedStoreReady(const RequestPtr &req) const
+{
+    if (!req || !req->getExtension<TSOOrderedStore>())
+        return true;
+    if (m_orderedStores.empty() || m_orderedStores.front() != req.get())
+        return false;
+    // One different line can become visible per cycle. Consecutive writes
+    // to the same line may share its callback and retain their byte order.
+    return !m_orderedLineValid || m_orderedLineCycle != curCycle() ||
+        m_orderedLine == makeLineAddress(req->getPaddr());
+}
+
+void
+Sequencer::wakeParkedOrderedHead()
+{
+    if (m_orderedStores.empty()) {
+        panic_if(!m_parkedOrderedLines.empty(),
+                 "Parked ordered stores remain without a global head");
+        return;
+    }
+    const auto *head = m_orderedStores.front();
+    const Addr line = makeLineAddress(head->getPaddr());
+    if (!m_parkedOrderedLines.erase(line))
+        return;
+
+    const auto it = m_RequestTable.find(line);
+    panic_if(it == m_RequestTable.end() || it->second.empty() ||
+                 it->second.front().pkt->req.get() != head,
+             "Parked ordered head is not at the front of its line queue");
+    auto &request = it->second.front();
+    // Re-enter L0 instead of assuming the earlier permission still holds.
+    issueRequest(request.pkt, request.m_second_type,
+                 curCycle() - request.issue_time);
+    ++orderedStoreStats.woken;
+}
+
+bool
+Sequencer::isBlockedLine(Addr address) const
+{
+    return m_controller->isBlocked(makeLineAddress(address));
 }
 
 void
@@ -404,6 +607,7 @@ Sequencer::storePrepareComplete()
 {
     assert(m_store_prepare_outstanding > 0);
     --m_store_prepare_outstanding;
+    ++storePrepareStats.completed;
     testDrainComplete();
 }
 
@@ -480,7 +684,7 @@ Sequencer::writeCallbackScFail(Addr address, DataBlock& data)
     writeCallback(address, data);
 }
 
-void
+bool
 Sequencer::writeCallback(Addr address, DataBlock& data,
                          const bool externalHit, const MachineType mach,
                          const Cycles initialRequestTime,
@@ -499,13 +703,45 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     // Perform hitCallback on every cpu request made to this cache block while
     // ruby request was outstanding. Since only 1 ruby request was made,
     // profile the ruby latency once.
+    const RequestPtr service_parent = seq_req_list.front().pkt->req;
     bool ruby_request = true;
     while (!seq_req_list.empty()) {
         SequencerRequest &seq_req = seq_req_list.front();
+        if (!isOrderedStoreReady(seq_req.pkt->req)) {
+            // An older unrelated request can have caused this line's
+            // callback before a later marked store reaches the global head.
+            // Keep it in the request table; the parked path reissues
+            // it through L0 only once it becomes the global head.
+            ++orderedStoreStats.retries;
+            panic_if(m_orderedStores.empty(),
+                     "Ordered store callback has no global head");
+            if (m_orderedStores.front() != seq_req.pkt->req.get()) {
+                const bool inserted =
+                    m_parkedOrderedLines.insert(address).second;
+                panic_if(!inserted, "Duplicate parked ordered line callback");
+                ++orderedStoreStats.parked;
+            } else {
+                // A different line became visible this cycle. Retry later.
+                ++orderedStoreStats.headRateRetries;
+                issueRequest(seq_req.pkt, seq_req.m_second_type,
+                             curCycle() - seq_req.issue_time);
+            }
+            break;
+        }
         // Atomic Request may be executed remotly in the cache hierarchy
         bool atomic_req =
            ((seq_req.m_type == RubyRequestType_ATOMIC_RETURN) ||
             (seq_req.m_type == RubyRequestType_ATOMIC_NO_RETURN));
+
+        if (!ruby_request &&
+            m_ruby_system->getProtocolInfo().getName() == "MESI_Three_Level" &&
+            (isIndependentDataRead(seq_req) || isUnlockedRmwRead(seq_req))) {
+            // The older write has updated this DataBlock.  Let subsequent
+            // reads and unlocked RMW reads go through L1 instead of completing
+            // them from this write callback without a request-local lookup.
+            issueReadyLineRequests(address);
+            break;
+        }
 
         if ((noCoales || atomic_req) && !ruby_request) {
             // Do not process follow-up requests
@@ -524,9 +760,21 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
         }
 
         // handle write request
+        if (!ruby_request) {
+            seq_req.serviceParent = service_parent;
+            seq_req.serviceParentIsWrite = true;
+        }
         if ((seq_req.m_type != RubyRequestType_LD) &&
             (seq_req.m_type != RubyRequestType_Load_Linked) &&
             (seq_req.m_type != RubyRequestType_IFETCH)) {
+            if (seq_req.pkt->req->getExtension<TSOOrderedStore>()) {
+                panic_if(!isOrderedStoreReady(seq_req.pkt->req),
+                         "Ruby TSO store became visible out of order");
+                m_orderedLineValid = true;
+                m_orderedLineCycle = curCycle();
+                m_orderedLine = makeLineAddress(seq_req.pkt->req->getPaddr());
+                m_orderedStores.pop_front();
+            }
             // LL/SC support (tested with ARMv8)
             bool success = true;
 
@@ -582,6 +830,13 @@ Sequencer::writeCallback(Addr address, DataBlock& data,
     if (seq_req_list.empty()) {
         m_RequestTable.erase(address);
     }
+    wakeParkedOrderedHead();
+    // The first request may have been deferred to preserve TSO order. In
+    // that case no data was written, so the controller must not mark a
+    // clean line dirty or refresh replacement state for this action.
+    if (ruby_request)
+        ++orderedStoreStats.deferredNoWriteCallbacks;
+    return !ruby_request;
 }
 
 bool
@@ -616,7 +871,7 @@ Sequencer::readCallback(Addr address, DataBlock& data,
                         bool externalHit, const MachineType mach,
                         Cycles initialRequestTime,
                         Cycles forwardRequestTime,
-                        Cycles firstResponseTime)
+                        Cycles firstResponseTime, const bool code_stale)
 {
     //
     // Free up read requests until we hit the first Write request
@@ -629,9 +884,25 @@ Sequencer::readCallback(Addr address, DataBlock& data,
     // Perform hitCallback on every cpu request made to this cache block while
     // ruby request was outstanding. Since only 1 ruby request was made,
     // profile the ruby latency once.
+    const RequestPtr service_parent = seq_req_list.front().pkt->req;
     bool ruby_request = true;
     while (!seq_req_list.empty()) {
         SequencerRequest &seq_req = seq_req_list.front();
+        if (!ruby_request &&
+            m_ruby_system->getProtocolInfo().getName() == "MESI_Three_Level" &&
+            isIndependentDataRead(seq_req)) {
+            // An earlier instruction fetch or other serial request cannot
+            // satisfy this demand read without its own L1 observation.
+            issueReadyLineRequests(address);
+            break;
+        }
+        if (!ruby_request)
+            seq_req.serviceParent = service_parent;
+        if (code_stale && seq_req.m_type == RubyRequestType_IFETCH) {
+            auto validity = std::make_shared<InstructionCodeValidity>();
+            validity->stale = true;
+            seq_req.pkt->req->setExtension(validity);
+        }
         if (processReadCallback(seq_req, data, ruby_request, externalHit, mach,
                                 initialRequestTime, forwardRequestTime,
                                 firstResponseTime)) {
@@ -654,6 +925,103 @@ Sequencer::readCallback(Addr address, DataBlock& data,
     if (seq_req_list.empty()) {
         m_RequestTable.erase(address);
     }
+}
+
+void
+Sequencer::registerReadFill(const RequestPtr &request, bool follower,
+                            bool has_service_source)
+{
+    if (!request)
+        return;
+    const auto it = m_RequestTable.find(makeLineAddress(request->getPaddr()));
+    if (it == m_RequestTable.end())
+        return;
+    for (auto &entry : it->second) {
+        if (entry.pkt->req == request &&
+            (entry.m_type == RubyRequestType_LD ||
+             entry.m_type == RubyRequestType_Load_Linked)) {
+            entry.waitingForDataFill = true;
+            entry.dataFillFollower = follower;
+            entry.dataFillHasServiceSource = has_service_source;
+            return;
+        }
+    }
+}
+
+void
+Sequencer::readRequestCallback(Addr address, DataBlock &data,
+                               const RequestPtr &request)
+{
+    const auto table = m_RequestTable.find(makeLineAddress(address));
+    panic_if(table == m_RequestTable.end(),
+             "L1 hit has no matching Sequencer line request");
+    auto &requests = table->second;
+    auto entry = std::find_if(requests.begin(), requests.end(),
+        [&request](const auto &item) { return item.pkt->req == request; });
+    panic_if(entry == requests.end(), "L1 hit has no matching request");
+    for (auto older = requests.begin(); older != entry; ++older) {
+        panic_if(!isReadFillShareable(*older),
+                 "L1 hit crossed an older same-line ordering barrier");
+    }
+    panic_if(entry->waitingForDataFill,
+             "Request already registered for a data fill hit in L1");
+    recordMissLatency(&*entry, true, MachineType_NUM, false,
+                      Cycles(0), Cycles(0), Cycles(0));
+    markRemoved();
+    hitCallback(&*entry, data, true, MachineType_NUM, false,
+                Cycles(0), Cycles(0), Cycles(0), false);
+    requests.erase(entry);
+    if (requests.empty())
+        // hitCallback can synchronously retry another port and rehash the
+        // table. References to its elements survive rehash; iterators do not.
+        m_RequestTable.erase(makeLineAddress(address));
+    else
+        issueReadyLineRequests(address);
+}
+
+void
+Sequencer::readFillCallback(Addr address, DataBlock &data, int service_source,
+                            int l2_outcome, int l3_outcome)
+{
+    const auto table = m_RequestTable.find(makeLineAddress(address));
+    panic_if(table == m_RequestTable.end(),
+             "L1 fill has no matching Sequencer line request");
+    auto &requests = table->second;
+    // Only requests actually observed by L1 can consume this fill.  A later
+    // queued request will make its own lookup once the cache state permits.
+    // The mandatory queue need not preserve same-cycle arrival order, so the
+    // fill's initiating read need not be the first request in the line list.
+    // Never traverse an older write/atomic or other ordering barrier.
+    bool completed = false;
+    for (auto entry = requests.begin(); entry != requests.end();) {
+        const bool shareable = isReadFillShareable(*entry);
+        if (!shareable && entry != requests.begin())
+            break;
+        if (!entry->waitingForDataFill) {
+            if (!shareable)
+                break;
+            ++entry;
+            continue;
+        }
+        if (entry->dataFillHasServiceSource)
+            TaoTraceNativeAccessRegistry::noteServiceSource(
+                entry->pkt->req, service_source, l2_outcome, l3_outcome,
+                entry->dataFillFollower);
+        recordMissLatency(&*entry, true, MachineType_NUM, true,
+                          Cycles(0), Cycles(0), Cycles(0));
+        markRemoved();
+        hitCallback(&*entry, data, true, MachineType_NUM, true,
+                    Cycles(0), Cycles(0), Cycles(0), false);
+        entry = requests.erase(entry);
+        completed = true;
+        if (!shareable)
+            break;
+    }
+    panic_if(!completed, "L1 fill has no registered request");
+    if (requests.empty())
+        m_RequestTable.erase(makeLineAddress(address));
+    else
+        issueReadyLineRequests(address);
 }
 
 void
@@ -727,6 +1095,52 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
 
     PacketPtr pkt = srequest->pkt;
     if (pkt->req) {
+        if (was_coalesced && srequest->admissionDataSource)
+            TaoTraceNativeAccessRegistry::noteHierarchy(
+                pkt->req, 0, srequest->admissionDataSource == 2 ?
+                    TaoTraceNativeCacheOutcome::MergedMiss :
+                    TaoTraceNativeCacheOutcome::Hit);
+        else if (was_coalesced) {
+            if (debug::RubySequencerShared) {
+                const auto &req = pkt->req;
+                const auto &parent = srequest->serviceParent;
+                const auto ext = req->getExtension<TaoTraceRubyResponseExtension>();
+                // This is a service-time observation, not a Marker/retirement
+                // filter. Request addresses identify objects only while alive.
+                DPRINTF(RubySequencerShared,
+                    "shared req=%p parent=%p context_valid=%d context=%d "
+                    "seq_valid=%d seq=%llu pc_valid=%d pc=%#llx "
+                    "addr=%#llx type=%s secondary=%s cmd=%s "
+                    "write_callback=%d admission_source=%u issued_l1=%d "
+                    "sw_prefetch=%d prefetch=%d inst_fetch=%d ptwalk=%d "
+                    "uncacheable=%d strict=%d llsc=%d locked_rmw=%d rmw=%d "
+                    "parent_inst_fetch=%d parent_locked_rmw=%d parent_rmw=%d "
+                    "ext=%d admissions=%u responses=%u l1_baseline=%u "
+                    "l1_accesses=%u identity_ambiguous=%d\n",
+                    req.get(), parent.get(), req->hasContextId(),
+                    req->hasContextId() ? int(req->contextId()) : -1,
+                    req->hasInstSeqNum(),
+                    static_cast<unsigned long long>(req->hasInstSeqNum() ?
+                        req->getReqInstSeqNum() : 0), req->hasPC(),
+                    static_cast<unsigned long long>(req->hasPC() ? req->getPC() : 0),
+                    static_cast<unsigned long long>(pkt->getAddr()),
+                    RubyRequestType_to_string(srequest->m_type),
+                    RubyRequestType_to_string(srequest->m_second_type),
+                    pkt->cmdString(), srequest->serviceParentIsWrite,
+                    unsigned(srequest->admissionDataSource), srequest->issuedToL1,
+                    pkt->cmd.isSWPrefetch(), req->isPrefetch(), req->isInstFetch(),
+                    req->isPTWalk(), req->isUncacheable(), req->isStrictlyOrdered(),
+                    req->isLLSC(), req->isLockedRMW(), req->isReadModifyWrite(),
+                    parent && parent->isInstFetch(), parent && parent->isLockedRMW(),
+                    parent && parent->isReadModifyWrite(), bool(ext),
+                    ext ? ext->admissions : 0, ext ? ext->responses : 0,
+                    ext ? ext->admissionAccesses[0] : 0,
+                    ext ? ext->hierarchy.accesses[0] : 0,
+                    ext && ext->serviceFactIdentityAmbiguous);
+            }
+            TaoTraceNativeAccessRegistry::noteSequencerShared(
+                pkt->req, srequest->serviceParent, srequest->serviceParentIsWrite);
+        }
         // In this Sequencer API externalHit=true denotes a controller miss;
         // preserve the protocol-native spelling in the sideband so the event
         // dictionary, not this observer, decides its eventual PMU mapping.
@@ -813,7 +1227,7 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
     // If using the RubyTester, update the RubyTester sender state's
     // subBlock with the recieved data.  The tester will later access
     // this state.
-    if (m_usingRubyTester) {
+    if (m_usingRubyTester && pkt->needsResponse()) {
         DPRINTF(RubySequencer, "hitCallback %s 0x%x using RubyTester\n",
                 pkt->cmdString(), pkt->getAddr());
         RubyTester::SenderState* testerSenderState =
@@ -980,6 +1394,15 @@ RequestStatus
 Sequencer::makeRequest(PacketPtr pkt)
 {
     if (pkt->req->isStorePrepare()) {
+        // Preparation is a hint: if the optional bound is reached, consume
+        // it without blocking demand requests or modifying architectural data.
+        if (m_maxStorePrepareOutstanding &&
+            static_cast<unsigned>(m_store_prepare_outstanding) >=
+                m_maxStorePrepareOutstanding) {
+            ++storePrepareStats.dropped;
+            return RequestStatus_Issued;
+        }
+        ++storePrepareStats.accepted;
         ++m_store_prepare_outstanding;
         m_controller->enqueuePrefetch(
             makeLineAddress(pkt->getAddr()), RubyRequestType_Store_Prepare);
@@ -988,8 +1411,26 @@ Sequencer::makeRequest(PacketPtr pkt)
 
     // HTM abort signals must be allowed to reach the Sequencer
     // the same cycle they are issued. They cannot be retried.
+    // A transport ingress limit prevents unbounded protocol request queues;
+    // it counts packets, not fill entries, and is configured separately.
     if ((m_outstanding_count >= m_max_outstanding_requests) &&
         !pkt->req->isHTMAbort()) {
+        const uint64_t cycle = uint64_t(curCycle());
+        ++saturationStats.bufferFullRequests;
+        if (lastBufferFullCycle != cycle) {
+            ++saturationStats.bufferFullCycles;
+            lastBufferFullCycle = cycle;
+        }
+        const bool demand_data = !pkt->req->isInstFetch() &&
+            !pkt->req->isPrefetch() && !pkt->cmd.isSWPrefetch() &&
+            (pkt->isRead() || pkt->isWrite());
+        if (demand_data) {
+            ++saturationStats.demandDataFullRequests;
+            if (lastDemandDataFullCycle != cycle) {
+                ++saturationStats.demandDataFullCycles;
+                lastDemandDataFullCycle = cycle;
+            }
+        }
         perf_cache_native::observer().retry(m_version,uint64_t(curTick()));
         return RequestStatus_BufferFull;
     }
@@ -1130,9 +1571,54 @@ Sequencer::makeRequest(PacketPtr pkt)
         TaoTraceNativeAccessRegistry::noteAdmission(
             pkt->req, status == RequestStatus_Aliased);
     }
+    const bool independent_data_request =
+        m_ruby_system->getProtocolInfo().getName() == "MESI_Three_Level" &&
+        pkt->req && !pkt->req->isMemMgmt() &&
+        pkt->cmd != MemCmd::MemSyncReq &&
+        [&]() {
+            const auto it = m_RequestTable.find(makeLineAddress(pkt->getAddr()));
+            return it != m_RequestTable.end() && !it->second.empty() &&
+                it->second.back().pkt == pkt &&
+                isIndependentDataRead(it->second.back());
+        }();
+    const bool independent_read =
+        status == RequestStatus_Aliased && independent_data_request &&
+        [&]() {
+            const auto it = m_RequestTable.find(makeLineAddress(pkt->getAddr()));
+            if (it == m_RequestTable.end() || it->second.empty()) return false;
+            for (const auto &entry : it->second) {
+                if (!isReadFillShareable(entry)) return false;
+                if (entry.pkt == pkt) return true;
+            }
+            return false;
+        }();
+    if (!independent_data_request &&
+        m_ruby_system->getProtocolInfo().getName() == "MESI_Three_Level" &&
+        m_dataCache_ptr && pkt->req &&
+        (pkt->req->isPTWalk() ||
+         (!pkt->req->isPrefetch() && !pkt->cmd.isSWPrefetch())) &&
+        (primary_type == RubyRequestType_LD ||
+         primary_type == RubyRequestType_Load_Linked ||
+         primary_type == RubyRequestType_RMW_Read ||
+         primary_type == RubyRequestType_Locked_RMW_Read)) {
+        const Addr line = makeLineAddress(pkt->getAddr());
+        // A request merged before any FB admission remains unknown. Never
+        // infer its source from the leading request's eventual response.
+        if (m_dataCache_ptr->dataFillPending(line)) {
+            const bool joins = status != RequestStatus_Aliased ||
+                tailCanFollow(line);
+            if (joins)
+                m_dataCache_ptr->observeDataFillDemandRead(line);
+            if (joins && status == RequestStatus_Aliased)
+                m_RequestTable.at(line).back().admissionDataSource = 2;
+        } else if (status == RequestStatus_Aliased && tailCanFollow(line) &&
+                   m_dataCache_ptr->hasReadableData(line)) {
+            m_RequestTable.at(line).back().admissionDataSource = 1;
+        }
+    }
     // non-aliased with any existing request in the request table, just issue
     // to the cache
-    if (status != RequestStatus_Aliased)
+    if (status != RequestStatus_Aliased || independent_read)
         issueRequest(pkt, secondary_type);
 
     // TODO: issue hardware prefetches here
@@ -1140,9 +1626,22 @@ Sequencer::makeRequest(PacketPtr pkt)
 }
 
 void
-Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
+Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
+                        Cycles overlapped)
 {
     assert(pkt != NULL);
+    if (pkt->req && !pkt->req->isMemMgmt() &&
+        pkt->cmd != MemCmd::MemSyncReq) {
+        const auto it = m_RequestTable.find(makeLineAddress(pkt->getAddr()));
+        if (it != m_RequestTable.end()) {
+            for (auto &entry : it->second) {
+                if (entry.pkt == pkt) {
+                    entry.issuedToL1 = true;
+                    break;
+                }
+            }
+        }
+    }
     ContextID proc_id = pkt->req->hasContextId() ?
         pkt->req->contextId() : InvalidContextID;
 
@@ -1221,8 +1720,22 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
         msg->m_htmTransactionUid = pkt->getHtmTransactionUid();
     }
 
-    Tick latency = cyclesToTicks(
-                        m_controller->mandatoryQueueLatency(secondary_type));
+    Cycles service = m_controller->mandatoryQueueLatency(secondary_type);
+    if (secondary_type != RubyRequestType_IFETCH &&
+        m_dataCache_ptr->getDataLatency() > Cycles(1)) {
+        // The baseline one-cycle queue covers the default array service.
+        // A longer configured data-array pipeline delays hierarchy entry.
+        service += m_dataCache_ptr->getDataLatency() - Cycles(1);
+    }
+    if (overlapped > Cycles(0) && !m_mandatory_q_ptr->getOrdered()) {
+        // The aliased request has waited for an earlier access to this same
+        // line. Allow that wait to overlap the entry pipeline, while still
+        // passing through the L0 state machine and its permission checks.
+        const Cycles saved = std::min(overlapped, service - Cycles(1));
+        service = service - saved;
+        orderedStoreStats.overlappedCycles += uint64_t(saved);
+    }
+    Tick latency = cyclesToTicks(service);
     assert(latency > 0);
 
     assert(m_mandatory_q_ptr != NULL);

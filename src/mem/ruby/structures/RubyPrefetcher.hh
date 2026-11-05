@@ -45,6 +45,8 @@
 // Implements Power 4 like prefetching
 
 #include <bitset>
+#include <array>
+#include <unordered_set>
 
 #include "base/circular_queue.hh"
 #include "base/statistics.hh"
@@ -120,6 +122,11 @@ class RubyPrefetcher : public SimObject
          * @param address   The physical address that missed out of the cache.
          */
         void observeMiss(Addr address, const RubyRequestType& type);
+        void observeDataMiss(RequestPtr request);
+        void observeDataAccess(RequestPtr request);
+        void observeAdjacent(Addr address);
+        void prefetchDequeued(Addr address);
+        void prefetchDropped(Addr address);
 
         /**
          * Print out some statistics
@@ -129,6 +136,25 @@ class RubyPrefetcher : public SimObject
         { m_controller = _ctrl; }
 
     private:
+        struct PcStrideEntry
+        {
+            bool valid = false;
+            bool secure = false;
+            ContextID context = InvalidContextID;
+            Addr pc = 0;
+            Addr lastLine = 0;
+            int64_t stride = 0;
+            unsigned samples = 0;
+            uint64_t lastUse = 0;
+        };
+
+        bool enqueueCandidate(Addr address, const RubyRequestType &type);
+        std::array<PcStrideEntry, 64> pcStrideTable{};
+        std::unordered_set<Addr> queuedPrefetches;
+        uint64_t pcStrideClock = 0;
+        bool ipStrideEnabled;
+        bool queueDedupEnabled;
+
         struct UnitFilterEntry
         {
             /** Address to which this filter entry refers. */
@@ -259,6 +285,12 @@ class RubyPrefetcher : public SimObject
             statistics::Scalar numAllocatedStreams;
             //! Count of prefetch requests made
             statistics::Scalar numPrefetchRequested;
+            statistics::Scalar numDuplicateCandidates;
+            statistics::Scalar numDroppedCandidates;
+            statistics::Scalar numStreamCandidates;
+            statistics::Scalar numIpCandidates;
+            statistics::Scalar numIpPageStops;
+            statistics::Scalar numAdjacentCandidates;
             //! Count of successful prefetches
             statistics::Scalar numHits;
             //! Count of partial successful prefetches

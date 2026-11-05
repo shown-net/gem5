@@ -41,6 +41,7 @@
 #ifndef __CPU_O3_MEM_DEP_UNIT_HH__
 #define __CPU_O3_MEM_DEP_UNIT_HH__
 
+#include <array>
 #include <list>
 #include <memory>
 #include <set>
@@ -75,17 +76,16 @@ namespace o3
 
 class CPU;
 class InstructionQueue;
+class LSQ;
 
 /**
  * Memory dependency unit class.  This holds the memory dependence predictor.
  * As memory operations are issued to the IQ, they are also issued to this
  * unit, which then looks up the prediction as to what they are dependent
- * upon.  This unit must be checked prior to a memory operation being able
- * to issue.  Although this is templated, it's somewhat hard to make a generic
- * memory dependence unit.  This one is mostly for store sets; it will be
- * quite limited in what other memory dependence predictions it can also
- * utilize.  Thus this class should be most likely be rewritten for other
- * dependence prediction schemes.
+ * upon. This unit must be checked prior to a memory operation being able
+ * to issue. The SPR policy separates store-address resolution from memory
+ * completion, learns local load independence and applies a global watchdog.
+ * Other configurations retain the generic StoreSet predictor.
  */
 class MemDepUnit
 {
@@ -120,6 +120,13 @@ class MemDepUnit
     /** Sets the pointer to the IQ. */
     void setIQ(InstructionQueue *iq_ptr);
 
+    /** Address resolution is distinct from store data/completion. */
+    void setLSQ(LSQ *lsq_ptr) { lsq = lsq_ptr; }
+    void addressReady(const DynInstPtr &inst);
+    void noteForwarding(const DynInstPtr &load);
+    void loadRetired(const DynInstPtr &load);
+    bool canSpeculate(const DynInstPtr &inst) const;
+
     /** Inserts a memory instruction. */
     void insert(const DynInstPtr &inst);
 
@@ -142,6 +149,9 @@ class MemDepUnit
      *  the ready list.
      */
     void replay();
+
+    /** Replay one previously rescheduled instruction, if still waiting. */
+    bool replayOne(const DynInstPtr &inst);
 
     /** Notifies completion of an instruction. */
     void completeInst(const DynInstPtr &inst);
@@ -199,6 +209,9 @@ class MemDepUnit
 
         /** A vector of any dependent instructions. */
         std::vector<MemDepEntryPtr> dependInsts;
+        std::vector<MemDepEntryPtr> addressDependents;
+        std::vector<InstSeqNum> observingLoads;
+        bool addressResolved = false;
 
         /** If the registers are ready or not. */
         bool regsReady = false;
@@ -243,6 +256,28 @@ class MemDepUnit
      */
     StoreSet depPred;
 
+    // Golden Cove mechanism prior.  The five watchdog states model the
+    // documented four-violation disable behavior, not a physical bit encoding.
+    bool sprPredictor = false;
+    LSQ *lsq = nullptr;
+    std::array<uint8_t, 512> independence{};
+    int speculationCredit = 3;
+    unsigned safePredictions = 0;
+    struct LoadObservation {
+        DynInstPtr load;
+        std::vector<DynInstPtr> olderStores;
+        unsigned unresolved = 0;
+        bool addressObserved = false;
+        bool dependent = false;
+        bool trained = false;
+        bool localPrediction = false;
+        bool hadUnresolvedStore = false;
+        bool violationCharged = false;
+    };
+    std::unordered_map<InstSeqNum, LoadObservation, SNHash> loadObservations;
+    void observeLoad(const DynInstPtr &inst);
+    void trainLoad(LoadObservation &observation);
+
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;
 
@@ -276,6 +311,13 @@ class MemDepUnit
         /** Stat for number of conflicting stores that had to wait for a
          *  store. */
         statistics::Scalar conflictingStores;
+        statistics::Scalar independencePredictions;
+        statistics::Scalar addressWaits;
+        statistics::Scalar resolvedIndependentLoads;
+        statistics::Scalar resolvedDependentLoads;
+        statistics::Scalar watchdogBlocks;
+        statistics::Scalar watchdogDisables;
+        statistics::Scalar watchdogRecoveries;
     } stats;
 };
 

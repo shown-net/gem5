@@ -87,6 +87,9 @@ class FUPool;
 class IEW
 {
   public:
+    /** FSFP validation failure recovers without training memory-disambiguation. */
+    void squashFastForwarding(const DynInstPtr &inst);
+
     /** Overall IEW stage status. Used to determine if the CPU can
      * deschedule itself due to a lack of activity.
      */
@@ -179,6 +182,8 @@ class IEW
 
     /** Re-executes all rescheduled memory instructions. */
     void replayMemInst(const DynInstPtr &inst);
+
+    bool replayOneMemInst(const DynInstPtr &inst);
 
     /** Moves memory instruction onto the list of cache blocked instructions */
     void blockMemInst(const DynInstPtr &inst);
@@ -396,18 +401,8 @@ class IEW
     /** Width of issue, in instructions. */
     unsigned issueWidth;
 
-    /** Index into queue of instructions being written back. */
-    unsigned wbNumInst;
-
-    /** Cycle number within the queue of instructions being written back.
-     * Used in case there are too many instructions writing back at the current
-     * cycle and writesbacks need to be scheduled for the future. See comments
-     * in instToCommit().
-     */
-    unsigned wbCycle;
-
-    /** Writeback width. */
-    unsigned wbWidth;
+    /** Result values already produced, awaiting their completion notification. */
+    unsigned pendingResultCompletions = 0;
 
     /** Number of active threads. */
     ThreadID numThreads;

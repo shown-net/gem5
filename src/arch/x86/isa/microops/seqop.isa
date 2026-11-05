@@ -123,6 +123,7 @@ let {{
                 microFlags.remove("IsLastMicroop")
             if not "IsDelayedCommit" in microFlags:
                 microFlags.append("IsDelayedCommit")
+            microFlags.append("IsMicrocodeControl")
 
             return '''new %(class_name)s(machInst, macrocodeBlock,
                     %(flags)s, %(target)s, %(cc)s)''' % {
@@ -148,6 +149,7 @@ let {{
                 microFlags.append("IsLastMicroop")
             if "IsDelayedCommit" in microFlags:
                 microFlags.remove("IsDelayedCommit")
+            microFlags.append("IsMicrocodeControl")
 
             return '''new %(class_name)s(machInst, macrocodeBlock,
                     %(flags)s, %(cc)s)''' % {

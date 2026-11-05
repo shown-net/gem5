@@ -44,9 +44,11 @@
 #ifndef __CPU_O3_CPU_HH__
 #define __CPU_O3_CPU_HH__
 
+#include <array>
 #include <iostream>
 #include <list>
 #include <queue>
+#include <array>
 #include <set>
 #include <vector>
 
@@ -60,6 +62,7 @@
 #include "cpu/o3/decode.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/fetch.hh"
+#include "cpu/o3/frontend.hh"
 #include "cpu/o3/free_list.hh"
 #include "cpu/o3/ftq.hh"
 #include "cpu/o3/iew.hh"
@@ -79,6 +82,7 @@ namespace gem5
 template <class>
 class Checker;
 class ThreadContext;
+class ResultForwarding;
 
 class Checkpoint;
 class Process;
@@ -87,6 +91,8 @@ namespace o3
 {
 
 class ThreadContext;
+class ZeroIdiom;
+class FrontendCoordinator;
 
 /**
  * O3CPU class, has each of the stages (fetch through commit)
@@ -97,6 +103,10 @@ class CPU : public BaseCPU
 {
   public:
     bool markerObservation = false;
+    const bool tmaEnabled;
+    FrontendCoordinator *frontend = nullptr;
+    ResultForwarding *resultForwarding = nullptr;
+    ZeroIdiom *zeroIdiom = nullptr;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -588,6 +598,12 @@ class CPU : public BaseCPU
                 flags, res, std::move(amo_op), byte_enable);
     }
 
+    Fault
+    writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size)
+    {
+        return iew.ldstQueue.writeStoreData(inst, data, size);
+    }
+
     /** Used by the fetch unit to get a hold of the instruction port. */
     Port &
     getInstPort() override
@@ -615,7 +631,221 @@ class CPU : public BaseCPU
         statistics::Scalar quiesceCycles;
     } cpuStats;
 
+    struct UnhaltedClockStats : public statistics::Group
+    {
+        explicit UnhaltedClockStats(CPU *cpu);
+        void setActive(ThreadID tid, bool active);
+        void account();
+        void preDumpStats() override;
+        void resetStats() override;
+        CPU *owner;
+        std::array<bool, MaxThreads> running{};
+        std::array<uint64_t, MaxThreads> lastCycle{};
+        std::array<Tick, MaxThreads> lastTick{};
+        statistics::Scalar THREAD, REF_TSC;
+    } unhaltedClockStats;
+
+    /** Window-local allocation-slot model; not Intel's internal PMU logic. */
+    struct TmaStats : public statistics::Group
+    {
+        explicit TmaStats(CPU *cpu, unsigned width);
+        void setActive(bool active);
+        void begin();
+        void end();
+        void allocated(const DynInstPtr &inst);
+        void onRetire(const DynInstPtr &inst);
+        void onOtherSquash(const DynInstPtr &inst);
+        void squashAfter(InstSeqNum sequence, bool speculation,
+                         bool branch = false);
+        void renameCycle(bool blocked, bool squashing, bool no_candidate);
+        void preDumpStats() override;
+        void resetStats() override;
+
+      private:
+        enum class EmptyReason { Frontend, Backend, Recovery, Unattributed };
+        void accountUntil(uint64_t now);
+        void emptySlots(uint64_t slots, EmptyReason reason);
+        CPU *owner;
+        const unsigned width;
+        bool active = false, tracking = false, recovery = false;
+        bool sawRecoverySquash = false;
+        uint64_t lastCycle = 0;
+        unsigned accepted = 0;
+        std::map<InstSeqNum, AllocationGroupPtr> outstanding;
+      public:
+        statistics::Scalar slots, retiring, badSpeculation, frontendBound;
+        statistics::Scalar backendBound, pending, otherSquashes, unattributed;
+        statistics::Scalar carryInRetired, frontendAmbiguous, frontendBackendOverlap;
+        statistics::Scalar allocatedOps, fusedPairs;
+        statistics::Scalar branchSquashedAllocations;
+        statistics::Scalar frontendOnlyEmpty, backendOnlyEmpty;
+        statistics::Scalar overlapEmpty, recoveryEmpty, unknownEmpty;
+    } tmaStats;
+
+    struct BranchInstStats : public statistics::Group
+    {
+        explicit BranchInstStats(CPU *cpu);
+        statistics::Scalar ALL_BRANCHES, COND, INDIRECT, NEAR_RETURN;
+    } branchInstStats;
+
+    struct BranchMispStats : public statistics::Group
+    {
+        explicit BranchMispStats(CPU *cpu);
+        statistics::Scalar ALL_BRANCHES, COND, INDIRECT, RET;
+    } branchMispStats;
+
+    struct InstRetiredStats : public statistics::Group
+    {
+        explicit InstRetiredStats(CPU *cpu);
+        statistics::Scalar ANY, MACRO_FUSED;
+    } instRetiredStats;
+
+    // Cycle thresholds are updated on each action, before any Marker probe.
+    struct ActionCycle {
+        uint64_t cycle = 0;
+        unsigned units = 0;
+        bool valid = false;
+        unsigned add(uint64_t now, unsigned amount) {
+            if (!valid || cycle != now) {
+                cycle = now;
+                units = 0;
+                valid = true;
+            }
+            const unsigned before = units;
+            units += amount;
+            return before;
+        }
+    };
+    struct UopsRetiredStats : public statistics::Group {
+        explicit UopsRetiredStats(CPU *cpu);
+        CPU *owner;
+        statistics::Scalar SLOTS, CYCLES, STALLS;
+        std::array<ActionCycle, MaxThreads> activity{};
+        void preDumpStats() override;
+        void resetStats() override {
+            statistics::Group::resetStats();
+            activity = {};
+        }
+    } uopsRetiredStats;
+    struct IdqStats : public statistics::Group {
+        explicit IdqStats(CPU *cpu);
+        statistics::Scalar MITE_UOPS, DSB_UOPS, MS_UOPS;
+        statistics::Scalar MITE_CYCLES_ANY, MITE_CYCLES_OK;
+        statistics::Scalar DSB_CYCLES_ANY, DSB_CYCLES_OK, MS_CYCLES_ANY;
+        std::array<ActionCycle, 3> activity{};
+        void resetStats() override {
+            statistics::Group::resetStats();
+            activity = {};
+        }
+    } idqStats;
+    struct LsdStats : public statistics::Group {
+        explicit LsdStats(CPU *cpu);
+        statistics::Scalar UOPS, CYCLES_ACTIVE, CYCLES_OK;
+        ActionCycle activity;
+        void resetStats() override {
+            statistics::Group::resetStats();
+            activity = {};
+        }
+    } lsdStats;
+    struct UopsIssuedStats : public statistics::Group {
+        explicit UopsIssuedStats(CPU *cpu);
+        statistics::Scalar ANY, CYCLES;
+        std::array<ActionCycle, MaxThreads> activity{};
+        void resetStats() override {
+            statistics::Group::resetStats();
+            activity = {};
+        }
+    } uopsIssuedStats;
+    struct UopsExecutedStats : public statistics::Group {
+        explicit UopsExecutedStats(CPU *cpu);
+        CPU *owner;
+        statistics::Scalar THREAD, CYCLES_GE_1, CYCLES_GE_2;
+        statistics::Scalar CYCLES_GE_3, CYCLES_GE_4;
+        statistics::Scalar STALLS;
+        std::array<ActionCycle, MaxThreads> activity{};
+        void preDumpStats() override;
+        void resetStats() override {
+            statistics::Group::resetStats();
+            activity = {};
+        }
+    } uopsExecutedStats;
+    struct UopsDispatchedStats : public statistics::Group {
+        explicit UopsDispatchedStats(CPU *cpu);
+        statistics::Scalar PORT_0, PORT_1, PORT_2_3_10, PORT_4_9;
+        statistics::Scalar PORT_5_11, PORT_6, PORT_7_8;
+    } uopsDispatchedStats;
+
+    void recordFrontendDelivery(FrontendSource source, unsigned units,
+                                uint64_t cycle);
+    void recordAllocatedUops(unsigned count, const DynInstPtr &inst);
+    void recordExecutedUops(unsigned count, ThreadID tid);
+    void recordRetiredUops(unsigned count, ThreadID tid);
+    void recordDispatchedPort(unsigned port, unsigned count = 1);
+
+    struct MoveEliminationStats : public statistics::Group
+    {
+        explicit MoveEliminationStats(CPU *cpu);
+        statistics::Scalar accepted, retired;
+    } moveEliminationStats;
+
+    struct MemoryInstRetiredStats : public statistics::Group
+    {
+        explicit MemoryInstRetiredStats(CPU *cpu);
+        statistics::Scalar ALL_LOADS, ALL_STORES;
+        statistics::Scalar ALL_STORES_USER, ALL_STORES_NONUSER, ALL_STORES_MIXED;
+    } memoryInstRetiredStats;
+    struct MemoryLoadRetiredStats : public statistics::Group
+    {
+        explicit MemoryLoadRetiredStats(CPU *cpu);
+        statistics::Scalar L1_HIT, L1_HIT_NO_FORWARD, L1_OBSERVED_HIT;
+        statistics::Scalar L1_MISS, L2_HIT, L2_MISS, L3_HIT, L3_MISS, FB_HIT;
+        statistics::Scalar storeForward, sourceIncompleteResponse;
+        statistics::Vector sharedFillServiceSource;
+        statistics::Scalar sourceUnobservedL1, sourceMixedLocalEvents;
+        statistics::Scalar sourceSequencerShared, sourceOtherTerminal;
+        statistics::Scalar sourcePermissionUpgrade, sourceRemoteSupply;
+        statistics::Scalar sharedParentL1Hit, sharedParentL1Miss, sharedParentL2Hit;
+        statistics::Scalar sharedParentL2Miss, sharedParentL3Hit, sharedParentL3Miss;
+        statistics::Scalar sharedParentOther, sharedParentIFetch, sharedParentMissing;
+        statistics::Scalar sharedParentWriteCallback, sourcePrefetchInFlight;
+        statistics::Scalar incompleteNoRequest, incompleteNoResponse;
+        statistics::Scalar incompleteOpen, incompleteMismatch, incompletePrefetch, incompleteAtomic;
+        statistics::Scalar l2MissingLookup, l2OtherOutcome, l2CountMismatch;
+        statistics::Scalar l2MismatchSplit, l2MismatchLocked, l2MismatchCoalesced;
+        statistics::Scalar sourceL2AssociationGap, sourceL3AssociationGap;
+    } memoryLoadRetiredStats;
+    struct MemoryLoadCompletedStats : public statistics::Group
+    {
+        explicit MemoryLoadCompletedStats(CPU *cpu);
+        statistics::Scalar L1_MISS_ANY;
+    } memoryLoadCompletedStats;
+    struct PendingMemoryRetirement {
+        bool load = false, store = false;
+        bool storeUserSeen = false, storeNonuserSeen = false;
+        bool physicalL1Hit = false, l1HitWithoutForward = false;
+        uint8_t sources = 0, sourceGaps = 0;
+        uint8_t sharedFillSources = 0;
+        bool sequencerShared = false, unobservedL1 = false, otherTerminal = false;
+        bool permissionUpgrade = false, remoteSupply = false;
+        bool prefetchInFlight = false;
+        uint16_t sharedParentSources = 0, incompleteReasons = 0;
+        uint8_t l2Reasons = 0, l2MismatchKinds = 0;
+    };
+    std::array<PendingMemoryRetirement, MaxThreads> pendingMemoryRetirement{};
+    bool memoryObservationActive = false;
+    void beginMemoryObservation();
+    void endMemoryObservation();
+    void recordMemoryRetirement(const DynInstPtr &inst);
+    void recordCompletedLoad(const DynInstPtr &inst);
+    void releaseMemoryRetirement(const DynInstPtr &inst, bool squashed = false);
+    void discardMemoryRetirement(ThreadID tid) { pendingMemoryRetirement[tid] = {}; }
+
+    void recordBranchRetirement(const DynInstPtr &inst);
+    void resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next)
+    { fetch.resolveMicrocodeControl(inst, next); }
+
   public:
+
     // hardware transactional memory
     void htmSendAbortSignal(ThreadID tid, uint64_t htm_uid,
                             HtmFailureFaultCause cause) override;

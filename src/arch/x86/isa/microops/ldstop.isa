@@ -178,7 +178,7 @@ def template MicroStoreExecute {{
         %(code)s;
 
         if (fault == NoFault) {
-            fault = writeMemAtomic(xc, traceData, Mem, dataSize, EA,
+            fault = writeMemAtomic(xc, traceData, Mem, %(memDataSize)s, EA,
                     memFlags, NULL);
             if (fault == NoFault) {
                 %(op_wb)s;
@@ -205,7 +205,7 @@ def template MicroStoreInitiateAcc {{
         %(code)s;
 
         if (fault == NoFault) {
-            fault = writeMemTiming(xc, traceData, Mem, dataSize, EA,
+            fault = writeMemTiming(xc, traceData, Mem, %(memDataSize)s, EA,
                     memFlags, NULL);
         }
         return fault;
@@ -221,6 +221,36 @@ def template MicroStoreCompleteAcc {{
         %(op_rd)s;
         %(complete_code)s;
         %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+def template MicroStoreAddressExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        Fault fault = NoFault;
+        Addr EA;
+        %(op_decl)s;
+        %(op_rd)s;
+        %(ea_code)s;
+        if (fault == NoFault)
+            fault = xc->initiateStoreAddress(EA, dataSize, memFlags);
+        return fault;
+    }
+
+    Fault
+    %(class_name)s::initiateAcc(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        return execute(xc, traceData);
+    }
+
+    Fault
+    %(class_name)s::completeAcc(PacketPtr pkt, ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
         return NoFault;
     }
 }};
@@ -534,6 +564,49 @@ let {{
 
     defineMicroLoadOp('Ldfp', code='FpData_uqw = Mem', big=False,
             is_float=True)
+    defineMicroLoadOp('Ldfprip', code='FpData_uqw = Mem', big=False,
+                     is_float=True, ea_code=rip_load_ea)
+
+    def defineMicroFpPairLoad(Name, ea_code, scalar_size=None):
+        global header_output, exec_output
+        name = Name.lower()
+        iop = InstObjParams(name, Name, 'X86ISA::LdStFpPairOp',
+                            {"code": ('''
+                                FpDestReg_uqw = Mem_u2qw[0];
+                                FpDestHiReg_uqw = Mem_u2qw[1];
+                            ''' if scalar_size is None else '''
+                                FpDestReg_uqw = Mem;
+                                FpDestHiReg_uqw = 0;
+                            '''), "ea_code": ea_code,
+                             "memDataSize": ("dataSize" if scalar_size == "dataSize"
+                                             else str(scalar_size or 8))},
+                            ['FloatMemReadOp'])
+        header_output += MicroLdStOpDeclare.subst(iop)
+        # Packed atomic/getMem helpers take element width; timing initiation
+        # takes total access width. Two 64-bit elements form one 16-byte read.
+        exec_output += MicroLoadExecute.subst(iop)
+        exec_output += MicroLoadCompleteAcc.subst(iop)
+        iop.snippets["memDataSize"] = str(scalar_size or 16)
+        exec_output += MicroLoadInitiateAcc.subst(iop)
+
+        class LoadOp(LdStOp):
+            def __init__(self, data, segment, addr, disp=0,
+                         dataSize=scalar_size or 16, addressSize="env.addressSize"):
+                low, high = data
+                super().__init__("%s, %s" % (low, high), segment, addr, disp,
+                                 dataSize, addressSize, "0",
+                                 False, False, False, False)
+                self.className = Name
+                self.mnemonic = name
+        microopClasses[name] = LoadOp
+
+    defineMicroFpPairLoad('Ldfpxmm', calculateEA)
+    defineMicroFpPairLoad('Ldfpxmmrip', rip_load_ea)
+    defineMicroFpPairLoad('Ldfpxmms', calculateEA, "dataSize")
+    defineMicroFpPairLoad('Ldfpxmmsrip', rip_load_ea, "dataSize")
+    for size in (4, 8):
+        defineMicroFpPairLoad('Ldfpxmm%d' % size, calculateEA, size)
+        defineMicroFpPairLoad('Ldfpxmm%drip' % size, rip_load_ea, size)
 
     defineMicroLoadOp('Ldfp87', code='''
         switch (dataSize)
@@ -614,7 +687,8 @@ let {{
                            nonSpec=True)
 
     def defineMicroStoreOp(mnemonic, code, completeCode="", mem_flags="0",
-                           is_float=False, has_data=True, ea_code=calculateEA):
+                           is_float=False, has_data=True, store_address=False,
+                           ea_code=calculateEA):
         global header_output
         global decoder_output
         global exec_output
@@ -634,11 +708,16 @@ let {{
                             { "code": code,
                               "complete_code": completeCode,
                               "ea_code": ea_code,
-                              "memDataSize": "dataSize" })
+                              "memDataSize": "dataSize" },
+                            ['IsStore', 'X86StoreAddressOp'] if store_address
+                            else [])
         header_output += MicroLdStOpDeclare.subst(iop)
-        exec_output += MicroStoreExecute.subst(iop)
-        exec_output += MicroStoreInitiateAcc.subst(iop)
-        exec_output += MicroStoreCompleteAcc.subst(iop)
+        if store_address:
+            exec_output += MicroStoreAddressExecute.subst(iop)
+        else:
+            exec_output += MicroStoreExecute.subst(iop)
+            exec_output += MicroStoreInitiateAcc.subst(iop)
+            exec_output += MicroStoreCompleteAcc.subst(iop)
 
 
         if has_data:
@@ -664,6 +743,9 @@ let {{
         microopClasses[name] = StoreOp
 
     defineMicroStoreOp('St', 'Mem = PData;')
+    defineMicroStoreOp('Sta', '', has_data=False, store_address=True)
+    defineMicroStoreOp('Starip', '', has_data=False, store_address=True,
+                       ea_code=rip_load_ea)
     defineMicroStoreOp('Strip', 'Mem = PData;', ea_code=rip_load_ea)
     defineMicroStoreOp('Stis', 'Mem = PData;')
     defineMicroStoreOp('Stul', 'Mem = PData;', mem_flags="Request::LOCKED_RMW")
@@ -671,6 +753,36 @@ let {{
                        mem_flags="Request::LOCKED_RMW", ea_code=rip_load_ea)
 
     defineMicroStoreOp('Stfp', code='Mem = FpData_uqw;', is_float=True)
+    defineMicroStoreOp('Stfprip', code='Mem = FpData_uqw;', is_float=True,
+                       ea_code=rip_load_ea)
+
+    def defineMicroFpPairStore(Name, ea_code):
+        global header_output, exec_output
+        name = Name.lower()
+        iop = InstObjParams(name, Name, 'X86ISA::StFpPairOp',
+                            {"code": '''
+                                Mem_u2qw[0] = FpSrcReg1_uqw;
+                                Mem_u2qw[1] = FpSrcReg2_uqw;
+                            ''', "complete_code": "", "ea_code": ea_code,
+                             "memDataSize": "8"}, ['FloatMemWriteOp'])
+        header_output += MicroLdStOpDeclare.subst(iop)
+        exec_output += MicroStoreExecute.subst(iop)
+        exec_output += MicroStoreInitiateAcc.subst(iop)
+        exec_output += MicroStoreCompleteAcc.subst(iop)
+
+        class StoreOp(LdStOp):
+            def __init__(self, data, segment, addr, disp=0,
+                         dataSize=16, addressSize="env.addressSize"):
+                low, high = data
+                super().__init__("%s, %s" % (low, high), segment, addr, disp,
+                                 dataSize, addressSize, "0",
+                                 False, False, False, False)
+                self.className = Name
+                self.mnemonic = name
+        microopClasses[name] = StoreOp
+
+    defineMicroFpPairStore('Stfpxmm', calculateEA)
+    defineMicroFpPairStore('Stfpxmmrip', rip_load_ea)
 
     defineMicroStoreOp('Stfp87', code='''
         switch (dataSize)
@@ -764,11 +876,37 @@ let {{
 
     microopClasses["lea"] = LeaOp
 
+    for name, code in (("Learip", "Data = merge(Data, data, EA, dataSize);"),
+                       ("LearipBig", "Data = EA & mask(dataSize * 8);")):
+        iop = InstObjParams("learip", name, 'X86ISA::LdStOp',
+                            {"code": code,
+                             "ea_code": "EA = bits(xc->pcState().as<PCState>().npc() + disp, addressSize * 8 - 1, 0);",
+                             "memDataSize": "dataSize"})
+        header_output += MicroLeaDeclare.subst(iop)
+        exec_output += MicroLeaExecute.subst(iop)
+
+    class LearipOp(LeaOp):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.className = "Learip"
+            self.mnemonic = "learip"
+
+    microopClasses["learip"] = LearipOp
+
 
     iop = InstObjParams("tia", "Tia", 'X86ISA::MemNoDataOp',
-                        { "code": "xc->demapPage(EA, 0);",
+                        { "code": '''
+                            CR4 cr4 = CR4Op;
+                            CR3 cr3 = CR3Op;
+                            // INVLPG ignores non-canonical addresses.
+                            Efer efer = EferOp;
+                            if (!efer.lma || EA == szext<48>(EA))
+                                xc->demapPage(EA, cr4.pcide ?
+                                              uint64_t(cr3.pcid) : 0);
+                          ''',
                           "ea_code": calculateEA,
-                          "memDataSize": "dataSize" })
+                          "memDataSize": "dataSize" },
+                        ["IsNonSpeculative"])
     header_output += MicroLeaDeclare.subst(iop)
     exec_output += MicroLeaExecute.subst(iop)
 

@@ -139,6 +139,8 @@ class Commit
     /** Construct a Commit with the given parameters. */
     Commit(CPU *_cpu, const BaseO3CPUParams &params);
 
+    ROB &reorderBuffer() { return *rob; }
+
     /** Returns the name of the Commit. */
     std::string name() const;
 

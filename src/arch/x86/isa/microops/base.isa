@@ -197,6 +197,8 @@ let {{
     class IntSrc2Op(IntOp, Src2Op, Operand):
         pass
 
+    class IntSrc3Op(IntOp, Src3Op, Operand):
+        pass
     class FloatSrc3Op(FloatOp, Src3Op, Operand):
         pass
     class FloatSrc4Op(FloatOp, Src4Op, Operand):

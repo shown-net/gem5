@@ -148,6 +148,7 @@ void
 BAC::clearStates(ThreadID tid)
 {
     bacStatus[tid] = Running;
+    targetReadyCycle[tid] = 0;
     set(bacPC[tid], cpu->pcState(tid));
 
     stalls[tid].fetch = false;
@@ -494,6 +495,7 @@ BAC::squash(const PCStateBase &new_pc, ThreadID tid)
 
     // Set the new PC
     set(bacPC[tid], new_pc);
+    targetReadyCycle[tid] = 0;
 
     // Then squash all fetch targets
     ftq->squash(tid);
@@ -565,6 +567,7 @@ bool
 BAC::predict(ThreadID tid, const StaticInstPtr &inst, const FetchTargetPtr &ft,
              PCStateBase &pc)
 {
+    bpu->setUserMode(tid, cpu->inUserMode(tid));
 
     /** Perform the prediction.
      * The prediction history object is pushed onto the fetch target. This
@@ -613,11 +616,17 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
      * CPU's.
      */
 
+    const uint64_t cycle = uint64_t(cpu->curCycle());
+    if (cycle < targetReadyCycle[tid]) {
+        cpu->activityThisCycle();
+        return;
+    }
     PCStateBase &cur_pc = *bacPC[tid];
     int num_ft = 0;
     int num_taken = 0;
 
-    while ((num_ft < maxFTPerCycle) && (num_taken < maxTakenPredPerCycle)) {
+    while ((num_ft < maxFTPerCycle) && (num_taken < maxTakenPredPerCycle) &&
+           cycle >= targetReadyCycle[tid]) {
         // Get a reference to the current PC state for this thread.
         // The search itself is done on the instruction address to speed up
         // simulation time.
@@ -630,6 +639,7 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 
         bool branch_found = false;
         bool predict_taken = false;
+        Cycles target_latency(0);
 
         // Scan through the instruction stream and search for branches.
         // The BTB contains only branches where taken at least once.
@@ -667,6 +677,8 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         StaticInstPtr staticInst = nullptr;
 
         if (branch_found) {
+            // Capture the supplying level before predict() refills replicas.
+            target_latency = btbLookupLatency(tid, cur_pc.instAddr());
             // Branch found in instruction stream. As the current
             // BPU implementation required the static instruction we need to
             // look it up from the BTB.
@@ -728,6 +740,15 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         // - a branch is found
         // - or the maximum fetch bandwidth is reached.
         curFT->finalize(cur_pc, branch_found, predict_taken, *next_pc);
+        // Target feedback becomes available at lookup completion. The extra
+        // handoff cycle belongs to Fetch, not the next predictor lookup.
+        const uint64_t lookup_ready = branch_found ? cycle +
+            uint64_t(target_latency) : cycle;
+        const uint64_t ready = branch_found ? lookup_ready + 1 : cycle;
+        curFT->setReadyCycle(ready);
+        if (predict_taken) {
+            targetReadyCycle[tid] = std::max(cycle + 1, lookup_ready);
+        }
 
         ftq->insert(tid, curFT);
         wroteToTimeBuffer = true;
@@ -898,6 +919,44 @@ BAC::updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
 
     DPRINTF(BAC, "%s done. next PC:%s\n", __func__, pc);
     return hist->predTaken;
+}
+
+FrontendPrediction
+BAC::predictInstruction(const StaticInstPtr &inst, InstSeqNum sequence,
+                        ThreadID tid, PCStateBase &next_pc)
+{
+    bpu->setUserMode(tid, cpu->inUserMode(tid));
+    FrontendPrediction result;
+    if (inst->isControl()) {
+        result.taken = bpu->predict(inst, sequence, next_pc, tid);
+        ++stats.branches;
+        if (result.taken) ++stats.predTakenBranches;
+    } else {
+        inst->advancePC(next_pc);
+    }
+    return result;
+}
+
+FrontendPrediction
+BAC::predictFrontendInstruction(const StaticInstPtr &inst, InstSeqNum sequence,
+                                ThreadID tid, PCStateBase &next_pc,
+                                const FetchTargetPtr &ft)
+{
+    FrontendPrediction result;
+    if (inst->isControl())
+        result.taken = updatePreDecode(tid, sequence, inst, next_pc, ft);
+    else
+        inst->advancePC(next_pc);
+    return result;
+}
+
+void
+BAC::discardNonBranchTarget(ThreadID tid, Addr pc)
+{
+    // Predecode found an ordinary instruction at a predicted branch exit.
+    // A resteer alone would leave the stale target resident for every loop.
+    bpu->invalidateBTB(tid, pc);
+    ++stats.noBranchMisspredict;
 }
 
 bool

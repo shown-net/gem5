@@ -12,6 +12,7 @@
 #include <memory>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "base/extensible.hh"
 #include "mem/request.hh"
@@ -30,6 +31,8 @@ enum class TaoTraceNativeTerminalReason : uint32_t
     FailedStoreConditional = 1u << 4,
     ZeroSize = 1u << 5,
     PrefetchSkipped = 1u << 6,
+    StoreOverwriteElided = 1u << 7,
+    StoreBufferCombined = 1u << 8,
 };
 
 enum class TaoTraceNativeCacheOutcome : uint32_t
@@ -39,6 +42,44 @@ enum class TaoTraceNativeCacheOutcome : uint32_t
     PermissionUpgrade = 2,
     MergedMiss = 3,
     RemoteSupply = 4,
+};
+
+// The origin of the data in this particular fill, not the last network
+// sender and not an extra lookup attributed to a merged load.
+enum class TaoTraceServiceSource : uint32_t
+{
+    Unknown = 0, L2 = 1, LLC = 2, Memory = 3, RemoteOwner = 4,
+};
+
+// A hierarchy outcome for the fill transaction, kept distinct from the
+// eventual data supplier. Zero is explicitly unknown when recorded.
+enum class TaoTraceServiceOutcome : uint32_t
+{
+    Unknown = 0, Hit = 1, Miss = 2, NotAccessed = 3,
+};
+
+// One fact per completed physical fragment.  Preserve the tuple across split
+// aggregation; independent masks would combine outcomes from different lines.
+struct TaoTraceServiceFact
+{
+    uint8_t source = 0;
+    uint8_t l2Outcome = 0;
+    uint8_t l3Outcome = 0;
+    bool follower = false;
+    // This fragment's own lookups, independent of a shared fill's path.
+    // Bits: 0=unknown, 1=hit, 2=miss, 3=not accessed.
+    uint8_t ownL2Mask = 0;
+    uint8_t ownL3Mask = 0;
+};
+
+enum TaoTraceSharedParent : uint16_t
+{
+    SharedParentL1Hit = 1u << 0, SharedParentL1Miss = 1u << 1,
+    SharedParentL1Other = 1u << 2, SharedParentL2Hit = 1u << 3,
+    SharedParentL2Miss = 1u << 4, SharedParentL2Other = 1u << 5,
+    SharedParentL3Hit = 1u << 6, SharedParentL3Miss = 1u << 7,
+    SharedParentL3Other = 1u << 8, SharedParentIFetch = 1u << 9,
+    SharedParentMissing = 1u << 10, SharedParentWriteCallback = 1u << 11
 };
 
 struct TaoTraceNativeHierarchyFacts
@@ -108,6 +149,13 @@ class TaoTraceRubyResponseExtension
     uint32_t externalHits = 0;
     uint32_t externalMisses = 0;
     uint32_t coalesced = 0;
+    // Responses supplied by the Sequencer without a request-local L1 lookup
+    // or an admission-time L1/fill observation.
+    uint32_t sequencerShared = 0;
+    uint16_t sharedParentSources = 0;
+    // Empty means no service observation. Fields with value zero record an
+    // observed but unknown supplier or hierarchy outcome.
+    std::vector<TaoTraceServiceFact> serviceFacts;
     uint64_t responderMachineMask = 0;
     uint32_t responderMachineUnknown = 0;
     bool hasAdmissionTick = false;
@@ -119,11 +167,44 @@ class TaoTraceRubyResponseExtension
     bool terminalNoRuby = false;
     uint32_t terminalReasonMask = 0;
     TaoTraceNativeHierarchyFacts hierarchy;
+    // The same Request can be retried. These snapshots identify observations
+    // made after the current admission instead of reusing an earlier attempt.
+    std::array<uint32_t, TaoTraceNativeHierarchyFacts::Levels> admissionAccesses{};
+    std::array<uint32_t, TaoTraceNativeHierarchyFacts::Levels> admissionHits{};
+    std::array<uint32_t, TaoTraceNativeHierarchyFacts::Levels> admissionMisses{};
+    uint32_t admissionL1Merges = 0;
+    uint32_t admissionL1Upgrades = 0;
+    uint32_t admissionL1Remote = 0;
+    // Final local L1 observation for this physical request. Bits are
+    // unknown, hit, tag miss, fill merge, upgrade, remote supply.
+    uint8_t l1FinalMask = 0;
+    uint32_t serviceExpected = 0;
+    bool l1ObservationMissing = false;
+    bool serviceFactIdentityAmbiguous = false;
+
+    bool l1ObservationPending() const
+    {
+        return admissions > responses &&
+            hierarchy.accesses[0] <= admissionAccesses[0];
+    }
 
     void
     admit(bool aliased)
     {
         const uint64_t tick = uint64_t(curTick());
+        // Multiple concurrent admissions of one Request cannot be associated
+        // with the single current-attempt snapshot without more identities.
+        serviceFactIdentityAmbiguous = admissions > responses;
+        l1ObservationMissing = serviceFactIdentityAmbiguous;
+        l1FinalMask = 0;
+        serviceExpected = 0;
+        serviceFacts.clear();
+        admissionAccesses = hierarchy.accesses;
+        admissionHits = hierarchy.hits;
+        admissionMisses = hierarchy.tagMisses;
+        admissionL1Merges = hierarchy.mergedMisses[0];
+        admissionL1Upgrades = hierarchy.permissionUpgrades[0];
+        admissionL1Remote = hierarchy.remoteSupplies[0];
         ++admissions;
         if (aliased) ++aliasedAdmissions;
         if (!hasAdmissionTick) {
@@ -140,6 +221,26 @@ class TaoTraceRubyResponseExtension
     observe(bool external_hit, bool was_coalesced, int machine)
     {
         const uint64_t tick = uint64_t(curTick());
+        const auto accesses = hierarchy.accesses[0] - admissionAccesses[0];
+        const auto hits = hierarchy.hits[0] - admissionHits[0];
+        const auto misses = hierarchy.tagMisses[0] - admissionMisses[0];
+        const auto merges = hierarchy.mergedMisses[0] - admissionL1Merges;
+        const auto upgrades = hierarchy.permissionUpgrades[0] - admissionL1Upgrades;
+        const auto remote = hierarchy.remoteSupplies[0] - admissionL1Remote;
+        if (l1ObservationMissing || accesses != 1 ||
+            accesses != hits + misses + merges + upgrades + remote) {
+            // More than one lookup may contain discarded/replayed outcomes;
+            // without a final-attempt identity don't infer a positive result.
+            l1FinalMask = 1u;
+            l1ObservationMissing = true;
+        } else {
+            if (hits) l1FinalMask |= 1u << 1;
+            if (misses) l1FinalMask |= 1u << 2;
+            if (merges) l1FinalMask |= 1u << 3;
+            if (upgrades) l1FinalMask |= 1u << 4;
+            if (remote) l1FinalMask |= 1u << 5;
+        }
+        serviceExpected = (l1FinalMask & ((1u << 2) | (1u << 3))) ? 1 : 0;
         ++responses;
         if (external_hit) {
             ++externalMisses;
@@ -166,6 +267,15 @@ class TaoTraceRubyResponseExtension
         externalHits += other.externalHits;
         externalMisses += other.externalMisses;
         coalesced += other.coalesced;
+        sequencerShared += other.sequencerShared;
+        sharedParentSources |= other.sharedParentSources;
+        l1ObservationMissing |= other.l1ObservationMissing ||
+                                other.l1ObservationPending();
+        serviceFactIdentityAmbiguous |= other.serviceFactIdentityAmbiguous;
+        l1FinalMask |= other.l1FinalMask;
+        serviceExpected += other.serviceExpected;
+        serviceFacts.insert(serviceFacts.end(), other.serviceFacts.begin(),
+                            other.serviceFacts.end());
         responderMachineMask |= other.responderMachineMask;
         responderMachineUnknown += other.responderMachineUnknown;
         if (other.hasAdmissionTick) {
@@ -224,6 +334,13 @@ class TaoTraceNativeAccessRegistry
         uint32_t externalHits = 0;
         uint32_t externalMisses = 0;
         uint32_t coalesced = 0;
+        uint32_t sequencerShared = 0;
+        uint16_t sharedParentSources = 0;
+        std::vector<TaoTraceServiceFact> serviceFacts;
+        bool l1ObservationMissing = false;
+        bool serviceFactIdentityAmbiguous = false;
+        uint8_t l1FinalMask = 0;
+        uint32_t serviceExpected = 0;
         uint64_t responderMachineMask = 0;
         uint32_t responderMachineUnknown = 0;
         bool hasAdmissionTick = false;
@@ -270,6 +387,35 @@ class TaoTraceNativeAccessRegistry
         pretracking_contexts_.erase(context_id);
     }
 
+    static void enableRetirementContext(uint32_t context_id)
+    {
+        retirement_contexts_.insert(context_id);
+    }
+
+    static void disableRetirementContext(uint32_t context_id)
+    {
+        retirement_contexts_.erase(context_id);
+        if (!traceOwnsContext(context_id)) records_.erase(context_id);
+    }
+
+    // Marker counters read before the commit probes. TaoTrace may retain a
+    // retired store until its response, so only the standalone marker owner
+    // releases identities here.
+    static void releaseRetired(uint32_t context_id, uint64_t seq_num,
+                               bool pending_store = false)
+    {
+        if (traceOwnsContext(context_id)) return;
+        const auto facts = snapshot(context_id, seq_num);
+        if (!facts.found) {
+            // Stores may enter Ruby only after retirement. Retain that exact
+            // identity so their later response can release the marker record.
+            if (pending_store) noteCommitted(context_id, seq_num);
+            return;
+        }
+        if (facts.resolved()) erase(context_id, seq_num);
+        else noteCommitted(context_id, seq_num);
+    }
+
     static void
     noteAdmission(const RequestPtr &req, bool aliased)
     {
@@ -283,6 +429,10 @@ class TaoTraceNativeAccessRegistry
         }
         auto &facts = records_[context_id][seq_num];
         facts.found = true;
+        // A new admission after a completed service may be a replay or a
+        // delayed split fragment. The instruction-scoped trace cannot tell.
+        if (facts.admissions)
+            facts.serviceFactIdentityAmbiguous = true;
         const uint64_t tick = uint64_t(curTick());
         ++facts.admissions;
         if (aliased) ++facts.aliasedAdmissions;
@@ -314,6 +464,12 @@ class TaoTraceNativeAccessRegistry
         }
         auto &facts = records_[context_id][seq_num];
         facts.found = true;
+        if (extension && extension->l1ObservationMissing)
+            facts.l1ObservationMissing = true;
+        if (extension) {
+            facts.l1FinalMask |= extension->l1FinalMask;
+            facts.serviceExpected += extension->serviceExpected;
+        }
         const uint64_t tick = uint64_t(curTick());
         ++facts.responses;
         if (external_hit) {
@@ -329,9 +485,115 @@ class TaoTraceNativeAccessRegistry
         }
         facts.hasResponseTick = true;
         facts.lastResponseTick = std::max(facts.lastResponseTick, tick);
-        if (facts.squashed && facts.resolved()) {
+        if ((facts.squashed ||
+             (facts.committed && retirement_contexts_.count(context_id) &&
+              !traceOwnsContext(context_id))) && facts.resolved()) {
             erase(context_id, seq_num);
         }
+    }
+
+    static void
+    noteServiceSource(const RequestPtr &req, unsigned source,
+                      unsigned l2_outcome, unsigned l3_outcome,
+                      bool follower = false)
+    {
+        // Invalid protocol metadata is conservative rather than being
+        // interpreted as a new physical supplier or cache outcome.
+        auto extension = ensureExtension(req);
+        if (!extension) return;
+        if (!extension->serviceFacts.empty()) {
+            // A second completion on the same Request cannot be attributed
+            // safely to the earlier service without an attempt identity.
+            // Retain one explicit unknown rather than preserving stale data
+            // or manufacturing another completed fragment.  The registry is
+            // instruction-scoped, so conservatively invalidate its collected
+            // service facts too; its fragment identity is not available here.
+            auto &previous = extension->serviceFacts.front();
+            previous = TaoTraceServiceFact{0, 0, 0, true, 1, 1};
+            mutate(req, [](Snapshot &facts) {
+                for (auto &observed : facts.serviceFacts) {
+                    observed.source = 0;
+                    observed.l2Outcome = 0;
+                    observed.l3Outcome = 0;
+                    observed.ownL2Mask = 1;
+                    observed.ownL3Mask = 1;
+                }
+            });
+            return;
+        }
+        const auto &hierarchy = extension->hierarchy;
+        const auto ownOutcomes = [&hierarchy, &extension](unsigned level) -> uint8_t {
+            if (hierarchy.accesses[level] < extension->admissionAccesses[level] ||
+                hierarchy.hits[level] < extension->admissionHits[level] ||
+                hierarchy.tagMisses[level] < extension->admissionMisses[level])
+                return 1u;
+            const auto accesses = hierarchy.accesses[level] - extension->admissionAccesses[level];
+            const auto hits = hierarchy.hits[level] - extension->admissionHits[level];
+            const auto misses = hierarchy.tagMisses[level] - extension->admissionMisses[level];
+            if (!accesses) return 0;
+            uint8_t mask = 0;
+            if (hits) mask |= 1u << 1;
+            if (misses) mask |= 1u << 2;
+            if (accesses != hits + misses)
+                mask |= 1u;
+            return mask;
+        };
+        uint8_t own_l2 = extension->l1ObservationMissing ? 1u :
+                         follower ? 1u << 3 : ownOutcomes(1);
+        uint8_t own_l3 = extension->l1ObservationMissing ? 1u :
+                         follower ? 1u << 3 : ownOutcomes(2);
+        if (!own_l2) own_l2 = follower ? 1u << 3 : 1u;
+        if (!own_l3) {
+            own_l3 = follower || own_l2 == (1u << 1) ? 1u << 3 : 1u;
+        }
+        const bool ambiguous = extension->l1ObservationMissing;
+        const TaoTraceServiceFact fact{
+            uint8_t(!ambiguous && source <= 4 ? source : 0),
+            uint8_t(!ambiguous && l2_outcome <= 3 ? l2_outcome : 0),
+            uint8_t(!ambiguous && l3_outcome <= 3 ? l3_outcome : 0), follower,
+            own_l2, own_l3};
+        extension->serviceFacts.push_back(fact);
+        mutate(req, [fact](Snapshot &facts) {
+            facts.serviceFacts.push_back(fact);
+        });
+    }
+
+    static void
+    noteSequencerShared(const RequestPtr &req, const RequestPtr &parent,
+                        bool write_callback)
+    {
+        uint16_t sources = write_callback ? SharedParentWriteCallback : 0;
+        const auto ext = parent ?
+            parent->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
+        if (parent && parent->isInstFetch())
+            sources |= SharedParentIFetch;
+        if (ext) {
+            const auto &h = ext->hierarchy;
+            if (h.hits[0]) sources |= SharedParentL1Hit;
+            if (h.tagMisses[0]) sources |= SharedParentL1Miss;
+            if (h.permissionUpgrades[0] || h.mergedMisses[0] || h.remoteSupplies[0]) sources |= SharedParentL1Other;
+            if (h.hits[1]) sources |= SharedParentL2Hit;
+            if (h.tagMisses[1]) sources |= SharedParentL2Miss;
+            if (h.permissionUpgrades[1] || h.mergedMisses[1] || h.remoteSupplies[1]) sources |= SharedParentL2Other;
+            if (h.hits[2]) sources |= SharedParentL3Hit;
+            if (h.tagMisses[2]) sources |= SharedParentL3Miss;
+            if (h.permissionUpgrades[2] || h.mergedMisses[2] || h.remoteSupplies[2]) sources |= SharedParentL3Other;
+            if ((!h.accesses[0] && !(sources & SharedParentIFetch)) ||
+                (h.tagMisses[0] && !h.accesses[1]) ||
+                (h.tagMisses[1] && !h.accesses[2]))
+                sources |= SharedParentMissing;
+        } else if (!(sources & SharedParentIFetch)) {
+            sources |= SharedParentMissing;
+        }
+        auto extension = ensureExtension(req);
+        if (extension) {
+            ++extension->sequencerShared;
+            extension->sharedParentSources |= sources;
+        }
+        mutate(req, [sources](Snapshot &facts) {
+            ++facts.sequencerShared;
+            facts.sharedParentSources |= sources;
+        });
     }
 
     static void
@@ -347,6 +609,19 @@ class TaoTraceNativeAccessRegistry
                   TaoTraceNativeCacheOutcome outcome)
     {
         mutate(context_id, seq_num, [level, outcome](Snapshot &facts) {
+            facts.hierarchy.observe(level, outcome);
+        });
+    }
+
+    // Used when the Sequencer directly observes a request-local cache/FB
+    // outcome. Do not transfer the initiating request's lower-level facts.
+    static void
+    noteHierarchy(const RequestPtr &req, unsigned level,
+                  TaoTraceNativeCacheOutcome outcome)
+    {
+        auto extension = ensureExtension(req);
+        if (extension) extension->hierarchy.observe(level, outcome);
+        mutate(req, [level, outcome](Snapshot &facts) {
             facts.hierarchy.observe(level, outcome);
         });
     }
@@ -493,6 +768,14 @@ class TaoTraceNativeAccessRegistry
         facts.externalHits = extension.externalHits;
         facts.externalMisses = extension.externalMisses;
         facts.coalesced = extension.coalesced;
+        facts.sequencerShared = extension.sequencerShared;
+        facts.sharedParentSources = extension.sharedParentSources;
+        facts.serviceFacts = extension.serviceFacts;
+        facts.serviceFactIdentityAmbiguous = extension.serviceFactIdentityAmbiguous;
+        facts.l1ObservationMissing = extension.l1ObservationMissing ||
+                                     extension.l1ObservationPending();
+        facts.l1FinalMask = extension.l1FinalMask;
+        facts.serviceExpected = extension.serviceExpected;
         facts.responderMachineMask = extension.responderMachineMask;
         facts.responderMachineUnknown = extension.responderMachineUnknown;
         facts.hasAdmissionTick = extension.hasAdmissionTick;
@@ -542,6 +825,13 @@ class TaoTraceNativeAccessRegistry
     inline static std::unordered_map<uint32_t, ContextRecords> records_;
     inline static std::unordered_set<uint32_t> enabled_contexts_;
     inline static std::unordered_set<uint32_t> pretracking_contexts_;
+    inline static std::unordered_set<uint32_t> retirement_contexts_;
+
+    static bool traceOwnsContext(uint32_t context_id)
+    {
+        return enabled_contexts_.count(context_id) ||
+            pretracking_contexts_.count(context_id);
+    }
 
     static bool
     identity(const RequestPtr &req, uint32_t &context_id, uint64_t &seq_num)
@@ -565,7 +855,8 @@ class TaoTraceNativeAccessRegistry
     static bool
     shouldTrack(uint32_t context_id, uint64_t seq_num)
     {
-        if (enabled_contexts_.count(context_id) != 0) return true;
+        if (enabled_contexts_.count(context_id) != 0 ||
+            retirement_contexts_.count(context_id) != 0) return true;
         const auto context = records_.find(context_id);
         return context != records_.end() &&
             context->second.count(seq_num) != 0;
@@ -633,6 +924,7 @@ class TaoTraceFrontendRegistry
         RetryDiscard,
         Response,
         SquashedResponse,
+        DsbValidation,
         Count
     };
 

@@ -274,7 +274,7 @@ class TaoTrace : public ProbeListenerObject
                          uint64_t exposed_cyc, uint64_t macro_cyc,
                          uint64_t branch_pen_cyc,
                          uint64_t fetch_lat_cyc, uint64_t exec_lat_cyc,
-                         uint8_t branch_mispred);
+                         uint8_t branch_mispred, bool latency_valid);
     void writeDiagLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
                        uint64_t fetch_tick, uint64_t commit_tick,
                        uint64_t prev_commit_tick, uint64_t last_squash_tick);
@@ -975,7 +975,7 @@ private:
         native_diag_by_scope_{};
     std::array<std::array<uint64_t, 2>, 5>
         native_diag_proxy_confusion_{};
-    std::array<uint64_t, 7> native_diag_terminal_reason_counts_{};
+    std::array<uint64_t, 9> native_diag_terminal_reason_counts_{};
     std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
     uint64_t native_diag_anomaly_samples_dropped_ = 0;
     bool native_diag_finalized_ = false;

@@ -49,6 +49,7 @@
 #include "debug/RubyResourceStalls.hh"
 #include "debug/RubyStats.hh"
 #include "mem/cache/replacement_policies/weighted_lru_rp.hh"
+#include "mem/cache/replacement_policies/qlru_h00_m1_r0_u1_rp.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/system/RubySystem.hh"
 
@@ -77,11 +78,142 @@ CacheMemory::CacheMemory(const Params &p)
     m_cache_assoc = p.assoc;
     m_replacementPolicy_ptr = p.replacement_policy;
     m_start_index_bit = p.start_index_bit;
+    m_index_divisor = p.index_divisor;
+    fatal_if(!m_index_divisor, "Cache index divisor must be positive");
     m_is_instruction_only_cache = p.is_icache;
     m_resource_stalls = p.resourceStalls;
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
+    m_fill_capacity = p.fill_capacity;
+    dataFillBuffer.setCapacity(p.fill_capacity);
+    if (p.fill_stats_clock)
+        dataFillClock = std::make_unique<DataFillClock>(*p.fill_stats_clock);
     m_use_occupancy = dynamic_cast<replacement_policy::WeightedLRU*>(
                                     m_replacementPolicy_ptr) ? true : false;
+}
+
+bool
+CacheMemory::canAllocateFill() const
+{
+    return m_fill_capacity == 0 || m_fill_in_flight < m_fill_capacity;
+}
+
+void
+CacheMemory::allocateFill()
+{
+    assert(canAllocateFill());
+    ++m_fill_in_flight;
+    ++cacheMemoryStats.fillAllocations;
+    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+}
+
+void
+CacheMemory::releaseFill()
+{
+    assert(m_fill_in_flight > 0);
+    --m_fill_in_flight;
+    ++cacheMemoryStats.fillCompletions;
+    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+}
+
+void
+CacheMemory::recordFillBlocked()
+{
+    ++cacheMemoryStats.fillBlockedRequests;
+}
+
+uint64_t
+CacheMemory::currentDataFillCycle() const
+{
+    return dataFillClock ? uint64_t(dataFillClock->curCycle()) :
+                           uint64_t(m_ruby_system->curCycle());
+}
+
+void
+CacheMemory::accountDataFillCycles()
+{
+    if (!m_ruby_system) return;
+    const uint64_t now = currentDataFillCycle();
+    const uint64_t elapsed = now - lastDataFillCycle;
+    cacheMemoryStats.dataFillDemandReadPending +=
+        elapsed * dataFillBuffer.demandReadCount();
+    if (dataFillBuffer.demandReadCount())
+        cacheMemoryStats.dataFillDemandReadPendingCycles += elapsed;
+    lastDataFillCycle = now;
+}
+
+bool
+CacheMemory::canAllocateDataFill() const
+{
+    return dataFillBuffer.canAllocate();
+}
+
+void
+CacheMemory::allocateDataFill(Addr address, bool demand_read)
+{
+    assert(canAllocateDataFill());
+    accountDataFillCycles();
+    dataFillBuffer.allocate(makeLineAddress(address), demand_read);
+    ++cacheMemoryStats.fillAllocations;
+    cacheMemoryStats.fillOccupancy = dataFillBuffer.size();
+}
+
+void
+CacheMemory::markDataFillReady(Addr address)
+{
+    dataFillBuffer.markReady(makeLineAddress(address));
+}
+
+void
+CacheMemory::releaseDataFill(Addr address)
+{
+    accountDataFillCycles();
+    dataFillBuffer.release(makeLineAddress(address));
+    ++cacheMemoryStats.fillCompletions;
+    cacheMemoryStats.fillOccupancy = dataFillBuffer.size();
+}
+
+void
+CacheMemory::finishDataFill(Addr address)
+{
+    // Permission-only transactions do not own a data fill. The protocol
+    // calls this after its data action and local callbacks, independently of
+    // deallocating the coherence transaction.
+    if (dataFillBuffer.contains(makeLineAddress(address)))
+        releaseDataFill(address);
+}
+
+void
+CacheMemory::recordDemandFillBlocked()
+{
+    ++cacheMemoryStats.fillBlockedRequests;
+    const uint64_t now = currentDataFillCycle();
+    if (lastDemandFillBlockedCycle != now) {
+        ++cacheMemoryStats.dataFillDemandBlockedCycles;
+        lastDemandFillBlockedCycle = now;
+    }
+}
+
+bool
+CacheMemory::dataFillPending(Addr address) const
+{
+    return dataFillBuffer.pending(makeLineAddress(address));
+}
+
+void
+CacheMemory::observeDataFillDemandRead(Addr address)
+{
+    const Addr line = makeLineAddress(address);
+    if (!dataFillBuffer.needsDemandRead(line)) return;
+    accountDataFillCycles();
+    dataFillBuffer.observeDemandRead(line);
+}
+
+bool
+CacheMemory::hasReadableData(Addr address) const
+{
+    const auto *entry = lookup(makeLineAddress(address));
+    return entry && (entry->m_Permission == AccessPermission_Read_Only ||
+                     entry->m_Permission == AccessPermission_Read_Write);
 }
 
 void
@@ -137,8 +269,16 @@ int64_t
 CacheMemory::addressToCacheSet(Addr address) const
 {
     assert(address == makeLineAddress(address));
-    return bitSelect(address, m_start_index_bit,
-                     m_start_index_bit + m_cache_num_set_bits - 1);
+    if (m_index_divisor != 1) {
+        return ((address >> m_start_index_bit) / m_index_divisor) %
+               m_cache_num_sets;
+    }
+    if (isPowerOf2(m_cache_num_sets)) {
+        return bitSelect(address, m_start_index_bit,
+                         m_start_index_bit + m_cache_num_set_bits - 1);
+    }
+    // Exclude the block offset and any bank-selection bits before indexing.
+    return (address >> m_start_index_bit) % m_cache_num_sets;
 }
 
 // Given a cache index: returns the index of the tag in a set.
@@ -331,6 +471,32 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
     panic("Allocate didn't find an available entry");
 }
 
+AbstractCacheEntry*
+CacheMemory::lookupDirectory(Addr address)
+{
+    const auto it = m_directory.find(address);
+    return it == m_directory.end() ? nullptr : it->second.get();
+}
+
+AbstractCacheEntry*
+CacheMemory::allocateDirectory(Addr address, AbstractCacheEntry* entry)
+{
+    assert(address == makeLineAddress(address));
+    assert(entry && !lookupDirectory(address));
+    entry->m_Address = address;
+    entry->m_Permission = AccessPermission_Invalid;
+    entry->setRubySystem(m_ruby_system);
+    m_directory.emplace(address, std::unique_ptr<AbstractCacheEntry>(entry));
+    return entry;
+}
+
+void
+CacheMemory::deallocateDirectory(Addr address)
+{
+    [[maybe_unused]] const auto erased = m_directory.erase(address);
+    assert(erased == 1);
+}
+
 void
 CacheMemory::deallocate(Addr address)
 {
@@ -392,6 +558,19 @@ CacheMemory::setMRU(Addr address)
     if (entry != nullptr) {
         m_replacementPolicy_ptr->touch(entry->replacementData);
         entry->setLastAccess(curTick());
+    }
+}
+
+void
+CacheMemory::setMRUOnFill(Addr address)
+{
+    // QLRU inserts when the miss reserves its way; the response completing
+    // that same request is not a second reference to the inserted line.
+    if (dynamic_cast<replacement_policy::QLRUH00M1R0U1*>(m_replacementPolicy_ptr)) {
+        if (auto *entry = lookup(makeLineAddress(address)))
+            entry->setLastAccess(curTick());
+    } else {
+        setMRU(address);
     }
 }
 
@@ -546,8 +725,9 @@ CacheMemory::isLocked(Addr address, int context)
 }
 
 CacheMemory::
-CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
+CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
     : statistics::Group(parent),
+      owner(parent),
       ADD_STAT(numDataArrayReads, "Number of data array reads"),
       ADD_STAT(numDataArrayWrites, "Number of data array writes"),
       ADD_STAT(numTagArrayReads, "Number of tag array reads"),
@@ -556,6 +736,16 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(numDataArrayStalls, "Number of stalls caused by data array"),
       ADD_STAT(numAtomicALUOperations, "Number of atomic ALU operations"),
       ADD_STAT(numAtomicALUArrayStalls, "Number of stalls caused by atomic ALU array"),
+      ADD_STAT(fillAllocations, "New cache-line fill transactions allocated"),
+      ADD_STAT(fillCompletions, "Cache-line fill transactions released"),
+      ADD_STAT(fillBlockedRequests, "Fill admissions retried because the budget was full"),
+      ADD_STAT(fillOccupancy, "Average number of live tracked line fills"),
+      ADD_STAT(dataFillDemandBlockedCycles, "Candidate cycles a demand request waits for data fill-buffer capacity"),
+      ADD_STAT(dataFillDemandReadPending, "Integral of L0 data fill entries containing a demand read"),
+      ADD_STAT(dataFillDemandReadPendingCycles, "Cycles with at least one L0 demand-read data fill"),
+      ADD_STAT(demandDataReadHits, "Candidate cacheable demand data read requests observed hitting the private L2"),
+      ADD_STAT(demandDataReadTrueMisses, "Candidate cacheable demand data read requests observed missing the private L2, excluding merges and upgrades"),
+      ADD_STAT(dataLineFills, "Data lines installed by private L2 line-fill transactions"),
       ADD_STAT(htmTransCommitReadSet, "Read set size of a committed "
                                       "transaction"),
       ADD_STAT(htmTransCommitWriteSet, "Write set size of a committed "
@@ -636,6 +826,20 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
             .flags(statistics::nozero)
             ;
     }
+}
+
+void
+CacheMemory::CacheMemoryStats::preDumpStats()
+{
+    owner->accountDataFillCycles();
+    statistics::Group::preDumpStats();
+}
+
+void
+CacheMemory::CacheMemoryStats::resetStats()
+{
+    owner->accountDataFillCycles();
+    statistics::Group::resetStats();
 }
 
 // assumption: SLICC generated files will only call this function
@@ -804,6 +1008,24 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+void
+CacheMemory::profileDemandDataReadHit()
+{
+    ++cacheMemoryStats.demandDataReadHits;
+}
+
+void
+CacheMemory::profileDemandDataReadMiss()
+{
+    ++cacheMemoryStats.demandDataReadTrueMisses;
+}
+
+void
+CacheMemory::profileDataLineFill()
+{
+    ++cacheMemoryStats.dataLineFills;
 }
 
 void

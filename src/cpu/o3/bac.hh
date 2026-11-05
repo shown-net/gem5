@@ -43,6 +43,7 @@
 #include "base/statistics.hh"
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/frontend_record.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/branch_type.hh"
@@ -286,6 +287,18 @@ class BAC
      */
     bool updatePC(const DynInstPtr &inst, PCStateBase &fetch_pc,
                   FetchTargetPtr &ft);
+    Cycles btbLookupLatency(ThreadID tid, Addr pc) const
+    {
+        return bpu->btbLookupLatency(tid, pc);
+    }
+
+    void discardNonBranchTarget(ThreadID tid, Addr pc);
+
+    FrontendPrediction predictInstruction(const StaticInstPtr &instruction,
+        InstSeqNum sequence, ThreadID tid, PCStateBase &next_pc);
+    FrontendPrediction predictFrontendInstruction(
+        const StaticInstPtr &instruction, InstSeqNum sequence, ThreadID tid,
+        PCStateBase &next_pc, const FetchTargetPtr &ft);
 
   private:
     /** Pre-decode update -----------------------------------------
@@ -359,6 +372,7 @@ class BAC
 
     /** The decoupled PC which runs ahead of fetch */
     std::unique_ptr<PCStateBase> bacPC[MaxThreads];
+    uint64_t targetReadyCycle[MaxThreads] = {};
 
     /** Variable that tracks if BAC has written to the time buffer this
      * cycle. Used to tell CPU if there is activity this cycle.

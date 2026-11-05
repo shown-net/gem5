@@ -54,6 +54,10 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     // Functional observers may read it; dirty-writeback and DMA states stay Busy.
     IM, AccessPermission:Read_Only, desc="Memory is current while a clean fetch is pending";
     MI, AccessPermission:Busy, desc="Intermediate State M>I";
+    MR, AccessPermission:Busy, desc="Writeback updates memory but retains LLC ownership";
+    MRD, AccessPermission:Read_Only, desc="Current LLC owner reloads memory-current data";
+    M_DRD_R, AccessPermission:Busy, desc="DMA read waits for retained writeback";
+    M_DWR_R, AccessPermission:Busy, desc="DMA write waits for retained writeback";
     M_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
     M_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
     M_DWR, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
@@ -63,7 +67,9 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   // Events
   enumeration(Event, desc="Directory events") {
     Fetch, desc="A memory fetch arrives";
+    Fetch_Owner, desc="Directory owner reloads a data-absent clean LLC line";
     Data, desc="writeback data arrives";
+    DataRetain, desc="Writeback updates memory while preserving owner";
     Memory_Data, desc="Fetched data from memory arrives";
     Memory_Ack, desc="Writeback Ack from memory arrives";
 //added by SS for dma
@@ -206,7 +212,14 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
       peek(requestNetwork_in, RequestMsg) {
         assert(in_msg.Destination.isElement(machineID));
         if (isGETRequest(in_msg.Type)) {
-          trigger(Event:Fetch, in_msg.addr, TBEs[in_msg.addr]);
+          State state := getState(TBEs[in_msg.addr], in_msg.addr);
+          if ((state == State:M || state == State:M_DRD ||
+               state == State:M_DWR) &&
+              getDirectoryEntry(in_msg.addr).Owner == in_msg.Requestor) {
+            trigger(Event:Fetch_Owner, in_msg.addr, TBEs[in_msg.addr]);
+          } else {
+            trigger(Event:Fetch, in_msg.addr, TBEs[in_msg.addr]);
+          }
         } else if (in_msg.Type == CoherenceRequestType:DMA_READ) {
           trigger(Event:DMA_READ, makeLineAddress(in_msg.addr),
                   TBEs[makeLineAddress(in_msg.addr)]);
@@ -227,6 +240,8 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         assert(in_msg.Destination.isElement(machineID));
         if (in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
           trigger(Event:Data, in_msg.addr, TBEs[in_msg.addr]);
+        } else if (in_msg.Type == CoherenceResponseType:MEMORY_DATA_RETAIN) {
+          trigger(Event:DataRetain, in_msg.addr, TBEs[in_msg.addr]);
         } else if (in_msg.Type == CoherenceResponseType:ACK) {
           trigger(Event:CleanReplacement, in_msg.addr, TBEs[in_msg.addr]);
         } else {
@@ -354,6 +369,17 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     }
   }
 
+  action(qf_queueMemoryFetchFromTBE, "qft", desc="Read memory after clean directory-only owner release") {
+    assert(is_valid(tbe));
+    enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_READ;
+      out_msg.Sender := tbe.Requestor;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+      out_msg.Len := 0;
+    }
+  }
+
   action(p_popIncomingDMARequestQueue, "p", desc="Pop incoming DMA queue") {
     requestNetwork_in.dequeue(clockEdge());
   }
@@ -454,6 +480,21 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     }
   }
 
+  action(qw_queueMergedOwnerDMAWrite, "qwm", desc="Merge DMA bytes into current owner data before full writeback") {
+    peek(responseNetwork_in, ResponseMsg) {
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_WB;
+        out_msg.Sender := in_msg.Sender;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.DataBlk.copyPartial(tbe.DataBlk,
+                                   getOffset(tbe.PhysicalAddress), tbe.Len);
+        out_msg.Len := 0;
+      }
+    }
+  }
+
   action(w_deallocateTBE, "w", desc="Deallocate TBE") {
     TBEs.deallocate(address);
     unset_tbe();
@@ -470,6 +511,41 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   transition(M, Fetch) {
     inv_sendCacheInvalidate;
     z_stallAndWaitRequest;
+  }
+
+  transition(M, Fetch_Owner, MRD) {
+    qf_queueMemoryFetchRequest;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(MRD, Memory_Data, M) {
+    d_sendData;
+    l_popMemQueue;
+    kd_wakeUpDependents;
+  }
+
+  // DMA may invalidate just as a directory-only LLC starts a reload. Let
+  // that owner receive data so it can finish the invalidation; stalling both
+  // the reload here and the INV at the LLC would deadlock. Keep the DMA TBE.
+  transition({M_DRD, M_DWR}, Fetch_Owner) {
+    qf_queueMemoryFetchRequest;
+    j_popIncomingRequestQueue;
+  }
+
+  transition({M_DRD, M_DWR}, Memory_Data) {
+    d_sendData;
+    l_popMemQueue;
+  }
+
+  transition(M, DataRetain, MR) {
+    qw_queueMemoryWBRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(MR, Memory_Ack, M) {
+    aa_sendAck;
+    l_popMemQueue;
+    kd_wakeUpDependents;
   }
 
   transition(IM, Memory_Data, M) {
@@ -523,11 +599,11 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     kd_wakeUpDependents;
   }
 
-  transition({ID, ID_W, M_DRDI, M_DWRI, IM, MI}, {Fetch, Data} ) {
+  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI, MR, MRD, M_DRD_R, M_DWR_R}, Fetch) {
     z_stallAndWaitRequest;
   }
 
-  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI}, {DMA_WRITE, DMA_READ} ) {
+  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI, MR, MRD, M_DRD_R, M_DWR_R}, {DMA_WRITE, DMA_READ} ) {
     zz_recycleDMAQueue;
   }
 
@@ -545,6 +621,24 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     k_popIncomingResponseQueue;
   }
 
+  transition(M_DRD, CleanReplacement, ID) {
+    a_sendAck;
+    qf_queueMemoryFetchFromTBE;
+    k_popIncomingResponseQueue;
+  }
+
+  // An eviction writeback may race the DMA invalidation on different vnets.
+  // Complete it and acknowledge it without treating it as ownership release.
+  transition(M_DRD, DataRetain, M_DRD_R) {
+    qw_queueMemoryWBRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(M_DRD_R, Memory_Ack, M_DRD) {
+    aa_sendAck;
+    l_popMemQueue;
+  }
+
   transition(M_DRDI, Memory_Ack, I) {
     aa_sendAck;
     l_popMemQueue;
@@ -558,8 +652,23 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   }
 
   transition(M_DWR, Data, M_DWRI) {
+    qw_queueMergedOwnerDMAWrite;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(M_DWR, CleanReplacement, M_DWRI) {
     qw_queueMemoryWBRequest_partialTBE;
     k_popIncomingResponseQueue;
+  }
+
+  transition(M_DWR, DataRetain, M_DWR_R) {
+    qw_queueMemoryWBRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(M_DWR_R, Memory_Ack, M_DWR) {
+    aa_sendAck;
+    l_popMemQueue;
   }
 
   transition(M_DWRI, Memory_Ack, I) {

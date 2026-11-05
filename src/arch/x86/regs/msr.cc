@@ -39,6 +39,8 @@ typedef MsrMap::value_type MsrVal;
 const MsrMap::value_type msrMapData[] = {
     MsrVal(0x10, misc_reg::Tsc),
     MsrVal(0x1B, misc_reg::ApicBase),
+    MsrVal(0x48, misc_reg::SpecCtrl),
+    MsrVal(0x49, misc_reg::PredCmd),
     MsrVal(0xFE, misc_reg::Mtrrcap),
     MsrVal(0x174, misc_reg::SysenterCs),
     MsrVal(0x175, misc_reg::SysenterEsp),

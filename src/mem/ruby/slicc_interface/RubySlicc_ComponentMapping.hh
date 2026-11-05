@@ -53,6 +53,16 @@ mapAddressToRange(Addr addr, MachineType type, int low_bit,
     return mach;
 }
 
+// Logical slice mapping. Unlike bit selection this reaches every bank when
+// the number of slices is not a power of two (SPR uses 52 in this model).
+inline MachineID
+mapAddressToModulo(Addr addr, MachineType type, int low_bit,
+                   int banks, int cluster_id)
+{
+    assert(banks > 0);
+    return {type, NodeID((addr >> low_bit) % banks + banks * cluster_id)};
+}
+
 inline NodeID
 machineIDToNodeID(MachineID machID)
 {

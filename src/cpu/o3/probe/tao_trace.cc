@@ -2993,7 +2993,8 @@ TaoTrace::finalizeNativeResponseDiagnostic()
     }
     static constexpr const char *reason_names[] = {
         "predicated_off", "no_request", "store_forward", "local_access",
-        "failed_store_conditional", "zero_size", "prefetch_skipped"};
+        "failed_store_conditional", "zero_size", "prefetch_skipped",
+        "store_overwrite_elided"};
     std::fputs("},\"terminal_reason_counts\":{", summary);
     bool first_reason = true;
     for (unsigned bit = 0; bit < native_diag_terminal_reason_counts_.size();
@@ -3210,6 +3211,7 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
     facts.admissions = native.admissions;
     facts.responses = native.responses;
     facts.coalesced = native.coalesced;
+    facts.sequencer_shared = native.sequencerShared;
     facts.hierarchy_requests = native.hierarchyRequests;
     facts.external_hits = native.externalHits;
     facts.external_misses = native.externalMisses;
@@ -3231,6 +3233,10 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
     facts.l3_remote_supplies=native.hierarchy.remoteSupplies[2];
     facts.l2_permission_upgrades=native.hierarchy.permissionUpgrades[1];
     facts.l3_permission_upgrades=native.hierarchy.permissionUpgrades[2];
+    facts.service_identity_ambiguous=native.serviceFactIdentityAmbiguous;
+    facts.l1_final_mask=native.l1FinalMask;
+    facts.service_expected=native.serviceExpected;
+    retirement::addServiceFacts(facts, native.serviceFacts);
     return facts;
 }
 
@@ -4989,7 +4995,7 @@ TaoTrace::emitSyscallRecord(const DynInstPtr &inst)
     writeRecordsSyscallLine(core_id, thread_id, seq_id, pc, op_class, st);
     writeLabelsLine(core_id, thread_id, seq_id, exposed_cyc, macro_cyc, 0,
                     /*fetch_lat_cyc*/ 0, /*exec_lat_cyc*/ 0,
-                    /*branch_mispred*/ 0u);
+                    /*branch_mispred*/ 0u, /*latency_valid*/ false);
     writeDiagLine(core_id, thread_id, seq_id,
                   sc.fetch_tick, curTick(), prev, last_squash_tick_[thread_id]);
 
@@ -5449,9 +5455,9 @@ TaoTrace::flushMacro(MacroAccum &acc, const DynInstPtr &lastInst)
         last_squash_tick_.erase(it_sq);
     }
 
-    // V1 多核新增：fetch / execution latency 拆分
-    //   exec_t   = completeTick − issueTick （宽口径，ROB head 到 writeback）
-    //   fetch_t  = macro_t − exec_t （retire 之前的所有暴露时间归 fetch）
+    // Legacy stage decomposition: completeTick is execute accounting, not
+    // the response time of memory instructions. The complement is not a
+    // measurement of fetch latency; retain both as proxies only.
     uint64_t exec_t = 0;
     if (acc.last_issue_tick_delta >= 0 &&
         acc.last_complete_tick_delta >= 0 &&
@@ -5497,7 +5503,8 @@ TaoTrace::flushMacro(MacroAccum &acc, const DynInstPtr &lastInst)
                      acc.branch_history_before, acc.access_distance_bucket);
     writeLabelsLine(acc.core_id, acc.thread_id, acc.first_seq,
                     exposed_cyc, macro_cyc, branch_pen_cyc,
-                    fetch_cyc, exec_cyc, branch_mispred);
+                    fetch_cyc, exec_cyc, branch_mispred,
+                    /* latency_valid: issue/execute accounting is a proxy */ false);
     writeDiagLine(acc.core_id, acc.thread_id, acc.first_seq,
                   acc.first_fetch_tick, acc.last_commit_tick, prev,
                   last_squash_tick_[acc.thread_id]);
@@ -5590,7 +5597,7 @@ TaoTrace::writeLabelsLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
                           uint64_t exposed_cyc, uint64_t macro_cyc,
                           uint64_t branch_pen_cyc,
                           uint64_t fetch_lat_cyc, uint64_t exec_lat_cyc,
-                          uint8_t branch_mispred)
+                          uint8_t branch_mispred, bool latency_valid)
 {
     if (!out_labels_) return;
     if (!emitGateOpen(core_id)) return;  // V28.1 per-core ROI 闸门
@@ -5599,12 +5606,22 @@ TaoTrace::writeLabelsLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
         "\"exposed_stall_cycles\":%" PRIu64 ","
         "\"macro_cycles\":%" PRIu64 ","
         "\"branch_penalty_cycles\":%" PRIu64 ","
-        "\"fetch_latency_cyc\":%" PRIu64 ","
-        "\"execution_latency_cyc\":%" PRIu64 ","
-        "\"branch_mispred\":%u}\n",
+        "\"fetch_latency_proxy_cyc\":%" PRIu64 ","
+        "\"execution_latency_proxy_cyc\":%" PRIu64 ","
+        "\"execution_latency_valid\":%s,",
         core_id, thread_id, seq_id,
         exposed_cyc, macro_cyc, branch_pen_cyc,
-        fetch_lat_cyc, exec_lat_cyc, unsigned(branch_mispred));
+        fetch_lat_cyc, exec_lat_cyc, latency_valid ? "true" : "false");
+    // No measured fetch latency is available from this subtraction. A memory
+    // macro may comprise multiple operations, so its execute-accounting
+    // timestamp cannot be promoted to full load/store completion either.
+    if (latency_valid) {
+        std::fprintf(out_labels_, "\"execution_latency_cyc\":%" PRIu64 ",", exec_lat_cyc);
+    } else {
+        std::fprintf(out_labels_, "\"execution_latency_cyc\":null,");
+    }
+    std::fprintf(out_labels_, "\"fetch_latency_cyc\":null,\"branch_mispred\":%u}\n",
+                 unsigned(branch_mispred));
 }
 
 void
@@ -5937,23 +5954,39 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     }
 
     if (out_labels_micro_) {
-        // V9.4：新增 ready_tick 绝对时刻
-        //   load/atomic：LSQUnit::writeback 已覆盖 completeTick = cache 数据返回时刻
-        //   ALU/branch/store：iew.cc updateExeInstStats 设置 completeTick = execute 完成
-        //   兜底（completeTick=0/-1）：退化为 commit_tick
-        uint64_t ready_tick = (complete_tick > 0)
-                                ? (fetch_tick + complete_tick)
-                                : commit_tick;
-        int ready_source = (complete_tick > 0) ? 0 : 1; // 0=complete 1=fallback
+        // completeTick is IEW execute accounting, not a load response.
+        // For a load, only publish a ready tick if both a complete value and
+        // a non-earlier dependency wake were observed. A speculative wake or
+        // an unsupported path is left missing rather than guessed.
+        const bool load_value = inst->isLoad() || inst->isAtomic();
+        const bool have_return = inst->dataReturnTick != Tick(-1);
+        const bool have_wake = inst->lastWakeDependents != Tick(-1);
+        const bool valid_load_ready = have_return && have_wake &&
+            inst->lastWakeDependents >= inst->dataReturnTick;
+        uint64_t ready_tick = load_value
+            ? (valid_load_ready ? uint64_t(inst->lastWakeDependents) : 0)
+            : (complete_tick > 0 ? fetch_tick + complete_tick : commit_tick);
+        // 0=execute, 1=commit fallback, 2=missing, 3=observed load wake.
+        int ready_source = load_value ? (valid_load_ready ? 3 : 2)
+                                      : (complete_tick > 0 ? 0 : 1);
+        char ready_json[32];
+        if (load_value && !valid_load_ready)
+            std::snprintf(ready_json, sizeof(ready_json), "null");
+        else
+            std::snprintf(ready_json, sizeof(ready_json), "%" PRIu64, ready_tick);
         std::fprintf(out_labels_micro_,
             "{\"core_id\":%u,\"thread_id\":%u,\"micro_seq\":%" PRIu64 ","
             "\"fetch_tick\":%" PRIu64 ",\"issue_tick\":%" PRIu64 ","
             "\"complete_tick\":%" PRIu64 ",\"commit_tick\":%" PRIu64 ","
-            "\"ready_tick\":%" PRIu64 ",\"ready_source\":%d,"
+            "\"ready_tick\":%s,\"ready_source\":%d,"
+            "\"data_return_tick\":%" PRId64 ",\"wake_tick\":%" PRId64 ","
             "\"mispredicted\":%d}\n",
             core_id, thread_id, micro_seq,
             fetch_tick, issue_tick, complete_tick, commit_tick,
-            ready_tick, ready_source, mispredicted);
+            ready_json, ready_source,
+            have_return ? int64_t(inst->dataReturnTick) : int64_t(-1),
+            have_wake ? int64_t(inst->lastWakeDependents) : int64_t(-1),
+            mispredicted);
     }
 
     if (out_fst_) {

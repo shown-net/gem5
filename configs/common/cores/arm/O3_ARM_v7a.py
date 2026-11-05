@@ -186,7 +186,6 @@ class O3_ARM_v7a_3(ArmO3CPU):
     issueToExecuteDelay = 1
     dispatchWidth = 6
     issueWidth = 8
-    wbWidth = 8
     iewToCommitDelay = 1
     renameToROBDelay = 1
     commitWidth = 8

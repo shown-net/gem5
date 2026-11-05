@@ -60,7 +60,7 @@ parser.add_argument(
 parser.add_argument(
     "--test-type",
     default="SeriesGetx",
-    choices=["SeriesGetx", "SeriesGets", "SeriesGetMixed", "Invalidate"],
+    choices=["SeriesGetx", "SeriesGets", "SeriesGetMixed", "Invalidate", "LoadLinkedUpgrade"],
     help="Type of test",
 )
 parser.add_argument(
@@ -93,6 +93,10 @@ elif args.test_type == "SeriesGetMixed":
     )
 elif args.test_type == "Invalidate":
     generator = InvalidateGenerator(num_cpus=args.num_cpus)
+elif args.test_type == "LoadLinkedUpgrade":
+    if args.num_cpus != 2 or int(args.requests) != 1:
+        parser.error("LoadLinkedUpgrade requires --num-cpus=2 --requests=1")
+    generator = LoadLinkedUpgradeGenerator(num_cpus=args.num_cpus)
 else:
     print("Error: unknown direct test generator")
     sys.exit(1)

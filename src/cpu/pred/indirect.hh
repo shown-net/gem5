@@ -68,6 +68,9 @@ class IndirectPredictor : public SimObject
 
     virtual void reset() {};
 
+    /** Capture the privilege domain at prediction, if the model uses it. */
+    virtual void setUserMode(ThreadID tid, bool user) {}
+
     /**
      * Predicts the indirect target of an indirect branch.
      * @param tid Thread ID of the branch.

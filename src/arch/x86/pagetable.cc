@@ -67,6 +67,7 @@ TlbEntry::serialize(CheckpointOut &cp) const
 {
     SERIALIZE_SCALAR(paddr);
     SERIALIZE_SCALAR(vaddr);
+    SERIALIZE_SCALAR(pcid);
     SERIALIZE_SCALAR(logBytes);
     SERIALIZE_SCALAR(writable);
     SERIALIZE_SCALAR(user);
@@ -85,6 +86,7 @@ TlbEntry::unserialize(CheckpointIn &cp)
     functionalTranslation = {};
     UNSERIALIZE_SCALAR(paddr);
     UNSERIALIZE_SCALAR(vaddr);
+    UNSERIALIZE_SCALAR(pcid);
     UNSERIALIZE_SCALAR(logBytes);
     UNSERIALIZE_SCALAR(writable);
     UNSERIALIZE_SCALAR(user);

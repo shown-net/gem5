@@ -47,6 +47,9 @@
 #include "cpu/checker/cpu.hh"
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/zero_idiom.hh"
+#include "arch/x86/mmu.hh"
+#include "arch/x86/regs/misc.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/simple_thread.hh"
@@ -70,8 +73,19 @@ struct BaseCPUParams;
 namespace o3
 {
 
+void
+removeCommThreadInsts(ThreadID tid, IEWStruct &comm)
+{
+    auto last = std::remove_if(comm.insts.begin(), comm.insts.end(),
+        [tid](const auto &inst) {
+            return inst && inst->threadNumber == tid;
+        });
+    comm.insts.erase(last, comm.insts.end());
+    comm.size = comm.insts.size();
+}
+
 CPU::CPU(const BaseO3CPUParams &params)
-    : BaseCPU(params),
+    : BaseCPU(params), tmaEnabled(params.numThreads == 1),
       mmu(params.mmu),
       tickEvent([this] { tick(); }, "O3CPU tick", false, Event::CPU_Tick_Pri),
       threadExitEvent([this] { exitThreads(); }, "O3CPU exit threads", false,
@@ -93,7 +107,8 @@ CPU::CPU(const BaseO3CPUParams &params)
               params.numPhysMatRegs, params.numPhysCCRegs,
               params.isa[0]->regClasses()),
 
-      freeList(name() + ".freelist", &regFile),
+      freeList(name() + ".freelist", &regFile, params.numPhysFloatRegEntries,
+               params.numPhysFloatWideEntries),
 
       rob(this, params),
 
@@ -113,10 +128,32 @@ CPU::CPU(const BaseO3CPUParams &params)
       globalFTSeqNum(1),
       system(params.system),
       lastRunningCycle(curCycle()),
-      cpuStats(this)
+      cpuStats(this),
+      unhaltedClockStats(this),
+      tmaStats(this, params.renameWidth),
+      branchInstStats(this), branchMispStats(this), instRetiredStats(this),
+      uopsRetiredStats(this), idqStats(this), lsdStats(this),
+      uopsIssuedStats(this), uopsExecutedStats(this),
+      uopsDispatchedStats(this), moveEliminationStats(this),
+      memoryInstRetiredStats(this), memoryLoadRetiredStats(this),
+      memoryLoadCompletedStats(this)
 {
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
+    resultForwarding = params.resultForwarding;
+    zeroIdiom = params.zeroIdiom;
+    frontend = params.frontend;
+    if (frontend) {
+        frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
+        frontend->setDeliveryObserver(
+            [this](const FrontendRecord &record, uint64_t cycle) {
+                recordFrontendDelivery(record.source, record.demand.frontendUnits, cycle);
+            });
+        auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
+        fatal_if(!x86_mmu, "Component frontend requires an x86 MMU");
+        x86_mmu->onInstructionCodeInvalidation(
+            [this] { fetch.invalidateTranslations(); });
+    }
 
     fatal_if(!FullSystem && params.numThreads < params.workload.size(),
             "More workload items (%d) than threads (%d) on CPU %s.",
@@ -169,6 +206,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     decode.setFetchQueue(&fetchQueue);
     commit.setFetchQueue(&fetchQueue);
     decode.setDecodeQueue(&decodeQueue);
+    fetch.setRenameQueue(&decodeQueue);
     rename.setDecodeQueue(&decodeQueue);
     rename.setRenameQueue(&renameQueue);
     iew.setRenameQueue(&renameQueue);
@@ -249,12 +287,19 @@ CPU::CPU(const BaseO3CPUParams &params)
     for (ThreadID tid = 0; tid < active_threads; tid++) {
         for (auto type = (RegClassType)0; type <= CCRegClass;
                 type = (RegClassType)(type + 1)) {
+            PhysRegIdPtr previous = nullptr;
+            RegIndex previous_group = 0;
             for (auto &id: *regClasses.at(type)) {
                 // Note that we can't use the rename() method because we don't
                 // want special treatment for the zero register at this point
-                PhysRegIdPtr phys_reg = freeList.getReg(type);
+                const auto group = id.regClass().regAllocationGroup(id);
+                auto peer = type == FloatRegClass && group == previous_group ?
+                    previous : nullptr;
+                PhysRegIdPtr phys_reg = freeList.getReg(type, peer);
                 renameMap[tid].setEntry(id, phys_reg);
                 commitRenameMap[tid].setEntry(id, phys_reg);
+                previous = phys_reg;
+                previous_group = group;
             }
         }
     }
@@ -381,7 +426,7 @@ CPU::tick()
 
     fetch.tick();
 
-    decode.tick();
+    if (!frontend) decode.tick();
 
     rename.tick();
 
@@ -458,6 +503,8 @@ CPU::startup()
 void
 CPU::activateThread(ThreadID tid)
 {
+    unhaltedClockStats.setActive(tid, true);
+    if (tid == 0) tmaStats.setActive(true);
     auto active_it = std::find(
             activeThreads.begin(), activeThreads.end(), tid);
 
@@ -474,6 +521,8 @@ CPU::activateThread(ThreadID tid)
 void
 CPU::deactivateThread(ThreadID tid)
 {
+    unhaltedClockStats.setActive(tid, false);
+    if (tid == 0) tmaStats.setActive(false);
     // hardware transactional memory
     // shouldn't deactivate thread in the middle of a transaction
     assert(!commit.executingHtmTransaction(tid));
@@ -617,10 +666,17 @@ CPU::insertThread(ThreadID tid)
 
     for (auto type = (RegClassType)0; type <= CCRegClass;
             type = (RegClassType)(type + 1)) {
+        PhysRegIdPtr previous = nullptr;
+        RegIndex previous_group = 0;
         for (auto &id: *regClasses.at(type)) {
-            PhysRegIdPtr phys_reg = freeList.getReg(type);
+            const auto group = id.regClass().regAllocationGroup(id);
+            auto peer = type == FloatRegClass && group == previous_group ?
+                previous : nullptr;
+            PhysRegIdPtr phys_reg = freeList.getReg(type, peer);
             renameMap[tid].setEntry(id, phys_reg);
             scoreboard.setReg(phys_reg);
+            previous = phys_reg;
+            previous_group = group;
         }
     }
 
@@ -818,6 +874,7 @@ bool
 CPU::isCpuDrained() const
 {
     bool drained(true);
+    if (zeroIdiom && !zeroIdiom->empty()) drained = false;
 
     if (!instList.empty() || !removeList.empty()) {
         DPRINTF(Drain, "Main CPU structures not drained.\n");
@@ -898,6 +955,9 @@ void
 CPU::switchOut()
 {
     DPRINTF(O3CPU, "Switching out\n");
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        unhaltedClockStats.setActive(tid, false);
+    tmaStats.setActive(false);
     BaseCPU::switchOut();
 
     activityRec.reset();
@@ -962,6 +1022,8 @@ void
 CPU::setMiscReg(int misc_reg, RegVal val, ThreadID tid)
 {
     executeStats[tid]->numMiscRegWrites++;
+    if (misc_reg == X86ISA::misc_reg::PredCmd && (val & 1))
+        iew.ldstQueue.clearFastForwarding(tid);
     isa[tid]->setMiscReg(misc_reg, val);
 }
 
@@ -1179,6 +1241,7 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 void
 CPU::removeFrontInst(const DynInstPtr &inst)
 {
+    if (inst->isSquashed()) tmaStats.onOtherSquash(inst);
     DPRINTF(O3CPU, "Removing committed instruction [tid:%i] PC %s "
             "[sn:%lli]\n",
             inst->threadNumber, inst->pcState(), inst->seqNum);
@@ -1285,6 +1348,8 @@ void
 CPU::cleanUpRemovedInsts()
 {
     while (!removeList.empty()) {
+        if ((*removeList.front())->isSquashed())
+            tmaStats.onOtherSquash(*removeList.front());
         DPRINTF(O3CPU, "Removing instruction, "
                 "[tid:%i] [sn:%lli] PC %s\n",
                 (*removeList.front())->threadNumber,

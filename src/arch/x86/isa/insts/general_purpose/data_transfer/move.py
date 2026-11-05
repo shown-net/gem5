@@ -53,19 +53,24 @@ def macroop MOV_R_R {
 };
 
 def macroop MOV_M_R {
-    st reg, seg, sib, disp
+    .microfused_store
+    sta seg, sib, disp
+    storedata reg
 };
 
 def macroop MOV_P_R {
-    rdip t7
-    st reg, seg, riprel, disp
+    .microfused_store
+    starip seg, riprel, disp
+    storedata reg
 };
 
 def macroop MOV_R_M {
+    .microfused_load
     ld reg, seg, sib, disp
 };
 
 def macroop MOV_R_P {
+    .microfused_load
     ldrip reg, seg, riprel, disp
 };
 
@@ -79,9 +84,8 @@ def macroop MOV_M_I {
 };
 
 def macroop MOV_P_I {
-    rdip t7
     limm t1, imm
-    st t1, seg, riprel, disp
+    strip t1, seg, riprel, disp
 };
 
 #
@@ -93,10 +97,12 @@ def macroop MOVSXD_R_R {
 };
 
 def macroop MOVSXD_R_M {
+    .microfused_load
     ldsxd reg, seg, sib, disp
 };
 
 def macroop MOVSXD_R_P {
+    .microfused_load
     ldsxdrip reg, seg, riprel, disp
 };
 
@@ -105,10 +111,12 @@ def macroop MOVSX_B_R_R {
 };
 
 def macroop MOVSX_B_R_M {
+    .microfused_load
     ldsxb reg, seg, sib, disp
 };
 
 def macroop MOVSX_B_R_P {
+    .microfused_load
     ldsxbrip reg, seg, riprel, disp
 };
 
@@ -117,10 +125,12 @@ def macroop MOVSX_W_R_R {
 };
 
 def macroop MOVSX_W_R_M {
+    .microfused_load
     ldsxw reg, seg, sib, disp
 };
 
 def macroop MOVSX_W_R_P {
+    .microfused_load
     ldsxwrip reg, seg, riprel, disp
 };
 
@@ -133,10 +143,12 @@ def macroop MOVZX_B_R_R {
 };
 
 def macroop MOVZX_B_R_M {
+    .microfused_load
     ldzxb reg, seg, sib, disp
 };
 
 def macroop MOVZX_B_R_P {
+    .microfused_load
     ldzxbrip reg, seg, riprel, disp
 };
 
@@ -145,10 +157,12 @@ def macroop MOVZX_W_R_R {
 };
 
 def macroop MOVZX_W_R_M {
+    .microfused_load
     ldzxw reg, seg, sib, disp
 };
 
 def macroop MOVZX_W_R_P {
+    .microfused_load
     ldzxwrip reg, seg, riprel, disp
 };
 
@@ -321,23 +335,19 @@ def macroop MOVNTI_P_R {
 };
 
 def macroop MOVD_XMM_R {
-   mov2fp xmml, regm, srcSize=dsz, destSize=8
-   lfpimm xmmh, 0
+    mxmmfromint xmml, xmmh, regm, srcSize=dsz, destSize=8
 };
 
 def macroop MOVD_XMM_M {
-    ldfp xmml, seg, sib, disp, dataSize=dsz
-    lfpimm xmmh, 0
+    ldfpxmms (xmml, xmmh), seg, sib, disp, dataSize=dsz
 };
 
 def macroop MOVD_XMM_P {
-    rdip t7
-    ldfp xmml, seg, riprel, disp, dataSize=dsz
-    lfpimm xmmh, 0
+    ldfpxmmsrip (xmml, xmmh), seg, riprel, disp, dataSize=dsz
 };
 
 def macroop MOVD_R_XMM {
-    mov2int reg, xmmlm, size=dsz
+    mxmmtoint reg, xmmlm, size=dsz
 };
 
 def macroop MOVD_M_XMM {
@@ -345,8 +355,7 @@ def macroop MOVD_M_XMM {
 };
 
 def macroop MOVD_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, disp, dataSize=dsz
+    stfprip xmml, seg, riprel, disp, dataSize=dsz
 };
 
 """

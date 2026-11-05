@@ -35,24 +35,17 @@
 
 microcode = """
 def macroop PSHUFD_XMM_XMM_I {
-    shuffle ufp1, xmmlm, xmmhm, size=4, ext="IMMEDIATE"
-    shuffle xmmh, xmmlm, xmmhm, size=4, ext="IMMEDIATE >> 4"
-    movfp xmml, ufp1, dataSize=8
+    mxmmshuffle xmml, xmmh, xmmlm, xmmhm, xmmlm, xmmhm, size=4, ext="IMMEDIATE"
 };
 
 def macroop PSHUFD_XMM_M_I {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    shuffle xmml, ufp1, ufp2, size=4, ext="IMMEDIATE"
-    shuffle xmmh, ufp1, ufp2, size=4, ext="IMMEDIATE >> 4"
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmshuffle xmml, xmmh, ufp1, ufp2, ufp1, ufp2, size=4, ext="IMMEDIATE"
 };
 
 def macroop PSHUFD_XMM_P_I {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    shuffle xmml, ufp1, ufp2, size=4, ext="IMMEDIATE"
-    shuffle xmmh, ufp1, ufp2, size=4, ext="IMMEDIATE >> 4"
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmshuffle xmml, xmmh, ufp1, ufp2, ufp1, ufp2, size=4, ext="IMMEDIATE"
 };
 
 def macroop PSHUFHW_XMM_XMM_I {

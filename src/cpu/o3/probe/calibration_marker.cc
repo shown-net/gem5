@@ -118,12 +118,23 @@ CalibrationMarker::observeMarkerCommit(const DynInstPtr &inst)
     auto *owner = marker_owner_;
     if (!owner || !marker_capture_started_ ||
         owner->marker_measurement_phase_ == MarkerMeasurementPhase::Complete ||
-        (inst->isMicroop() && !inst->isLastMicroop()) ||
-        !inst->fetchedFromUser || !inst->fetchedAddressSpaceId ||
+        (inst->isMicroop() && !inst->isLastMicroop()))
+        return;
+    const Addr pc = inst->pcState().instAddr();
+    if (pc == marker_pc_) {
+        // Endpoints belong to the retiring context. Fetch metadata can lag
+        // x86 privilege returns and address-space transitions.
+        auto *tc = owner->marker_cpu_->tcBase(inst->threadNumber);
+        const uint64_t root = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) &
+                              ~uint64_t(0xfff);
+        if (!owner->marker_cpu_->inUserMode(inst->threadNumber) || !root ||
+            (owner->marker_address_space_ && owner->marker_address_space_ != root))
+            return;
+        owner->marker_address_space_ = root;
+    } else if (!inst->fetchedFromUser || !inst->fetchedAddressSpaceId ||
         (owner->marker_address_space_ &&
          owner->marker_address_space_ != inst->fetchedAddressSpaceId))
         return;
-    const Addr pc = inst->pcState().instAddr();
     // Fetch-time CPL can lag an x86 exception entry. Linux user PCs occupy
     // the lower canonical half, with the legacy vsyscall page as an exception.
     const bool linuxUserPc = !(pc >> 63) ||
@@ -132,10 +143,11 @@ CalibrationMarker::observeMarkerCommit(const DynInstPtr &inst)
         owner->marker_pc_trace_ && linuxUserPc) {
         const int64_t fetch_tick = inst->fetchTick == Tick(-1) ? -1 : int64_t(inst->fetchTick);
         owner->marker_pc_trace_->append(pc, curTick(), fetch_tick,
-            inst->dispatchTick, inst->issueTick, inst->completeTick);
+            inst->dispatchTick, inst->issueTick, inst->completeTick,
+            inst->dataReturnTick == Tick(-1) ? -1 : int64_t(inst->dataReturnTick),
+            inst->lastWakeDependents == Tick(-1) ? -1 : int64_t(inst->lastWakeDependents));
     }
     if (pc != marker_pc_) return;
-    owner->marker_address_space_ = inst->fetchedAddressSpaceId;
     ++owner->marker_ordinal_;
     const bool begin = owner->marker_ordinal_ == owner->marker_begin_;
     const bool end = owner->marker_ordinal_ == owner->marker_end_;
@@ -143,6 +155,15 @@ CalibrationMarker::observeMarkerCommit(const DynInstPtr &inst)
     owner->marker_measurement_phase_ = begin ?
         MarkerMeasurementPhase::Measuring : MarkerMeasurementPhase::Complete;
     if (end && owner->marker_pc_trace_) owner->marker_pc_trace_->finalizeTrace();
+    if (owner->marker_cpu_->tmaEnabled) {
+        if (begin) {
+            owner->marker_cpu_->beginMemoryObservation();
+            owner->marker_cpu_->tmaStats.begin();
+        } else {
+            owner->marker_cpu_->tmaStats.end();
+            owner->marker_cpu_->endMemoryObservation();
+        }
+    }
     // Snapshot at retirement without draining or changing pipeline state.
     statistics::dump();
     if (begin && owner->marker_pc_trace_) owner->marker_pc_trace_->initializeTrace();

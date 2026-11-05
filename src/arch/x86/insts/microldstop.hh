@@ -119,6 +119,47 @@ class LdStFpOp : public InstOperands<MemOp, FloatDataOp, AddrOp>
 };
 
 /**
+ * Base class for a single 128-bit load with two FP destinations.
+ */
+class LdStFpPairOp :
+    public InstOperands<MemOp, FloatDestOp, FloatDestHiOp, AddrOp>
+{
+  public:
+    bool isFullXmmWrite() const override { return true; }
+
+  protected:
+    LdStFpPairOp(ExtMachInst mach_inst, const char *mnem, const char *inst_mnem,
+            uint64_t set_flags, FpRegIndex data_low, FpRegIndex data_hi,
+            uint8_t _scale, GpRegIndex _index, GpRegIndex _base,
+            uint64_t _disp, SegRegIndex _segment,
+            uint8_t data_size, uint8_t address_size,
+            Request::FlagsType mem_flags, OpClass op_class) :
+    InstOperands<MemOp, FloatDestOp, FloatDestHiOp, AddrOp>(
+            mach_inst, mnem, inst_mnem, set_flags, op_class,
+            { data_low, data_hi, { _scale, _index, _base, _disp, _segment } },
+            data_size, address_size, mem_flags | _segment.index)
+    {}
+};
+
+/** One memory write with both 64-bit halves of an XMM source. */
+class StFpPairOp :
+    public InstOperands<MemOp, FloatSrc1Op, FloatSrc2Op, AddrOp>
+{
+  protected:
+    StFpPairOp(ExtMachInst mach_inst, const char *mnem, const char *inst_mnem,
+            uint64_t set_flags, FpRegIndex data_low, FpRegIndex data_hi,
+            uint8_t _scale, GpRegIndex _index, GpRegIndex _base,
+            uint64_t _disp, SegRegIndex _segment,
+            uint8_t data_size, uint8_t address_size,
+            Request::FlagsType mem_flags, OpClass op_class) :
+    InstOperands<MemOp, FloatSrc1Op, FloatSrc2Op, AddrOp>(
+            mach_inst, mnem, inst_mnem, set_flags, op_class,
+            { data_low, data_hi, { _scale, _index, _base, _disp, _segment } },
+            data_size, address_size, mem_flags | _segment.index)
+    {}
+};
+
+/**
  * Base class for the tia microop which has no destination register.
  */
 class MemNoDataOp : public InstOperands<MemOp, AddrOp>

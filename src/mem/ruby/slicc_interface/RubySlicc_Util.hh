@@ -133,6 +133,23 @@ taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
 }
 
 inline void
+nativeCacheOutcome(const RequestPtr &req, bool valid, int context_id,
+                   Addr seq_num, int level, int outcome)
+{
+    if (level < 0 || level >= int(TaoTraceNativeHierarchyFacts::Levels) ||
+        outcome < int(TaoTraceNativeCacheOutcome::Hit) ||
+        outcome > int(TaoTraceNativeCacheOutcome::RemoteSupply))
+        return;
+    if (req) {
+        TaoTraceNativeAccessRegistry::noteHierarchy(
+            req, unsigned(level), TaoTraceNativeCacheOutcome(outcome));
+    } else {
+        taotraceCacheOutcomeByIdentity(valid, context_id, seq_num, level,
+                                      outcome);
+    }
+}
+
+inline void
 taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num)
 {
     if (!valid || context_id < 0) return;

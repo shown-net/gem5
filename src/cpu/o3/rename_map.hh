@@ -111,7 +111,7 @@ class SimpleRenameMap
      * @return A RenameInfo pair indicating both the new and previous
      * physical registers.
      */
-    RenameInfo rename(const RegId& arch_reg);
+    RenameInfo rename(const RegId& arch_reg, PhysRegIdPtr entry_peer = nullptr);
 
     /**
      * Look up the physical register mapped to an architectural register.
@@ -177,6 +177,7 @@ class UnifiedRenameMap
      * on MiscRegs, as they are stored in it.
      */
     PhysRegFile *regFile;
+    UnifiedFreeList *freeList = nullptr;
 
   public:
 
@@ -203,7 +204,7 @@ class UnifiedRenameMap
      * physical registers.
      */
     RenameInfo
-    rename(const RegId& arch_reg)
+    rename(const RegId& arch_reg, PhysRegIdPtr entry_peer = nullptr)
     {
         if (!arch_reg.isRenameable()) {
             // misc regs aren't really renamed, just remapped
@@ -218,7 +219,7 @@ class UnifiedRenameMap
             return RenameInfo(phys_reg, phys_reg);
         }
 
-        return renameMaps[arch_reg.classValue()].rename(arch_reg);
+        return renameMaps[arch_reg.classValue()].rename(arch_reg, entry_peer);
     }
 
     /**
@@ -294,6 +295,7 @@ class UnifiedRenameMap
      * Return whether there are enough registers to serve the request.
      */
     bool canRename(DynInstPtr inst) const;
+    bool canRename(DynInstPtr inst, RegClassType type) const;
 };
 
 } // namespace o3

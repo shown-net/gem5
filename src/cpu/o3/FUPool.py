@@ -47,6 +47,8 @@ class FUPool(SimObject):
     cxx_class = "gem5::o3::FUPool"
     cxx_header = "cpu/o3/fu_pool.hh"
     FUList = VectorParam.FUDesc("list of FU's for this pool")
+    storeDataPorts = VectorParam.Unsigned([], "FU indices reserved with a store address")
+    branchPorts = VectorParam.Unsigned([], "FU indices eligible for control operations")
 
 
 class DefaultFUPool(FUPool):

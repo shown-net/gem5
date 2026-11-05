@@ -30,6 +30,7 @@ from m5.objects import (
     RubyPortProxy,
     RubySequencer,
     RubySystem,
+    SrcClockDomain,
 )
 
 from ....coherence_protocol import CoherenceProtocol
@@ -50,7 +51,7 @@ from .caches.mesi_three_level.dma_controller import DMAController
 from .caches.mesi_three_level.l1_cache import L1Cache
 from .caches.mesi_three_level.l2_cache import L2Cache
 from .caches.mesi_three_level.l3_cache import L3Cache
-from .topologies.simple_pt2pt import SimplePt2Pt
+from .topologies.simple_pt2pt import SimplePt2Pt, SimpleUncore
 
 
 class MESIThreeLevelCacheHierarchy(
@@ -72,6 +73,7 @@ class MESIThreeLevelCacheHierarchy(
         l3_size: str,
         l3_assoc: int,
         num_l3_banks: int,
+        uncore_clock: str = None,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractThreeLevelCacheHierarchy.__init__(
@@ -87,6 +89,7 @@ class MESIThreeLevelCacheHierarchy(
         )
 
         self._num_l3_banks = num_l3_banks
+        self._uncore_clock = uncore_clock
 
     @overrides(AbstractCacheHierarchy)
     def get_coherence_protocol(self):
@@ -97,11 +100,20 @@ class MESIThreeLevelCacheHierarchy(
         cache_line_size = board.get_cache_line_size()
 
         self.ruby_system = RubySystem()
+        self.ruby_system.clk_domain = (
+            SrcClockDomain(clock=self._uncore_clock,
+                           voltage_domain=board.get_clock_domain().voltage_domain)
+            if self._uncore_clock else board.get_clock_domain()
+        )
 
         # MESI_Three_Level needs 3 virtual networks
         self.ruby_system.number_of_virtual_networks = 3
 
-        self.ruby_system.network = SimplePt2Pt(self.ruby_system)
+        self.ruby_system.network = (
+            SimpleUncore(self.ruby_system) if self._uncore_clock
+            else SimplePt2Pt(self.ruby_system)
+        )
+        self.ruby_system.network.clk_domain = self.ruby_system.clk_domain
         self.ruby_system.network.number_of_virtual_networks = 3
 
         self._l1_controllers = []
@@ -124,6 +136,7 @@ class MESIThreeLevelCacheHierarchy(
             l1_cache.sequencer = RubySequencer(
                 version=core_idx,
                 dcache=l1_cache.Dcache,
+                max_outstanding_requests=128,
                 clk_domain=l1_cache.clk_domain,
                 ruby_system=self.ruby_system,
             )
@@ -183,6 +196,7 @@ class MESIThreeLevelCacheHierarchy(
                 cluster_id=0,  # cluster_id is ignored in point-to-point topology
             )
             l3_cache.ruby_system = self.ruby_system
+            l3_cache.clk_domain = self.ruby_system.clk_domain
             self._l3_controllers.append(l3_cache)
 
         # TODO: Make this prettier: The problem is not being able to proxy
@@ -198,6 +212,7 @@ class MESIThreeLevelCacheHierarchy(
         # the ruby system correctly
         for dir in self._directory_controllers:
             dir.ruby_system = self.ruby_system
+            dir.clk_domain = self.ruby_system.clk_domain
 
         self._dma_controllers = []
         if board.has_dma_ports():
@@ -211,6 +226,7 @@ class MESIThreeLevelCacheHierarchy(
                     ),
                     self.ruby_system,
                 )
+                ctrl.clk_domain = self.ruby_system.clk_domain
                 self._dma_controllers.append(ctrl)
 
         self.ruby_system.num_of_sequencers = len(self._l1_controllers) + len(
@@ -248,3 +264,17 @@ class MESIThreeLevelCacheHierarchy(
         L2Cache._version = 0
         L3Cache._version = 0
         DMAController._version = 0
+
+
+class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
+    """Selected SPR private caches with system-supplied LLC geometry."""
+
+    def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int,
+                 uncore_clock: str = "2.5GHz"):
+        super().__init__(
+            l1i_size="32KiB", l1i_assoc=8,
+            l1d_size="48KiB", l1d_assoc=12,
+            l2_size="2MiB", l2_assoc=16,
+            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
+            uncore_clock=uncore_clock,
+        )

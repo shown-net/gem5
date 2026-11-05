@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "arch/x86/fs_workload.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/page_size.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
@@ -626,9 +627,14 @@ X86_64Process::initState()
             // same virtual addresses belonging to different processes
             tc->setMiscReg(misc_reg::Cr3, pTable->pid());
 
-            // Setting pcide bit in CR4
+            // In SE mode gem5 supplies the OS initialization normally done
+            // by Linux. Enable FSGSBASE only when this ISA advertises it.
             CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
             cr4.pcide = 1;
+            CpuidResult features{};
+            auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+            cr4.fsgsbase = isa->cpuid->doCpuid(
+                tc, ExtendedFeatures, 0, features) && (features.rbx & 1);
             tc->setMiscReg(misc_reg::Cr4, cr4);
         }
     }

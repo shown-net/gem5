@@ -60,6 +60,9 @@ class OpClass(Enum):
         "SimdCmp",
         "SimdCvt",
         "SimdMisc",
+        "SimdPack",
+        "SimdExtract",
+        "SimdInsert",
         "SimdMult",
         "SimdMultAcc",
         "SimdMatMultAcc",
@@ -100,6 +103,8 @@ class OpClass(Enum):
         "MatrixOP",
         "MemRead",
         "MemWrite",
+        "X86StoreAddress",
+        "X86StoreData",
         "FloatMemRead",
         "FloatMemWrite",
         "InstPrefetch",
@@ -141,6 +146,7 @@ class OpDesc(SimObject):
 
     opClass = Param.OpClass("type of operation")
     opLat = Param.Cycles(1, "cycles until result is available")
+    issueLat = Param.Cycles(1, "minimum cycles between issues of this operation")
     pipelined = Param.Bool(
         True,
         "set to true when the functional unit for"

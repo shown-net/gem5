@@ -837,11 +837,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.Requestor:= machineID;
       out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
                           l2_select_low_bit, l2_select_num_bits, intToID(0)));
-      if (cache_entry.Dirty) {
-        out_msg.MessageSize := MessageSizeType:Writeback_Data;
-      } else {
-        out_msg.MessageSize := MessageSizeType:Writeback_Control;
-      }
+      // The noninclusive LLC may have no data backup for a clean E owner.
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
     }
   }
 
@@ -1277,9 +1274,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(E, Inv, I) {
-    // don't send data
     forward_eviction_to_cpu;
-    fi_sendInvAck;
+    d2_sendDataToL2;
     l_popRequestQueue;
   }
 

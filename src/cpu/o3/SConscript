@@ -44,9 +44,17 @@ Import('*')
 
 if env['CONF']['BUILD_ISA']:
     SimObject('FUPool.py', sim_objects=['FUPool'])
+    SimObject('ZeroIdiom.py', sim_objects=['ZeroIdiom'])
+    SimObject('Frontend.py', sim_objects=[
+        'InstructionBytes', 'InstructionDeliveryQueue', 'MiteService',
+        'DsbTemplates', 'MicrocodeService', 'FrontendCoordinator'])
+    Source('zero_idiom.cc')
+    SimObject('IntExecution.py', sim_objects=[
+        'ExecutionPort', 'ExecutionPorts', 'IntExecutionResource', 'IntegerALU',
+        'ResultPathRule', 'ResultForwarding'])
     SimObject('FuncUnitConfig.py', sim_objects=[])
     SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
-        enums=['TSOStore'])
+        enums=[])
     SimObject('IQUnit.py', sim_objects=['IQUnit'])
     SimObject('SMT.py',
         enums=['SMTFetchPolicy', 'SMTQueuePolicy', 'CommitPolicy'])
@@ -54,14 +62,19 @@ if env['CONF']['BUILD_ISA']:
     Source('bac.cc')
     Source('commit.cc')
     Source('cpu.cc')
+    Source('tma_stats.cc')
     Source('decode.cc')
     Source('dyn_inst.cc')
     Source('fetch.cc')
+    Source('frontend.cc')
+    Source('frontend_fetch.cc')
+    Source('frontend_record.cc')
     Source('free_list.cc')
     Source('ftq.cc')
     Source('fu_pool.cc')
     Source('iew.cc')
     Source('inst_queue.cc')
+    Source('int_execution.cc')
     Source('lsq.cc')
     Source('lsq_unit.cc')
     Source('mem_dep_unit.cc')

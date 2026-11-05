@@ -39,18 +39,15 @@ def macroop XORPD_XMM_XMM {
 };
 
 def macroop XORPD_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    mxor xmml, xmml, ufp1
-    mxor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmxor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop XORPD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    mxor xmml, xmml, ufp1
-    mxor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmxor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop XORPS_XMM_XMM {
@@ -58,17 +55,14 @@ def macroop XORPS_XMM_XMM {
 };
 
 def macroop XORPS_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    mxor xmml, xmml, ufp1
-    mxor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmxor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop XORPS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    mxor xmml, xmml, ufp1
-    mxor xmmh, xmmh, ufp2
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmxor xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 """

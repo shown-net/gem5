@@ -64,6 +64,7 @@
 #include "mem/ruby/slicc_interface/Message.hh"
 #include "params/MessageBuffer.hh"
 #include "sim/sim_object.hh"
+#include "sim/clock_domain.hh"
 
 namespace gem5
 {
@@ -279,6 +280,9 @@ class MessageBuffer : public SimObject
     bool m_last_message_strict_fifo_bypassed;
 
     const bool m_strict_fifo;
+    const bool m_delay_to_preserve_order;
+    ClockDomain *const m_data_transfer_clock;
+    Tick m_next_data_arrival = 0;
     const MessageRandomization m_randomization;
     const bool m_allow_zero_latency;
 
@@ -295,6 +299,8 @@ class MessageBuffer : public SimObject
     statistics::Scalar m_stall_count;
     statistics::Formula m_avg_stall_time;
     statistics::Formula m_occupancy;
+    statistics::Scalar fifoOrderDeferrals;
+    statistics::Scalar fifoDeferredTicks;
 };
 
 Tick random_time();

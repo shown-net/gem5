@@ -86,6 +86,10 @@ class IQUnit : public SimObject
 
     void insert(const DynInstPtr &inst);
     void remove(const DynInstPtr &inst);
+    void reserve(const DynInstPtr &inst);
+    void cancelReservation(InstSeqNum sequence);
+    bool hasReservation(InstSeqNum sequence) const;
+    void cancelReservations(ThreadID tid, InstSeqNum through);
 
     unsigned
     numEntries() const
@@ -102,10 +106,12 @@ class IQUnit : public SimObject
     unsigned
     numFreeEntries(ThreadID tid) const
     {
-        return maxEntries[tid] - count[tid];
+        return std::min(_freeEntries, maxEntries[tid] - count[tid]);
     }
 
     unsigned numFreeEntries(const DynInstPtr &inst) const;
+    bool allows(const DynInstPtr &inst) const;
+    bool allows(OpClass op_class) const;
 
     /** Returns the number of used entries for a thread. */
     unsigned
@@ -156,6 +162,15 @@ class IQUnit : public SimObject
 
     /** Function unit pool. */
     FUPool *_fuPool;
+    std::vector<OpClass> allowedOpClasses;
+    std::vector<OpClass> excludedOpClasses;
+    struct SchedulerEntry
+    {
+        ThreadID thread;
+        unsigned slots;
+        bool resident = false;
+    };
+    std::map<InstSeqNum, SchedulerEntry> entries;
 };
 
 /**
@@ -251,6 +266,12 @@ class InstructionQueue
 
     /** Returns number of free entries for a thread. */
     unsigned numFreeEntries(const DynInstPtr &inst);
+    bool canReserve(const std::vector<DynInstPtr> &insts);
+    void reserve(const DynInstPtr &inst);
+    bool hasReservation(const DynInstPtr &inst) const;
+    void cancelReservation(InstSeqNum sequence);
+    void cancelReservations(ThreadID tid, InstSeqNum through);
+    MemDepUnit &memoryDependence(ThreadID tid) { return memDepUnit[tid]; }
 
     /** Returns whether or not the IQ is full. */
     bool isFull();
@@ -263,6 +284,10 @@ class InstructionQueue
      * instruction type (OpClass)
      */
     bool isFull(const DynInstPtr &inst);
+
+    // Diagnostics sample actual queue reservations at the end of each IEW tick.
+    void sampleQueueOccupancy();
+    void recordAdmissionBlocked(const DynInstPtr &inst);
 
     /** Returns a vector of FU pools */
     std::vector<FUPool *> allFUPools();
@@ -309,6 +334,8 @@ class InstructionQueue
         addToProducers(inst);
     }
 
+    void recordCompletedProducer(const DynInstPtr &inst);
+
     /** Process FU completion event. */
     void processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
                              int fu_idx);
@@ -329,7 +356,8 @@ class InstructionQueue
     void commit(const InstSeqNum &inst, ThreadID tid = 0);
 
     /** Wakes all dependents of a completed instruction. */
-    int wakeDependents(const DynInstPtr &completed_inst);
+    int wakeDependents(const DynInstPtr &completed_inst,
+                       bool complete_memory = true);
 
     /** Adds a ready memory instruction to the ready list. */
     void addReadyMemInst(const DynInstPtr &ready_inst);
@@ -342,6 +370,9 @@ class InstructionQueue
 
     /** Replays a memory instruction. It must be rescheduled first. */
     void replayMemInst(const DynInstPtr &replay_inst);
+
+    /** Replay only this instruction if it is still on the replay list. */
+    bool replayOneMemInst(const DynInstPtr &replay_inst);
 
     /**
      * Defers a memory instruction when its DTB translation incurs a hw
@@ -423,6 +454,9 @@ class InstructionQueue
      *  complete (hw page table walk in progress).
      */
     std::list<DynInstPtr> deferredMemInsts;
+    // These records remain owned by the bounded LSQ while waiting for an RS
+    // credit. Waiting for data alone never adds an instruction to this list.
+    std::list<DynInstPtr> admissionWaitMemInsts;
 
     /** List of instructions that have been cache blocked. */
     std::list<DynInstPtr> blockedMemInsts;
@@ -554,13 +588,15 @@ class InstructionQueue
 
     struct IQStats : public statistics::Group
     {
-        IQStats(CPU *cpu, const unsigned &total_width);
+        IQStats(CPU *cpu, const unsigned &total_width, unsigned queues);
         /** Stat for number of instructions added. */
         statistics::Scalar instsAdded;
         /** Stat for number of non-speculative instructions added. */
         statistics::Scalar nonSpecInstsAdded;
 
         statistics::Scalar instsIssued;
+        statistics::Vector iqOccupancyEntryCycles, iqObservedCycles;
+        statistics::Vector iqAdmissionBlocked, iqIssuedOps;
         /** Stat for number of integer instructions issued. */
         statistics::Scalar intInstsIssued;
         /** Stat for number of floating point instructions issued. */

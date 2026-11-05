@@ -184,9 +184,14 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     bool Dirty, default="false",   desc="data is dirty";
     int pendingAcks, default="0", desc="number of pending acks";
     bool isLoadLinked, default="false", desc="Set if it was caused by a Load-Linked";
+    int ServiceSource, default="0", desc="Actual data supply source for this fill";
+    int ServiceL2Outcome, default="0", desc="L2 lookup outcome for this fill";
+    int ServiceL3Outcome, default="0", desc="LLC lookup outcome for this fill";
+    bool SourceReliable, default="true", desc="Fill provenance not invalidated";
   }
 
   structure(TBETable, external="yes") {
+    bool areNSlotsAvailable(int n, Tick current_time);
     TBE lookup(Addr);
     void allocate(Addr);
     void deallocate(Addr);
@@ -374,6 +379,21 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   in_port(optionalQueue_in, RubyRequest, prefetchQueue, desc="...", rank = 2) {
     if (optionalQueue_in.isReady(clockEdge())) {
       peek(optionalQueue_in, RubyRequest) {
+        if (in_msg.Type != RubyRequestType:Store_Prepare &&
+            (mandatoryQueue.isReady(clockEdge()) ||
+             TBEs.isPresent(in_msg.LineAddress) ||
+             !TBEs.areNSlotsAvailable(1, clockEdge()) ||
+             (in_msg.Type != RubyRequestType:IFETCH &&
+              !Dcache.canAllocateDataFill()))) {
+          prefetcher.prefetchDropped(in_msg.LineAddress);
+          optionalQueue_in.dequeue(clockEdge());
+        } else if (in_msg.Type != RubyRequestType:IFETCH &&
+            getState(TBEs[in_msg.LineAddress],
+                     getDCacheEntry(in_msg.LineAddress), in_msg.LineAddress) == State:I &&
+            !Dcache.canAllocateDataFill()) {
+          Dcache.recordFillBlocked();
+          optionalQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
+        } else {
         // first check for valid address
         MachineID mid := mapAddressToMachine(in_msg.LineAddress, MachineType:Directory);
         NodeID nid := machineIDToNodeID(mid);
@@ -420,11 +440,15 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
           } else {
             // No room in the L0-I, so we need to make room in the L0-I
             Addr addr := Icache.cacheProbe(in_msg.LineAddress);
-            check_on_cache_probe(optionalQueue_in, addr);
-
-            trigger(Event:PF_L0_Replacement, addr,
-                    getICacheEntry(addr),
-                    TBEs[addr]);
+            if (sequencer.isBlockedLine(addr)) {
+              prefetcher.prefetchDropped(in_msg.LineAddress);
+              optionalQueue_in.dequeue(clockEdge());
+            } else {
+              check_on_cache_probe(optionalQueue_in, addr);
+              trigger(Event:PF_L0_Replacement, addr,
+                      getICacheEntry(addr),
+                      TBEs[addr]);
+            }
           }
         } else {
           // Data prefetch
@@ -457,12 +481,21 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
           } else {
             // No room in the L0-D, so we need to make room in the L0-D
             Addr addr := Dcache.cacheProbe(in_msg.LineAddress);
-            check_on_cache_probe(optionalQueue_in, addr);
-
-            trigger(Event:PF_L0_Replacement, addr,
-                    getDCacheEntry(addr),
-                    TBEs[addr]);
+            if (sequencer.isBlockedLine(addr)) {
+              if (in_msg.Type == RubyRequestType:Store_Prepare) {
+                optionalQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
+              } else {
+                prefetcher.prefetchDropped(in_msg.LineAddress);
+                optionalQueue_in.dequeue(clockEdge());
+              }
+            } else {
+              check_on_cache_probe(optionalQueue_in, addr);
+              trigger(Event:PF_L0_Replacement, addr,
+                      getDCacheEntry(addr),
+                      TBEs[addr]);
+            }
           }
+        }
         }
       }
     }
@@ -521,7 +554,16 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
         // Check for data access to blocks in I-cache and ifetchs to blocks in D-cache
 
-        if (in_msg.Type == RubyRequestType:IFETCH) {
+        if (in_msg.Type != RubyRequestType:IFETCH &&
+                   in_msg.Type != RubyRequestType:FLUSH &&
+                   in_msg.Type != RubyRequestType:Store_Conditional &&
+                   getState(TBEs[in_msg.LineAddress],
+                            getDCacheEntry(in_msg.LineAddress),
+                            in_msg.LineAddress) == State:I &&
+                   !Dcache.canAllocateDataFill()) {
+          Dcache.recordDemandFillBlocked();
+          mandatoryQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
+        } else if (in_msg.Type == RubyRequestType:IFETCH) {
           // ** INSTRUCTION ACCESS ***
 
           Entry Icache_entry := getICacheEntry(in_msg.LineAddress);
@@ -622,8 +664,11 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 address, out_msg.Dest);
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TrainPrefetch := in_msg.prefetchTrainingEligible();
         out_msg.FillAuditRole := in_msg.fillAuditRole();
         out_msg.PerfTransactionId := in_msg.perfTransactionId();
+        out_msg.NativeRequest := in_msg.getRequestPtr();
         out_msg.TraceValid := in_msg.traceIdentityValid();
         out_msg.TraceContextId := in_msg.traceContextId();
         out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
@@ -644,8 +689,11 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 address, out_msg.Dest);
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TrainPrefetch := in_msg.prefetchTrainingEligible();
         out_msg.FillAuditRole := in_msg.fillAuditRole();
         out_msg.PerfTransactionId := in_msg.perfTransactionId();
+        out_msg.NativeRequest := in_msg.getRequestPtr();
         out_msg.TraceValid := in_msg.traceIdentityValid();
         out_msg.TraceContextId := in_msg.traceContextId();
         out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
@@ -665,8 +713,11 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 address, out_msg.Dest);
         out_msg.MessageSize := MessageSizeType:Control;
         out_msg.AccessMode := in_msg.AccessMode;
+        out_msg.Prefetch := in_msg.Prefetch;
+        out_msg.TrainPrefetch := in_msg.prefetchTrainingEligible();
         out_msg.FillAuditRole := in_msg.fillAuditRole();
         out_msg.PerfTransactionId := in_msg.perfTransactionId();
+        out_msg.NativeRequest := in_msg.getRequestPtr();
         out_msg.TraceValid := in_msg.traceIdentityValid();
         out_msg.TraceContextId := in_msg.traceContextId();
         out_msg.TraceInstSeqNum := in_msg.traceInstSeqNum();
@@ -742,6 +793,37 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     }
   }
 
+  action(fvi_ackOwnInvalidateDuringFlush, "fvi", desc="Respond to own invalidation while flush is pending") {
+    enqueue(requestNetwork_out, CoherenceMsg, response_latency) {
+      out_msg.addr := address;
+      out_msg.Sender := machineID;
+      out_msg.Dest := createMachineID(MachineType:L1Cache, version);
+      if (is_valid(cache_entry) && cache_entry.Dirty) {
+        out_msg.Class := CoherenceClass:INV_DATA;
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.Dirty := true;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      } else {
+        out_msg.Class := CoherenceClass:INV_ACK;
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+      }
+    }
+    if (is_valid(cache_entry)) {
+      cache_entry.Dirty := false;
+    }
+  }
+
+  action(fin_dropLineDuringAbsentFlush, "fin", desc="Drop any local line invalidated during an absent flush") {
+    if (is_valid(cache_entry)) {
+      if (Dcache.isTagPresent(address)) {
+        Dcache.deallocate(address);
+      } else {
+        Icache.deallocate(address);
+      }
+      unset_cache_entry();
+    }
+  }
+
   action(forward_eviction_to_cpu, "\cc", desc="Send eviction information to the processor") {
     if (send_evictions) {
       DPRINTF(RubySlicc, "Sending invalidation for %#x to the CPU\n", address);
@@ -771,7 +853,10 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
     Dcache.setMRU(cache_entry);
-    sequencer.readCallback(address, cache_entry.DataBlk);
+    peek(mandatoryQueue_in, RubyRequest) {
+      sequencer.readRequestCallback(address, cache_entry.DataBlk,
+                                    in_msg.getRequestPtr());
+    }
   }
 
   action(h_ifetch_hit, "hi", desc="Notify sequencer the ifetch completed (cache hit)") {
@@ -788,7 +873,18 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
     Dcache.setMRU(cache_entry);
-    sequencer.readCallback(address, cache_entry.DataBlk, true);
+    assert(is_valid(tbe));
+    if (tbe.SourceReliable) {
+      sequencer.readFillCallback(address, cache_entry.DataBlk,
+          tbe.ServiceSource, tbe.ServiceL2Outcome, tbe.ServiceL3Outcome);
+    } else {
+      sequencer.readFillCallback(address, cache_entry.DataBlk, 0, 0, 0);
+    }
+  }
+
+  action(hx_load_stale, "hxds", desc="Complete a stale data fill without inferred source") {
+    assert(is_valid(cache_entry));
+    sequencer.readFillCallback(address, cache_entry.DataBlk, 0, 0, 0);
   }
 
   // The action name uses a counterintuitive _hit prefix when it is only
@@ -801,12 +897,19 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     sequencer.readCallback(address, cache_entry.DataBlk, true);
   }
 
+  action(hx_ifetch_stale, "hxs", desc="Return stale code without reusable template permission") {
+    assert(is_valid(cache_entry));
+    Icache.setMRU(cache_entry);
+    sequencer.readCallbackStale(address, cache_entry.DataBlk);
+  }
+
   action(hh_store_hit, "\h", desc="Notify sequencer that store completed (cache hit)") {
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
-    Dcache.setMRU(cache_entry);
-    sequencer.writeCallback(address, cache_entry.DataBlk);
-    cache_entry.Dirty := true;
+    if (sequencer.writeCallback(address, cache_entry.DataBlk)) {
+      Dcache.setMRU(cache_entry);
+      cache_entry.Dirty := true;
+    }
   }
 
   // The action name uses a counterintuitive _hit prefix when it is only
@@ -815,13 +918,19 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   action(hhx_store_hit, "\hx", desc="Notify sequencer that store completed (cache miss)") {
     assert(is_valid(cache_entry));
     DPRINTF(RubySlicc, "%s\n", cache_entry.DataBlk);
-    Dcache.setMRU(cache_entry);
-    sequencer.writeCallback(address, cache_entry.DataBlk, true);
-    cache_entry.Dirty := true;
+    if (sequencer.writeCallback(address, cache_entry.DataBlk, true)) {
+      Dcache.setMRU(cache_entry);
+      cache_entry.Dirty := true;
+    }
   }
 
   action(f_flush_complete, "fcm", desc="Notify sequencer that flush completed") {
-    sequencer.writeCallback(address, cache_entry.DataBlk);
+    // The flush may have started in I, in which case no cache entry exists.
+    // Both flush paths own a TBE until after this callback.
+    assert(is_valid(tbe));
+    // A flush invalidates the line; later same-line stores must be reissued
+    // after it completes instead of modifying the soon-to-be-discarded data.
+    sequencer.writeUniqueCallback(address, tbe.DataBlk);
   }
 
   action(i_allocateTBE, "i", desc="Allocate TBE (number of invalidates=0)") {
@@ -837,6 +946,16 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     check_allocate(TBEs);
     TBEs.allocate(address);
     set_tbe(TBEs[address]);
+  }
+
+  action(fd_allocateDataFill, "fd", desc="Account for an L1 data line fill") {
+    assert(is_valid(tbe));
+    Dcache.allocateDataFill(address, sequencer.hasPendingDemandRead(address));
+  }
+
+  action(fp_allocatePrefetchFill, "fp", desc="Account for a non-demand data fill") {
+    assert(is_valid(tbe));
+    Dcache.allocateDataFill(address, false);
   }
 
   action(k_popMandatoryQueue, "k", desc="Pop mandatory queue") {
@@ -860,10 +979,19 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     unset_tbe();
   }
 
+  action(fr_finishDataFill, "fr", desc="Release completed L1 data fill") {
+    Dcache.finishDataFill(address);
+  }
+
   action(u_writeDataToCache, "u", desc="Write data to cache") {
     peek(messgeBuffer_in, CoherenceMsg) {
       assert(is_valid(cache_entry));
+      assert(is_valid(tbe));
       cache_entry.DataBlk := in_msg.DataBlk;
+      tbe.ServiceSource := in_msg.ServiceSource;
+      tbe.ServiceL2Outcome := in_msg.ServiceL2Outcome;
+      tbe.ServiceL3Outcome := in_msg.ServiceL3Outcome;
+      Dcache.markDataFillReady(address);
     }
   }
 
@@ -909,6 +1037,12 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     wakeUpAllBuffers(address);
   }
 
+  action(su_markSourceUnreliable, "su", desc="Invalidate in-flight fill provenance") {
+    if (is_valid(tbe)) {
+      tbe.SourceReliable := false;
+    }
+  }
+
   action(uu_profileInstMiss, "\ui", desc="Profile the demand miss") {
     Icache.profileDemandMiss();
   }
@@ -920,7 +1054,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   action(uu_profileDataMiss, "\ud", desc="Profile the demand miss") {
     Dcache.profileDemandMiss();
     peek(mandatoryQueue_in, RubyRequest) {
-      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
+      sequencer.registerReadFill(in_msg.getRequestPtr(), false, true);
+      nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
           in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 1);
     }
   }
@@ -928,15 +1063,30 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   action(uu_profileDataHit, "\udh", desc="Profile the demand hit") {
     Dcache.profileDemandHit();
     peek(mandatoryQueue_in, RubyRequest) {
-      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
+      nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
           in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 0);
+    }
+  }
+
+  action(uu_profileDataFillFollower, "\udf", desc="Demand load joined an in-flight data fill") {
+    Dcache.profileDemandMiss();
+    Dcache.observeDataFillDemandRead(address);
+    peek(mandatoryQueue_in, RubyRequest) {
+      sequencer.registerReadFill(in_msg.getRequestPtr(), true, true);
+      nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
+          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 3);
     }
   }
 
   action(uu_profileDataUpgrade, "\udu", desc="Profile permission upgrade") {
     Dcache.profileDemandMiss();
     peek(mandatoryQueue_in, RubyRequest) {
-      taotraceCacheOutcomeByIdentity(in_msg.traceIdentityValid(),
+      // A shared-state Load-Linked waits for the upgrade response through
+      // readFillCallback, although the permission upgrade owns no data fill.
+      // It owns no fill entry; even if invalidated during the upgrade, its
+      // service source stays unknown. The registration ignores stores.
+      sequencer.registerReadFill(in_msg.getRequestPtr(), false, false);
+      nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
           in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 2);
     }
   }
@@ -1011,6 +1161,11 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   action(pq_popPrefetchQueue, "\pq", desc="Pop the prefetch request queue") {
+    peek(optionalQueue_in, RubyRequest) {
+      if (in_msg.Type != RubyRequestType:Store_Prepare) {
+        prefetcher.prefetchDequeued(in_msg.LineAddress);
+      }
+    }
     optionalQueue_in.dequeue(clockEdge());
   }
 
@@ -1025,8 +1180,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   action(po_observeMiss, "\po", desc="Inform the prefetcher about a cache miss") {
     peek(mandatoryQueue_in, RubyRequest) {
-      if (enable_prefetch) {
-        prefetcher.observeMiss(in_msg.LineAddress, in_msg.Type);
+      if (enable_prefetch && in_msg.Type == RubyRequestType:LD) {
+        prefetcher.observeDataMiss(in_msg.getRequestPtr());
       }
     }
   }
@@ -1035,6 +1190,14 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
          desc="Inform the prefetcher about a cache miss with in-flight prefetch") {
     peek(mandatoryQueue_in, RubyRequest) {
       prefetcher.observePfMiss(in_msg.LineAddress);
+    }
+  }
+
+  action(pd_observeDataAccess, "pd", desc="Train the per-PC data prefetcher") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      if (enable_prefetch && in_msg.Type == RubyRequestType:LD) {
+        prefetcher.observeDataAccess(in_msg.getRequestPtr());
+      }
     }
   }
 
@@ -1071,31 +1234,73 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   //*****************************************************
 
   // Transitions for Load/Store/Replacement/WriteBack from transient states
-  transition({Inst_IS, IS, IM, SM, I_F, V_F}, {Load, Ifetch, Store, L0_Replacement, Load_Linked}) {
+  transition({Inst_IS, IM, SM, I_F, V_F}, {Load, Ifetch, Store, L0_Replacement, Load_Linked}) {
     z_stallAndWaitMandatoryQueue;
+  }
+
+  transition(IS, {Ifetch, Store, L0_Replacement, Load_Linked}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition(IS, Load) {
+    uu_profileDataFillFollower;
+    pd_observeDataAccess;
+    k_popMandatoryQueue;
   }
 
   transition({LLSC_E, LLSC_M}, L0_Replacement) {
     z_stallAndWaitMandatoryQueue;
   }
 
-  transition({LLSC_E, LLSC_M, I_F, V_F}, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR, InvOwn, InvElse}) {
+  transition({LLSC_E, LLSC_M}, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR, InvOwn, InvElse}) {
     z_stallAndWaitMessageBufferQueue;
   }
 
+  transition(I_F, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR, InvElse}) {
+    z_stallAndWaitMessageBufferQueue;
+  }
+
+  // L1 may already be waiting for this acknowledgement before it can
+  // service our flush. I_F has no local data-cache copy, but an I-cache
+  // entry can still be present and must be invalidated if so.
+  transition(I_F, InvOwn) {
+    forward_eviction_to_cpu;
+    fvi_ackOwnInvalidateDuringFlush;
+    fin_dropLineDuringAbsentFlush;
+    l_popRequestQueue;
+  }
+
+  transition(V_F, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR, InvElse}) {
+    z_stallAndWaitMessageBufferQueue;
+  }
+
+  transition(V_F, InvOwn) {
+    fvi_ackOwnInvalidateDuringFlush;
+    l_popRequestQueue;
+  }
+
   // Transitions from Idle
+  // A completed flush can leave an invalid tagged victim selected by a
+  // concurrent replacement. It has no permissions or data to write back.
+  transition(I, L0_Replacement) {
+    ff_deallocateCacheBlock;
+  }
+
   transition(I, Load, IS) {
     oo_allocateDCacheBlock;
     i_allocateTBE;
+    fd_allocateDataFill;
     a_issueGETS;
     uu_profileDataMiss;
     po_observeMiss;
+    pd_observeDataAccess;
     k_popMandatoryQueue;
   }
 
   transition(I, Load_Linked, IS) {
     oo_allocateDCacheBlock;
     i_allocateTBE;
+    fd_allocateDataFill;
     ll_markLoadLinked;
     b_issueGETX;
     uu_profileDataMiss;
@@ -1115,6 +1320,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(I, Store, IM) {
     oo_allocateDCacheBlock;
     i_allocateTBE;
+    fd_allocateDataFill;
     b_issueGETX;
     uu_profileDataMiss;
     po_observeMiss;
@@ -1122,12 +1328,14 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition({I, IS, IM, Inst_IS}, {InvOwn, InvElse}) {
+    su_markSourceUnreliable;
     forward_eviction_to_cpu;
     fi_sendInvAck;
     l_popRequestQueue;
   }
 
   transition(SM, {InvOwn, InvElse}, IM) {
+    su_markSourceUnreliable;
     forward_eviction_to_cpu;
     fi_sendInvAck;
     l_popRequestQueue;
@@ -1135,8 +1343,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   // Transitions from Shared
   transition({S,E,M}, Load) {
-    h_load_hit;
+    pd_observeDataAccess;
     uu_profileDataHit;
+    h_load_hit;
     pph_observePfHit;
     k_popMandatoryQueue;
   }
@@ -1164,8 +1373,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(E, Load_Linked, LLSC_E) {
-    h_load_hit;
     uu_profileDataHit;
+    h_load_hit;
     pph_observePfHit;
     ll_scheduleLoadLinkedLockTimeout;
     k_popMandatoryQueue;
@@ -1185,8 +1394,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   // Transitions from Exclusive
   transition({E,M}, Store, M) {
-    hh_store_hit;
     uu_profileDataHit;
+    hh_store_hit;
     pph_observePfHit;
     k_popMandatoryQueue;
   }
@@ -1230,8 +1439,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(M, Load_Linked, LLSC_M) {
-    h_load_hit;
     uu_profileDataHit;
+    h_load_hit;
     pph_observePfHit;
     ll_scheduleLoadLinkedLockTimeout;
     k_popMandatoryQueue;
@@ -1240,6 +1449,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(IS, Data, S) {
     u_writeDataToCache;
     hx_load_hit;
+    fr_finishDataFill;
     s_deallocateTBE;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
@@ -1248,6 +1458,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(IS, Data_Exclusive, E) {
     u_writeDataToCache;
     hx_load_hit;
+    fr_finishDataFill;
     s_deallocateTBE;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
@@ -1256,6 +1467,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(IS, LLSC_Data_Exclusive, LLSC_E) {
     u_writeDataToCache;
     hx_load_hit;
+    fr_finishDataFill;
     s_deallocateTBE;
     ll_scheduleLoadLinkedLockTimeout;
     o_popIncomingResponseQueue;
@@ -1265,7 +1477,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(IS, Data_Stale, I) {
     u_writeDataToCache;
     forward_eviction_to_cpu;
-    hx_load_hit;
+    hx_load_stale;
+    fr_finishDataFill;
     s_deallocateTBE;
     ff_deallocateCacheBlock;
     o_popIncomingResponseQueue;
@@ -1290,7 +1503,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition(Inst_IS, Data_Stale, I) {
     u_writeInstToCache;
-    hx_ifetch_hit;
+    hx_ifetch_stale;
     s_deallocateTBE;
     ff_deallocateCacheBlock;
     o_popIncomingResponseQueue;
@@ -1300,6 +1513,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition({IM,SM}, Data_Exclusive, M) {
     u_writeDataToCache;
     hhx_store_hit;
+    fr_finishDataFill;
     s_deallocateTBE;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
@@ -1308,6 +1522,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition({IM, SM}, LLSC_Data_Exclusive, LLSC_M) {
     u_writeDataToCache;
     hx_load_hit;
+    fr_finishDataFill;
     s_deallocateTBE;
     ll_scheduleLoadLinkedLockTimeout;
     o_popIncomingResponseQueue;
@@ -1356,6 +1571,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(I, Store_Prepare, SP_IE) {
     oo_allocateDCacheBlock;
     i_allocateTBE;
+    fp_allocatePrefetchFill;
     pb_issuePfGETX;
     pq_popPrefetchQueue;
   }
@@ -1363,13 +1579,15 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(I, PF_Load, PF_IS) {
     oo_allocateDCacheBlock;
     i_allocateTBE;
+    fp_allocatePrefetchFill;
     pa_issuePfGETS;
     pq_popPrefetchQueue;
   }
 
   transition(PF_IS, Load, IS) {
-    uu_profileDataMiss;
+    uu_profileDataFillFollower;
     ppm_observePfMiss;
+    pd_observeDataAccess;
     k_popMandatoryQueue;
   }
 
@@ -1389,6 +1607,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   transition(I, PF_Store, PF_IE) {
     oo_allocateDCacheBlock;
     i_allocateTBE;
+    fp_allocatePrefetchFill;
     pb_issuePfGETX;
     pq_popPrefetchQueue;
   }
@@ -1406,12 +1625,14 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition({PF_Inst_IS, PF_IS, PF_IE, SP_IE}, {InvOwn, InvElse}) {
+    su_markSourceUnreliable;
     fi_sendInvAck;
     l_popRequestQueue;
   }
 
   transition(PF_IS, Data, S) {
     u_writeDataToCache;
+    fr_finishDataFill;
     s_deallocateTBE;
     mp_markPrefetched;
     o_popIncomingResponseQueue;
@@ -1420,6 +1641,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition(PF_IS, Data_Exclusive, E) {
     u_writeDataToCache;
+    fr_finishDataFill;
     s_deallocateTBE;
     mp_markPrefetched;
     o_popIncomingResponseQueue;
@@ -1428,6 +1650,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition(PF_IS, Data_Stale, I) {
     u_writeDataToCache;
+    fr_finishDataFill;
     s_deallocateTBE;
     mp_markPrefetched;
     ff_deallocateCacheBlock;
@@ -1453,6 +1676,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition(PF_IE, Data_Exclusive, E) {
     u_writeDataToCache;
+    fr_finishDataFill;
     s_deallocateTBE;
     mp_markPrefetched;
     o_popIncomingResponseQueue;
@@ -1461,6 +1685,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition(SP_IE, Data_Exclusive, E) {
     u_writeDataToCache;
+    fr_finishDataFill;
     s_deallocateTBE;
     sp_completeStorePrepare;
     o_popIncomingResponseQueue;
@@ -1479,8 +1704,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   // Transitions from LLSC_E and LLSC_M
 
   transition({LLSC_E, LLSC_M}, {Load, Load_Linked}) {
-    h_load_hit;
     uu_profileDataHit;
+    h_load_hit;
     pph_observePfHit;
     k_popMandatoryQueue;
   }
@@ -1493,8 +1718,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition({LLSC_E, LLSC_M}, Store, LLSC_M) {
-    hh_store_hit;
     uu_profileDataHit;
+    hh_store_hit;
     pph_observePfHit;
     k_popMandatoryQueue;
   }

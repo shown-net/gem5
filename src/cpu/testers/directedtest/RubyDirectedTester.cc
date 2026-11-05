@@ -99,6 +99,7 @@ RubyDirectedTester::getPort(const std::string &if_name, PortID idx)
 bool
 RubyDirectedTester::CpuPort::recvTimingResp(PacketPtr pkt)
 {
+    tester->generator->checkResponse(id, pkt);
     tester->hitCallback(id, pkt->getAddr());
 
     //

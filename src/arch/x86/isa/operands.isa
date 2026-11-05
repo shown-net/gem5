@@ -140,6 +140,7 @@ def operands {{
         'SrcReg2':       IntReg('src2', 2),
         'PSrcReg2':      PickedReg('src2', 2),
         'SPSrcReg2':     SignedPickedReg('src2', 2),
+        'SrcReg3':       IntReg('src3', 3),
         'Index':         IntReg('index', 3),
         'Base':          IntReg('base', 4),
         'DestReg':       IntReg('dest', 5),
@@ -280,6 +281,7 @@ def operands {{
         # Operands to access specific control registers directly.
         'EferOp':        SquashCReg('X86ISA::misc_reg::Efer', 200),
         'CR4Op':         ControlReg('X86ISA::misc_reg::Cr4', 201),
+        'CR3Op':         ControlReg('X86ISA::misc_reg::Cr3', 214),
         'DR7Op':         ControlReg('X86ISA::misc_reg::Dr7', 202),
         'LDTRBase':      ControlReg('X86ISA::misc_reg::TslBase', 203),
         'LDTRLimit':     ControlReg('X86ISA::misc_reg::TslLimit', 204),

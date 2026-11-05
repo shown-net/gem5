@@ -70,6 +70,12 @@ namespace gem5
  */
 class ExecContext
 {
+  private:
+    Addr splitStoreAddress = 0;
+    unsigned splitStoreSize = 0;
+    Request::Flags splitStoreFlags = 0;
+    bool splitStoreAddressValid = false;
+
   public:
     virtual ~ExecContext() = default;
 
@@ -158,6 +164,29 @@ class ExecContext
     virtual Fault writeMem(uint8_t *data, unsigned int size, Addr addr,
                            Request::Flags flags, uint64_t *res,
                            const std::vector<bool>& byte_enable) = 0;
+
+    virtual Fault
+    initiateStoreAddress(Addr addr, unsigned size, Request::Flags flags)
+    {
+        splitStoreAddress = addr;
+        splitStoreSize = size;
+        splitStoreFlags = flags;
+        splitStoreAddressValid = true;
+        // Sequential contexts perform the actual translation and write when
+        // the following store-data operation executes. The first micro-op is
+        // delayed-commit, so a fault still belongs to the same x86 macro-op.
+        return NoFault;
+    }
+
+    virtual Fault
+    writeStoreData(uint8_t *data, unsigned size)
+    {
+        panic_if(!splitStoreAddressValid || size != splitStoreSize,
+                 "Store data has no matching address");
+        splitStoreAddressValid = false;
+        return writeMem(data, size, splitStoreAddress, splitStoreFlags,
+                        nullptr, std::vector<bool>(size, true));
+    }
 
     /**
      * For atomic-mode contexts, perform an atomic AMO (a.k.a., Atomic

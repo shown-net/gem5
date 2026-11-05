@@ -37,6 +37,8 @@ microcode = """
 def macroop POP_R {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
+    .stack_reg_allocation
+    .stack_pop_direct
 
     ld t1, ss, [1, t0, rsp], addressSize=ssz
     addi rsp, rsp, dsz, dataSize=ssz
@@ -76,8 +78,10 @@ def macroop POP_REAL_S {
 def macroop PUSH_R {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
+    .stack_reg_allocation
 
-    st reg, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedata reg
     subi rsp, rsp, dsz, dataSize=ssz
 };
 
@@ -95,7 +99,8 @@ def macroop PUSH_M {
     .adjust_env oszIn64Override
 
     ld t1, seg, sib, disp
-    st t1, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedata t1
     subi rsp, rsp, dsz, dataSize=ssz
 };
 
@@ -103,9 +108,9 @@ def macroop PUSH_P {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
 
-    rdip t7
-    ld t1, seg, riprel, disp
-    st t1, ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    ldrip t1, seg, riprel, disp
+    sta ss, [1, t0, rsp], "-env.dataSize", addressSize=ssz
+    storedata t1
     subi rsp, rsp, dsz, dataSize=ssz
 };
 

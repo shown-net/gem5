@@ -26,7 +26,8 @@ MarkerPcTrace::initializeTrace()
 void
 MarkerPcTrace::append(Addr pc, Tick commitTick, int64_t fetchTick,
                       int32_t dispatchTick, int32_t issueTick,
-                      int32_t completeTick)
+                      int32_t completeTick, int64_t dataReturnTick,
+                      int64_t wakeTick)
 {
     batch->add_pc(pc);
     batch->add_commit_tick(commitTick);
@@ -34,6 +35,8 @@ MarkerPcTrace::append(Addr pc, Tick commitTick, int64_t fetchTick,
     batch->add_dispatch_from_fetch(dispatchTick);
     batch->add_issue_from_fetch(issueTick);
     batch->add_complete_from_fetch(completeTick);
+    batch->add_data_return_tick(dataReturnTick);
+    batch->add_wake_tick(wakeTick);
     if (batch->pc_size() >= BatchSize)
         flush();
 }

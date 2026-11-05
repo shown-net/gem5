@@ -136,6 +136,7 @@ def macroop IMUL_R_R
 def macroop IMUL_R_M
 {
     .low_result_mul
+    .microfused_load
     ld t1, seg, sib, disp
     mul1s reg, t1, flags=(CF,OF)
     mulel reg
@@ -144,8 +145,9 @@ def macroop IMUL_R_M
 
 def macroop IMUL_R_P
 {
-    rdip t7
-    ld t1, seg, riprel, disp
+    .low_result_mul
+    .microfused_load
+    ldrip t1, seg, riprel, disp
     mul1s reg, t1, flags=(CF,OF)
     mulel reg
     muleh t0
@@ -167,6 +169,7 @@ def macroop IMUL_R_R_I
 def macroop IMUL_R_M_I
 {
     .low_result_mul
+    .microfused_load
     limm t1, imm
     ld t2, seg, sib, disp
     mul1s t2, t1, flags=(OF,CF)
@@ -176,9 +179,10 @@ def macroop IMUL_R_M_I
 
 def macroop IMUL_R_P_I
 {
-    rdip t7
+    .low_result_mul
+    .microfused_load
     limm t1, imm
-    ld t2, seg, riprel, disp
+    ldrip t2, seg, riprel, disp
     mul1s t2, t1, flags=(OF,CF)
     mulel reg
     muleh t0

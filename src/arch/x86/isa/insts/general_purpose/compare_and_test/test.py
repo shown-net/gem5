@@ -36,39 +36,39 @@
 microcode = """
 def macroop TEST_M_R
 {
+    .microfused_load
     ld t1, seg, sib, disp
-    and t0, t1, reg, flags=(OF, SF, ZF, PF, CF, AF)
+    testf t1, reg, flags=(OF, SF, ZF, PF, CF, AF)
 };
 
 def macroop TEST_P_R
 {
+    .microfused_load
     ldrip t1, seg, riprel, disp
-    and t0, t1, reg, flags=(OF, SF, ZF, PF, CF, AF)
+    testf t1, reg, flags=(OF, SF, ZF, PF, CF, AF)
 };
 
 def macroop TEST_R_R
 {
-    and t0, reg, regm, flags=(OF, SF, ZF, PF, CF, AF)
+    testf reg, regm, flags=(OF, SF, ZF, PF, CF, AF)
 };
 
 def macroop TEST_M_I
 {
+    .microfused_load
     ld t1, seg, sib, disp
-    limm t2, imm
-    and t0, t1, t2, flags=(OF, SF, ZF, PF, CF, AF)
+    testfi t1, imm, flags=(OF, SF, ZF, PF, CF, AF)
 };
 
 def macroop TEST_P_I
 {
+    .microfused_load
     ldrip t1, seg, riprel, disp
-    limm t2, imm
-    and t0, t1, t2, flags=(OF, SF, ZF, PF, CF, AF)
+    testfi t1, imm, flags=(OF, SF, ZF, PF, CF, AF)
 };
 
 def macroop TEST_R_I
 {
-    .direct_imm
-    limm t1, imm
-    and t0, reg, t1, flags=(OF, SF, ZF, PF, CF, AF)
+    testfi reg, imm, flags=(OF, SF, ZF, PF, CF, AF)
 };
 """

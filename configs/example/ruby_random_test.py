@@ -57,6 +57,16 @@ parser.add_argument(
     default=10,
     help="Wakeup every N cycles",
 )
+parser.add_argument(
+    "--l1-fill-resource",
+    action="store_true",
+    help="Exercise the MESI three-level L1 data-fill resource",
+)
+parser.add_argument("--no-check-flush", action="store_true")
+parser.add_argument("--l1-fill-capacity", type=int)
+parser.add_argument("--l1-request-capacity", type=int, default=128)
+parser.add_argument("--tester-deadlock-threshold", type=int, default=50000)
+parser.add_argument("--tester-seed", type=int)
 
 #
 # Add the ruby specific and protocol specific options
@@ -72,6 +82,10 @@ exec(
 )
 
 args = parser.parse_args()
+if args.tester_seed is not None:
+    from _m5.core import seedRandom
+
+    seedRandom(args.tester_seed)
 
 #
 # Set the default cache size and associativity to be very small to encourage
@@ -96,9 +110,12 @@ if buildEnv["PROTOCOL"] == "MOESI_hammer":
     check_flush = True
 if buildEnv["PROTOCOL"] == "MESI_Three_Level":
     check_flush = True
+if args.no_check_flush:
+    check_flush = False
 
 tester = RubyTester(
     check_flush=check_flush,
+    deadlock_threshold=args.tester_deadlock_threshold,
     checks_to_complete=args.maxloads,
     wakeup_frequency=args.wakeup_freq,
 )
@@ -141,6 +158,13 @@ tester.num_cpus = len(system.ruby._cpu_ports)
 system.ruby.randomization = True
 
 for ruby_port in system.ruby._cpu_ports:
+    if args.l1_fill_resource:
+        if buildEnv["PROTOCOL"] != "MESI_Three_Level":
+            raise ValueError("--l1-fill-resource requires MESI_Three_Level")
+        ruby_port.max_outstanding_requests = args.l1_request_capacity
+        ruby_port.dcache.fill_capacity = 16
+    if args.l1_fill_capacity is not None:
+        ruby_port.dcache.fill_capacity = args.l1_fill_capacity
     #
     # Tie the ruby tester ports to the ruby cpu read and write ports
     #

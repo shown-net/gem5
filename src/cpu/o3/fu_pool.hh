@@ -44,10 +44,13 @@
 #include <array>
 #include <bitset>
 #include <list>
+#include <map>
 #include <string>
 #include <vector>
 
+#include "base/statistics.hh"
 #include "cpu/op_class.hh"
+#include "cpu/o3/int_execution.hh"
 #include "params/FUPool.hh"
 #include "sim/sim_object.hh"
 
@@ -69,12 +72,17 @@ namespace o3
  * FU pool would have to be ticked each cycle to update which units became
  * free. This FU pool lets the IEW stage handle freeing units, which frees
  * them as their scheduled execution events complete. This limits units in this
- * model to either have identical issue and op latencies, or 1 cycle issue
- * latencies.
+ * model to retain a non-pipelined unit until completion. Pipelined operations
+ * can additionally constrain their initiation interval independently.
  */
 class FUPool : public SimObject
 {
   private:
+    ExecutionPorts *executionPorts = nullptr;
+    ResultForwarding *forwarding = nullptr;
+    std::array<IntExecutionResource *, 6> integerResources{};
+    std::array<IntegerALU *, 12> integerALUs{};
+    bool individualALUs = false;
     /** Maximum op execution latencies, per op class. */
     std::array<Cycles, Num_OpClasses> maxOpLatencies;
     /** Whether op is pipelined or not. */
@@ -85,6 +93,17 @@ class FUPool : public SimObject
 
     /** Bitvector listing which FUs are busy. */
     std::vector<bool> unitBusy;
+    std::vector<int> pairedUnit;
+    std::vector<std::array<Cycles, Num_OpClasses>> issueIntervals;
+    std::vector<std::array<Cycles, Num_OpClasses>> nextIssue;
+    std::array<uint16_t, Num_OpClasses> capablePorts{};
+    std::array<unsigned, 12> pendingPortLoads{};
+    std::array<unsigned, 12> allocationLoadSnapshot{};
+    std::map<uint16_t, unsigned> batchMaskUses;
+    Cycles bindingCycle = Cycles(0);
+    bool haveBindingCycle = false;
+    const std::vector<unsigned> storeDataPorts;
+    const std::vector<unsigned> branchPorts;
 
     /** List of units to be freed at the end of this cycle. */
     std::vector<int> unitsToBeFreed;
@@ -131,10 +150,28 @@ class FUPool : public SimObject
     /** Functional units. */
     std::vector<FuncUnit *> funcUnits;
 
+    struct PoolStats : public statistics::Group
+    {
+        explicit PoolStats(FUPool *pool);
+        statistics::Vector issuedByUnit;
+    } stats;
+
   public:
     typedef FUPoolParams Params;
     /** Constructs a FU pool. */
     FUPool(const Params &p);
+    void bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
+                              IntExecutionResource *alu, IntExecutionResource *shift,
+                              IntExecutionResource *slow, IntExecutionResource *bm,
+                              IntExecutionResource *branch,
+                              const std::vector<IntegerALU *> &alus);
+    bool usesIntegerResources(const DynInstPtr &inst) const;
+    bool issueInteger(CPU *cpu, const DynInstPtr &inst,
+                      std::function<void()> available, std::function<void()> complete);
+    void bindPort(const DynInstPtr &inst, Cycles cycle);
+    void startAllocationCycle(Cycles cycle);
+    void releasePortBinding(const DynInstPtr &inst);
+    uint16_t portMask(const DynInstPtr &inst) const;
     ~FUPool();
 
     /**
@@ -175,7 +212,8 @@ class FUPool : public SimObject
      * capability, NoFreeFU if there is no free FU, and the FU's index
      * otherwise.
      */
-    int getUnit(OpClass capability);
+    int getUnit(CPU *cpu, ThreadID tid, OpClass capability, Cycles cycle,
+                bool store = false, bool branch = false, int bound_port = -1);
 
     /** Frees a FU at the end of this cycle. */
     void freeUnitNextCycle(int fu_idx);
@@ -203,7 +241,7 @@ class FUPool : public SimObject
     bool isDrained() const;
 
     /** Takes over from another CPU's thread. */
-    void takeOverFrom() {};
+    void takeOverFrom();
 };
 
 } // namespace o3

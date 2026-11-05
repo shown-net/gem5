@@ -48,6 +48,7 @@
 #include "arch/generic/pcstate.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
+#include <vector>
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/limits.hh"
 #include "sim/faults.hh"
@@ -90,7 +91,8 @@ struct IEWStruct
 {
     int size;
 
-    DynInstPtr insts[MaxWidth];
+    // Completion notifications are not a shared physical writeback port.
+    std::vector<DynInstPtr> insts;
     DynInstPtr mispredictInst[MaxThreads];
     Addr mispredPC[MaxThreads];
     InstSeqNum squashedSeqNum[MaxThreads];
@@ -155,7 +157,10 @@ struct TimeStruct
         unsigned iqCount = 0;
         unsigned ldstqCount = 0;
 
+        // Allocation units forwarded by IEW; fused followers cost zero.
         unsigned dispatched = 0;
+        unsigned noIQDispatched = 0;
+        unsigned extraIQDispatched = 0;
         bool usedIQ = false;
         bool usedLSQ = false;
     };
@@ -256,6 +261,8 @@ removeCommThreadInsts(ThreadID tid, CommStruct& comm_struct)
     std::fill(last, comm_struct.insts + comm_struct.size, nullptr);
     comm_struct.size = last - comm_struct.insts;
 }
+
+void removeCommThreadInsts(ThreadID tid, IEWStruct &comm);
 
 } // namespace o3
 } // namespace gem5

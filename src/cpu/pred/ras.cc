@@ -72,7 +72,7 @@ ReturnAddrStack::AddrStack::reset()
 const PCStateBase *
 ReturnAddrStack::AddrStack::top()
 {
-    return addrStack[tos].get();
+    return usedEntries ? addrStack[tos].get() : nullptr;
 }
 
 
@@ -94,9 +94,8 @@ ReturnAddrStack::AddrStack::pop()
 {
     if (usedEntries > 0) {
         --usedEntries;
+        decrTos();
     }
-
-    decrTos();
 }
 
 void
@@ -154,11 +153,17 @@ ReturnAddrStack::reset()
 }
 
 void
-ReturnAddrStack::makeRASHistory(void* &ras_history)
+ReturnAddrStack::makeRASHistory(ThreadID tid, void* &ras_history)
 {
     RASHistory* history = new RASHistory;
     history->pushed = false;
     history->poped = false;
+    auto &stack = addrStacks[tid];
+    history->tos = stack.tos;
+    history->usedEntries = stack.usedEntries;
+    history->entries.resize(stack.addrStack.size());
+    for (unsigned i = 0; i < stack.addrStack.size(); ++i)
+        set(history->entries[i], stack.addrStack[i].get());
     ras_history = static_cast<void*>(history);
 }
 
@@ -169,7 +174,7 @@ ReturnAddrStack::push(ThreadID tid, const PCStateBase &pc,
     // Note: The RAS may be both popped and pushed to
     //       support coroutines.
     if (ras_history == nullptr) {
-        makeRASHistory(ras_history);
+        makeRASHistory(tid, ras_history);
     }
     RASHistory *history = static_cast<RASHistory*>(ras_history);
     stats.pushes++;
@@ -190,16 +195,14 @@ ReturnAddrStack::pop(ThreadID tid, void * &ras_history)
     // Note: The RAS may be both popped and pushed to
     //       support coroutines.
     if (ras_history == nullptr) {
-        makeRASHistory(ras_history);
+        makeRASHistory(tid, ras_history);
     }
     RASHistory *history = static_cast<RASHistory*>(ras_history);
     stats.pops++;
 
     history->poped = true;
-    history->tos = addrStacks[tid].tos;
-
-
     set(history->ras_entry, addrStacks[tid].top());
+    if (!history->ras_entry) ++stats.emptyPops;
     // Pop the top of stack
     addrStacks[tid].pop();
 
@@ -224,24 +227,11 @@ ReturnAddrStack::squash(ThreadID tid, void * &ras_history)
 
     RASHistory *history = static_cast<RASHistory*>(ras_history);
 
-    if (history->pushed) {
-        stats.pops++;
-        addrStacks[tid].pop();
-
-        DPRINTF(RAS, "RAS::%s Incorrect push. Pop RAS[%i]. "
-                "Entries used: %i, tid:%i\n", __func__,
-                addrStacks[tid].tos, addrStacks[tid].usedEntries, tid);
-    }
-
-    if (history->poped) {
-        stats.pushes++;
-        addrStacks[tid].restore(history->tos, history->ras_entry.get());
-        DPRINTF(RAS, "RAS::%s Incorrect pop. Restore to: RAS[%i]:%#x. "
-            "Entries used: %i, tid:%i\n", __func__,
-            history->tos,  (history->ras_entry.get() != nullptr)
-            ? history->ras_entry->instAddr() : 0,
-            addrStacks[tid].usedEntries, tid);
-    }
+    auto &stack = addrStacks[tid];
+    stack.tos = history->tos;
+    stack.usedEntries = history->usedEntries;
+    for (unsigned i = 0; i < stack.addrStack.size(); ++i)
+        set(stack.addrStack[i], history->entries[i].get());
     // DPRINTF(RAS, "[%s]\n", addrStacks[tid].toString(10));
     delete history;
     ras_history = nullptr;
@@ -311,6 +301,8 @@ ReturnAddrStack::ReturnAddrStackStats::ReturnAddrStackStats(
                "Number of times a PC was pushed onto the RAS"),
       ADD_STAT(pops, statistics::units::Count::get(),
                "Number of times a PC was poped from the RAS"),
+      ADD_STAT(emptyPops, statistics::units::Count::get(),
+               "RAS pop operations with no target, including corrections"),
       ADD_STAT(squashes, statistics::units::Count::get(),
                "Number of times the stack operation was squashed due to "
                "wrong speculation."),

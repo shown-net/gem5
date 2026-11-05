@@ -41,6 +41,7 @@
 
 #include "mem/ruby/structures/RubyPrefetcher.hh"
 
+#include <algorithm>
 #include <cassert>
 
 #include "base/bitfield.hh"
@@ -66,6 +67,8 @@ RubyPrefetcher::RubyPrefetcher(const Params &p)
     m_block_size_bytes(p.block_size),
     rubyPrefetcherStats(this)
 {
+    ipStrideEnabled = p.ip_stride;
+    queueDedupEnabled = p.queue_dedup;
     assert(m_num_streams > 0);
     assert(m_num_startup_pfs <= MAX_PF_INFLIGHT);
 }
@@ -77,6 +80,12 @@ RubyPrefetcherStats::RubyPrefetcherStats(statistics::Group *parent)
       ADD_STAT(numAllocatedStreams, "Number of streams allocated for "
                                     "prefetching"),
       ADD_STAT(numPrefetchRequested, "Number of prefetch requests made"),
+      ADD_STAT(numDuplicateCandidates, "Duplicate targets already queued"),
+      ADD_STAT(numDroppedCandidates, "Unadmitted candidates discarded under resource pressure"),
+      ADD_STAT(numStreamCandidates, "Stream candidates submitted"),
+      ADD_STAT(numIpCandidates, "Per-PC stride candidates submitted"),
+      ADD_STAT(numIpPageStops, "Per-PC stride candidates stopped at a page boundary"),
+      ADD_STAT(numAdjacentCandidates, "Adjacent-line candidates submitted"),
       ADD_STAT(numHits, "Number of prefetched blocks accessed "
                         "(for the first time)"),
       ADD_STAT(numPartialHits, "Number of misses observed for a block being "
@@ -85,6 +94,125 @@ RubyPrefetcherStats::RubyPrefetcherStats(statistics::Group *parent)
       ADD_STAT(numMissedPrefetchedBlocks, "Number of misses for blocks that "
                                           "were prefetched, yet missed")
 {
+}
+
+bool
+RubyPrefetcher::enqueueCandidate(Addr address, const RubyRequestType &type)
+{
+    address = makeLineAddress(address, m_block_size_bits);
+    if (queueDedupEnabled && !queuedPrefetches.insert(address).second) {
+        ++rubyPrefetcherStats.numDuplicateCandidates;
+        return false;
+    }
+    ++rubyPrefetcherStats.numPrefetchRequested;
+    m_controller->enqueuePrefetch(address, type);
+    return true;
+}
+
+void
+RubyPrefetcher::prefetchDequeued(Addr address)
+{
+    queuedPrefetches.erase(makeLineAddress(address, m_block_size_bits));
+}
+
+void
+RubyPrefetcher::prefetchDropped(Addr address)
+{
+    prefetchDequeued(address);
+    ++rubyPrefetcherStats.numDroppedCandidates;
+}
+
+void
+RubyPrefetcher::observeAdjacent(Addr address)
+{
+    const Addr line = makeLineAddress(address, m_block_size_bits);
+    const Addr adjacent = line ^ Addr(m_block_size_bytes);
+    if (pageAddress(line) != pageAddress(adjacent))
+        return;
+    if (enqueueCandidate(adjacent, RubyRequestType_LD))
+        ++rubyPrefetcherStats.numAdjacentCandidates;
+}
+
+void
+RubyPrefetcher::observeDataMiss(RequestPtr req)
+{
+    if (!req || !req->hasPaddr() || req->isUncacheable() ||
+        req->isStrictlyOrdered() || req->isInstFetch() || req->isPrefetch() ||
+        req->isPTWalk() || req->isSecure()) {
+        return;
+    }
+    observeMiss(req->getPaddr(), RubyRequestType_LD);
+}
+
+void
+RubyPrefetcher::observeDataAccess(RequestPtr req)
+{
+    if (!ipStrideEnabled || !req || !req->hasPC() || !req->hasVaddr() ||
+        !req->hasPaddr() || req->isUncacheable() || req->isStrictlyOrdered() ||
+        req->isInstFetch() || req->isPrefetch() || req->isPTWalk() ||
+        req->isSecure()) {
+        return;
+    }
+
+    const Addr line = makeLineAddress(req->getVaddr(), m_block_size_bits);
+    const Addr physical = makeLineAddress(req->getPaddr(), m_block_size_bits);
+    const Addr pc = req->getPC();
+    const ContextID context = req->hasContextId() ?
+        req->contextId() : InvalidContextID;
+    const bool secure = req->isSecure();
+    const size_t set = ((pc >> 2) ^ static_cast<uint64_t>(context)) & 15;
+    PcStrideEntry *entry = nullptr;
+    PcStrideEntry *victim = &pcStrideTable[set * 4];
+    for (size_t way = 0; way < 4; ++way) {
+        auto &candidate = pcStrideTable[set * 4 + way];
+        if (candidate.valid && candidate.pc == pc &&
+            candidate.context == context && candidate.secure == secure) {
+            entry = &candidate;
+            break;
+        }
+        if (!candidate.valid ||
+            (victim->valid && candidate.lastUse < victim->lastUse)) {
+            victim = &candidate;
+        }
+    }
+    if (!entry) {
+        *victim = PcStrideEntry{};
+        victim->valid = true;
+        victim->secure = secure;
+        victim->context = context;
+        victim->pc = pc;
+        victim->lastLine = line;
+        victim->samples = 1;
+        victim->lastUse = ++pcStrideClock;
+        return;
+    }
+    entry->lastUse = ++pcStrideClock;
+    if (line == entry->lastLine)
+        return;
+    if (pageAddress(line) != pageAddress(entry->lastLine)) {
+        entry->lastLine = line;
+        entry->stride = 0;
+        entry->samples = 1;
+        return;
+    }
+
+    const int64_t delta = static_cast<int64_t>(line & ((Addr(1) << pageShift) - 1)) -
+        static_cast<int64_t>(entry->lastLine & ((Addr(1) << pageShift) - 1));
+    entry->samples = delta == entry->stride ?
+        std::min(entry->samples + 1, 4u) : 2;
+    entry->stride = delta;
+    entry->lastLine = line;
+    if (entry->samples < 4)
+        return;
+
+    const int64_t nextOffset = static_cast<int64_t>(line & ((Addr(1) << pageShift) - 1)) + delta;
+    if (nextOffset < 0 || nextOffset >= (int64_t(1) << pageShift)) {
+        ++rubyPrefetcherStats.numIpPageStops;
+        return;
+    }
+    const Addr target = pageAddress(physical) | static_cast<Addr>(nextOffset);
+    if (enqueueCandidate(target, RubyRequestType_LD))
+        ++rubyPrefetcherStats.numIpCandidates;
 }
 
 void
@@ -107,7 +235,6 @@ RubyPrefetcher::observeMiss(Addr address, const RubyRequestType& type)
             } else {
                 // The controller has issued the prefetch request,
                 // but the request for the block arrived earlier.
-                rubyPrefetcherStats.numPartialHits++;
                 observePfMiss(line_addr);
                 return;
             }
@@ -181,11 +308,11 @@ RubyPrefetcher::issueNextPrefetch(Addr address, PrefetchEntry *stream)
     }
 
     // launch next prefetch
-    rubyPrefetcherStats.numPrefetchRequested++;
     stream->m_address = line_addr;
     stream->m_use_time = m_controller->curCycle();
     DPRINTF(RubyPrefetcher, "Requesting prefetch for %#x\n", line_addr);
-    m_controller->enqueuePrefetch(line_addr, stream->m_type);
+    if (enqueueCandidate(line_addr, stream->m_type))
+        ++rubyPrefetcherStats.numStreamCandidates;
 }
 
 uint32_t
@@ -239,9 +366,9 @@ RubyPrefetcher::initializeStream(Addr address, int stride,
         }
 
         // launch prefetch
-        rubyPrefetcherStats.numPrefetchRequested++;
         DPRINTF(RubyPrefetcher, "Requesting prefetch for %#x\n", line_addr);
-        m_controller->enqueuePrefetch(line_addr, m_array[index].m_type);
+        if (enqueueCandidate(line_addr, m_array[index].m_type))
+            ++rubyPrefetcherStats.numStreamCandidates;
     }
 
     // update the address to be the last address prefetched

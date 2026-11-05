@@ -60,6 +60,12 @@ class InvalidateGenerator(DirectedGenerator):
     addr_increment_size = Param.Int(64, "address increment size")
 
 
+class LoadLinkedUpgradeGenerator(DirectedGenerator):
+    type = "LoadLinkedUpgradeGenerator"
+    cxx_header = "cpu/testers/directedtest/LoadLinkedUpgradeGenerator.hh"
+    cxx_class = "gem5::LoadLinkedUpgradeGenerator"
+
+
 class RubyDirectedTester(ClockedObject):
     type = "RubyDirectedTester"
     cxx_header = "cpu/testers/directedtest/RubyDirectedTester.hh"

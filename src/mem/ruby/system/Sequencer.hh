@@ -42,8 +42,10 @@
 #define __MEM_RUBY_SYSTEM_SEQUENCER_HH__
 
 #include <iostream>
+#include <deque>
 #include <list>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "mem/ruby/common/Address.hh"
@@ -60,27 +62,41 @@ namespace gem5
 namespace ruby
 {
 
+// A request and its local observation remain with the Sequencer until Ruby
+// completes it. Coalescing alone does not establish a fill-buffer hit.
 struct SequencerRequest
 {
     PacketPtr pkt;
     RubyRequestType m_type;
     RubyRequestType m_second_type;
     Cycles issue_time;
-    SequencerRequest(PacketPtr _pkt, RubyRequestType _m_type,
-                     RubyRequestType _m_second_type, Cycles _issue_time)
-                : pkt(_pkt), m_type(_m_type), m_second_type(_m_second_type),
-                  issue_time(_issue_time)
+    uint8_t admissionDataSource = 0; // 1: readable L1, 2: pending fill
+    // A request issued independently to the L1 controller owns its own
+    // response.  A read may join a line fill only after the controller has
+    // observed that request, never merely because it shares a line address.
+    bool issuedToL1 = false;
+    bool waitingForDataFill = false;
+    bool dataFillFollower = false;
+    bool dataFillHasServiceSource = false;
+    // The request whose callback supplied a coalesced follower. Observer only.
+    RequestPtr serviceParent;
+    bool serviceParentIsWrite = false;
+
+    SequencerRequest(PacketPtr pkt, RubyRequestType type,
+                     RubyRequestType second_type, Cycles issue_time)
+        : pkt(pkt), m_type(type), m_second_type(second_type),
+          issue_time(issue_time)
     {}
 
     bool functionalWrite(Packet *func_pkt) const
     {
-        // Follow-up on RubyRequest::functionalWrite
-        // This makes sure the hitCallback won't overrite the value we
-        // expect to find
         assert(func_pkt->isWrite());
         return func_pkt->trySatisfyFunctional(pkt);
     }
 };
+
+using SequencerRequestTable =
+    std::unordered_map<Addr, std::list<SequencerRequest>>;
 
 class Sequencer : public RubyPort
 {
@@ -96,12 +112,19 @@ class Sequencer : public RubyPort
     void writeCallbackScFail(Addr address,
                         DataBlock& data);
 
+    /** The L0 controller may make marked stores visible only in this order. */
+    bool isOrderedStoreReady(const RequestPtr &req) const;
+
+    /** A locked RMW line must not be selected as a prefetch victim. */
+    bool isBlockedLine(Addr address) const;
+    bool hasPendingDemandRead(Addr address) const;
+
     // Public Methods
     virtual void wakeup(); // Used only for deadlock detection
     void resetStats() override;
     void collateStats();
 
-    void writeCallback(Addr address,
+    bool writeCallback(Addr address,
                        DataBlock& data,
                        const bool externalHit = false,
                        const MachineType mach = MachineType_NUM,
@@ -123,7 +146,19 @@ class Sequencer : public RubyPort
                       const MachineType mach = MachineType_NUM,
                       const Cycles initialRequestTime = Cycles(0),
                       const Cycles forwardRequestTime = Cycles(0),
-                      const Cycles firstResponseTime = Cycles(0));
+                      const Cycles firstResponseTime = Cycles(0),
+                      const bool code_stale = false);
+    void readCallbackStale(Addr address, DataBlock &data)
+    { readCallback(address, data, true, MachineType_NUM,
+                   Cycles(0), Cycles(0), Cycles(0), true); }
+
+    // MESI_Three_Level data reads have request-local L1 observations.
+    void readRequestCallback(Addr address, DataBlock &data,
+                             const RequestPtr &request);
+    void registerReadFill(const RequestPtr &request, bool follower,
+                          bool has_service_source);
+    void readFillCallback(Addr address, DataBlock &data, int service_source,
+                          int l2_outcome, int l3_outcome);
 
     void atomicCallback(Addr address,
                         DataBlock& data,
@@ -214,7 +249,9 @@ class Sequencer : public RubyPort
     { return m_IncompleteTimes[t]; }
 
   protected:
-    void issueRequest(PacketPtr pkt, RubyRequestType type);
+    void issueReadyLineRequests(Addr address);
+    void issueRequest(PacketPtr pkt, RubyRequestType type,
+                      Cycles overlapped = Cycles(0));
     virtual void hitCallback(SequencerRequest* srequest, DataBlock& data,
                              bool llscSuccess,
                              const MachineType mach, const bool externalHit,
@@ -244,8 +281,15 @@ class Sequencer : public RubyPort
     Sequencer& operator=(const Sequencer& obj);
 
   protected:
-    // RequestTable contains both read and write requests, handles aliasing
-    std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
+    // Retain packets and preserve same-line ordering independently of FBs.
+    SequencerRequestTable m_RequestTable;
+    std::deque<const Request *> m_orderedStores;
+    std::unordered_set<Addr> m_parkedOrderedLines;
+    void wakeParkedOrderedHead();
+    bool tailCanFollow(Addr address) const;
+    bool m_orderedLineValid = false;
+    Cycles m_orderedLineCycle = Cycles(0);
+    Addr m_orderedLine = 0;
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other
     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
@@ -277,6 +321,7 @@ class Sequencer : public RubyPort
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
     int m_store_prepare_outstanding;
+    unsigned m_maxStorePrepareOutstanding;
     bool m_deadlock_check_scheduled;
 
     int m_coreId;
@@ -318,6 +363,26 @@ class Sequencer : public RubyPort
     std::vector<statistics::Histogram *> m_InitialToForwardDelayHist;
     std::vector<statistics::Histogram *> m_ForwardToFirstResponseDelayHist;
     std::vector<statistics::Histogram *> m_FirstResponseToCompletionDelayHist;
+    struct OrderedStoreStats : statistics::Group
+    {
+        statistics::Scalar retries, overlappedCycles, deferredNoWriteCallbacks;
+        statistics::Scalar parked, woken, headRateRetries;
+        explicit OrderedStoreStats(Sequencer *owner);
+    } orderedStoreStats;
+    struct StorePrepareStats : statistics::Group
+    {
+        statistics::Scalar accepted, dropped, completed;
+        statistics::Value outstanding;
+        explicit StorePrepareStats(Sequencer *owner);
+    } storePrepareStats;
+    struct SaturationStats : statistics::Group
+    {
+        statistics::Scalar bufferFullRequests, bufferFullCycles;
+        statistics::Scalar demandDataFullRequests, demandDataFullCycles;
+        explicit SaturationStats(Sequencer *owner);
+    } saturationStats;
+    uint64_t lastBufferFullCycle = uint64_t(-1);
+    uint64_t lastDemandDataFullCycle = uint64_t(-1);
     std::vector<statistics::Counter> m_IncompleteTimes;
 
     EventFunctionWrapper deadlockCheckEvent;

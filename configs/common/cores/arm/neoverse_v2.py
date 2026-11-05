@@ -273,7 +273,6 @@ class NeoverseV2(ArmO3CPU):
     dispatchWidth = 8
     issueWidth = 8
     issueToExecuteDelay = 1
-    wbWidth = 8
     iewToCommitDelay = 1
     commitWidth = 8
     # Uncomment sqaush with for instant squash (restoring checkpoint)

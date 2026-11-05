@@ -269,7 +269,7 @@ ElasticTrace::updateRegDep(const DynInstConstPtr& dyn_inst)
 
     // Loop through the destination registers of this instruction and update
     // the physical register dependency map for last writers to registers.
-    max_regs = dyn_inst->numDestRegs();
+    max_regs = dyn_inst->eliminatedMove ? 0 : dyn_inst->numDestRegs();
     for (int dest_idx = 0; dest_idx < max_regs; dest_idx++) {
         // For data dependency tracking the register must be an int, float or
         // CC register and not a Misc register.

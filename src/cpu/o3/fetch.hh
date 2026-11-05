@@ -42,6 +42,7 @@
 #ifndef __CPU_O3_FETCH_HH__
 #define __CPU_O3_FETCH_HH__
 
+#include <optional>
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"
 #include "base/random.hh"
@@ -50,6 +51,7 @@
 #include "cpu/o3/comm.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/ftq.hh"
+#include "cpu/o3/frontend.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/pc_event.hh"
 #include "cpu/pred/bpred_unit.hh"
@@ -103,6 +105,8 @@ class Fetch
 
         /** Handles doing a retry of a failed fetch. */
         virtual void recvReqRetry();
+        bool isSnooping() const override { return true; }
+        void recvTimingSnoopReq(PacketPtr pkt) override;
     };
 
     class FetchTranslation : public BaseMMU::Translation
@@ -148,7 +152,7 @@ class Fetch
         void
         process()
         {
-            assert(fetch->numInst < fetch->fetchWidth);
+            assert(fetch->frontend || fetch->numInst < fetch->fetchWidth);
             fetch->finishTranslation(fault, req);
         }
 
@@ -227,6 +231,11 @@ class Fetch
 
     /** Sets pointer to time buffer used to communicate to the next stage. */
     void setFetchQueue(TimeBuffer<FetchStruct> *fq_ptr);
+    void setRenameQueue(TimeBuffer<DecodeStruct> *queue)
+    { toRename = queue->getWire(0); }
+    void invalidateTranslations();
+    void invalidateCode(Addr physical_block);
+    void resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next);
 
     /** Sets pointer to branch address calculation stage and FTQ */
     void setBACandFTQPtr(BAC *bac_ptr, FTQ *ftq_ptr);
@@ -366,6 +375,15 @@ class Fetch
     RequestPort &getInstPort() { return icachePort; }
 
   private:
+    void fetchFrontend(bool &status_change);
+    bool emitFrontendRecord(FrontendRecordPtr record);
+    FrontendSource expansionSource = FrontendSource::Mite;
+    std::optional<FrontendTemplate> expansionTemplate;
+    AllocationGroupPtr memoryExpansionGroup;
+    std::vector<FrontendRecordPtr> pendingMemoryExpansion;
+    bool decodeCanReuse = true;
+    bool frontendBatchPending = false;
+    uint64_t requestEpoch[MaxThreads] = {};
     DynInstPtr buildInst(ThreadID tid, StaticInstPtr staticInst,
             StaticInstPtr curMacroop, const PCStateBase &this_pc,
             const PCStateBase &next_pc, bool trace);
@@ -395,6 +413,7 @@ class Fetch
   private:
     /** Pointer to the O3CPU. */
     CPU *cpu;
+    FrontendCoordinator *frontend;
 
     /** Time buffer interface. */
     TimeBuffer<TimeStruct> *timeBuffer;
@@ -417,6 +436,7 @@ class Fetch
     //Might be annoying how this name is different than the queue.
     /** Wire used to write any information heading to decode. */
     TimeBuffer<FetchStruct>::wire toDecode;
+    TimeBuffer<DecodeStruct>::wire toRename;
 
     /** BPredict. */
     BAC *bac;
@@ -510,6 +530,10 @@ class Fetch
     /** Whether or not the fetch buffer data is valid. */
     bool fetchBufferValid[MaxThreads];
 
+    /** Earliest cycle for the next fetch after a coupled BTB prediction. */
+    uint64_t btbReadyCycle[MaxThreads]{};
+    InstSeqNum microcodeControl[MaxThreads]{};
+
     /** Size of instructions. */
     int instSize;
 
@@ -559,6 +583,8 @@ class Fetch
         statistics::Vector status;
         /** Stat for total number of predicted branches. */
         statistics::Scalar predictedBranches;
+        /** Frontend batches which consumed more than one taken target. */
+        statistics::Scalar multiTakenBatches;
         /** Total number of cycles spent in any other state. */
         statistics::Scalar miscStallCycles;
         /** Total number of cycles spent in waiting for drains. */

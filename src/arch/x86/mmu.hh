@@ -56,11 +56,28 @@ class MMU : public BaseMMU
       : BaseMMU(p)
     {}
 
+    void onInstructionCodeInvalidation(std::function<void()> callback)
+    { static_cast<TLB *>(itb)->onCodeInvalidation(std::move(callback)); }
+
     void
-    flushNonGlobal()
+    flushNonGlobal(int pcid = -1)
     {
-        static_cast<TLB*>(itb)->flushNonGlobal();
-        static_cast<TLB*>(dtb)->flushNonGlobal();
+        static_cast<TLB*>(itb)->flushNonGlobal(pcid);
+        static_cast<TLB*>(dtb)->flushNonGlobal(pcid);
+    }
+
+    void
+    contextChanged()
+    {
+        static_cast<TLB *>(itb)->contextChanged();
+        static_cast<TLB *>(dtb)->contextChanged();
+    }
+
+    void
+    invalidatePage(Addr va, uint16_t pcid, bool include_global)
+    {
+        static_cast<TLB *>(itb)->invalidatePage(va, pcid, include_global);
+        static_cast<TLB *>(dtb)->invalidatePage(va, pcid, include_global);
     }
 
     Walker*

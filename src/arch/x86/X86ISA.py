@@ -57,6 +57,9 @@ class X86ISA(BaseISA):
     name_string = Param.String(
         "Fake gem5 x86_64 CPU", "Processor name for CPUID instruction"
     )
+    tsc_frequency = Param.UInt64(
+        2600000000, "Invariant TSC frequency in Hz, independent of CPU clocks"
+    )
 
     # For the functions that return numerical values we use a vector of ints.
     # The order of the values is: EAX, EBX, EDX, ECX.
@@ -73,7 +76,7 @@ class X86ISA(BaseISA):
     #     https://sandpile.org/x86/cpuid.htm
     # 0000_0001h
     FamilyModelStepping = VectorParam.UInt32(
-        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00800209],
+        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00820209],
         "type/family/model/stepping and feature flags",
     )
     # 0000_0004h
@@ -83,8 +86,8 @@ class X86ISA(BaseISA):
     )
     # 0000_0007h
     ExtendedFeatures = VectorParam.UInt32(
-        # FSGSBASE and validated ADCX/ADOX. The partial BMI1 set stays hidden.
-        [0x00000000, 0x01880001, 0x00000000, 0x00000000], "feature flags"
+        # FSGSBASE, INVPCID and ADCX/ADOX. The partial BMI1 set stays hidden.
+        [0x00000000, 0x01880401, 0x00000000, 0x00000000], "feature flags"
     )
     # 0000_000Dh - This uses ECX index, so the last entry must be all zeros
     ExtendedState = VectorParam.UInt32(
@@ -102,7 +105,7 @@ class X86ISA(BaseISA):
     )
     # 8000_0001h
     FamilyModelSteppingBrandFeatures = VectorParam.UInt32(
-        [0x00020F51, 0x00000405, 0xEBD3FBFF, 0x00020001],
+        [0x00020F51, 0x00000405, 0xEFD3FBFF, 0x00020001],
         "family/model/stepping and features flags",
     )
     # 8000_0005h
@@ -117,7 +120,7 @@ class X86ISA(BaseISA):
     )
     # 8000_0007h
     APMInfo = VectorParam.UInt32(
-        [0x80000018, 0x68747541, 0x69746E65, 0x444D4163],
+        [0x00000000, 0x00000000, 0x00000100, 0x00000000],
         "processor feedback capabilities",
     )
     # 8000_0008h

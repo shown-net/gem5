@@ -171,6 +171,12 @@ class RegClassOps
     virtual ~RegClassOps() = default;
     /** Print the name of the register specified in id. */
     virtual std::string regName(const RegId &id) const;
+    /** Resource group for the initial architectural rename mapping. */
+    virtual RegIndex
+    regAllocationGroup(const RegId &id) const
+    {
+        return id.index();
+    }
     /** Print the value of a register pointed to by val of size size. */
     virtual std::string valString(const void *val, const size_t& size) const;
     /** Flatten register id id using information in the ISA object isa. */
@@ -258,6 +264,11 @@ class RegClass
     }
 
     std::string regName(const RegId &id) const { return _ops->regName(id); }
+    RegIndex
+    regAllocationGroup(const RegId &id) const
+    {
+        return _ops->regAllocationGroup(id);
+    }
     std::string
     valString(const void *val) const
     {
@@ -433,6 +444,7 @@ class PhysRegId : private RegId
     RegIndex flatIdx;
     int numPinnedWritesToComplete;
     bool pinned;
+    unsigned renameReferences = 0;
 
   public:
     explicit PhysRegId() : RegId(invalidRegClass, -1), flatIdx(-1),
@@ -492,6 +504,14 @@ class PhysRegId : private RegId
 
     /** Flat index accessor */
     const RegIndex& flatIndex() const { return flatIdx; }
+
+    unsigned numRenameReferences() const { return renameReferences; }
+    void allocateRenameReference()
+    { assert(!renameReferences); renameReferences = 1; }
+    void retainRenameReference()
+    { assert(renameReferences); ++renameReferences; }
+    bool releaseRenameReference()
+    { assert(renameReferences); return --renameReferences == 0; }
 
     int getNumPinnedWrites() const { return numPinnedWrites; }
 

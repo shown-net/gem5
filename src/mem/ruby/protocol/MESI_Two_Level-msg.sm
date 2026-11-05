@@ -53,6 +53,7 @@ enumeration(CoherenceResponseType, desc="...") {
   DATA, desc="Data block for L1 cache in S state";
   DATA_EXCLUSIVE, desc="Data block for L1 cache in M/E state";
   MEMORY_DATA, desc="Data block from / to main memory";
+  MEMORY_DATA_RETAIN, desc="Write data to memory while retaining LLC directory ownership";
   ACK, desc="Generic invalidate ack";
   WB_ACK, desc="writeback ack";
   UNBLOCK, desc="unblock";
@@ -76,13 +77,16 @@ structure(RequestMsg, desc="...", interface="Message") {
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
   int FillAuditRole, default="0", desc="Observer-only originating request role";
   Addr PerfTransactionId, default="0", desc="Independent native transaction ID, no retirement gate";
+  RequestPtr NativeRequest, desc="Originating request for cache-source accounting";
   bool TraceValid, default="false", desc="Oracle trace identity is valid";
   int TraceContextId, default="-1", desc="Oracle CPU context identity";
   Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
 
   bool functionalRead(Packet *pkt) {
-    // Only PUTX messages contains the data block
-    if (Type == CoherenceRequestType:PUTX) {
+    // These messages always carry data, including clean exclusive returns.
+    if (Type == CoherenceRequestType:PUTX ||
+        Type == CoherenceRequestType:FLUSH ||
+        Type == CoherenceRequestType:FLUSH_DATA) {
         return testAndRead(addr, DataBlk, pkt);
     }
 
@@ -103,6 +107,10 @@ structure(ResponseMsg, desc="...", interface="Message") {
   MachineID Sender,             desc="What component sent the data";
   NetDest Destination,          desc="Node to whom the data is sent";
   DataBlock DataBlk,            desc="Data for the cache line";
+  // Data provenance belongs to this response's data version, not Sender.
+  // Outcomes: 0=unknown, 1=hit, 2=miss, 3=not accessed.
+  int ServiceSource, default="0", desc="Actual modeled fill data supplier";
+  int ServiceL3Outcome, default="0", desc="LLC outcome of the fill transaction";
   bool Dirty, default="false",  desc="Dirty bit";
   int AckCount, default="0",  desc="number of acks in this message";
   MessageSizeType MessageSize,  desc="size category of the message";
@@ -111,7 +119,8 @@ structure(ResponseMsg, desc="...", interface="Message") {
     // Valid data block is only present in message with following types
     if (Type == CoherenceResponseType:DATA ||
         Type == CoherenceResponseType:DATA_EXCLUSIVE ||
-        Type == CoherenceResponseType:MEMORY_DATA) {
+        Type == CoherenceResponseType:MEMORY_DATA ||
+        Type == CoherenceResponseType:MEMORY_DATA_RETAIN) {
 
         return testAndRead(addr, DataBlk, pkt);
     }

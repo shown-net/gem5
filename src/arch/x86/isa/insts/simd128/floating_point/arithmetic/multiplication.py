@@ -35,72 +35,66 @@
 
 microcode = """
 def macroop MULSS_XMM_XMM {
-    mmulf xmml, xmml, xmmlm, size=4, ext=Scalar
+    mxmmmuls xmml, xmmh, xmml, xmmh, xmmlm, size=4
 };
 
 def macroop MULSS_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    mmulf xmml, xmml, ufp1, size=4, ext=Scalar
+    .microfused_load
+    ldfp ufp1, seg, sib, disp, dataSize=4
+    mxmmmuls xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop MULSS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    mmulf xmml, xmml, ufp1, size=4, ext=Scalar
+    .microfused_load
+    ldfprip ufp1, seg, riprel, disp, dataSize=4
+    mxmmmuls xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop MULSD_XMM_XMM {
-    mmulf xmml, xmml, xmmlm, size=8, ext=Scalar
+    mxmmmuls xmml, xmmh, xmml, xmmh, xmmlm, size=8
 };
 
 def macroop MULSD_XMM_M {
+    .microfused_load
     ldfp ufp1, seg, sib, disp, dataSize=8
-    mmulf xmml, xmml, ufp1, size=8, ext=Scalar
+    mxmmmuls xmml, xmmh, xmml, xmmh, ufp1, size=8
 };
 
 def macroop MULSD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    mmulf xmml, xmml, ufp1, size=8, ext=Scalar
+    .microfused_load
+    ldfprip ufp1, seg, riprel, disp, dataSize=8
+    mxmmmuls xmml, xmmh, xmml, xmmh, ufp1, size=8
 };
 
 def macroop MULPS_XMM_XMM {
-    mmulf xmml, xmml, xmmlm, size=4, ext=0
-    mmulf xmmh, xmmh, xmmhm, size=4, ext=0
+    mxmmmulf xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=4
 };
 
 def macroop MULPS_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    mmulf xmml, xmml, ufp1, size=4, ext=0
-    mmulf xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmmulf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop MULPS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    mmulf xmml, xmml, ufp1, size=4, ext=0
-    mmulf xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmmulf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop MULPD_XMM_XMM {
-    mmulf xmml, xmml, xmmlm, size=8, ext=0
-    mmulf xmmh, xmmh, xmmhm, size=8, ext=0
+    mxmmmulf xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop MULPD_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    mmulf xmml, xmml, ufp1, size=8, ext=0
-    mmulf xmmh, xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmmulf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop MULPD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    mmulf xmml, xmml, ufp1, size=8, ext=0
-    mmulf xmmh, xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmmulf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 """

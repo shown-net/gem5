@@ -59,6 +59,7 @@ class ISA : public BaseISA
             SegAttr csAttr, SegAttr ssAttr, RFLAGS rflags);
 
     std::string vendorString;
+    const uint64_t tscFrequency;
 
   public:
     void clear() override;
@@ -72,6 +73,13 @@ class ISA : public BaseISA
     using Params = X86ISAParams;
 
     ISA(const Params &p);
+
+    uint64_t tscCycles(Tick tick) const;
+    bool referenceClockCycles(Tick tick, uint64_t &cycles) const override
+    {
+        cycles = tscCycles(tick);
+        return true;
+    }
 
     RegVal readMiscRegNoEffect(RegIndex idx) const override;
     RegVal readMiscReg(RegIndex idx) override;

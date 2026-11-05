@@ -42,6 +42,7 @@
 #ifndef __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 #define __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -54,8 +55,10 @@
 #include "mem/ruby/slicc_interface/AbstractCacheEntry.hh"
 #include "mem/ruby/structures/ALUFreeListArray.hh"
 #include "mem/ruby/structures/BankedArray.hh"
+#include "mem/ruby/structures/DataFillBuffer.hh"
 #include "mem/ruby/system/CacheRecorder.hh"
 #include "params/RubyCache.hh"
+#include "sim/clocked_object.hh"
 #include "sim/sim_object.hh"
 
 namespace gem5
@@ -115,6 +118,14 @@ class CacheMemory : public SimObject
     AbstractCacheEntry* lookup(Addr address);
     const AbstractCacheEntry* lookup(Addr address) const;
 
+    // Logical noninclusive directory. The protocol supplies a metadata-only
+    // entry (no DataBlock); data remains exclusively in the bounded ways.
+    // Its capacity is an explicit model proxy, not a measured SPR capacity.
+    AbstractCacheEntry* lookupDirectory(Addr address);
+    AbstractCacheEntry* allocateDirectory(Addr address,
+                                         AbstractCacheEntry* entry);
+    void deallocateDirectory(Addr address);
+
     Cycles getTagLatency() const { return tagArray.getLatency(); }
     Cycles getDataLatency() const { return dataArray.getLatency(); }
 
@@ -126,6 +137,7 @@ class CacheMemory : public SimObject
 
     // Set this address to most recently used
     void setMRU(Addr address);
+    void setMRUOnFill(Addr address);
     void setMRU(Addr addr, int occupancy);
     void setMRU(AbstractCacheEntry* entry);
     int getReplacementWeight(int64_t set, int64_t loc);
@@ -146,6 +158,25 @@ class CacheMemory : public SimObject
 
     bool checkResourceAvailable(CacheResourceType res, Addr addr);
     void recordRequestType(CacheRequestType requestType, Addr addr);
+
+    // MESI controllers own the transaction in their TBE. This budget counts
+    // only the TBEs which actually fetch a line, not every coherence TBE.
+    bool canAllocateFill() const;
+    void allocateFill();
+    void releaseFill();
+    void recordFillBlocked();
+
+    // L0 data fill-buffer ownership is distinct from the protocol TBE and
+    // from the legacy lower-level fill budget. Addresses are cache lines.
+    bool canAllocateDataFill() const;
+    void allocateDataFill(Addr address, bool demand_read);
+    void markDataFillReady(Addr address);
+    void releaseDataFill(Addr address);
+    void finishDataFill(Addr address);
+    void recordDemandFillBlocked();
+    bool dataFillPending(Addr address) const;
+    void observeDataFillDemandRead(Addr address);
+    bool hasReadableData(Addr address) const;
 
     // hardware transactional memory
     void htmAbortTransaction();
@@ -179,6 +210,7 @@ class CacheMemory : public SimObject
     // The first index is the # of cache lines.
     // The second index is the the amount associativity.
     std::unordered_map<Addr, int> m_tag_index;
+    std::unordered_map<Addr, std::unique_ptr<AbstractCacheEntry>> m_directory;
     std::vector<std::vector<AbstractCacheEntry*> > m_cache;
 
     /** We use the replacement policies from the Classic memory system. */
@@ -193,8 +225,25 @@ class CacheMemory : public SimObject
     int m_cache_num_set_bits;
     int m_cache_assoc;
     int m_start_index_bit;
+    unsigned m_index_divisor;
     bool m_resource_stalls;
     int m_block_size;
+    unsigned m_fill_capacity;
+    unsigned m_fill_in_flight = 0;
+
+    DataFillBuffer dataFillBuffer;
+    // The L1 controller can use a different clock from RubySystem. Keep the
+    // occupancy integral in the controller/core domain when configured.
+    class DataFillClock : public Clocked
+    {
+      public:
+        explicit DataFillClock(ClockDomain &domain) : Clocked(domain) {}
+    };
+    std::unique_ptr<DataFillClock> dataFillClock;
+    uint64_t lastDataFillCycle = 0;
+    uint64_t lastDemandFillBlockedCycle = uint64_t(-1);
+    uint64_t currentDataFillCycle() const;
+    void accountDataFillCycles();
 
     /**
      * We store all the ReplacementData in a 2-dimensional array. By doing
@@ -223,7 +272,10 @@ class CacheMemory : public SimObject
     private:
       struct CacheMemoryStats : public statistics::Group
       {
-          CacheMemoryStats(statistics::Group *parent);
+          explicit CacheMemoryStats(CacheMemory *parent);
+          void preDumpStats() override;
+          void resetStats() override;
+          CacheMemory *owner;
 
           statistics::Scalar numDataArrayReads;
           statistics::Scalar numDataArrayWrites;
@@ -235,6 +287,16 @@ class CacheMemory : public SimObject
 
           statistics::Scalar numAtomicALUOperations;
           statistics::Scalar numAtomicALUArrayStalls;
+
+          statistics::Scalar fillAllocations;
+          statistics::Scalar fillCompletions;
+          statistics::Scalar fillBlockedRequests;
+          statistics::Average fillOccupancy;
+          statistics::Scalar dataFillDemandBlockedCycles;
+          statistics::Scalar dataFillDemandReadPending;
+          statistics::Scalar dataFillDemandReadPendingCycles;
+          statistics::Scalar demandDataReadHits, demandDataReadTrueMisses;
+          statistics::Scalar dataLineFills;
 
           // hardware transactional memory
           statistics::Histogram htmTransCommitReadSet;
@@ -258,6 +320,9 @@ class CacheMemory : public SimObject
       // each time they are called
       void profileDemandHit();
       void profileDemandMiss();
+      void profileDemandDataReadHit();
+      void profileDemandDataReadMiss();
+      void profileDataLineFill();
       void profilePrefetchHit();
       void profilePrefetchMiss();
 };

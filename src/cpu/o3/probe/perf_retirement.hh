@@ -20,7 +20,9 @@ namespace gem5 { namespace o3 { namespace retirement {
 
 enum Source : unsigned {
     Unknown=1, L1=2, Miss=4, FillBuffer=8, Forwarded=16,
-    L2Hit=32, L2Miss=64, L3Hit=128, L3Miss=256, L2Unknown=512, L3Unknown=1024
+    L2Hit=32, L2Miss=64, L3Hit=128, L3Miss=256, L2Unknown=512, L3Unknown=1024,
+    SequencerShared=2048, OtherTerminal=4096,
+    PermissionUpgrade=8192, RemoteSupply=16384
 };
 
 inline bool knownRomEntry(uint64_t micro_pc, uint64_t rom_bit,
@@ -141,6 +143,7 @@ inline void writeNativeMemberDiagnostic(std::ostream &out,
 struct NativeFacts {
     bool resolved=false, store_forward=false, other_terminal=false;
     uint64_t admissions=0, responses=0, coalesced=0, hierarchy_requests=0;
+    uint64_t sequencer_shared=0;
     uint64_t external_hits=0, external_misses=0;
     uint64_t accesses=0, hits=0, tag_misses=0;
     uint64_t permission_upgrades=0, merged_misses=0, remote_supplies=0;
@@ -148,7 +151,24 @@ struct NativeFacts {
     uint64_t l3_accesses=0,l3_hits=0,l3_tag_misses=0,l3_other=0;
     uint64_t l3_merged_misses=0,l3_remote_supplies=0,terminal_reason_mask=0;
     uint64_t l2_permission_upgrades=0,l3_permission_upgrades=0;
+    // Each mask is reduced from completed physical-fragment facts, not from
+    // the shared fill supplier. Bits: unknown, hit, miss, not accessed.
+    uint8_t own_l2_mask=0, own_l3_mask=0;
+    uint8_t l1_final_mask=0;
+    uint64_t service_fact_count=0;
+    uint64_t service_expected=0;
+    bool service_identity_ambiguous=false;
 };
+
+template<class Facts>
+inline void addServiceFacts(NativeFacts &native, const Facts &facts)
+{
+    for (const auto &fact : facts) {
+        native.own_l2_mask |= fact.ownL2Mask;
+        native.own_l3_mask |= fact.ownL3Mask;
+        ++native.service_fact_count;
+    }
+}
 
 inline unsigned classify(const NativeFacts &n)
 {
@@ -177,64 +197,55 @@ inline unsigned classify(const NativeFacts &n)
 // data which completed this retired load. Hardware event mapping stays unverified.
 inline unsigned classifyIndependent(const NativeFacts &n)
 {
-    // LSQ emits StoreForward only after full address/size coverage. The data
-    // is delivered locally; earlier discarded Ruby requests are not this
-    // retired load's effective service. Keep the explicit forwarding label,
-    // with known negative membership in all three retired miss events.
-    if (n.resolved && n.store_forward && !n.other_terminal) return L1|Forwarded;
-    // An S->M ownership upgrade has resident data. It is a permission miss,
-    // not a retired-load data miss, even if the callback is externally marked
-    // miss and ownership traffic continues through lower levels.
-    if (n.resolved && !n.other_terminal && n.permission_upgrades && !n.tag_misses &&
-        n.responses && n.responses==n.admissions &&
-        n.responses==n.external_hits+n.external_misses &&
-        n.responses==n.hierarchy_requests+n.coalesced &&
-        n.accesses==n.hierarchy_requests && n.accesses==n.hits+n.permission_upgrades &&
-        !n.merged_misses && !n.remote_supplies && n.external_hits>=n.hits &&
-        n.external_misses>=n.permission_upgrades) {
-        unsigned source=L1;
-        if (n.external_misses>n.permission_upgrades) source|=FillBuffer;
-        return source;
+    // Candidate SPR L1_HIT membership for the LSQ full-coverage terminal.
+    // This mapping is subject to instruction-form controlled validation.
+    if (n.resolved && n.store_forward && !n.other_terminal)
+        return L1|Forwarded;
+    if (n.service_identity_ambiguous)
+        return Unknown | (n.store_forward ? unsigned(Forwarded) : 0u);
+    // No independent L1 lookup occurred for these followers. Their service
+    // path is known, but the leader's cache outcome must not be inherited.
+    if (n.resolved && n.other_terminal && !n.responses)
+        return OtherTerminal | (n.store_forward ? unsigned(Forwarded) : 0u);
+    // Reduce final physical-fragment results. Positive observations survive
+    // another fragment's unknown result; discarded attempts are excluded.
+    if (n.l1_final_mask) {
+        unsigned source = 0;
+        if (n.l1_final_mask & 1u) source |= Unknown;
+        if (n.l1_final_mask & (1u<<1)) source |= L1;
+        if (n.l1_final_mask & (1u<<2)) source |= Miss;
+        if (n.l1_final_mask & (1u<<3)) source |= FillBuffer;
+        if (n.sequencer_shared) source |= SequencerShared;
+        if (n.l1_final_mask & (1u<<4)) source |= PermissionUpgrade;
+        if (n.l1_final_mask & (1u<<5)) source |= RemoteSupply;
+        if (n.other_terminal) source |= OtherTerminal;
+        if (!n.resolved || n.responses != n.admissions) source |= Unknown;
+        return source ? source : Unknown;
     }
-    return classify(n);
+    return Unknown | (n.store_forward ? unsigned(Forwarded) : 0u);
 }
 
-// SPR retired-load service membership. Native Sequencer followers are FB-path
-// loads, not copies of the initiating request. A directly observed fragment
-// can still contribute its own lower-level miss in a mixed split load.
+// Candidate retired-load events use this request's own lower-level lookups.
+// A follower's shared supplier is a separate model fact, not another lookup.
 inline unsigned classifyRetiredCache(const NativeFacts &n) {
     if (n.resolved && n.store_forward && !n.other_terminal) return 0;
-    if (!n.resolved || n.other_terminal ||
-        !n.responses || n.responses!=n.admissions)
-        return L2Unknown|L3Unknown;
     const auto upper=classifyIndependent(n);
-    // Complete L1 hits and coalesced-only followers have no lower-level
-    // lookup for this load. No inherited parent miss is generated.
-    if (!(upper&Unknown) && !(upper&Miss)) return 0;
+    if (n.service_identity_ambiguous) return L2Unknown|L3Unknown;
     unsigned result=0;
-    if (n.l2_hits || n.l2_permission_upgrades) result|=L2Hit;
-    if (n.l2_tag_misses) result|=L2Miss;
-    const bool l2_unknown=n.l2_accesses!=n.tag_misses ||
-        n.l2_other!=n.l2_permission_upgrades ||
-        n.l2_accesses!=n.l2_hits+n.l2_tag_misses+n.l2_permission_upgrades;
-    if (l2_unknown)
-        result|=L2Unknown;
-    // Complete private-L2 resident data needs no LLC data event. Its lower
-    // ownership requests remain independently counted request diagnostics.
-    if (!l2_unknown && !n.l2_tag_misses) return result;
-    // Mixed L2 data/ownership paths need fragment attribution below L2.
-    // An aggregate positive LLC bit is not proven: OR-ing it with Unknown
-    // would incorrectly make sourceCounts certify that positive membership.
-    if (n.l2_permission_upgrades && n.l2_tag_misses) return result|L3Unknown;
-    // MT remote-owner service is a shared LLC snoop/HitM hit, independently
-    // of the physical data supplier. IS/ISS merges have no resident LLC data
-    // and retain the miss for this originating core's direct request.
-    if (n.l3_hits || n.l3_remote_supplies || n.l3_permission_upgrades) result|=L3Hit;
-    if (n.l3_tag_misses || n.l3_merged_misses) result|=L3Miss;
-    if (l2_unknown || n.l3_accesses!=n.l2_tag_misses ||
-        n.l3_other!=n.l3_merged_misses+n.l3_remote_supplies+n.l3_permission_upgrades ||
-        n.l3_accesses!=n.l3_hits+n.l3_tag_misses+n.l3_merged_misses+n.l3_remote_supplies+n.l3_permission_upgrades)
-        result|=L3Unknown;
+    if (n.own_l2_mask & (1u<<1)) result|=L2Hit;
+    if (n.own_l2_mask & (1u<<2)) result|=L2Miss;
+    if (n.own_l3_mask & (1u<<1)) result|=L3Hit;
+    if (n.own_l3_mask & (1u<<2)) result|=L3Miss;
+    if (n.own_l2_mask & 1u) result|=L2Unknown|L3Unknown;
+    if (n.own_l3_mask & 1u) result|=L3Unknown;
+
+    // A service fact belongs to one physical fragment. Preserve positive
+    // observations if another fragment or its response is unresolved.
+    const bool incomplete = !n.resolved || n.other_terminal ||
+        !n.responses || n.responses!=n.admissions ||
+        (upper & (Unknown|SequencerShared|PermissionUpgrade|RemoteSupply));
+    const bool missing_fact = n.service_fact_count < n.service_expected;
+    if (incomplete || missing_fact) result|=L2Unknown|L3Unknown;
     return result;
 }
 
@@ -334,8 +345,11 @@ class Ledger {
         c.unresolved_source_uops=m.unresolved;
         c.unsupported_loads=m.unsupported;
         const bool boundary_unknown=m.unsupported || m.leading || m.crossing;
+        // A model follower's path is known, but without its own lookup its
+        // membership in a hardware-named event is not established.
         const bool unknown=boundary_unknown || m.unresolved ||
-            (m.independent_source&Unknown);
+            (m.independent_source & (Unknown|SequencerShared|
+                                     PermissionUpgrade|RemoteSupply));
         // Positive membership can be proven even when another member's source
         // is unresolved. Each event keeps its own unknown population.
         c.independent_l1_hits=!boundary_unknown &&
@@ -346,13 +360,13 @@ class Ledger {
         c.independent_l1_misses_unknown=unknown && !c.independent_l1_misses;
         c.independent_fb_hits_unknown=unknown && !c.independent_fb_hits;
         c.independent_l2_hits=!boundary_unknown && bool(m.independent_source&L2Hit);
-        c.independent_l2_hits_unknown=(boundary_unknown || m.unresolved || (m.independent_source&L2Unknown)) && !c.independent_l2_hits;
+        c.independent_l2_hits_unknown=(boundary_unknown || m.unresolved || (m.independent_source&(L2Unknown|SequencerShared))) && !c.independent_l2_hits;
         c.independent_l2_misses=!boundary_unknown && bool(m.independent_source&L2Miss);
-        c.independent_l2_misses_unknown=(boundary_unknown || m.unresolved || (m.independent_source&L2Unknown)) && !c.independent_l2_misses;
+        c.independent_l2_misses_unknown=(boundary_unknown || m.unresolved || (m.independent_source&(L2Unknown|SequencerShared))) && !c.independent_l2_misses;
         c.independent_l3_hits=!boundary_unknown && bool(m.independent_source&L3Hit);
-        c.independent_l3_hits_unknown=(boundary_unknown || m.unresolved || (m.independent_source&L3Unknown)) && !c.independent_l3_hits;
+        c.independent_l3_hits_unknown=(boundary_unknown || m.unresolved || (m.independent_source&(L3Unknown|SequencerShared))) && !c.independent_l3_hits;
         c.independent_l3_misses=!boundary_unknown && bool(m.independent_source&L3Miss);
-        c.independent_l3_misses_unknown=(boundary_unknown || m.unresolved || (m.independent_source&L3Unknown)) && !c.independent_l3_misses;
+        c.independent_l3_misses_unknown=(boundary_unknown || m.unresolved || (m.independent_source&(L3Unknown|SequencerShared))) && !c.independent_l3_misses;
         if (m.unresolved || (m.source&Unknown) || !classes ||
             m.unsupported || m.leading) c.unclassified_loads=1;
         else {

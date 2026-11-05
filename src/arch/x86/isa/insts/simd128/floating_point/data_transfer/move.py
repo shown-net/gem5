@@ -35,116 +35,99 @@
 
 microcode = """
 def macroop MOVAPS_XMM_M {
-    # Check low address.
-    ldfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    ldfp xmml, seg, sib, disp, dataSize=8
+    ldfpxmm (xmml, xmmh), seg, sib, disp
 };
 
 def macroop MOVAPS_XMM_P {
-    rdip t7
-    # Check low address.
-    ldfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    ldfp xmml, seg, riprel, disp, dataSize=8
+    ldfpxmmrip (xmml, xmmh), seg, riprel, disp
 };
 
 def macroop MOVAPS_M_XMM {
-    # Check low address.
-    stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    stfp xmml, seg, sib, disp, dataSize=8
+    .microfused_store
+    sta seg, sib, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVAPS_P_XMM {
-    rdip t7
-    # Check low address.
-    stfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    stfp xmml, seg, riprel, disp, dataSize=8
+    .microfused_store
+    starip seg, riprel, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVAPS_XMM_XMM {
-    # Check low address.
-    movfp xmml, xmmlm, dataSize=8
-    movfp xmmh, xmmhm, dataSize=8
+    mxmmmov xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop MOVAPD_XMM_XMM {
-    movfp xmml, xmmlm, dataSize=8
-    movfp xmmh, xmmhm, dataSize=8
+    mxmmmov xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop MOVAPD_XMM_M {
-    ldfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    ldfpxmm (xmml, xmmh), seg, sib, disp
 };
 
 def macroop MOVAPD_XMM_P {
-    rdip t7
-    ldfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    ldfpxmmrip (xmml, xmmh), seg, riprel, disp
 };
 
 def macroop MOVAPD_M_XMM {
-    stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
-    stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    .microfused_store
+    sta seg, sib, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVAPD_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
-    stfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    .microfused_store
+    starip seg, riprel, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVUPS_XMM_XMM {
-    movfp xmml, xmmlm, dataSize=8
-    movfp xmmh, xmmhm, dataSize=8
+    mxmmmov xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop MOVUPS_XMM_M {
-    ldfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    ldfpxmm (xmml, xmmh), seg, sib, disp
 };
 
 def macroop MOVUPS_XMM_P {
-    rdip t7
-    ldfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    ldfpxmmrip (xmml, xmmh), seg, riprel, disp
 };
 
 def macroop MOVUPS_M_XMM {
-    stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
-    stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    .microfused_store
+    sta seg, sib, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVUPS_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
-    stfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    .microfused_store
+    starip seg, riprel, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVUPD_XMM_XMM {
-    movfp xmml, xmmlm, dataSize=8
-    movfp xmmh, xmmhm, dataSize=8
+    mxmmmov xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop MOVUPD_XMM_M {
-    ldfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    ldfpxmm (xmml, xmmh), seg, sib, disp
 };
 
 def macroop MOVUPD_XMM_P {
-    rdip t7
-    ldfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    ldfpxmmrip (xmml, xmmh), seg, riprel, disp
 };
 
 def macroop MOVUPD_M_XMM {
-    stfp xmml, seg, sib, "DISPLACEMENT", dataSize=8
-    stfp xmmh, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    .microfused_store
+    sta seg, sib, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVUPD_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, "DISPLACEMENT", dataSize=8
-    stfp xmmh, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    .microfused_store
+    starip seg, riprel, disp, dataSize=16
+    storedataxmm xmml, xmmh
 };
 
 def macroop MOVHPS_XMM_M {
@@ -152,8 +135,7 @@ def macroop MOVHPS_XMM_M {
 };
 
 def macroop MOVHPS_XMM_P {
-    rdip t7
-    ldfp xmmh, seg, riprel, disp, dataSize=8
+    ldfprip xmmh, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVHPS_M_XMM {
@@ -161,8 +143,7 @@ def macroop MOVHPS_M_XMM {
 };
 
 def macroop MOVHPS_P_XMM {
-    rdip t7
-    stfp xmmh, seg, riprel, disp, dataSize=8
+    stfprip xmmh, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVHPD_XMM_M {
@@ -170,8 +151,7 @@ def macroop MOVHPD_XMM_M {
 };
 
 def macroop MOVHPD_XMM_P {
-    rdip t7
-    ldfp xmmh, seg, riprel, disp, dataSize=8
+    ldfprip xmmh, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVHPD_M_XMM {
@@ -179,8 +159,7 @@ def macroop MOVHPD_M_XMM {
 };
 
 def macroop MOVHPD_P_XMM {
-    rdip t7
-    stfp xmmh, seg, riprel, disp, dataSize=8
+    stfprip xmmh, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVLPS_XMM_M {
@@ -188,8 +167,7 @@ def macroop MOVLPS_XMM_M {
 };
 
 def macroop MOVLPS_XMM_P {
-    rdip t7
-    ldfp xmml, seg, riprel, disp, dataSize=8
+    ldfprip xmml, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVLPS_M_XMM {
@@ -197,8 +175,7 @@ def macroop MOVLPS_M_XMM {
 };
 
 def macroop MOVLPS_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, disp, dataSize=8
+    stfprip xmml, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVLPD_XMM_M {
@@ -206,8 +183,7 @@ def macroop MOVLPD_XMM_M {
 };
 
 def macroop MOVLPD_XMM_P {
-    rdip t7
-    ldfp xmml, seg, riprel, disp, dataSize=8
+    ldfprip xmml, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVLPD_M_XMM {
@@ -215,8 +191,7 @@ def macroop MOVLPD_M_XMM {
 };
 
 def macroop MOVLPD_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, disp, dataSize=8
+    stfprip xmml, seg, riprel, disp, dataSize=8
 };
 
 def macroop MOVHLPS_XMM_XMM {
@@ -232,45 +207,43 @@ def macroop MOVSS_XMM_XMM {
 };
 
 def macroop MOVSS_XMM_M {
-    lfpimm xmml, 0
-    lfpimm xmmh, 0
-    ldfp xmml, seg, sib, disp, dataSize=4
+    ldfpxmm4 (xmml, xmmh), seg, sib, disp
 };
 
 def macroop MOVSS_XMM_P {
-    rdip t7
-    lfpimm xmml, 0
-    lfpimm xmmh, 0
-    ldfp xmml, seg, riprel, disp, dataSize=4
+    ldfpxmm4rip (xmml, xmmh), seg, riprel, disp
 };
 
 def macroop MOVSS_M_XMM {
-    stfp xmml, seg, sib, disp, dataSize=4
+    .microfused_store
+    sta seg, sib, disp, dataSize=4
+    storedatafp xmml, dataSize=4
 };
 
 def macroop MOVSS_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, disp, dataSize=4
+    .microfused_store
+    starip seg, riprel, disp, dataSize=4
+    storedatafp xmml, dataSize=4
 };
 
 def macroop MOVSD_XMM_M {
-    lfpimm xmmh, 0
-    ldfp xmml, seg, sib, disp, dataSize=8
+    ldfpxmm8 (xmml, xmmh), seg, sib, disp
 };
 
 def macroop MOVSD_XMM_P {
-    rdip t7
-    lfpimm xmmh, 0
-    ldfp xmml, seg, riprel, disp, dataSize=8
+    ldfpxmm8rip (xmml, xmmh), seg, riprel, disp
 };
 
 def macroop MOVSD_M_XMM {
-    stfp xmml, seg, sib, disp, dataSize=8
+    .microfused_store
+    sta seg, sib, disp, dataSize=8
+    storedatafp xmml, dataSize=8
 };
 
 def macroop MOVSD_P_XMM {
-    rdip t7
-    stfp xmml, seg, riprel, disp, dataSize=8
+    .microfused_store
+    starip seg, riprel, disp, dataSize=8
+    storedatafp xmml, dataSize=8
 };
 
 def macroop MOVSD_XMM_XMM {

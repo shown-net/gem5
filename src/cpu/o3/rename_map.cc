@@ -69,7 +69,7 @@ SimpleRenameMap::init(const RegClass &reg_class, SimpleFreeList *_freeList)
 }
 
 SimpleRenameMap::RenameInfo
-SimpleRenameMap::rename(const RegId& arch_reg)
+SimpleRenameMap::rename(const RegId& arch_reg, PhysRegIdPtr entry_peer)
 {
     PhysRegIdPtr renamed_reg;
     // Record the current physical register that is renamed to the
@@ -88,7 +88,7 @@ SimpleRenameMap::rename(const RegId& arch_reg)
         renamed_reg = prev_reg;
         renamed_reg->decrNumPinnedWrites();
     } else {
-        renamed_reg = freeList->getReg();
+        renamed_reg = freeList->getReg(entry_peer);
         map[arch_reg.index()] = renamed_reg;
         renamed_reg->setNumPinnedWrites(arch_reg.getNumPinnedWrites());
         renamed_reg->setNumPinnedWritesToComplete(
@@ -108,9 +108,10 @@ SimpleRenameMap::rename(const RegId& arch_reg)
 
 void
 UnifiedRenameMap::init(const BaseISA::RegClasses &regClasses,
-        PhysRegFile *_regFile, UnifiedFreeList *freeList)
+        PhysRegFile *_regFile, UnifiedFreeList *_freeList)
 {
     regFile = _regFile;
+    freeList = _freeList;
 
     for (int i = 0; i < renameMaps.size(); i++)
         renameMaps[i].init(*regClasses.at(i), &(freeList->freeLists[i]));
@@ -119,11 +120,30 @@ UnifiedRenameMap::init(const BaseISA::RegClasses &regClasses,
 bool
 UnifiedRenameMap::canRename(DynInstPtr inst) const
 {
+    if (inst->eliminatedMove) return true;
     for (int i = 0; i < renameMaps.size(); i++) {
-        if (inst->numDestRegs((RegClassType)i) >
-                renameMaps[i].numFreeEntries()) {
+        if (!canRename(inst, static_cast<RegClassType>(i))) {
             return false;
         }
+    }
+    return true;
+}
+
+bool
+UnifiedRenameMap::canRename(DynInstPtr inst, RegClassType type) const
+{
+    if (inst->eliminatedMove)
+        return true;
+    const unsigned fragments = inst->numDestRegs(type);
+    if (fragments > renameMaps[type].numFreeEntries())
+        return false;
+    if (type == FloatRegClass) {
+        const unsigned entries = inst->stageDemand.floatWideEntries ?
+            inst->stageDemand.floatWideEntries :
+            inst->staticInst->numFloatDestEntries();
+        return entries <= freeList->numFreeFloatEntries() &&
+            inst->stageDemand.floatWideEntries <=
+                freeList->numFreeFloatWideEntries();
     }
     return true;
 }

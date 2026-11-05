@@ -1633,9 +1633,15 @@ X86KvmCPU::setCPUID(const Kvm::CPUIDVector &cpuid)
 void
 X86KvmCPU::setMSRs(const struct kvm_msrs &msrs)
 {
-    if (ioctl(KVM_SET_MSRS, (void *)&msrs) == -1)
+    const int transferred = ioctl(KVM_SET_MSRS, (void *)&msrs);
+    if (transferred == -1)
         panic("KVM: Failed to set guest MSRs (errno: %i)\n",
               errno);
+    // KVM can stop at the first rejected entry without returning -1.
+    // A partial restore must not silently drop speculation controls.
+    panic_if(transferred != static_cast<int>(msrs.nmsrs),
+             "KVM: Incomplete guest MSR restore (%i of %u entries)\n",
+             transferred, msrs.nmsrs);
 }
 
 void
@@ -1653,9 +1659,15 @@ X86KvmCPU::setMSRs(const KvmMSRVector &msrs)
 void
 X86KvmCPU::getMSRs(struct kvm_msrs &msrs) const
 {
-    if (ioctl(KVM_GET_MSRS, (void *)&msrs) == -1)
+    const int transferred = ioctl(KVM_GET_MSRS, (void *)&msrs);
+    if (transferred == -1)
         panic("KVM: Failed to get guest MSRs (errno: %i)\n",
               errno);
+    // Callers initialize entries before reading; accepting a short read
+    // would copy zero/unread state (including SPEC_CTRL) into the timing CPU.
+    panic_if(transferred != static_cast<int>(msrs.nmsrs),
+             "KVM: Incomplete guest MSR capture (%i of %u entries)\n",
+             transferred, msrs.nmsrs);
 }
 
 
@@ -1696,7 +1708,12 @@ X86KvmCPU::getMsrIntersection() const
 
         DPRINTF(Kvm, "kvm-x86: Updating MSR intersection\n");
         for (auto it = kvm_msrs.cbegin(); it != kvm_msrs.cend(); ++it) {
-            if (X86ISA::msrMap.find(*it) != X86ISA::msrMap.end()) {
+            const auto reg = X86ISA::msrMap.find(*it);
+            if (reg != X86ISA::msrMap.end()) {
+                // Commands have no architectural value to capture/restore.
+                // SPEC_CTRL remains in the ordinary state intersection.
+                if (reg->second == X86ISA::misc_reg::PredCmd)
+                    continue;
                 cachedMsrIntersection.push_back(*it);
                 DPRINTF(Kvm, "kvm-x86: Adding MSR 0x%x\n", *it);
             } else {

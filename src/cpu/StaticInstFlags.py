@@ -65,6 +65,8 @@ class StaticInstFlags(Enum):
         "IsMatrix",  # References Matrix regs.
         "IsLoad",  # Reads from memory (load or prefetch).
         "IsStore",  # Writes to memory.
+        "IsStoreAddress",  # Address/translation half of a split store.
+        "IsStoreData",  # Independently scheduled data half of that store.
         "IsAtomic",  # Does atomic RMW to memory.
         "IsStoreConditional",  # Store conditional instruction.
         "IsInstPrefetch",  # Instruction-cache prefetch.
@@ -91,6 +93,9 @@ class StaticInstFlags(Enum):
         # Flags for microcode
         "IsMacroop",  # Is a macroop containing microops
         "IsMicroop",  # Is a microop
+        "IsMicrocodeControl",  # Internal micro-PC branch or return
+        "IsMicroFusedMemory",  # Load and ALU records share an allocation unit
+        "IsStackRegAllocation",  # Candidate 64-bit register stack operation
         "IsDelayedCommit",  # This microop doesn't commit right away
         "IsLastMicroop",  # This microop ends a microop sequence
         "IsFirstMicroop",  # This microop begins a microop sequence

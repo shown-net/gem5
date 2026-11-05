@@ -41,12 +41,11 @@ def macroop CALL_NEAR_I
     .function_call
     .control_direct
 
-    limm t1, imm
     rdip t7
     # Check target of call
     st t7, ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
     subi rsp, rsp, dsz, dataSize=ssz
-    wrip t7, t1
+    jmprel imm
 };
 
 def macroop CALL_NEAR_R

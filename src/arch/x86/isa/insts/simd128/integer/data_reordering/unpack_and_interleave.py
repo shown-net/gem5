@@ -149,23 +149,19 @@ def macroop PUNPCKHDQ_XMM_P {
 };
 
 def macroop PUNPCKHQDQ_XMM_XMM {
-    movfp xmml, xmmh
-    movfp xmmh, xmmhm
+    mxmmunpack xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8, ext=1
 };
 
 def macroop PUNPCKHQDQ_XMM_M {
-    lea t1, seg, sib, disp, dataSize=asz
-    ldfp ufp1, seg, [1, t0, t1], 8, dataSize=8
-    movfp xmml, xmmh
-    movfp xmmh, ufp1
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmunpack xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8, ext=1
 };
 
 def macroop PUNPCKHQDQ_XMM_P {
-    rdip t7
-    lea t1, seg, riprel, disp, dataSize=asz
-    ldfp ufp1, seg, riprel, 8, dataSize=8
-    movfp xmml, xmmh
-    movfp xmmh, ufp1
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmunpack xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8, ext=1
 };
 
 def macroop PUNPCKLQDQ_XMM_XMM {

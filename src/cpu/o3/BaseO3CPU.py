@@ -44,6 +44,9 @@ from m5.objects.BaseCPU import BaseCPU
 # from m5.objects.O3Checker import O3Checker
 from m5.objects.BranchPredictor import *
 from m5.objects.FUPool import *
+from m5.objects.Frontend import FrontendCoordinator
+from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, ResultForwarding
+from m5.objects.ZeroIdiom import ZeroIdiom
 from m5.objects.IndexingPolicies import *
 from m5.objects.IQUnit import *
 from m5.objects.ReplacementPolicies import *
@@ -53,14 +56,20 @@ from m5.proxy import *
 from m5.SimObject import *
 
 
-class TSOStore(Enum):
-    vals = ["serial", "buffer"]
-
-
 class BaseO3CPU(BaseCPU):
     type = "BaseO3CPU"
     cxx_class = "gem5::o3::CPU"
     cxx_header = "cpu/o3/dyn_inst.hh"
+    executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
+    resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
+    zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+    frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
+    intALU = Param.IntExecutionResource(NULL, "ALU execution family")
+    intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
+    intSHFT = Param.IntExecutionResource(NULL, "Shift/carry execution family")
+    intSlow = Param.IntExecutionResource(NULL, "Slow integer execution family")
+    intBM = Param.IntExecutionResource(NULL, "Bit-manipulation execution family")
+    intBranch = Param.IntExecutionResource(NULL, "Branch resolution execution family")
 
     @classmethod
     def memory_mode(cls):
@@ -80,6 +89,15 @@ class BaseO3CPU(BaseCPU):
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
+    sprL1LoadBankConflicts = Param.Bool(
+        False, "Limit a third same-bank L1 data load in one cycle"
+    )
+    sprStoreBuffer = Param.Bool(
+        False, "Use a shared-credit committed store buffer for x86 TSO"
+    )
+    sprEarlyStorePrepare = Param.Bool(
+        False, "Speculatively prepare translated ordinary stores before retirement"
+    )
 
     # Backward pipeline delays
     fetchToBacDelay = Param.Cycles(1, "Fetch to Branch address calc. delay")
@@ -122,7 +140,6 @@ class BaseO3CPU(BaseCPU):
     )
     dispatchWidth = Param.Unsigned(8, "Dispatch width")
     issueWidth = Param.Unsigned(8, "Issue width")
-    wbWidth = Param.Unsigned(8, "Writeback width")
 
     iewToCommitDelay = Param.Cycles(
         1, "Issue/Execute/Writeback to commit delay"
@@ -181,6 +198,14 @@ class BaseO3CPU(BaseCPU):
     numPhysFloatRegs = Param.Unsigned(
         256, "Number of physical floating point registers"
     )
+    numPhysFloatRegEntries = Param.Unsigned(
+        0, "FP allocation entries shared by data fragments; 0 uses only the "
+        "physical data-register limit"
+    )
+    numPhysFloatWideEntries = Param.Unsigned(
+        0, "512-bit capable subset of shared FP entries; zero disables this "
+        "additional limit. Requires explicit ISA width demand."
+    )
     numPhysVecRegs = Param.Unsigned(256, "Number of physical vector registers")
     numPhysVecPredRegs = Param.Unsigned(
         32, "Number of physical predicate registers"
@@ -210,16 +235,20 @@ class BaseO3CPU(BaseCPU):
         "Branch Predictor",
     )
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
-    tsoStore = Param.TSOStore(
-        "serial", "Committed-store implementation used by TSO CPUs"
-    )
-    tsoStoreBufferSize = Param.Unsigned(
-        114, "Store-buffer entries used only by the buffer TSO implementation"
+    tsoOrderedStoreLineWindow = Param.Unsigned(
+        4, "Maximum distinct cache lines awaiting ordered TSO store completion"
     )
 
     recvRespThrottling = Param.Bool(
         False, "Enable load receive response throttling in the LSQ"
     )
+    loadCompletionWidth = Param.Unsigned(
+        0, "Ordinary load result deliveries per cycle; zero disables the limit"
+    )
+
+    sprMemoryDependence = Param.Bool(False, "Use the SPR local/global dependence predictor")
+    sprFastStoreForwarding = Param.Bool(False, "Use the tagged load/store-PC forwarding proxy")
+    sprL1WidthService = Param.Bool(False, "Use width-dependent L1 load/store service budgets")
     recvRespMaxCachelines = Param.Unsigned(
         1,
         "Maximum number of different receive response cachelines per cycle",

@@ -29,6 +29,7 @@ import math
 from m5.objects import (
     ClockDomain,
     LRURP,
+    QLRUH00M1R0U1RP,
     MESI_Three_Level_L1Cache_Controller,
     MessageBuffer,
     RubyCache,
@@ -68,24 +69,29 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
         self.cache = RubyCache(
             size=l2_size,
             assoc=l2_assoc,
+            fill_capacity=48,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
-            replacement_policy=LRURP(),
+            replacement_policy=(QLRUH00M1R0U1RP() if target_isa == ISA.X86
+                                else LRURP()),
         )
-        # l2_select_num_bits is ruby backend terminology.
-        # In stdlib terms, it is number of bits for selecting L3 cache.
-        self.l2_select_num_bits = int(math.log(num_l3Caches, 2))
+        # Logical L3 bank count, including non-power-of-two geometries.
+        self.l2_select_num_banks = num_l3Caches
         self.cluster_id = cluster_id
         self.clk_domain = clk_domain
-        self.prefetcher = RubyPrefetcher(block_size=cache_line_size)
+        self.prefetcher = RubyPrefetcher(
+            block_size=cache_line_size, queue_dedup=True
+        )
+        self.enable_prefetch = False
         self.transitions_per_cycle = 32
         # l1_request_latency, l1_response_latency, to_l2_latency are
         # ruby backend terminology.
         # In stdlib terms, they are L2 cache request latency, L2 response
         # latency, and to L3 cache latency respectively.
         self.l1_request_latency = 2
-        self.l1_response_latency = 2
+        self.l1_response_latency = 9
         self.to_l2_latency = 1
+        self.number_of_TBEs = 256
 
         self.version = self.versionCount()
         self.connectQueues(network)
@@ -97,6 +103,7 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
         return bits
 
     def connectQueues(self, network):
+        self.prefetchQueue = MessageBuffer()
         self.mandatoryQueue = MessageBuffer()
         self.optionalQueue = MessageBuffer()
 

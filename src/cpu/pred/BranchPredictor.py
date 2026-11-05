@@ -115,6 +115,8 @@ class BTBSetAssociative(BTBIndexingPolicy):
     # This is above the index and offset bit
     tag_bits = Param.Unsigned(64, "number of bits in the tag")
 
+    full_address_tag = Param.Bool(False, "Retain all address bits in the tag")
+
     # Number of threads sharing the BTB
     numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
 
@@ -142,6 +144,39 @@ class SimpleBTB(BranchTargetBuffer):
             numThreads=1,
         ),
         "BTB indexing policy",
+    )
+
+
+class BTBLevel(SimObject):
+    type = "BTBLevel"
+    cxx_class = "gem5::branch_prediction::BTBLevel"
+    cxx_header = "cpu/pred/multi_level_btb.hh"
+
+    tagBits = Param.Unsigned(64, "BTB tag bits")
+    numEntries = Param.Unsigned(4096, "BTB entries")
+    associativity = Param.Unsigned(8, "BTB associativity")
+    latency = Param.Cycles(1, "Relative target availability")
+    inclusive = Param.Bool(False, "Write new entries to this level")
+    numThreads = Param.Unsigned(Parent.numThreads, "Number of threads")
+    replPolicy = Param.BaseReplacementPolicy(LRURP(), "Replacement policy")
+    indexingPolicy = Param.BTBIndexingPolicy(
+        BTBSetAssociative(
+            assoc=Parent.associativity, num_entries=Parent.numEntries,
+            set_shift=5, tag_bits=Parent.tagBits, full_address_tag=True,
+            numThreads=Parent.numThreads,
+        ), "BTB indexing policy",
+    )
+
+
+class MultiLevelBTB(BranchTargetBuffer):
+    type = "MultiLevelBTB"
+    cxx_class = "gem5::branch_prediction::MultiLevelBTB"
+    cxx_header = "cpu/pred/multi_level_btb.hh"
+    levels = VectorParam.BTBLevel(
+        [BTBLevel(numEntries=128, associativity=4, latency=0, inclusive=True),
+         BTBLevel(numEntries=6144, associativity=6, latency=1, inclusive=True),
+         BTBLevel(numEntries=12288, associativity=12, latency=2, inclusive=True)],
+        "Levels ordered from the uppermost to the lowermost",
     )
 
 
@@ -196,6 +231,22 @@ class SimpleIndirectPredictor(IndirectPredictor):
     )
 
 
+class GoldenCoveBP(ConditionalPredictor):
+    type = "GoldenCoveBP"
+    cxx_class = "gem5::branch_prediction::GoldenCoveBP"
+    cxx_header = "cpu/pred/golden_cove.hh"
+    historyLengths = VectorParam.Unsigned(
+        [22, 58, 388],
+        "Three PHT spans: 388 measured; short spans are explicit engineering defaults",
+    )
+
+
+class GoldenCoveIndirectPredictor(IndirectPredictor):
+    type = "GoldenCoveIndirectPredictor"
+    cxx_class = "gem5::branch_prediction::GoldenCoveIndirectPredictor"
+    cxx_header = "cpu/pred/golden_cove.hh"
+
+
 class BranchPredictor(SimObject):
     type = "BranchPredictor"
     cxx_class = "gem5::branch_prediction::BPredUnit"
@@ -224,6 +275,10 @@ class BranchPredictor(SimObject):
         "needs to know the branch type to make the correct RAS operations. "
         "This info is only available from the BTB. "
         "Low-end CPUs predecoding might be used to identify branches. ",
+    )
+    useReturnFallback = Param.Bool(
+        True,
+        "Allow near returns without a RAS target to use BTB or indirect targets",
     )
     updateBTBAtSquash = Param.Bool(
         True,

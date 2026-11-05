@@ -123,6 +123,18 @@ enum FloatRegIndex
 
 class FlatFloatRegClassOps : public RegClassOps
 {
+  public:
+    RegIndex
+    regAllocationGroup(const RegId &id) const override
+    {
+        const auto index = id.index();
+        if (index >= float_reg::XmmBase && index < float_reg::MicrofpBase)
+            return float_reg::XmmBase +
+                ((index - float_reg::XmmBase) / 2) * 2;
+        return index;
+    }
+
+  private:
     std::string regName(const RegId &id) const override;
 };
 

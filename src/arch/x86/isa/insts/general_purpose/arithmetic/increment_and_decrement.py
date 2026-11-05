@@ -43,14 +43,16 @@ def macroop INC_M
 {
     ldst t1, seg, sib, disp
     addi t1, t1, 1, flags=(OF, SF, ZF, AF, PF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    storedata t1
 };
 
 def macroop INC_P
 {
     ldstrip t1, seg, riprel, disp
     addi t1, t1, 1, flags=(OF, SF, ZF, AF, PF)
-    strip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    storedata t1
 };
 
 def macroop INC_LOCKED_M
@@ -80,14 +82,16 @@ def macroop DEC_M
 {
     ldst t1, seg, sib, disp
     subi t1, t1, 1, flags=(OF, SF, ZF, AF, PF)
-    st t1, seg, sib, disp
+    sta seg, sib, disp
+    storedata t1
 };
 
 def macroop DEC_P
 {
     ldstrip t1, seg, riprel, disp
     subi t1, t1, 1, flags=(OF, SF, ZF, AF, PF)
-    strip t1, seg, riprel, disp
+    starip seg, riprel, disp
+    storedata t1
 };
 
 def macroop DEC_LOCKED_M
