@@ -168,8 +168,12 @@ int64_t
 CacheMemory::addressToCacheSet(Addr address) const
 {
     assert(address == makeLineAddress(address));
-    return bitSelect(address, m_start_index_bit,
-                     m_start_index_bit + m_cache_num_set_bits - 1);
+    if (isPowerOf2(m_cache_num_sets)) {
+        return bitSelect(address, m_start_index_bit,
+                         m_start_index_bit + m_cache_num_set_bits - 1);
+    }
+    // Exclude the block offset and any bank-selection bits before indexing.
+    return (address >> m_start_index_bit) % m_cache_num_sets;
 }
 
 // Given a cache index: returns the index of the tag in a set.

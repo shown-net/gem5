@@ -22,13 +22,19 @@ std::unordered_set<FixedWorkMarker *> FixedWorkMarker::instances_;
 gem5::ThreadContext *FixedWorkMarker::handoff_context_ = nullptr;
 bool FixedWorkMarker::handed_off_ = false;
 bool FixedWorkMarker::team_ended_ = false;
+Tick FixedWorkMarker::snapshot_origin_ = 0;
+FixedWorkMarker *FixedWorkMarker::snapshot_coordinator_ = nullptr;
 
 FixedWorkMarker::FixedWorkMarker(TaoTrace &owner, const TaoTraceParams &params)
     : owner_(owner), cpu_(dynamic_cast<CPU *>(params.manager)),
       begins_(params.fixed_work_begin_pcs), ends_(params.fixed_work_end_pcs),
       cores_(params.fixed_work_core_ids), workids_(params.fixed_work_workids),
       result_pc_(params.fixed_work_result_pc),
-      result_max_bytes_(params.fixed_work_result_max_bytes)
+      result_max_bytes_(params.fixed_work_result_max_bytes),
+      snapshot_interval_(params.fixed_work_snapshot_interval),
+      snapshot_event_([this] { periodicSnapshot(); },
+                      owner.name() + ".fixed_work_snapshot", false,
+                      Event::CPU_Tick_Pri + 1)
 {
     fatal_if(!cpu_ || begins_.empty() || begins_.size() > 4 ||
              ends_.size() != begins_.size() || cores_.size() != begins_.size() ||
@@ -53,6 +59,8 @@ FixedWorkMarker::FixedWorkMarker(TaoTrace &owner, const TaoTraceParams &params)
 }
 FixedWorkMarker::~FixedWorkMarker()
 {
+    if (snapshot_event_.scheduled()) owner_.deschedule(snapshot_event_);
+    if (snapshot_coordinator_ == this) snapshot_coordinator_ = nullptr;
     instances_.erase(this);
     if (snapshots_) std::fclose(snapshots_);
 }
@@ -79,7 +87,8 @@ void FixedWorkMarker::start()
              "fixed-work capture requires one trace per participant and HANDOFF");
     fatal_if(!std::all_of(instances_.begin(), instances_.end(), [this](auto *marker) {
                  return marker->result_pc_ == result_pc_ &&
-                        marker->result_max_bytes_ == result_max_bytes_;
+                        marker->result_max_bytes_ == result_max_bytes_ &&
+                        marker->snapshot_interval_ == snapshot_interval_;
              }), "fixed-work participants disagree on result completion");
     const std::string path = owner_.output_dir_ + "/fixed-work-snapshots-core" +
                              std::to_string(cores_[worker_]) + ".jsonl";
@@ -87,14 +96,39 @@ void FixedWorkMarker::start()
     fatal_if(!snapshots_, "cannot open fixed-work snapshots");
     capturing_ = true;
 }
-void FixedWorkMarker::snapshot(bool begin, const DynInstPtr &inst)
+void FixedWorkMarker::scheduleSnapshot()
+{
+    if (!snapshot_interval_ || snapshot_coordinator_ != this) return;
+    const Tick next = snapshot_origin_ +
+        ((curTick() - snapshot_origin_) / snapshot_interval_ + 1) * snapshot_interval_;
+    owner_.schedule(snapshot_event_, next);
+}
+void FixedWorkMarker::periodicSnapshot()
+{
+    fatal_if(snapshot_coordinator_ != this || team_ended_,
+             "invalid fixed-work team snapshot event");
+    // One event observes the team after all CPU tick/Commit events at this tick.
+    // A BEGIN or END at this same tick is the only sample for that worker.
+    std::vector<FixedWorkMarker *> ordered(instances_.begin(), instances_.end());
+    std::sort(ordered.begin(), ordered.end(), [](auto *a, auto *b) {
+        return a->worker_ < b->worker_;
+    });
+    for (auto *marker : ordered) {
+        if (marker->capturing_ && marker->phase_ == 1 &&
+            marker->begin_tick_ != curTick())
+            marker->snapshot("TICK", 0);
+    }
+    scheduleSnapshot();
+}
+void FixedWorkMarker::snapshot(const char *kind, Addr pc)
 {
     // CPU native retirement counters are updated before the Commit probe.
     cpu_->unhaltedClockStats.account();
     std::fprintf(snapshots_,
-        "{\"schema\":\"gem5-fixed-work-snapshot-v2\",\"kind\":\"%s\","
+        "{\"schema\":\"gem5-fixed-work-snapshot\",\"kind\":\"%s\","
         "\"worker\":%u,\"source_core\":%u,\"workid\":%lu,\"cr3\":%lu,"
         "\"pc\":%lu,\"tick\":%lu,\"record_after\":%lu,\"macro_after\":%lu,"
+        "\"snapshot_interval_ticks\":%lu,\"snapshot_origin_tick\":%lu,"
         "\"clock_period_ticks\":%lu,\"numCycles\":%.0f,"
         "\"INST_RETIRED.ANY\":%.0f,\"UOPS_RETIRED.SLOTS\":%.0f,"
         "\"gem5_functional_uops\":%.0f,"
@@ -107,12 +141,13 @@ void FixedWorkMarker::snapshot(bool begin, const DynInstPtr &inst)
         "\"MEM_LOAD_RETIRED.FB_HIT\":%.0f,\"MEM_LOAD_RETIRED.unknownSource\":%.0f,"
         "\"tma.slots\":%.0f,\"tma.retiring\":%.0f,\"tma.badSpeculation\":%.0f,"
         "\"tma.frontendBound\":%.0f,\"tma.backendBound\":%.0f,\"tma.pending\":%.0f",
-        begin ? "BEGIN" : "END", worker_, cores_[worker_], workids_[worker_],
-        cr3_, uint64_t(inst->pcState().instAddr()), uint64_t(curTick()),
+        kind, worker_, cores_[worker_], workids_[worker_],
+        cr3_, uint64_t(pc), uint64_t(curTick()),
         owner_.fst_record_count_, owner_.functional_instruction_count_,
+        uint64_t(snapshot_interval_), uint64_t(snapshot_origin_),
         uint64_t(cpu_->clockPeriod()), cpu_->baseStats.numCycles.value(),
         cpu_->instRetiredStats.ANY.value(), cpu_->uopsRetiredStats.SLOTS.value(),
-        cpu_->commitStats[inst->threadNumber]->numOps.value(),
+        cpu_->commitStats[0]->numOps.value(),
         cpu_->unhaltedClockStats.THREAD.value(), cpu_->unhaltedClockStats.REF_TSC.value(),
         cpu_->branchInstStats.ALL_BRANCHES.value(), cpu_->branchMispStats.ALL_BRANCHES.value(),
         cpu_->memoryInstRetiredStats.ALL_LOADS.value(), cpu_->memoryInstRetiredStats.ALL_STORES.value(),
@@ -128,13 +163,17 @@ void FixedWorkMarker::snapshot(bool begin, const DynInstPtr &inst)
         const auto *stat = dynamic_cast<const statistics::ScalarInfo *>(group->resolveStat(path));
         if (stat) std::fprintf(snapshots_, ",\"%s\":%.0f", name, double(stat->value()));
     };
-    const auto *mmu = cpu_->tcBase(inst->threadNumber)->getMMUPtr();
+    const auto *mmu = cpu_->tcBase(0)->getMMUPtr();
     emitScalar(mmu, "dtb.DTLB_LOAD_MISSES.STLB_HIT", "DTLB_LOAD_MISSES.STLB_HIT");
     emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.WALK_COMPLETED", "DTLB_LOAD_MISSES.WALK_COMPLETED");
     emitScalar(cpu_, "frontend.notDeliveredSlots", "frontend.notDeliveredSlots");
     emitScalar(cpu_, "frontend.zeroDeliveryCycles", "frontend.zeroDeliveryCycles");
     emitScalar(cpu_, "frontend.mite.sourceOps", "frontend.mite.sourceOps");
     emitScalar(cpu_, "frontend.dsb.sourceOps", "frontend.dsb.sourceOps");
+    if (kind[0] == 'E')
+        std::fprintf(snapshots_, ",\"completed_work\":%lu", completed_work_);
+    else
+        std::fputs(",\"completed_work\":null", snapshots_);
     std::fputs("}\n", snapshots_);
     std::fflush(snapshots_);
 }
@@ -162,14 +201,19 @@ void FixedWorkMarker::observe(const DynInstPtr &inst, uint64_t before)
         fatal_if((begin && phase_ != 0) || (end && phase_ != 1) ||
                  (end && root != cr3_), "invalid fixed-work BEGIN/END or CR3 continuity");
         if (begin) {
+            if (!snapshot_coordinator_) {
+                snapshot_origin_ = curTick();
+                snapshot_coordinator_ = this;
+            }
             cr3_ = root;
             cpu_->beginMemoryObservation();
             cpu_->tmaStats.begin();
             begin_record_ = owner_.fst_record_count_;
             begin_tick_ = curTick();
             begin_macro_ = owner_.functional_instruction_count_;
-            snapshot(true, inst);
+            snapshot("BEGIN", pc);
             phase_ = 1;
+            if (snapshot_coordinator_ == this) scheduleSnapshot();
             owner_.cpl_core_id_ = cores_[worker_];
             TaoTraceNativeAccessRegistry::enableContext(uint32_t(tc->contextId()));
             owner_.initializeCpl(begin_tick_, cpu_->clockPeriod(), true);
@@ -177,9 +221,10 @@ void FixedWorkMarker::observe(const DynInstPtr &inst, uint64_t before)
             end_record_ = owner_.fst_record_count_;
             end_tick_ = curTick();
             end_macro_ = owner_.functional_instruction_count_;
+            completed_work_ = uint64_t(tc->getReg(X86ISA::int_reg::Rdx));
             cpu_->tmaStats.end();
             cpu_->endMemoryObservation();
-            snapshot(false, inst);
+            snapshot("END", pc);
             phase_ = 2;
             // Existing identities still accept responses. Finalize must not
             // admit fresh requests into the closed business window.
@@ -189,6 +234,14 @@ void FixedWorkMarker::observe(const DynInstPtr &inst, uint64_t before)
                             [](auto *marker) { return marker->phase_ == 2; })) {
                 fatal_if(team_ended_, "duplicate fixed-work team END");
                 team_ended_ = true;
+                // Observe each producer at the last END's actual commit event.
+                // Other CPU events at the same tick may still follow.
+                for (auto *marker : instances_) {
+                    marker->team_end_tick_ = curTick();
+                    marker->team_end_record_ = marker->owner_.fst_record_count_;
+                }
+                if (snapshot_coordinator_ && snapshot_coordinator_->snapshot_event_.scheduled())
+                    snapshot_coordinator_->owner_.deschedule(snapshot_coordinator_->snapshot_event_);
                 exitSimulationLoopNow(9, {{"kind", "fixed_work_team_end"}});
             }
         }
@@ -215,6 +268,7 @@ void FixedWorkMarker::result(const DynInstPtr &inst, uint64_t before)
              "fixed-work result buffers exceed the configured bounds");
     result_context_ = tc;
     result_record_ = owner_.fst_record_count_;
+    result_tick_ = curTick();
     result_ready_ = true;
     if (std::all_of(instances_.begin(), instances_.end(),
                     [](auto *marker) { return marker->result_ready_; })) {
@@ -281,8 +335,14 @@ void FixedWorkMarker::finish()
          << ",\"workid\":" << workids_[worker_] << ",\"cr3\":" << cr3_
          << ",\"score_begin_record\":" << begin_record_
          << ",\"score_end_record\":" << end_record_
+         << ",\"team_end_observed_tick\":" << team_end_tick_
+         << ",\"team_end_observed_record\":" << team_end_record_
+         << ",\"result_tick\":" << result_tick_
+         << ",\"result_record\":" << result_record_
          << ",\"execution_end_record\":" << owner_.fst_record_count_
+         << ",\"execution_end_tick\":" << curTick()
          << ",\"begin_tick\":" << begin_tick_ << ",\"end_tick\":" << end_tick_
+         << ",\"completed_work\":" << completed_work_
          << ",\"begin_macro_after\":" << begin_macro_ << ",\"end_macro_after\":" << end_macro_
          << ",\"execution_macros\":" << owner_.functional_instruction_count_
          << ",\"completion\":\"" << (result_pc_ ? "result-buffers-drained" : "guest-exit")

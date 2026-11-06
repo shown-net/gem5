@@ -7,6 +7,7 @@
 #include <vector>
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "params/TaoTrace.hh"
+#include "sim/eventq.hh"
 
 namespace gem5 { class ThreadContext;
 namespace o3 {
@@ -29,7 +30,9 @@ class FixedWorkMarker
     static void handoff(gem5::ThreadContext *tc);
     static void resume();
   private:
-    void snapshot(bool begin, const DynInstPtr &inst);
+    void snapshot(const char *kind, Addr pc);
+    void periodicSnapshot();
+    void scheduleSnapshot();
     void result(const DynInstPtr &inst, uint64_t before);
     TaoTrace &owner_;
     CPU *cpu_;
@@ -41,15 +44,21 @@ class FixedWorkMarker
     bool capturing_ = false;
     const Addr result_pc_;
     const uint64_t result_max_bytes_;
+    const Tick snapshot_interval_;
+    EventFunctionWrapper snapshot_event_;
     bool result_ready_ = false;
     gem5::ThreadContext *result_context_ = nullptr;
     Addr input_addr_ = 0, output_addr_ = 0;
     uint64_t input_bytes_ = 0, output_bytes_ = 0, result_record_ = 0;
+    uint64_t result_tick_ = 0, team_end_record_ = 0, team_end_tick_ = 0;
     uint64_t cr3_ = 0, begin_record_ = 0, end_record_ = 0;
+    uint64_t completed_work_ = 0;
     uint64_t begin_tick_ = 0, end_tick_ = 0, begin_macro_ = 0, end_macro_ = 0;
     std::FILE *snapshots_ = nullptr;
     static std::unordered_set<FixedWorkMarker *> instances_;
     static gem5::ThreadContext *handoff_context_;
     static bool handed_off_, team_ended_;
+    static Tick snapshot_origin_;
+    static FixedWorkMarker *snapshot_coordinator_;
 };
 } }
