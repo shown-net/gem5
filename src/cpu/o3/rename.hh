@@ -507,6 +507,9 @@ class Rename
         statistics::Vector status;
         /** Stat for total number of renamed instructions. */
         statistics::Scalar renamedInsts;
+        /** Implicit PUSH updates, including wrong-path operations. */
+        statistics::Scalar pushUpdatesComputed;
+        statistics::Scalar pushUpdatesDeferred;
         /** Stat for total number of squashed instructions that rename
          * discards. */
         statistics::Scalar squashedInsts;

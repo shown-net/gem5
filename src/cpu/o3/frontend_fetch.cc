@@ -235,7 +235,8 @@ Fetch::fetchFrontend(bool &status_change)
             if (!memoryGroup) {
                 panic_if(at.microPC() != 0, "Microfused memory group began mid-expansion");
                 memoryGroup = std::make_shared<AllocationGroup>(record->sequence,
-                    record->sequence + current_macro->functionalMicroops() - 1, 0, 0);
+                    record->sequence + cpu->instSeqStride() *
+                        (current_macro->functionalMicroops() - 1), 0, 0);
                 memoryGroup->independentBackendEntries =
                     current_macro->isStackRegAllocation();
                 if (op->isStoreAddress()) {

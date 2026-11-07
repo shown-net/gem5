@@ -51,12 +51,40 @@
 #include "debug/Rename.hh"
 #include "params/BaseO3CPU.hh"
 #include "cpu/o3/zero_idiom.hh"
+#include "cpu/o3/stack_engine.hh"
+#include "arch/x86/insts/macroop.hh"
+#include "arch/x86/regs/int.hh"
+#include "debug/StackEngine.hh"
 
 namespace gem5
 {
 
 namespace o3
 {
+
+namespace
+{
+// Only the flag-free, implicit 64-bit PUSH register update is eligible.
+// Keep the functional micro-op for other CPU models and the unready case.
+bool
+isImplicitPushUpdate(const DynInstPtr &inst)
+{
+    if (!inst->isLastMicroop() || inst->isSquashed() ||
+        inst->getFault() != NoFault || inst->staticInst->getName() != "subi" ||
+        inst->numSrcRegs() != 1 || inst->numDestRegs() != 1)
+        return false;
+    auto *macro = dynamic_cast<X86ISA::MacroopBase *>(inst->macroop.get());
+    if (!macro || std::string(macro->getMicrocodeBlock()) != "PUSH_R")
+        return false;
+    const auto env = macro->getEmulEnv();
+    if (env.stackSize != 8 || env.dataSize != 8)
+        return false;
+    auto *isa = inst->tcBase()->getIsaPtr();
+    const auto rsp = X86ISA::int_reg::Rsp.flatten(*isa);
+    return inst->srcRegIdx(0).flatten(*isa) == rsp &&
+           inst->destRegIdx(0).flatten(*isa) == rsp;
+}
+}
 
 // clang-format off
 std::string Rename::RenameStats::statusStrings[ThreadStatusMax] = {
@@ -138,6 +166,10 @@ Rename::RenameStats::RenameStats(statistics::Group *parent)
                "Number of cycles spent in each rename state"),
       ADD_STAT(renamedInsts, statistics::units::Count::get(),
                "Number of instructions processed by rename"),
+      ADD_STAT(pushUpdatesComputed, statistics::units::Count::get(),
+               "Implicit 64-bit register PUSH updates computed at rename"),
+      ADD_STAT(pushUpdatesDeferred, statistics::units::Count::get(),
+               "Implicit 64-bit register PUSH updates sent to execution"),
       ADD_STAT(squashedInsts, statistics::units::Count::get(),
                "Number of squashed instructions processed by rename"),
       ADD_STAT(ROBFullEvents, statistics::units::Count::get(),
@@ -403,6 +435,8 @@ Rename::drainSanityCheck() const
 void
 Rename::squash(const InstSeqNum &squash_seq_num, ThreadID tid)
 {
+    if (cpu->stackEngine && cpu->stackEngine->enabled())
+        cpu->stackEngine->squash(tid, squash_seq_num);
     commit_ptr->reorderBuffer().cancelReservations(tid, squash_seq_num);
     iew_ptr->instQueue.cancelReservations(tid, squash_seq_num);
     if (cpu->frontend) cpu->frontend->cancelAfter(squash_seq_num);
@@ -729,6 +763,23 @@ Rename::renameInsts(ThreadID tid)
         assert(!insts_to_rename.empty());
 
         DynInstPtr inst = insts_to_rename.front();
+        StackEngine::Decision stack_decision;
+        if (cpu->stackEngine && !inst->isSquashed()) {
+            stack_decision = cpu->stackEngine->classify(inst);
+            if (stack_decision.sync && !inst->stackSyncSatisfied) {
+                inst->stackSyncSatisfied = true;
+                insts_to_rename.push_front(
+                    cpu->stackEngine->makeSync(inst, stack_decision.reason));
+                ++insts_available;
+                continue;
+            }
+            inst->stackTrackedWrite = stack_decision.trackedWrite;
+            inst->stackAbsorbed = stack_decision.absorbedUpdate;
+            if (inst->stackAbsorbed) {
+                inst->stageDemand.robUnits = 0;
+                inst->stageDemand.schedulerActions = 0;
+            }
+        }
         if (!inst->isSquashed() &&
             !inst->allocationGroup && inst->staticInst->isFullGprMove() &&
             inst->numSrcRegs() == 3 && inst->numDestRegs() == 1 &&
@@ -740,6 +791,8 @@ Rename::renameInsts(ThreadID tid)
             const auto dest_reg = inst->destRegIdx(0).flatten(*isa);
             inst->eliminatedMove = source_reg.is(IntRegClass) &&
                 dest_reg.is(IntRegClass) &&
+                !(stack_decision.sourceMask && cpu->stackEngine &&
+                  cpu->stackEngine->offset(tid) != 0) &&
                 !renameMap[tid]->lookup(source_reg)->isPinned() &&
                 !renameMap[tid]->lookup(dest_reg)->isPinned();
         }
@@ -768,6 +821,25 @@ Rename::renameInsts(ThreadID tid)
             // reserves its own independently defined entries. All functional
             // members must be present before any register mapping changes.
             for (const auto &member : insts_to_rename) {
+                if (cpu->stackEngine && cpu->stackEngine->enabled()) {
+                    const auto d = cpu->stackEngine->classify(member);
+                    member->stackTrackedWrite = d.trackedWrite;
+                    member->stackAbsorbed = d.absorbedUpdate;
+                    if (member->stackAbsorbed) {
+                        member->stageDemand.robUnits = 0;
+                        member->stageDemand.schedulerActions = 0;
+                    }
+                }
+                if ((!cpu->stackEngine || !cpu->stackEngine->enabled()) &&
+                    isImplicitPushUpdate(member)) {
+                    auto *isa = member->tcBase()->getIsaPtr();
+                    const auto rsp = X86ISA::int_reg::Rsp.flatten(*isa);
+                    auto source = renameMap[tid]->lookup(rsp);
+                    member->renameComputed =
+                        !source->isPinned() && scoreboard->getReg(source);
+                    member->stageDemand.schedulerActions =
+                        member->renameComputed ? 0 : 1;
+                }
                 admission_batch.push_back(member);
                 if (member->seqNum == inst->allocationEnd())
                     break;
@@ -796,6 +868,13 @@ Rename::renameInsts(ThreadID tid)
                     continue;
                 for (unsigned c = 0; c < fragments.size(); ++c)
                     fragments[c] += member->numDestRegs(RegClassType(c));
+                if (member->stackTrackedWrite) {
+                    auto *isa = member->tcBase()->getIsaPtr();
+                    for (unsigned i = 0; i < member->numDestRegs(); ++i)
+                        if (member->destRegIdx(i).flatten(*isa) ==
+                            X86ISA::int_reg::Rsp.flatten(*isa))
+                            --fragments[IntRegClass];
+                }
                 float_entries += member->stageDemand.floatWideEntries ?
                     member->stageDemand.floatWideEntries :
                     member->staticInst->numFloatDestEntries();
@@ -926,6 +1005,54 @@ Rename::renameInsts(ThreadID tid)
         renameSrcRegs(inst, inst->threadNumber);
 
         renameDestRegs(inst, inst->threadNumber);
+        if (inst->renameComputed) {
+            // The source was ready before the allocation group was reserved.
+            // Use the normal renamed PRF destination and squash history.
+            panic_if(!scoreboard->getReg(inst->renamedSrcIdx(0)),
+                     "Implicit PUSH source became unready after admission");
+            inst->execute();
+            panic_if(inst->getFault() != NoFault,
+                     "Implicit PUSH update faulted during rename");
+            if (cpu->resultForwarding)
+                cpu->resultForwarding->track(inst, false);
+            scoreboard->setReg(inst->renamedDestIdx(0));
+            inst->setExecuted();
+            inst->setResultsWoken();
+            ++stats.pushUpdatesComputed;
+        } else if ((!cpu->stackEngine || !cpu->stackEngine->enabled()) &&
+                   isImplicitPushUpdate(inst)) {
+            ++stats.pushUpdatesDeferred;
+        }
+        if (cpu->stackEngine) {
+            inst->stackSourceMask = stack_decision.sourceMask;
+            inst->stackSourceDelta = cpu->stackEngine->enabled() ?
+                cpu->stackEngine->offset(tid) : 0;
+            if (stack_decision.sourceMask || stack_decision.trackedWrite ||
+                stack_decision.fallback || inst->stackSync) {
+                DPRINTF(StackEngine,
+                    "[tid:%u] [sn:%llu] PC:%s op=%s base-delta=%lld "
+                    "source-delta=%lld source-mask=%#llx tracked=%u absorbed=%u step=%lld fallback=%u\n",
+                    tid, inst->seqNum, inst->pcState(), inst->staticInst->getName(),
+                    cpu->stackEngine->enabled() ? cpu->stackEngine->offset(tid) : 0,
+                    inst->stackSourceDelta,
+                    stack_decision.sourceMask, stack_decision.trackedWrite,
+                    stack_decision.absorbedUpdate, stack_decision.increment,
+                    stack_decision.fallback);
+            }
+            if (cpu->stackEngine->enabled() &&
+                (inst->stackSync || stack_decision.trackedWrite)) {
+                const int64_t after = inst->stackSync ? 0 :
+                    cpu->stackEngine->offset(tid) + stack_decision.increment;
+                cpu->stackEngine->apply(tid, inst->seqNum, after);
+                inst->stackStateChanged = true;
+                inst->stackDeltaAfter = after;
+                if (stack_decision.trackedWrite) cpu->stackEngine->noteTracked();
+            }
+            if (cpu->stackEngine->enabled() && stack_decision.fallback)
+                cpu->stackEngine->noteFallback();
+            if (cpu->stackEngine->enabled() && inst->isControl())
+                cpu->stackEngine->checkpoint(tid, inst->seqNum);
+        }
         if (inst->eliminatedMove) {
             inst->setExecuted();
             inst->setResultsWoken();
@@ -1340,6 +1467,15 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
 
         RegId flat_dest_regid = dest_reg.flatten(*isa);
         flat_dest_regid.setNumPinnedWrites(dest_reg.getNumPinnedWrites());
+
+        if (inst->stackTrackedWrite && flat_dest_regid ==
+            X86ISA::int_reg::Rsp.flatten(*isa)) {
+            const RegId invalid;
+            auto *unused = map->lookup(invalid);
+            inst->flattenedDestIdx(dest_idx, invalid);
+            inst->renameDestReg(dest_idx, unused, unused);
+            continue;
+        }
 
         if (inst->eliminatedMove) {
             auto source = inst->renamedSrcIdx(

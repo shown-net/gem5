@@ -53,6 +53,7 @@
 #include "cpu/exetrace.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/stack_engine.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/thread_state.hh"
@@ -831,6 +832,8 @@ Commit::commit()
 
             if (fromIEW->includeSquashInst[tid]) {
                 squashed_inst--;
+                auto preceding = rob->findInst(tid, squashed_inst);
+                if (preceding && preceding->stackSync) --squashed_inst;
             }
 
             if (oracle_cause_inst && oracle_cause_inst->allocationGroup &&
@@ -841,6 +844,8 @@ Commit::commit()
                 const auto group = oracle_cause_inst->allocationGroup;
                 auto leader = rob->findInst(tid, group->leader);
                 squashed_inst = group->leader - 1;
+                auto preceding = rob->findInst(tid, squashed_inst);
+                if (preceding && preceding->stackSync) --squashed_inst;
                 redirect_pc->set(leader ? leader->pcState().instAddr() :
                                          oracle_cause_inst->pcState().instAddr());
             }
@@ -1011,6 +1016,8 @@ Commit::commitInsts()
             for (InstSeqNum sn = head_inst->seqNum;
                  sn <= head_inst->retirementEnd(); ++sn) {
                 auto member = rob->findInst(commit_thread, sn);
+                if (!member && cpu->instSeqStride() == 2 && (sn & 1))
+                    continue;
                 group_ready &= member && member->readyToCommit();
                 fault_ready |= member && member->readyToCommit() &&
                     member->getFault() != NoFault;
@@ -1132,7 +1139,7 @@ Commit::commitInsts()
 
                 // Check instruction execution if it successfully commits and
                 // is not carrying a fault.
-                if (cpu->checker) {
+                if (cpu->checker && !head_inst->stackSync) {
                     cpu->checker->verify(head_inst);
                 }
 
@@ -1375,6 +1382,11 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     for (int i = 0; i < head_inst->numDestRegs(); i++) {
         renameMap[tid]->setEntry(head_inst->flattenedDestIdx(i),
                                  head_inst->renamedDestIdx(i));
+    }
+    if (cpu->stackEngine && cpu->stackEngine->enabled()) {
+        cpu->stackEngine->retire(tid, head_inst->seqNum,
+            head_inst->stackStateChanged, head_inst->stackDeltaAfter);
+        if (head_inst->stackSync) cpu->stackEngine->noteSyncRetired();
     }
 
     // hardware transactional memory

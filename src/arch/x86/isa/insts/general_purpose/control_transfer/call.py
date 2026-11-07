@@ -59,7 +59,9 @@ def macroop CALL_NEAR_R
     # Check target of call
     st t1, ss, [0, t0, rsp], "-env.dataSize", addressSize=ssz
     subi rsp, rsp, dsz, dataSize=ssz
-    wripi reg, 0
+    # CALL through RSP uses its value before the implicit stack update.
+    # With a 64-bit stack, undo that update in the branch target calculation.
+    wripi reg, "(env.reg == int_reg::_RspIdx && env.stackSize == 8) ? env.dataSize : 0"
 };
 
 def macroop CALL_NEAR_M

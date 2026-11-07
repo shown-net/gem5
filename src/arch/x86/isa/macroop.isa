@@ -122,7 +122,7 @@ def template MacroConstructor {{
             %(adjust_disp)s;
             %(init_env)s;
             %(constructor)s;
-            const char *macrocodeBlock = "%(class_name)s";
+            macrocodeBlock = "%(class_name)s";
             //alloc_microops is the code that sets up the microops
             //array in the parent class.
             %(alloc_microops)s;

@@ -1076,7 +1076,16 @@ IEW::dispatchInsts(ThreadID tid)
             inst->setCanCommit();
             instQueue.insertBarrier(inst);
             add_to_iq = false;
-        } else if (inst->eliminatedMove) {
+        } else if (inst->renameComputed) {
+            // Rename produced a new physical register value; publish it to
+            // the IQ scoreboard without occupying an execution resource.
+            inst->setIssued();
+            inst->setExecuted();
+            inst->setCanCommit();
+            if (inst->getFault() == NoFault)
+                instQueue.recordCompletedProducer(inst);
+            add_to_iq = false;
+        } else if (inst->eliminatedMove || inst->stackAbsorbed) {
             // The destination names the source producer's physical register.
             // Preserve its scoreboard and result-forwarding identity.
             inst->setIssued();

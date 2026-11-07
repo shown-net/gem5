@@ -48,6 +48,8 @@
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/zero_idiom.hh"
+#include "cpu/o3/stack_engine.hh"
+#include "arch/x86/regs/int.hh"
 #include "arch/x86/mmu.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/o3/limits.hh"
@@ -58,6 +60,7 @@
 #include "debug/Drain.hh"
 #include "debug/O3CPU.hh"
 #include "debug/Quiesce.hh"
+#include "debug/StackEngine.hh"
 #include "enums/MemoryMode.hh"
 #include "sim/cur_tick.hh"
 #include "sim/full_system.hh"
@@ -124,7 +127,8 @@ CPU::CPU(const BaseO3CPUParams &params)
       activityRec(name(), NumStages,
                   params.backComSize + params.forwardComSize, params.activity),
 
-      globalSeqNum(1),
+      globalSeqNum(params.stackEngine ? 2 : 1),
+      stackRspShadow(numThreads, 0), stackRspPending(numThreads, false),
       globalFTSeqNum(1),
       system(params.system),
       lastRunningCycle(curCycle()),
@@ -142,6 +146,8 @@ CPU::CPU(const BaseO3CPUParams &params)
             "SMT is not supported in O3 in full system mode currently.");
     resultForwarding = params.resultForwarding;
     zeroIdiom = params.zeroIdiom;
+    stackEngine = params.stackEngine;
+    if (stackEngine) stackEngine->configure(params.numThreads);
     frontend = params.frontend;
     if (frontend) {
         frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
@@ -415,6 +421,9 @@ CPU::tick()
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
+
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        flushStackRsp(tid);
 
     ++baseStats.numCycles;
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
@@ -765,6 +774,12 @@ CPU::processInterrupts(const Fault &interrupt)
 void
 CPU::trap(const Fault &fault, ThreadID tid, const StaticInstPtr &inst)
 {
+    if (stackEngine) {
+        DPRINTF(StackEngine,
+                "[tid:%u] trap=%s logical-rsp=%#llx committed-delta=%lld\n",
+                tid, fault->name(), getArchReg(X86ISA::int_reg::Rsp, tid),
+                stackEngine->enabled() ? stackEngine->committedOffset(tid) : 0);
+    }
     // Pass the thread's TC into the invoke method.
     fault->invoke(threadContexts[tid], inst);
 }
@@ -778,6 +793,7 @@ CPU::serializeThread(CheckpointOut &cp, ThreadID tid) const
 void
 CPU::unserializeThread(CheckpointIn &cp, ThreadID tid)
 {
+    if (stackEngine) stackEngine->reset(tid);
     thread[tid]->unserialize(cp);
 }
 
@@ -971,6 +987,9 @@ CPU::switchOut()
 void
 CPU::takeOverFrom(BaseCPU *oldCPU)
 {
+    if (stackEngine)
+        for (ThreadID tid = 0; tid < numThreads; ++tid)
+            stackEngine->reset(tid);
     BaseCPU::takeOverFrom(oldCPU);
 
     bac.takeOverFrom();
@@ -985,6 +1004,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
     auto *oldO3CPU = dynamic_cast<CPU *>(oldCPU);
     if (oldO3CPU)
         globalSeqNum = oldO3CPU->globalSeqNum;
+    if (stackEngine && (globalSeqNum & 1)) ++globalSeqNum;
 
     lastRunningCycle = curCycle();
     _status = Idle;
@@ -1147,43 +1167,84 @@ CPU::setReg(PhysRegIdPtr phys_reg, const void *val, ThreadID tid)
     regFile.setReg(phys_reg, val);
 }
 
+void
+CPU::flushStackRsp(ThreadID tid)
+{
+    if (!stackRspPending[tid]) return;
+    const auto rsp = X86ISA::int_reg::Rsp.flatten(*isa[tid]);
+    const auto physical = commitRenameMap[tid].lookup(rsp);
+    regFile.setReg(physical, stackRspShadow[tid] -
+                   uint64_t(stackEngine->committedOffset(tid)));
+    stackRspPending[tid] = false;
+}
+
 RegVal
 CPU::getArchReg(const RegId &reg, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
-    return regFile.getReg(phys_reg);
+    auto value = regFile.getReg(phys_reg);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid]))
+        value += uint64_t(stackEngine->committedOffset(tid));
+    return value;
 }
 
 void
 CPU::getArchReg(const RegId &reg, void *val, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
     regFile.getReg(phys_reg, val);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid]))
+        *static_cast<RegVal *>(val) += uint64_t(stackEngine->committedOffset(tid));
 }
 
 void *
 CPU::getWritableArchReg(const RegId &reg, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid])) {
+        stackRspShadow[tid] = regFile.getReg(phys_reg) +
+            uint64_t(stackEngine->committedOffset(tid));
+        stackRspPending[tid] = true;
+        if (!thread[tid]->trapPending && !thread[tid]->noSquashFromTC)
+            squashFromTC(tid);
+        return &stackRspShadow[tid];
+    }
     return regFile.getWritableReg(phys_reg);
 }
 
 void
 CPU::setArchReg(const RegId &reg, RegVal val, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid]))
+        val -= uint64_t(stackEngine->committedOffset(tid));
     regFile.setReg(phys_reg, val);
 }
 
 void
 CPU::setArchReg(const RegId &reg, const void *val, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid])) {
+        regFile.setReg(phys_reg, *static_cast<const RegVal *>(val) -
+                       uint64_t(stackEngine->committedOffset(tid)));
+        return;
+    }
     regFile.setReg(phys_reg, val);
 }
 
@@ -1212,6 +1273,12 @@ CPU::addInst(const DynInstPtr &inst)
     instList.push_back(inst);
 
     return --(instList.end());
+}
+
+CPU::ListIt
+CPU::insertInstBefore(const DynInstPtr &inst, const DynInstPtr &before)
+{
+    return instList.insert(before->getInstListIt(), inst);
 }
 
 void

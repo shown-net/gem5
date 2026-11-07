@@ -213,11 +213,15 @@ class ROB
 
     /** Returns if the ROB is empty. */
     bool isEmpty() const
-    { return numInstsInROB == 0; }
+    {
+        for (ThreadID tid = 0; tid < numThreads; ++tid)
+            if (!instList[tid].empty()) return false;
+        return true;
+    }
 
     /** Returns if a specific thread's partition is empty. */
     bool isEmpty(ThreadID tid) const
-    { return threadEntries[tid] == 0; }
+    { return instList[tid].empty(); }
 
     /** Executes the squash, marking squashed instructions. */
     void doSquash(ThreadID tid);

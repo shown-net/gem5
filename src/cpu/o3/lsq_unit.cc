@@ -248,6 +248,7 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
     // The CPU constructs its pipeline before initializing cpu->checker.
     sprStoreBuffer = params.sprStoreBuffer && needsTSO && !params.checker;
     sprEarlyStorePrepare = params.sprEarlyStorePrepare && sprStoreBuffer;
+    sprRetiredStorePrepare = params.sprRetiredStorePrepare;
     sprMemoryDependence = params.sprMemoryDependence;
     sprFastStoreForwarding = params.sprFastStoreForwarding && !params.checker;
     iewStage->instQueue.memoryDependence(lsqID).setLSQ(lsq);
@@ -1589,6 +1590,9 @@ LSQUnit::issueStorePrepareRequests()
             break;
         }
         if (store_it->committed() || store_it->storePrepareIssued()) {
+            continue;
+        }
+        if (store_it->canWB() && !sprRetiredStorePrepare) {
             continue;
         }
 

@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/rename_map.hh"
+#include "arch/x86/regs/int.hh"
 
 #include <vector>
 
@@ -134,7 +135,14 @@ UnifiedRenameMap::canRename(DynInstPtr inst, RegClassType type) const
 {
     if (inst->eliminatedMove)
         return true;
-    const unsigned fragments = inst->numDestRegs(type);
+    unsigned fragments = inst->numDestRegs(type);
+    if (type == IntRegClass && inst->stackTrackedWrite) {
+        auto *isa = inst->tcBase()->getIsaPtr();
+        for (unsigned i = 0; i < inst->numDestRegs(); ++i)
+            if (inst->destRegIdx(i).flatten(*isa) ==
+                X86ISA::int_reg::Rsp.flatten(*isa))
+                --fragments;
+    }
     if (fragments > renameMaps[type].numFreeEntries())
         return false;
     if (type == FloatRegClass) {

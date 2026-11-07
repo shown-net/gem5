@@ -154,10 +154,11 @@ def macroop LEAVE {
     # Make the default data size of pops 64 bits in 64 bit mode
     .adjust_env oszIn64Override
 
-    mov t1, t1, rbp
-    ld rbp, ss, [1, t0, t1], addressSize=ssz
-    mov rsp, rsp, t1, dataSize=ssz
-    addi rsp, rsp, dsz, dataSize=ssz
+    # Load before changing architectural registers so a fault leaves them
+    # untouched. The address uses the stack address size, even for POP BP.
+    ld t1, ss, [1, t0, rbp], addressSize=ssz
+    addi rsp, rbp, dsz, dataSize=ssz
+    mov rbp, rbp, t1
 };
 
 def macroop ENTER_I_I {

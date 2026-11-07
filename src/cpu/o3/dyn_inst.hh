@@ -355,6 +355,16 @@ class DynInst : public ExecContext, public RefCounted
     // Optional Marker observations; none drive the pipeline.
     bool fetchedFromUser = false;
     bool pendingFrontendAcceptance = false;
+    // Per-dynamic-operation stack operands and state transitions.
+    uint64_t stackSourceMask = 0;
+    int64_t stackSourceDelta = 0;
+    int64_t stackDeltaAfter = 0;
+    int64_t stackSyncImmediate = 0;
+    bool stackStateChanged = false;
+    bool stackTrackedWrite = false;
+    bool stackAbsorbed = false;
+    bool stackSync = false;
+    bool stackSyncSatisfied = false;
     AllocationGroupPtr allocationGroup;
     StageDemand stageDemand;
     // Selected on scheduler admission, retained until dispatch or squash.
@@ -660,8 +670,11 @@ class DynInst : public ExecContext, public RefCounted
     //
     bool isNop()          const { return staticInst->isNop(); }
     bool eliminatedMove = false;
+    // A ready implicit PUSH update was evaluated using the normal PRF at rename.
+    bool renameComputed = false;
     bool bypassesIQ() const
-    { return isNop() || staticInst->isZeroIdiom() || eliminatedMove; }
+    { return isNop() || staticInst->isZeroIdiom() || eliminatedMove ||
+             renameComputed || stackAbsorbed; }
     bool isMemRef()       const { return staticInst->isMemRef(); }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
@@ -1287,14 +1300,19 @@ class DynInst : public ExecContext, public RefCounted
         const PhysRegIdPtr reg = renamedSrcIdx(idx);
         if (reg->is(InvalidRegClass))
             return 0;
+        RegVal value;
         if (idx < sourceResultValues.size() && sourceResultValues[idx].producer) {
             const auto &ref = sourceResultValues[idx];
             panic_if(!ref.producer->hasResultValue(ref.destination) ||
                      ref.producer->resultAvailableAt() > curTick(),
                      "Consumer read a result before its value was available");
-            return ref.producer->resultValue(ref.destination);
+            value = ref.producer->resultValue(ref.destination);
+        } else {
+            value = cpu->getReg(reg, threadNumber);
         }
-        return cpu->getReg(reg, threadNumber);
+        if (idx < 64 && (stackSourceMask & (uint64_t(1) << idx)))
+            value += uint64_t(stackSourceDelta);
+        return value;
     }
 
     void
@@ -1304,6 +1322,8 @@ class DynInst : public ExecContext, public RefCounted
         if (reg->is(InvalidRegClass))
             return;
         cpu->getReg(reg, val, threadNumber);
+        if (idx < 64 && (stackSourceMask & (uint64_t(1) << idx)))
+            *static_cast<RegVal *>(val) += uint64_t(stackSourceDelta);
     }
 
     void *

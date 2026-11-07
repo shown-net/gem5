@@ -567,6 +567,7 @@ class LSQUnit
     int storesToWB;
     bool sprStoreBuffer = false;
     bool sprEarlyStorePrepare = false;
+    bool sprRetiredStorePrepare = true;
     bool sprMemoryDependence = false;
     bool sprFastStoreForwarding = false;
     uint64_t nextStoreBufferId = 1;

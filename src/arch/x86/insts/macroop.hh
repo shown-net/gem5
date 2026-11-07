@@ -104,6 +104,8 @@ class MacroopBase : public X86StaticInst
         return env;
     }
 
+    const char *getMicrocodeBlock() const { return macrocodeBlock; }
+
     bool usesMicrocodeService() const override
     {
         if (isArchitecturalBranch()) return false;

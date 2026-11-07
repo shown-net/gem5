@@ -39,6 +39,7 @@
  */
 
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/stack_engine.hh"
 
 #include <algorithm>
 
@@ -198,6 +199,8 @@ DynInst::operator delete(void *ptr)
 
 DynInst::~DynInst()
 {
+    if (stackSync && isSquashed() && cpu && cpu->stackEngine)
+        cpu->stackEngine->noteSyncSquashed();
     /*
      * The buffer this DynInst occupies also holds some of the structures it
      * points to. We need to call their destructors manually to make sure that
@@ -391,6 +394,8 @@ DynInst::writeResultValues()
 Fault
 DynInst::execute()
 {
+    if (stackSync && cpu->stackEngine)
+        cpu->stackEngine->noteSyncExecuted();
     // @todo: Pretty convoluted way to avoid squashing from happening
     // when using the TC during an instruction's execution
     // (specifically for instructions that have side-effects that use

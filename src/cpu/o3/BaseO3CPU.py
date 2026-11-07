@@ -47,6 +47,7 @@ from m5.objects.FUPool import *
 from m5.objects.Frontend import FrontendCoordinator
 from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, ResultForwarding
 from m5.objects.ZeroIdiom import ZeroIdiom
+from m5.objects.StackEngine import StackEngine
 from m5.objects.IndexingPolicies import *
 from m5.objects.IQUnit import *
 from m5.objects.ReplacementPolicies import *
@@ -63,6 +64,7 @@ class BaseO3CPU(BaseCPU):
     executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
     resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
     zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+    stackEngine = Param.StackEngine(NULL, "Speculative x86 stack-pointer tracking")
     frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
     intALU = Param.IntExecutionResource(NULL, "ALU execution family")
     intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
@@ -97,6 +99,9 @@ class BaseO3CPU(BaseCPU):
     )
     sprEarlyStorePrepare = Param.Bool(
         False, "Speculatively prepare translated ordinary stores before retirement"
+    )
+    sprRetiredStorePrepare = Param.Bool(
+        True, "Allow prepare hints for stores eligible for post-retirement writeback"
     )
 
     # Backward pipeline delays

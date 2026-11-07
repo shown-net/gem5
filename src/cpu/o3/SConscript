@@ -45,10 +45,12 @@ Import('*')
 if env['CONF']['BUILD_ISA']:
     SimObject('FUPool.py', sim_objects=['FUPool'])
     SimObject('ZeroIdiom.py', sim_objects=['ZeroIdiom'])
+    SimObject('StackEngine.py', sim_objects=['StackEngine'])
     SimObject('Frontend.py', sim_objects=[
         'InstructionBytes', 'InstructionDeliveryQueue', 'MiteService',
         'DsbTemplates', 'MicrocodeService', 'FrontendCoordinator'])
     Source('zero_idiom.cc')
+    Source('stack_engine.cc')
     SimObject('IntExecution.py', sim_objects=[
         'ExecutionPort', 'ExecutionPorts', 'IntExecutionResource', 'IntegerALU',
         'ResultPathRule', 'ResultForwarding'])
@@ -99,6 +101,7 @@ if env['CONF']['BUILD_ISA']:
     DebugFlag('ROB')
     DebugFlag('Rename')
     DebugFlag('Scoreboard')
+    DebugFlag('StackEngine')
     DebugFlag('StoreSet')
     DebugFlag('Writeback')
 

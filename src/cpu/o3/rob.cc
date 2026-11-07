@@ -250,7 +250,7 @@ ROB::retireHead(ThreadID tid)
 {
     stats.writes++;
 
-    assert(numInstsInROB > 0);
+    assert(!instList[tid].empty());
 
     // Get the head ROB instruction by copying it and remove it from the list
     InstIt head_it = instList[tid].begin();
@@ -354,7 +354,7 @@ ROB::reserve(const DynInstPtr &inst)
     auto found = trackingEntries.find(inst->robKey());
     if (found == trackingEntries.end()) {
         const unsigned slots = inst->backendSlots();
-        panic_if(!slots || numFreeEntries(inst->threadNumber) < slots,
+        panic_if(numFreeEntries(inst->threadNumber) < slots,
                  "ROB reservation without tracking-entry credits");
         found = trackingEntries.emplace(inst->robKey(),
             TrackingEntry{inst->threadNumber, slots}).first;
@@ -600,7 +600,7 @@ ROB::squash(InstSeqNum squash_num, ThreadID tid)
 const DynInstPtr&
 ROB::readHeadInst(ThreadID tid)
 {
-    if (threadEntries[tid] != 0) {
+    if (!instList[tid].empty()) {
         InstIt head_thread = instList[tid].begin();
 
         assert((*head_thread)->isInROB());

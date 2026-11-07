@@ -92,6 +92,7 @@ namespace o3
 
 class ThreadContext;
 class ZeroIdiom;
+class StackEngine;
 class FrontendCoordinator;
 
 /**
@@ -107,6 +108,7 @@ class CPU : public BaseCPU
     FrontendCoordinator *frontend = nullptr;
     ResultForwarding *resultForwarding = nullptr;
     ZeroIdiom *zeroIdiom = nullptr;
+    StackEngine *stackEngine = nullptr;
     typedef std::list<DynInstPtr>::iterator ListIt;
 
     friend class ThreadContext;
@@ -295,7 +297,13 @@ class CPU : public BaseCPU
     void verifyMemoryMode() const override;
 
     /** Get the current instruction sequence number, and increment it. */
-    InstSeqNum getAndIncrementInstSeq() { return globalSeqNum++; }
+    unsigned instSeqStride() const { return stackEngine ? 2 : 1; }
+    InstSeqNum getAndIncrementInstSeq()
+    {
+        const auto result = globalSeqNum;
+        globalSeqNum += instSeqStride();
+        return result;
+    }
 
     /** Get the current fetch target sequence number, and increment it. */
     InstSeqNum
@@ -370,6 +378,7 @@ class CPU : public BaseCPU
      *  instructions.  Used when new instructions are fetched.
      */
     ListIt addInst(const DynInstPtr &inst);
+    ListIt insertInstBefore(const DynInstPtr &inst, const DynInstPtr &before);
 
     /** Function to tell the CPU that an instruction has completed. */
     void instDone(ThreadID tid, const DynInstPtr &inst);
@@ -555,6 +564,11 @@ class CPU : public BaseCPU
 
     /** The global sequence number counter. */
     InstSeqNum globalSeqNum;
+
+    // Writable ThreadContext access to RSP exposes the logical, not PRF, value.
+    std::vector<RegVal> stackRspShadow;
+    std::vector<bool> stackRspPending;
+    void flushStackRsp(ThreadID tid);
 
     /** The global FT sequence number counter. */
     FTSeqNum globalFTSeqNum;

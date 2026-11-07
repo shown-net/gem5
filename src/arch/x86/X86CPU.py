@@ -36,6 +36,7 @@ from m5.objects.FuncUnit import *
 from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
 from m5.objects.ZeroIdiom import ZeroIdiom
+from m5.objects.StackEngine import StackEngine
 from m5.objects.Frontend import FrontendCoordinator
 from m5.objects.IntExecution import (
     ExecutionPorts,
@@ -244,6 +245,7 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     ]
     resultForwarding = ResultForwarding()
     zeroIdiom = ZeroIdiom()
+    stackEngine = StackEngine()
     frontend = FrontendCoordinator(enableLsdReplay=False)
     intSHFT = IntExecutionResource(family=2)
     intSlow = IntExecutionResource(family=3)
