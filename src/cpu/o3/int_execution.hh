@@ -16,6 +16,7 @@
 #include "params/ExecutionPort.hh"
 #include "params/IntExecutionResource.hh"
 #include "params/IntegerALU.hh"
+#include "params/IntegerDivider.hh"
 #include "params/ResultForwarding.hh"
 #include "params/ResultPathRule.hh"
 #include "sim/eventq.hh"
@@ -25,6 +26,7 @@ namespace gem5::o3
 {
 
 class CPU;
+class FUPool;
 
 class ResultPathRule : public SimObject
 {
@@ -104,7 +106,7 @@ class ResultForwarding : public SimObject
     };
 
   private:
-    std::unordered_map<RegIndex, Reference> producers;
+    std::unordered_map<PhysRegIndex, Reference> producers;
     struct Waiter { DynInstPtr inst; Tick when; };
     std::unordered_map<uint64_t, Waiter> waiters;
     const std::vector<ResultPathRule *> paths;
@@ -180,6 +182,43 @@ class IntegerALU : public IntExecutionResource
     IntegerALU(const IntegerALUParams &p);
     ExecutionPort *connection() const { return port; }
     bool accepts(IntExecutionFamily requested, unsigned number, Tick now) const override;
+};
+
+class IntegerDivider : public SimObject
+{
+    struct Operation
+    {
+        DynInstPtr inst;
+        FUPool *pool;
+        ResultForwarding *forwarding;
+        std::function<void()> available, complete, issuedAction;
+        Tick admitted;
+        std::array<Tick, 3> inputs;
+        std::array<Tick, 2> outputs{};
+        bool launched = false;
+        unsigned internalStages = 0, transferred = 0, written = 0;
+    };
+    CPU *cpu = nullptr;
+    Tick nextLaunch = 0;
+    std::list<std::shared_ptr<Operation>> operations;
+    EventFunctionWrapper serviceEvent;
+    struct Stats : statistics::Group
+    {
+        statistics::Scalar admitted, evaluated, cancelled;
+        statistics::Vector actions;
+        Stats(statistics::Group *parent);
+    } stats;
+    void service();
+    void arm();
+    void finish(const std::shared_ptr<Operation> &operation);
+    void releaseAction(const DynInstPtr &inst);
+
+  public:
+    IntegerDivider(const IntegerDividerParams &p);
+    bool issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
+        const DynInstPtr &inst, std::function<void()> available,
+        std::function<void()> complete, std::function<void()> issued_action);
+    DrainState drain() override;
 };
 
 } // namespace gem5::o3

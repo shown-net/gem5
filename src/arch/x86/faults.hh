@@ -52,6 +52,15 @@ namespace gem5
 namespace X86ISA
 {
 
+// Restart at the REP instruction with its already committed architectural
+// progress, so a newly special mapping can select the ordinary byte path.
+class RepRestart : public ReExec
+{
+  public:
+    void invoke(ThreadContext *tc, const StaticInstPtr &inst =
+                nullStaticInstPtr) override;
+};
+
 // Base class for all x86 "faults" where faults is in the m5 sense
 class X86FaultBase : public FaultBase
 {
@@ -325,6 +334,17 @@ class SIMDFloatingPointFault : public X86Fault
 {
   public:
     SIMDFloatingPointFault() : X86Fault("SIMD Floating-Point", "#XF", 19) {}
+};
+
+class SSEArithmeticFault : public SIMDFloatingPointFault
+{
+    const uint8_t status;
+    const bool invalidOpcode;
+  public:
+    explicit SSEArithmeticFault(uint8_t bits, bool ud = false)
+        : status(bits), invalidOpcode(ud) {}
+    void invoke(ThreadContext *tc, const StaticInstPtr &inst =
+                nullStaticInstPtr) override;
 };
 
 class SecurityException : public X86FaultBase

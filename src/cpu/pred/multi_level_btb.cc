@@ -205,6 +205,12 @@ MultiLevelBTB::lookupLatency(ThreadID tid, Addr instPC) const
     return Cycles(0);
 }
 
+bool
+MultiLevelBTB::earlyValid(ThreadID tid, Addr instPC)
+{
+    return levels.front()->btb.findEntry({instPC, tid}) != nullptr;
+}
+
 const PCStateBase *
 MultiLevelBTB::lookup(ThreadID tid, Addr instPC, BranchType type)
 {

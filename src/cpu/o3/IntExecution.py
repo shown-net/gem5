@@ -37,6 +37,12 @@ class IntegerALU(IntExecutionResource):
     port = Param.ExecutionPort("Port connected to this ALU instance")
 
 
+class IntegerDivider(SimObject):
+    type = "IntegerDivider"
+    cxx_class = "gem5::o3::IntegerDivider"
+    cxx_header = "cpu/o3/int_execution.hh"
+
+
 class ResultPathRule(SimObject):
     type = "ResultPathRule"
     cxx_class = "gem5::o3::ResultPathRule"

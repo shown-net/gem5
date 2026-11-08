@@ -73,6 +73,8 @@ class FP_MultDiv(FUDesc):
         OpDesc(opClass="FloatMisc", opLat=3),
         OpDesc(opClass="FloatDiv", opLat=12, pipelined=False),
         OpDesc(opClass="FloatSqrt", opLat=24, pipelined=False),
+        OpDesc(opClass="X86FloatSqrt32", opLat=12, issueLat=3),
+        OpDesc(opClass="X86FloatSqrt64", opLat=18, issueLat=6),
     ]
     count = 2
 

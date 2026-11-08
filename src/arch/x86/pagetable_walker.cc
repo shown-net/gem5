@@ -376,7 +376,11 @@ Walker::WalkerState::startWalk()
         nextState = state;
         state = Waiting;
         timingFault = NoFault;
-        sendPackets();
+        if (prefixHit) {
+            sendPrefixResponse();
+        } else {
+            sendPackets();
+        }
     } else {
         do {
             walker->port.sendAtomic(read);
@@ -395,6 +399,24 @@ Walker::WalkerState::startWalk()
         nextState = Waiting;
     }
     return fault;
+}
+
+void
+Walker::WalkerState::sendPrefixResponse()
+{
+    // A delayed prefix response owns no FB or PTE memory transaction. Reuse
+    // walk completion so cancellation and context races have one owner.
+    assert(prefixHit && read);
+    PacketPtr cached = read;
+    read = nullptr;
+    cached->makeTimingResponse();
+    cached->pushSenderState(new WalkerSenderState(this));
+    ++inflight;
+    Walker *owner = walker;
+    owner->schedule(new EventFunctionWrapper(
+        [owner, cached] { owner->recvTimingResp(cached); },
+        owner->name() + ".prefixResponse", true),
+        owner->clockEdge(owner->prefixHitLatency));
 }
 
 Fault
@@ -429,8 +451,11 @@ Fault
 Walker::WalkerState::stepWalk(PacketPtr &write)
 {
     assert(state != Ready && state != Waiting);
-    recordFunctionalTranslationPte(entry.functionalTranslation,
-                                   read->getAddr());
+    const bool fromPrefix = prefixHit;
+    prefixHit = false;
+    if (!fromPrefix)
+        recordFunctionalTranslationPte(entry.functionalTranslation,
+                                       read->getAddr());
     Fault fault = NoFault;
     write = NULL;
     PageTableEntry pte;
@@ -447,6 +472,14 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     bool badNX = pte.nx && mode == BaseMMU::Execute && enableNX;
     if (dataSize == 8 && enableNX)
         entry.noExec = entry.noExec || pte.nx;
+    if ((state == LongPML4 || state == LongPDP || state == LongPD || state == LongPTE) &&
+        pte.p && ((pte.nx && !enableNX) ||
+                  (state == LongPML4 && pte.ps) ||
+                  (physicalAddressBits < 52 &&
+                   bits(uint64_t(pte), 51, physicalAddressBits)))) {
+        endWalk();
+        return pageFault(true, true);
+    }
     switch(state) {
       case LongPML4:
         DPRINTF(PageTableWalker, "Got long mode PML4 entry %#016x.\n", pte);
@@ -672,7 +705,26 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
       default:
         panic("Unknown page table walker state %d!\n");
     }
+    if (state == LongPML4 || state == LongPDP || state == LongPD) {
+        // SDM 5.10.3 requires every relevant upper Accessed flag to be set in
+        // memory before caching. An outstanding A-bit write keeps this walk
+        // uncached; later walks can fill after that write has completed.
+        cacheablePrefix &= !doWrite;
+        if (!fromPrefix && timing && walker->pagingStructureCache &&
+            cacheablePrefix && !doEndWalk && fault == NoFault &&
+            translationGeneration == walker->tlb->generation()) {
+            const unsigned level = state == LongPML4 ? 0 : state == LongPDP ? 1 : 2;
+            PageTableEntry aggregate = pte;
+            aggregate.w = entry.writable;
+            aggregate.u = entry.user;
+            aggregate.nx = entry.noExec;
+            walker->pagingStructureCache->insert({level, walkCr3, walkCr4, walkEfer,
+                entry.pcid, (entry.vaddr & mask(48)) >> PagingStructureCache::shift(level),
+                read->getAddr(), uint64_t(aggregate), entry.functionalTranslation});
+        }
+    }
     if (doTLBInsert) {
+        entry.pwt = pte.pwt;
         completeFunctionalTranslationLeaf(entry.functionalTranslation,
             entry.vaddr, entry.paddr, entry.logBytes, entry.global);
     }
@@ -719,6 +771,8 @@ Walker::WalkerState::endWalk()
 void
 Walker::WalkerState::setupWalk(Addr vaddr)
 {
+    prefixHit = false;
+    cacheablePrefix = true;
     if (timing) translationGeneration = walker->tlb->generation();
     VAddr addr = vaddr;
     CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
@@ -730,6 +784,12 @@ Walker::WalkerState::setupWalk(Addr vaddr)
     // Check if we're in long mode or not
     Efer efer = tc->readMiscRegNoEffect(misc_reg::Efer);
     walkEfer = uint64_t(efer);
+    CpuidResult width;
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    if (isa->cpuid->doCpuid(tc, 0x80000008, 0, width))
+        physicalAddressBits = bits(width.rax, 7, 0);
+    fatal_if(physicalAddressBits < 32 || physicalAddressBits > 52,
+             "Unsupported x86 physical address width for paging");
     dataSize = 8;
     Addr topAddr;
     if (efer.lma) {
@@ -761,10 +821,21 @@ Walker::WalkerState::setupWalk(Addr vaddr)
     nextState = Ready;
     entry.vaddr = vaddr;
     entry.noExec = false;
+    entry.writable = entry.user = true;
 
     const Addr root = efer.lma ? Addr(cr3.longPdtb) << 12 :
         (cr4.pae ? Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
     beginFunctionalTranslationWalk(entry.functionalTranslation, root);
+
+    PagingStructureCache::Prefix prefix;
+    if (timing && efer.lma && walker->pagingStructureCache &&
+        walker->pagingStructureCache->lookup(walkCr3, walkCr4, walkEfer,
+                                            entry.pcid, vaddr, prefix)) {
+        prefixHit = true;
+        state = prefix.level == 0 ? LongPML4 : prefix.level == 1 ? LongPDP : LongPD;
+        topAddr = prefix.pteAddress;
+        entry.functionalTranslation = prefix.provenance;
+    }
 
     Request::Flags flags = Request::PHYSICAL;
     flags.set(Request::PT_WALK);
@@ -779,6 +850,8 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     read = new Packet(request, MemCmd::ReadReq);
     read->allocate();
+    if (prefixHit)
+        read->setLE<uint64_t>(prefix.pte);
 }
 
 bool
@@ -791,6 +864,7 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
     if (squashed) {
         // if were were squashed, return true once inflight is zero and
         // this WalkerState will be freed there.
+        delete pkt;
         return (inflight == 0);
     }
     if (pkt->isRead()) {
@@ -835,7 +909,10 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
             setupWalk(req->getVaddr());
             nextState = state;
             state = Waiting;
-            sendPackets();
+            if (prefixHit)
+                sendPrefixResponse();
+            else
+                sendPackets();
             return false;
         }
         if (requestMode == BaseMMU::Execute)

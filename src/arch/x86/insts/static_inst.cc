@@ -154,6 +154,9 @@ X86StaticInst::addCheckUnsignedOverflow(uint64_t &value, uint64_t addend,
 void
 X86StaticInst::printReg(std::ostream &os, RegId reg, int size)
 {
+    // A paired XMM load has a 16-byte memory access, but each printed floating
+    // operand is still one 64-bit storage register.
+    if (reg.is(FloatRegClass)) size = 8;
     assert(size == 1 || size == 2 || size == 4 || size == 8);
     static const char * abcdFormats[9] =
         {"", "%s",  "%sx",  "", "e%sx", "", "", "", "r%sx"};

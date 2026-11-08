@@ -124,6 +124,9 @@ ISA::clear()
 
     regVal[misc_reg::McgCap] = 0x104;
 
+    // IA32_MISC_ENABLE.FAST_STRING is enabled at architectural reset.
+    regVal[misc_reg::MiscEnable] = 1;
+
     regVal[misc_reg::Pat] = 0x0007040600070406ULL;
 
     // Bit 11 is mttr enable (1), bit 10 is fixed range enable (1)

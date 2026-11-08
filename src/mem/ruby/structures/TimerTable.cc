@@ -29,6 +29,7 @@
 #include "mem/ruby/structures/TimerTable.hh"
 
 #include "mem/ruby/system/RubySystem.hh"
+#include "sim/cur_tick.hh"
 
 namespace gem5
 {
@@ -70,12 +71,25 @@ TimerTable::nextAddress() const
 void
 TimerTable::set(Addr address, Tick ready_time)
 {
+    insert(address, ready_time);
+    assert(m_consumer_ptr != NULL);
+    m_consumer_ptr->scheduleEventAbsolute(ready_time);
+}
+
+void
+TimerTable::setReady(Addr address, Tick ready_time)
+{
+    assert(ready_time == curTick());
+    insert(address, ready_time);
+}
+
+void
+TimerTable::insert(Addr address, Tick ready_time)
+{
     assert(address == makeLineAddress(address, m_block_size_bits));
     assert(!m_map.count(address));
 
     m_map[address] = ready_time;
-    assert(m_consumer_ptr != NULL);
-    m_consumer_ptr->scheduleEventAbsolute(ready_time);
     m_next_valid = false;
 
     // Don't always recalculate the next ready address

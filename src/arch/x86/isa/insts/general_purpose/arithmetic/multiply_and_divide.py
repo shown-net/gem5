@@ -439,18 +439,11 @@ microcode += divcode % {"suffix": "P", "readOp1": pcRel % "t2", "op1": "t2",
 
 microcode += """
 def macroop DIV_R_32 {
-    divprepare rdx, t0
-    divquot32 t0, reg
-    divremainder
-    divwrite
+    divresult32 reg, t0
 };
 
 def macroop DIV_R_64 {
-    divprepare rdx, t0
-    divcheck reg, t0
-    divquot64 t0, divisor
-    divremainder64
-    divwrite
+    divresult64 reg, t0
 };
 
 def macroop DIV_B_R_ALIGNED {
@@ -462,18 +455,12 @@ def macroop DIV_B_R_ALIGNED {
 
 def macroop DIV_M_32 {
     ld t1, seg, sib, disp
-    divprepare rdx, t0
-    divquot32 t0, t1
-    divremainder
-    divwrite
+    divresult32 t1, t0
 };
 
 def macroop DIV_M_64 {
     ld t1, seg, sib, disp
-    divprepare rdx, t0
-    divquot64 t0, t1
-    divremainder64
-    divwrite
+    divresult64 t1, t0
 };
 
 def macroop DIV_B_M_ALIGNED {
@@ -486,18 +473,12 @@ def macroop DIV_B_M_ALIGNED {
 
 def macroop DIV_P_32 {
     ldrip t1, seg, riprel, disp
-    divprepare rdx, t0
-    divquot32 t0, t1
-    divremainder
-    divwrite
+    divresult32 t1, t0
 };
 
 def macroop DIV_P_64 {
     ldrip t1, seg, riprel, disp
-    divprepare rdx, t0
-    divquot64 t0, t1
-    divremainder64
-    divwrite
+    divresult64 t1, t0
 };
 
 def macroop DIV_B_P_ALIGNED {
@@ -509,18 +490,11 @@ def macroop DIV_B_P_ALIGNED {
 };
 
 def macroop IDIV_R_32 {
-    divprepare rdx, t0
-    idivquot32 t0, reg
-    divremainder
-    divwrite
+    idivresult32 reg, t0
 };
 
 def macroop IDIV_R_64 {
-    divprepare rdx, t0
-    divcheck reg, t0
-    idivquot64 t0, divisor
-    divremainder64
-    divwrite
+    idivresult64 reg, t0
 };
 
 def macroop IDIV_B_R_ALIGNED {
@@ -532,18 +506,12 @@ def macroop IDIV_B_R_ALIGNED {
 
 def macroop IDIV_M_32 {
     ld t1, seg, sib, disp
-    divprepare rdx, t0
-    idivquot32 t0, t1
-    divremainder
-    divwrite
+    idivresult32 t1, t0
 };
 
 def macroop IDIV_M_64 {
     ld t1, seg, sib, disp
-    divprepare rdx, t0
-    idivquot64 t0, t1
-    divremainder64
-    divwrite
+    idivresult64 t1, t0
 };
 
 def macroop IDIV_B_M_ALIGNED {
@@ -556,18 +524,12 @@ def macroop IDIV_B_M_ALIGNED {
 
 def macroop IDIV_P_32 {
     ldrip t1, seg, riprel, disp
-    divprepare rdx, t0
-    idivquot32 t0, t1
-    divremainder
-    divwrite
+    idivresult32 t1, t0
 };
 
 def macroop IDIV_P_64 {
     ldrip t1, seg, riprel, disp
-    divprepare rdx, t0
-    idivquot64 t0, t1
-    divremainder64
-    divwrite
+    idivresult64 t1, t0
 };
 
 def macroop IDIV_B_P_ALIGNED {

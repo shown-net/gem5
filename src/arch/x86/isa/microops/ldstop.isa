@@ -82,6 +82,15 @@ def template MicroLeaDeclare {{
         {
             %(set_reg_idx_arr)s;
             %(constructor)s;
+            if (dataSize >= 4 &&
+                (std::string(mnemonic) == "lea" || std::string(mnemonic) == "learip")) {
+                // SPR controls with base=index and a scaled index plus
+                // displacement give two cycles; simple and RIP LEA retain
+                // the one-cycle prior. Encoding and address form matter.
+                const bool three_terms = std::string(mnemonic) == "lea" &&
+                    base != int_reg::T0.index() && index != int_reg::T0.index() && disp != 0;
+                intExecutionInfo = {IntExecutionFamily::ALU, 0x863, three_terms ? 2u : 1u};
+            }
         }
 
         Fault execute(ExecContext *, trace::InstRecord *) const override;
@@ -533,6 +542,50 @@ let {{
 
     defineMicroLoadOp('Ld', 'Data = merge(Data, data, Mem, dataSize);',
                             'Data = Mem & mask(dataSize * 8);')
+
+    # One bounded REP read/write goes through the same dynamic LSQ request,
+    # timing translation, cache ports and store buffer as ordinary accesses.
+    # Eight functional words carry one line; they are not eight hardware uops.
+    def defineRepAccess(Name, store=False, fill=False):
+        global header_output, exec_output
+        name = Name.lower()
+        words = ['RepWord%d' % i for i in range(8)]
+        if store:
+            code = ('\n'.join('Mem_u8qw[%d] = %s;' % (i, word)
+                               for i, word in enumerate(words)) if not fill else
+                    '\n'.join('Mem_u8qw[%d] = (Rax & 0xff) * '
+                              '0x0101010101010101ULL;' % i for i in range(8)))
+        else:
+            code = '\n'.join('%s = Mem_u8qw[%d];' % (word, i)
+                              for i, word in enumerate(words))
+        iop = InstObjParams(name, Name, 'X86ISA::LdStOp',
+                            {"code": code, "complete_code": "",
+                             "ea_code": calculateEA, "memDataSize": "RepCount"})
+        header_output += MicroLdStOpDeclare.subst(iop)
+        if store:
+            for template in (MicroStoreExecute, MicroStoreInitiateAcc,
+                             MicroStoreCompleteAcc):
+                exec_output += template.subst(iop).replace(
+                    'writeMemAtomic(', 'writeRepMem(').replace(
+                    'writeMemTiming(', 'writeRepMem(')
+        else:
+            exec_output += MicroLoadExecute.subst(iop).replace(
+                'readMemAtomic(', 'readRepMemAtomic(')
+            exec_output += MicroLoadInitiateAcc.subst(iop)
+            exec_output += MicroLoadCompleteAcc.subst(iop).replace(
+                'getMem(', 'getRepMem(')
+        class RepAccess(LdStOp):
+            def __init__(self, data, segment, addr, disp=0,
+                         dataSize=1, addressSize="env.addressSize"):
+                super().__init__(data, segment, addr, disp, dataSize,
+                                 addressSize, "Request::REP_BULK", False, False, False, False)
+                self.className = Name
+                self.mnemonic = name
+        microopClasses[name] = RepAccess
+
+    defineRepAccess('Ldrep')
+    defineRepAccess('Strep', store=True)
+    defineRepAccess('Stosrep', store=True, fill=True)
     rip_load_ea = (
         'EA = SegBase + bits(xc->pcState().as<PCState>().npc() + disp, '
         'addressSize * 8 - 1, 0);')
@@ -602,6 +655,10 @@ let {{
 
     defineMicroFpPairLoad('Ldfpxmm', calculateEA)
     defineMicroFpPairLoad('Ldfpxmmrip', rip_load_ea)
+    # Legacy PMADDWD faults before accessing a misaligned m128 operand.
+    aligned_check = ' if (EA & 15) return std::make_shared<GeneralProtection>(0);'
+    defineMicroFpPairLoad('Ldfpxmmaligned', calculateEA + aligned_check)
+    defineMicroFpPairLoad('Ldfpxmmalignedrip', rip_load_ea + aligned_check)
     defineMicroFpPairLoad('Ldfpxmms', calculateEA, "dataSize")
     defineMicroFpPairLoad('Ldfpxmmsrip', rip_load_ea, "dataSize")
     for size in (4, 8):

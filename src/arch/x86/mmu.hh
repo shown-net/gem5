@@ -56,6 +56,8 @@ class MMU : public BaseMMU
       : BaseMMU(p)
     {}
 
+    TLB *dataTlb() const { return static_cast<TLB *>(dtb); }
+
     void onInstructionCodeInvalidation(std::function<void()> callback)
     { static_cast<TLB *>(itb)->onCodeInvalidation(std::move(callback)); }
 

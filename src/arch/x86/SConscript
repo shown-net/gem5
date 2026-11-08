@@ -62,6 +62,8 @@ Source('isa.cc', tags=['x86 isa'])
 Source('nativetrace.cc', tags=['x86 isa'])
 Source('pagetable.cc', tags=['x86 isa'])
 Source('pagetable_walker.cc', tags=['x86 isa'])
+Source('paging_structure_cache.cc', tags=['x86 isa'])
+Source('sse_math.cc', tags=['x86 isa'])
 Source('process.cc', tags=['x86 isa'])
 Source('remote_gdb.cc', tags=['x86 isa'])
 Source('tlb.cc', tags=['x86 isa'])
@@ -97,7 +99,7 @@ SimObject(
 )
 SimObject(
     'X86TLB.py',
-    sim_objects=['X86PagetableWalker', 'X86TLB'],
+    sim_objects=['X86PagetableWalker', 'X86TLB', 'X86PagingStructureCache'],
     tags=['x86 isa']
 )
 

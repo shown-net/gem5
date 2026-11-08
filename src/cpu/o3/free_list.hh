@@ -139,13 +139,14 @@ class SimpleFreeList
     }
 
     /** Get the next available register from the free list */
-    PhysRegIdPtr getReg(PhysRegIdPtr entry_peer = nullptr)
+    PhysRegIdPtr getReg(PhysRegIdPtr entry_peer = nullptr,
+                       bool allocation_entry = true)
     {
         assert(!freeRegs.empty());
         PhysRegIdPtr free_reg = freeRegs.front();
         freeRegs.pop();
         free_reg->allocateRenameReference();
-        if (!regEntries.empty()) {
+        if (!regEntries.empty() && allocation_entry) {
             unsigned entry;
             if (entry_peer) {
                 const int peer_entry = regEntries[entry_peer->index()];
@@ -234,16 +235,20 @@ class UnifiedFreeList
      *                           used by initial mappings.
      */
     UnifiedFreeList(const std::string &_my_name, PhysRegFile *_regFile,
-                    unsigned float_entries = 0, unsigned float_wide_entries = 0);
+                    unsigned float_entries = 0, unsigned float_wide_entries = 0,
+                    unsigned int_entries = 0);
 
     /** Gives the name of the freelist. */
     std::string name() const { return _name; };
 
     /** Gets a free register of type type. */
-    PhysRegIdPtr getReg(RegClassType type, PhysRegIdPtr entry_peer = nullptr)
+    PhysRegIdPtr getReg(RegClassType type, PhysRegIdPtr entry_peer = nullptr,
+                       bool allocation_entry = true)
     {
-        return freeLists[type].getReg(entry_peer);
+        return freeLists[type].getReg(entry_peer, allocation_entry);
     }
+    unsigned numFreeIntEntries() const
+    { return freeLists[IntRegClass].numFreeRegEntries(); }
 
     unsigned numFreeFloatEntries() const
     {

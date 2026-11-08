@@ -860,6 +860,12 @@ LSQ::hasStoresToWB(ThreadID tid)
     return thread.at(tid).hasStoresToWB();
 }
 
+bool
+LSQ::hasPendingCodeWrite(ThreadID tid, Addr physical_block)
+{
+    return thread.at(tid).hasPendingCodeWrite(physical_block);
+}
+
 int
 LSQ::numStoresToWB(ThreadID tid)
 {
@@ -951,6 +957,9 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
         // a strictly ordered load
         inst->getFault() = NoFault;
 
+        // The effective virtual address exists before translation starts.
+        // Ordinary LSU retries reuse this request and do not query MDP again.
+        iewStage->instQueue.memoryDependence(tid).addressGenerated(inst);
         request->initiateTranslation();
     }
 
@@ -960,6 +969,10 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
             inst->effAddr = request->getVaddr();
             inst->effSize = size;
             inst->effAddrValid(true);
+
+            // Preserve physical ranges before forwarding or retirement can
+            // release the request that owns its byte-enable information.
+            iewStage->instQueue.memoryDependence(tid).addressReady(inst);
 
             if (cpu->checker) {
                 inst->reqToVerify = std::make_shared<Request>(*request->req());
@@ -989,6 +1002,31 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
     return inst->getFault();
 }
 
+bool
+LSQ::LSQRequest::physicalBytes(std::vector<Addr> &bytes) const
+{
+    if (!flags.isSet(Flag::TranslationFinished) || _hasStaleTranslation ||
+        _inst->fault != NoFault || _reqs.empty())
+        return false;
+    std::vector<Addr> result;
+    for (const auto &req : _reqs) {
+        if (!req->hasVaddr() || !req->hasPaddr() ||
+            req->getVaddr() < _addr)
+            return false;
+        const Addr offset = req->getVaddr() - _addr;
+        if (offset > _size || req->getSize() > _size - offset)
+            return false;
+        for (unsigned byte = 0; byte < req->getSize(); ++byte) {
+            if (_byteEnable.empty() || _byteEnable.at(offset + byte))
+                result.push_back(req->getPaddr() + byte);
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    bytes = std::move(result);
+    return true;
+}
+
 void
 LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
         gem5::ThreadContext* tc, BaseMMU::Mode mode)
@@ -998,7 +1036,7 @@ LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
     numTranslatedFragments = 1;
     /* If the instruction has been squahsed, let the request know
      * as it may have to self-destruct. */
-    if (_inst->isSquashed()) {
+    if (_inst->isSquashed() || _inst->savedRequest != this || isReleased()) {
         squashTranslation();
     } else {
         _inst->strictlyOrdered(request->isStrictlyOrdered());
@@ -1038,7 +1076,7 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
         _mainReq->setFlags(req->getFlags());
 
     if (numTranslatedFragments == _reqs.size()) {
-        if (_inst->isSquashed()) {
+        if (_inst->isSquashed() || _inst->savedRequest != this || isReleased()) {
             squashTranslation();
         } else {
             _inst->strictlyOrdered(_mainReq->isStrictlyOrdered());
@@ -1060,6 +1098,7 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
                     _mainReq->setExtraData(*_res);
                 }
                 if (i == _fault.size()) {
+                    _port.noteSplitTranslation(_reqs);
                     _inst->fault = NoFault;
                     setState(State::Request);
                 } else {
@@ -1277,7 +1316,8 @@ LSQ::LSQRequest::addReq(Addr addr, unsigned size,
 LSQ::LSQRequest::~LSQRequest()
 {
     assert(!isAnyOutstandingRequest());
-    _inst->savedRequest = nullptr;
+    if (_inst->savedRequest == this)
+        _inst->savedRequest = nullptr;
 
     for (auto r: _packets)
         delete r;

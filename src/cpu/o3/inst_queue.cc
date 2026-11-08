@@ -137,22 +137,66 @@ IQUnit::remove(const DynInstPtr &inst)
     auto it = entries.find(inst->seqNum);
     assert(it != entries.end() && it->second.resident);
     _fuPool->releasePortBinding(inst);
-    _freeEntries += it->second.slots;
-    count[it->second.thread] -= it->second.slots;
+    releaseAllocation(it->second.allocation);
     entries.erase(it);
     assert(_freeEntries <= _numEntries);
+}
+
+// A compound divide keeps its remaining hardware actions in this same IQ
+// allocation. It does not create a second resource occupancy account.
+unsigned
+IQUnit::releaseOneAction(const DynInstPtr &inst)
+{
+    auto &entry = entries.at(inst->seqNum);
+    auto &allocation = allocations.at(entry.allocation);
+    assert(entry.resident && allocation.members == 1 && allocation.slots);
+    --allocation.slots;
+    ++_freeEntries;
+    --count[allocation.thread];
+    return allocation.slots;
 }
 
 void
 IQUnit::reserve(const DynInstPtr &inst)
 {
     assert(!hasReservation(inst->seqNum));
-    const unsigned slots = inst->iqSlots();
-    assert(numFreeEntries(inst->threadNumber) >= slots);
+    const auto key = inst->schedulerKey();
+    auto found = allocations.find(key);
+    if (found == allocations.end()) {
+        const unsigned slots = inst->iqSlots();
+        assert(numFreeEntries(inst->threadNumber) >= slots);
+        found = allocations.emplace(key, SchedulerAllocation{
+            inst->threadNumber, slots, 0}).first;
+        _freeEntries -= slots;
+        count[inst->threadNumber] += slots;
+    } else {
+        assert(found->second.thread == inst->threadNumber &&
+               found->second.slots == inst->iqSlots());
+    }
+    ++found->second.members;
     entries.emplace(inst->seqNum,
-                    SchedulerEntry{inst->threadNumber, slots, false});
-    _freeEntries -= slots;
-    count[inst->threadNumber] += slots;
+                    SchedulerEntry{inst->threadNumber, key, false});
+}
+
+unsigned
+IQUnit::reservationDemand(const DynInstPtr &inst) const
+{
+    return hasGroup(inst->schedulerKey()) ? 0 : inst->iqSlots();
+}
+
+void
+IQUnit::releaseAllocation(InstSeqNum key)
+{
+    auto it = allocations.find(key);
+    assert(it != allocations.end() && it->second.members);
+    if (--it->second.members == 0) {
+        _freeEntries += it->second.slots;
+        count[it->second.thread] -= it->second.slots;
+        DPRINTF(IQ, "Released scheduler allocation [key:%llu] "
+                "[slots:%u] [free:%u].\n", key, it->second.slots,
+                _freeEntries);
+        allocations.erase(it);
+    }
 }
 
 bool
@@ -167,8 +211,7 @@ IQUnit::cancelReservation(InstSeqNum seq)
     auto it = entries.find(seq);
     if (it == entries.end() || it->second.resident)
         return;
-    _freeEntries += it->second.slots;
-    count[it->second.thread] -= it->second.slots;
+    releaseAllocation(it->second.allocation);
     entries.erase(it);
 }
 
@@ -193,6 +236,7 @@ void
 IQUnit::resetState()
 {
     entries.clear();
+    allocations.clear();
     _freeEntries = _numEntries;
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
         count[tid] = 0;
@@ -327,7 +371,7 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     for (auto iq : iqs)
         iq->fuPool()->bindIntegerResources(params.executionPorts, params.resultForwarding,
             params.intALU, params.intSHFT, params.intSlow, params.intBM,
-            params.intBranch, params.intALUs);
+            params.intBranch, params.intDivider, params.intALUs);
 }
 
 InstructionQueue::~InstructionQueue()
@@ -714,7 +758,7 @@ InstructionQueue::isFull(ThreadID tid)
 bool
 InstructionQueue::isFull(const DynInstPtr &inst)
 {
-    return !hasReservation(inst) && numFreeEntries(inst) < inst->iqSlots();
+    return !hasReservation(inst) && !findIQ(inst);
 }
 
 bool
@@ -731,20 +775,28 @@ InstructionQueue::canReserve(const std::vector<DynInstPtr> &batch)
 {
     std::map<IQUnit *, unsigned> used;
     std::map<std::pair<IQUnit *, ThreadID>, unsigned> thread_used;
+    std::map<InstSeqNum, IQUnit *> groups;
     for (const auto &inst : batch) {
         if (inst->bypassesIQ() || hasReservation(inst))
             continue;
         bool found = false;
+        const auto group = inst->schedulerKey();
+        IQUnit *owner = groups.count(group) ? groups.at(group) : nullptr;
+        for (auto iq : iqs)
+            if (iq->hasGroup(group)) owner = iq;
         for (auto iq : iqs) {
+            if (owner && iq != owner) continue;
             if (!iq->allows(inst) || (inst->opClass() != No_OpClass &&
                 !iq->fuPool()->isCapable(inst->opClass())))
                 continue;
             const auto key = std::make_pair(iq, inst->threadNumber);
-            if (iq->numFreeEntries() >= used[iq] + inst->iqSlots() &&
+            const unsigned slots = groups.count(group) ? 0 : iq->reservationDemand(inst);
+            if (iq->numFreeEntries() >= used[iq] + slots &&
                 iq->numFreeEntries(inst->threadNumber) >=
-                    thread_used[key] + inst->iqSlots()) {
-                used[iq] += inst->iqSlots();
-                thread_used[key] += inst->iqSlots();
+                    thread_used[key] + slots) {
+                used[iq] += slots;
+                thread_used[key] += slots;
+                groups[group] = iq;
                 found = true;
                 break;
             }
@@ -836,14 +888,110 @@ InstructionQueue::findIQ(const DynInstPtr &inst)
     for (auto iq : iqs)
         if (iq->hasReservation(inst->seqNum))
             return iq;
+    for (auto iq : iqs)
+        if (iq->hasGroup(inst->schedulerKey()))
+            return iq->allows(inst) && (inst->opClass() == No_OpClass ||
+                iq->fuPool()->isCapable(inst->opClass())) ? iq : nullptr;
     for (auto iq : iqs) {
         if (iq->allows(inst) && (inst->opClass() == No_OpClass ||
             iq->fuPool()->isCapable(inst->opClass())) &&
-            iq->numFreeEntries(inst) >= inst->iqSlots()) {
+            iq->numFreeEntries(inst) >= iq->reservationDemand(inst)) {
             return iq;
         }
     }
     return nullptr;
+}
+
+IQUnit *
+InstructionQueue::findOrReclaimIQ(const DynInstPtr &inst)
+{
+    if (auto *iq = findIQ(inst))
+        return iq;
+
+    // A suspended action can be older than every resident entry. Younger
+    // entries may depend on it, so waiting for one of them to issue can
+    // deadlock. Move only a whole unissued allocation; dependencies and
+    // ready-list membership remain intact and no extra credit is created.
+    auto &thread_insts = instList[inst->threadNumber];
+    for (auto it = thread_insts.rbegin(); it != thread_insts.rend(); ++it) {
+        const auto &victim = *it;
+        if (!victim->isInIQ() || !victim->iqSlots() ||
+            victim->isIssued() || victim->isSquashed() ||
+            victim->seqNum <= inst->seqNum || !victim->iq->allows(inst) ||
+            (inst->opClass() != No_OpClass &&
+             !victim->iq->fuPool()->isCapable(inst->opClass())))
+            continue;
+        auto *owner = victim->iq;
+        const auto key = victim->schedulerKey();
+        std::vector<DynInstPtr> members;
+        bool suspendable = true;
+        for (const auto &member : thread_insts) {
+            if (member->schedulerKey() != key)
+                continue;
+            // Issued members normally leave the IQ immediately but remain
+            // in instList until retirement. Inspect them too: their absence
+            // from the resident allocation does not make the group unissued.
+            if (member->firstIssue != Tick(-1)) {
+                DPRINTF(IQ, "Preserving partially issued scheduler group "
+                        "[key:%llu] issued member [sn:%llu] for older "
+                        "action [sn:%llu].\n", key, member->seqNum,
+                        inst->seqNum);
+                suspendable = false;
+                break;
+            }
+            if (!member->isInIQ() || member->iq != owner)
+                continue;
+            if (member->isIssued() || member->isSquashed() ||
+                member->seqNum <= inst->seqNum) {
+                suspendable = false;
+                break;
+            }
+            members.push_back(member);
+        }
+        // Reservations for members not yet dispatched must stay in place.
+        if (!suspendable || members.size() != owner->groupMembers(key))
+            continue;
+        for (const auto &member : members)
+            member->clearInIQ();
+        DPRINTF(IQ, "Reclaimed younger scheduler allocation [sn:%llu] "
+                "for older action [sn:%llu] [key:%llu] [members:%u].\n",
+                victim->seqNum, inst->seqNum, key,
+                static_cast<unsigned>(members.size()));
+        if (auto *iq = findIQ(inst))
+            return iq;
+    }
+    return nullptr;
+}
+
+void
+InstructionQueue::restoreAllocation(IQUnit *iq, const DynInstPtr &inst)
+{
+    // A reclaimed allocation was suspended as a whole. Restore all of its
+    // still-unissued dispatched members together so the credit remains held
+    // after the first member issues and until the last member leaves.
+    const auto key = inst->schedulerKey();
+    unsigned restored = 0;
+    if (!inst->stageDemand.schedulerGroup) {
+        iq->insert(inst);
+        iq->fuPool()->bindPort(inst, cpu->curCycle());
+        DPRINTF(IQ, "Restored scheduler allocation [key:%llu] [members:1] "
+                "for action [sn:%llu].\n", key, inst->seqNum);
+        return;
+    }
+    for (const auto &member : instList[inst->threadNumber]) {
+        if (member->schedulerKey() != key || member->isInIQ() ||
+            member->isIssued() || member->isSquashed() || member->bypassesIQ())
+            continue;
+        panic_if(!iq->allows(member) || (member->opClass() != No_OpClass &&
+                 !iq->fuPool()->isCapable(member->opClass())),
+                 "Restored scheduler group has incompatible member");
+        iq->insert(member);
+        iq->fuPool()->bindPort(member, cpu->curCycle());
+        ++restored;
+    }
+    panic_if(!inst->isInIQ(), "Restored scheduler group is missing its action");
+    DPRINTF(IQ, "Restored scheduler allocation [key:%llu] [members:%u] "
+            "for action [sn:%llu].\n", key, restored, inst->seqNum);
 }
 
 void
@@ -1125,10 +1273,29 @@ InstructionQueue::scheduleReadyInsts()
             continue;
         }
 
+        // A suspended younger allocation keeps its dependency and ready-list
+        // state, but must reacquire its bounded scheduler credit before issue.
+        if (!issuing_inst->isInIQ()) {
+            auto *replacement = findOrReclaimIQ(issuing_inst);
+            if (!replacement) {
+                resource_deferred.push_back(issuing_inst);
+                readyInsts[op_class].pop();
+                if (!readyInsts[op_class].empty())
+                    moveToYoungerInst(order_it);
+                else {
+                    readyIt[op_class] = listOrder.end();
+                    queueOnList[op_class] = false;
+                }
+                listOrder.erase(order_it++);
+                continue;
+            }
+            restoreAllocation(replacement, issuing_inst);
+        }
+
         // Functional followers of a jointly executed fused operation do not
         // acquire another execution port. They may finish even when all real
         // port grants for this cycle have been used.
-        if (total_issued + issuing_inst->iqSlots() > totalWidth) {
+        if (total_issued + issuing_inst->issueSlots() > totalWidth) {
             resource_deferred.push_back(issuing_inst);
             readyInsts[op_class].pop();
             if (!readyInsts[op_class].empty())
@@ -1149,6 +1316,15 @@ InstructionQueue::scheduleReadyInsts()
         assert(iq);
         auto fu_pool = iq->fuPool();
         const bool managed = fu_pool->usesIntegerResources(issuing_inst);
+        if (iqs.size() == 1 && !managed &&
+            !fu_pool->fpDividerReady(op_class, cpu->curCycle())) {
+            // In the shared scheduler every younger member has the same
+            // unavailable divider candidates.
+            // Keep the ordered queue intact instead of removing and reinserting
+            // the whole independent window for an identical refusal this cycle.
+            ++order_it;
+            continue;
+        }
         bool path_blocked = false;
         if (!managed && cpu->resultForwarding) {
             auto pathAvailable = [this](const DynInstPtr &inst) {
@@ -1166,7 +1342,14 @@ InstructionQueue::scheduleReadyInsts()
         if (managed) {
             if (fu_pool->issueInteger(cpu, issuing_inst,
                 [this, issuing_inst] { wakeDependents(issuing_inst); },
-                [this, issuing_inst] { processFUCompletion(issuing_inst, nullptr, -1); })) {
+                [this, issuing_inst] { processFUCompletion(issuing_inst, nullptr, -1); },
+                [this, issuing_inst, iq] {
+                    ++iqStats.instsIssued;
+                    const auto at = std::find(iqs.begin(), iqs.end(), iq);
+                    panic_if(at == iqs.end(), "Divide action has no owning IQ");
+                    ++iqStats.iqIssuedOps[std::distance(iqs.begin(), at)];
+                    ++iqStats.issuedInstType[issuing_inst->threadNumber][IntDivOp];
+                })) {
                 ++wbOutstanding;
                 idx = FUPool::NoNeedFU;
             } else {
@@ -1174,7 +1357,8 @@ InstructionQueue::scheduleReadyInsts()
             }
             iqIOStats.intAluAccesses++;
         }
-        if (op_class != No_OpClass && !managed && !path_blocked) {
+        if (op_class != No_OpClass && !managed && !path_blocked &&
+            !issuing_inst->repFunctional()) {
             idx = fu_pool->getUnit(cpu, tid, op_class, cpu->curCycle(),
                                    issuing_inst->isStore() &&
                                    !issuing_inst->isStoreAddress(),
@@ -1268,11 +1452,11 @@ InstructionQueue::scheduleReadyInsts()
             }
 
             issuing_inst->setIssued();
-            total_issued += issuing_inst->iqSlots();
-            iqStats.instsIssued += issuing_inst->iqSlots();
+            total_issued += issuing_inst->issueSlots();
+            iqStats.instsIssued += issuing_inst->issueSlots();
             const auto iq_it = std::find(iqs.begin(), iqs.end(), iq);
             iqStats.iqIssuedOps[std::distance(iqs.begin(), iq_it)] +=
-                issuing_inst->iqSlots();
+                issuing_inst->issueSlots();
 
 #if TRACING_ON
             issuing_inst->issueTick = curTick() - issuing_inst->fetchTick;
@@ -1281,7 +1465,15 @@ InstructionQueue::scheduleReadyInsts()
             if (issuing_inst->firstIssue == -1)
                 issuing_inst->firstIssue = curTick();
 
-            issuing_inst->clearInIQ();
+            if (!issuing_inst->divisionManaged) {
+                const auto key = issuing_inst->schedulerKey();
+                issuing_inst->clearInIQ();
+                if (iq->hasGroup(key)) {
+                    DPRINTF(IQ, "Scheduler group [key:%llu] retains "
+                            "[members:%u] after issue [sn:%llu].\n", key,
+                            iq->groupMembers(key), issuing_inst->seqNum);
+                }
+            }
             if (issuing_inst->isMemRef()) {
                 memDepUnit[tid].issue(issuing_inst);
             }
@@ -1325,7 +1517,7 @@ InstructionQueue::scheduleReadyInsts()
     // @todo If the way deferred memory instructions are handeled due to
     // translation changes then the deferredMemInsts condition should be
     // removed from the code below.
-    if (total_issued || resumed_memory || !retryMemInsts.empty() || !deferredMemInsts.empty() ||
+    if (total_issued || i2e_info->size || resumed_memory || !retryMemInsts.empty() || !deferredMemInsts.empty() ||
         !admissionWaitMemInsts.empty()) {
         cpu->activityThisCycle();
     } else {
@@ -1423,6 +1615,10 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst,
          dest_reg_idx < completed_inst->numDestRegs();
          dest_reg_idx++)
     {
+        if (completed_inst->divisionManaged &&
+            (!completed_inst->hasResultValue(dest_reg_idx) ||
+             completed_inst->divideResultWoken(dest_reg_idx)))
+            continue;
         PhysRegIdPtr dest_reg =
             completed_inst->renamedDestIdx(dest_reg_idx);
 
@@ -1474,10 +1670,14 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst,
 
         // Mark the scoreboard as having that register ready.
         regScoreboard[dest_reg->flatIndex()] = true;
+        dest_reg->recordValueReady(curTick());
+        if (completed_inst->divisionManaged)
+            completed_inst->markDivideResultWoken(dest_reg_idx);
     }
     if (!completed_inst->wasEvaluatedByResource() && cpu->resultForwarding)
         cpu->resultForwarding->release(completed_inst);
-    completed_inst->setResultsWoken();
+    if (!completed_inst->divisionManaged || completed_inst->allDivideResultsWoken())
+        completed_inst->setResultsWoken();
     return dependents;
 }
 
@@ -1487,58 +1687,7 @@ InstructionQueue::addReadyMemInst(const DynInstPtr &ready_inst)
     if (ready_inst->isSquashed())
         return;
     if (!ready_inst->isInIQ()) {
-        auto iq = findIQ(ready_inst);
-        // A replay can become ready after younger instructions have filled
-        // the scheduler. If those instructions depend on this older load,
-        // waiting for a free entry would deadlock. Reclaim a younger memory
-        // entry and leave that instruction in the existing dependency/ROB
-        // state; when ready it must acquire an entry again. No extra scheduler
-        // capacity or execution-port grant is created.
-        if (!iq) {
-            auto &thread_insts = instList[ready_inst->threadNumber];
-            for (auto it = thread_insts.rbegin(); it != thread_insts.rend(); ++it) {
-                const auto &victim = *it;
-                if (!victim->isMemRef() || !victim->isInIQ() || !victim->iqSlots() ||
-                    victim->isIssued() || victim->isSquashed() ||
-                    victim->seqNum <= ready_inst->seqNum ||
-                    !victim->iq->allows(ready_inst) ||
-                    (ready_inst->opClass() != No_OpClass &&
-                     !victim->iq->fuPool()->isCapable(ready_inst->opClass())))
-                    continue;
-
-                const OpClass victim_class = victim->opClass();
-                auto &queue = readyInsts[victim_class];
-                ReadyInstQueue retained;
-                bool was_ready = false;
-                while (!queue.empty()) {
-                    auto entry = queue.top();
-                    queue.pop();
-                    if (entry == victim)
-                        was_ready = true;
-                    else
-                        retained.push(entry);
-                }
-                queue = std::move(retained);
-                if (queueOnList[victim_class]) {
-                    listOrder.erase(readyIt[victim_class]);
-                    readyIt[victim_class] = listOrder.end();
-                    queueOnList[victim_class] = false;
-                }
-                if (!queue.empty())
-                    addToOrderList(victim_class);
-                victim->clearInIQ();
-                if (was_ready && std::find(admissionWaitMemInsts.begin(),
-                    admissionWaitMemInsts.end(), victim) ==
-                    admissionWaitMemInsts.end())
-                    admissionWaitMemInsts.push_back(victim);
-                DPRINTF(IQ, "Reclaimed younger memory entry [sn:%llu] "
-                        "for older replay [sn:%llu].\n",
-                        victim->seqNum, ready_inst->seqNum);
-                iq = findIQ(ready_inst);
-                if (iq)
-                    break;
-            }
-        }
+        auto *iq = findOrReclaimIQ(ready_inst);
         if (!iq) {
             if (std::find(admissionWaitMemInsts.begin(),
                           admissionWaitMemInsts.end(), ready_inst) ==
@@ -1546,8 +1695,7 @@ InstructionQueue::addReadyMemInst(const DynInstPtr &ready_inst)
                 admissionWaitMemInsts.push_back(ready_inst);
             return;
         }
-        iq->insert(ready_inst);
-        iq->fuPool()->bindPort(ready_inst, cpu->curCycle());
+        restoreAllocation(iq, ready_inst);
     }
     OpClass op_class = ready_inst->opClass();
 
@@ -1727,7 +1875,7 @@ InstructionQueue::doSquash(ThreadID tid)
         if (cpu->resultForwarding && !squashed_inst->isIssued())
             cpu->resultForwarding->release(squashed_inst);
 
-        if (!squashed_inst->isIssued() ||
+        if (!squashed_inst->isIssued() || squashed_inst->divisionManaged ||
             (squashed_inst->isMemRef() &&
              !squashed_inst->memOpDone())) {
 

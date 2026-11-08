@@ -60,6 +60,7 @@
 #include "cpu/timebuf.hh"
 #include "debug/Activity.hh"
 #include "debug/Commit.hh"
+#include "debug/Fetch.hh"
 #include "debug/CommitRate.hh"
 #include "debug/Drain.hh"
 #include "debug/ExecFaulting.hh"
@@ -611,8 +612,14 @@ Commit::tick()
     wroteToTimeBuffer = false;
     _nextStatus = Inactive;
 
-    if (activeThreads->empty())
+    if (activeThreads->empty()) {
+        // A context can quiesce while older execution completions are still
+        // in the IEW-to-commit transport. The time buffer advances even on
+        // this tick; retain their ready state before it advances, without
+        // retiring work from an inactive thread.
+        markCompletedInsts();
         return;
+    }
 
     // Check if any of the threads are done squashing.  Change the
     // status if they are done.
@@ -905,10 +912,12 @@ Commit::commit()
         _nextStatus = Active;
     }
 
-    if (num_squashing_threads != numThreads) {
-        // If we're not currently squashing, then get instructions.
-        getInsts();
+    // Rename may restart after restoring its mappings while the ROB continues
+    // visiting invalid old-path records. Receive every bounded message here;
+    // otherwise it expires in the time buffer and leaks its reservations.
+    getInsts();
 
+    if (num_squashing_threads != numThreads) {
         // Try to commit any instructions.
         commitInsts();
     }
@@ -1010,6 +1019,7 @@ Commit::commitInsts()
         // returns without retiring it; require the whole group to be ready
         // only once the head has executed, before any member can retire.
         if (!head_inst->retirementGroupEnd() && !head_inst->isSquashed() &&
+            !head_inst->staleCode &&
             head_inst->isExecuted() && head_inst->getFault() == NoFault) {
             bool group_ready = true;
             bool fault_ready = false;
@@ -1229,7 +1239,7 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
 
     // If the instruction is not executed yet, then it will need extra
     // handling.  Signal backwards that it should be executed.
-    if (!head_inst->isExecuted()) {
+    if (!head_inst->isExecuted() && !head_inst->staleCode) {
         // Make sure we are only trying to commit un-executed instructions we
         // think are possible.
         assert(head_inst->isNonSpeculative() || head_inst->isStoreConditional()
@@ -1271,7 +1281,12 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     }
 
     // Check if the instruction caused a fault.  If so, trap.
-    Fault inst_fault = head_inst->getFault();
+    if (head_inst->staleCode) {
+        DPRINTF(Fetch, "[tid:%i] Replaying stale code [sn:%llu] PC %s\n",
+                tid, head_inst->seqNum, head_inst->pcState());
+    }
+    Fault inst_fault = head_inst->staleCode ?
+        std::make_shared<ReExec>() : head_inst->getFault();
 
     // hardware transactional memory
     // if a fault occurred within a HTM transaction
@@ -1429,9 +1444,7 @@ Commit::getInsts()
         const DynInstPtr &inst = fromRename->insts[inst_num];
         ThreadID tid = inst->threadNumber;
 
-        if (!inst->isSquashed() &&
-            commitStatus[tid] != ROBSquashing &&
-            commitStatus[tid] != TrapPending) {
+        if (!inst->isSquashed() && commitStatus[tid] != TrapPending) {
             changedROBNumEntries[tid] = true;
 
             DPRINTF(Commit, "[tid:%i] [sn:%llu] Inserting PC %s into ROB.\n",

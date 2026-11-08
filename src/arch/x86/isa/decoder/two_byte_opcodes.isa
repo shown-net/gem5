@@ -79,6 +79,8 @@
                            xc->armMonitor(Rax);
                         }});
                         0x1: MwaitInst::mwait({{
+                           if (!xc->getAddrMonitor()->armed)
+                               return NoFault;
                            uint64_t m = 0;          //mem
                            unsigned s = 0x8;        //size
                            unsigned f = 0;          //flags
@@ -909,7 +911,7 @@
                 }
                 // repne (0xF2)
                 0x8: decode OPCODE_OP_BOTTOM3 {
-                    0x0: WarnUnimpl::addsubps_Vo_Wo();
+                    0x0: ADDSUBPS(Vo,Wo);
                     0x6: MOVDQ2Q(Pq,VRq);
                     default: UD2();
                 }

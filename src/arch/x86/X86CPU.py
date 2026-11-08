@@ -41,6 +41,7 @@ from m5.objects.Frontend import FrontendCoordinator
 from m5.objects.IntExecution import (
     ExecutionPorts,
     IntegerALU,
+    IntegerDivider,
     IntExecutionResource,
     ResultForwarding,
 )
@@ -48,7 +49,7 @@ from m5.objects.X86Decoder import X86Decoder
 from m5.objects.X86ISA import X86ISA
 from m5.objects.X86LocalApic import X86LocalApic
 from m5.objects.X86MMU import X86MMU
-from m5.objects.X86TLB import X86TLB
+from m5.objects.X86TLB import X86TLB, X86PagingStructureCache
 from m5.proxy import Self
 
 
@@ -129,8 +130,9 @@ def spr_fu_pool():
         "FloatAdd": 3, "FloatMult": 4, "FloatDiv": 14, "FloatMisc": 1,
         "FloatMultAcc": 4, "SimdFloatMultAcc": 4,
         "SimdAlu": 1, "SimdAdd": 1, "SimdMisc": 1, "SimdCmp": 1,
-        "SimdShift": 1, "SimdMult": 3, "SimdFloatAdd": 3,
+        "SimdShift": 1, "SimdMult": 3, "SimdMultAcc": 5, "SimdFloatAdd": 3,
         "SimdFloatMult": 4, "SimdFloatDiv": 11,
+        "X86FloatSqrt32": 12, "X86FloatSqrt64": 18,
     }
     for name, op in specs.items():
         if name == "X86StoreAddress":
@@ -148,7 +150,7 @@ def spr_fu_pool():
         elif name == "IntDiv":
             indices = (1,)
         elif name in {"FloatMult", "SimdFloatMult", "FloatMultAcc",
-                      "SimdFloatMultAcc", "SimdCmp", "SimdShift"}:
+                      "SimdFloatMultAcc", "SimdMultAcc", "SimdCmp", "SimdShift"}:
             indices = (0, 1)
         elif name in {"SimdPack", "SimdInsert"}:
             indices = (5,)
@@ -160,11 +162,14 @@ def spr_fu_pool():
         for index in indices:
             desc = OpDesc(
                 opClass=op.opClass, opLat=latencies.get(name, op.opLat),
-                pipelined=True if name in {"FloatDiv", "SimdFloatDiv"}
+                pipelined=True if name in {"FloatDiv", "SimdFloatDiv",
+                                          "X86FloatSqrt32", "X86FloatSqrt64"}
                 else op.pipelined,
             )
             if name in {"FloatDiv", "SimdFloatDiv"}:
                 desc.issueLat = 4 if name == "FloatDiv" else 3
+            if name in {"X86FloatSqrt32", "X86FloatSqrt64"}:
+                desc.issueLat = 6 if name == "X86FloatSqrt64" else 3
             ports[index].append(desc)
     return FUPool(
         FUList=[FUDesc(opList=ops, count=1) for ops in ports],
@@ -182,6 +187,9 @@ _spr_mem_classes = sorted(
 def x86_o3_mmu():
     """Default O3 instruction translation and shared second-level proxy."""
     mmu = X86MMU()
+    mmu.pagingStructureCache = X86PagingStructureCache()
+    mmu.itb.walker.paging_structure_cache = mmu.pagingStructureCache
+    mmu.dtb.walker.paging_structure_cache = mmu.pagingStructureCache
     mmu.stlb = X86TLB(size=2048, entry_type="unified", spr_shared_domains=True)
     mmu.itb.size = 256
     mmu.itb.itlb_4k_ways = 8
@@ -213,11 +221,12 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     cacheLoadPorts = 3
     cacheStorePorts = 2
     loadCompletionWidth = 3
-    numPhysIntRegs = 288
-    # Functional storage uses 64-bit fragments; an XMM result owns two.
-    # The separate entry budget counts register values, not storage bytes.
-    numPhysFloatRegs = 640
+    # Storage covers the bounded O3 record window and functional results;
+    # hardware allocation credits remain independent of that representation.
+    numPhysIntRegEntries = 288
+    numPhysIntRegs = numPhysIntRegEntries + numROBEntries * 16 * 4
     numPhysFloatRegEntries = 320
+    numPhysFloatRegs = numPhysFloatRegEntries * 8 + numROBEntries * 16 * 2
     numPhysFloatWideEntries = 220
     sprL1LoadBankConflicts = False
     sprMemoryDependence = True
@@ -245,12 +254,13 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     ]
     resultForwarding = ResultForwarding()
     zeroIdiom = ZeroIdiom()
-    stackEngine = StackEngine()
+    stackEngine = StackEngine(enabled=True)
     frontend = FrontendCoordinator(enableLsdReplay=False)
     intSHFT = IntExecutionResource(family=2)
     intSlow = IntExecutionResource(family=3)
     intBM = IntExecutionResource(family=4)
     intBranch = IntExecutionResource(family=5)
+    intDivider = IntegerDivider()
 
     # For x86, each CC reg is used to hold only a subset of the
     # flags, so we need 4-5 times the number of CC regs as
@@ -258,7 +268,7 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     # typical real machines, CC regs are not explicitly renamed
     # (it's a side effect of int reg renaming), so they should
     # never be the bottleneck here.
-    numPhysCCRegs = Self.numPhysIntRegs * 5
+    numPhysCCRegs = (numPhysIntRegEntries + numROBEntries * 16) * 5
 
     # Shared scheduler capacity; no hard EU/MEM/STD partition is assumed.
     sprFUPool = spr_fu_pool()

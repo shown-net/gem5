@@ -61,4 +61,3 @@ class FrontendCoordinator(SimObject):
         "Simple-loop replay service; eligibility is a bounded model proxy",
     )
     idq = Param.InstructionDeliveryQueue(InstructionDeliveryQueue(), "Ordered IDQ")
-    dsbToMiteDelay = Param.Cycles(0, "Extra source-side DSB to MITE wait")

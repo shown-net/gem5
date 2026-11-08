@@ -53,7 +53,7 @@ if env['CONF']['BUILD_ISA']:
     Source('stack_engine.cc')
     SimObject('IntExecution.py', sim_objects=[
         'ExecutionPort', 'ExecutionPorts', 'IntExecutionResource', 'IntegerALU',
-        'ResultPathRule', 'ResultForwarding'])
+        'ResultPathRule', 'ResultForwarding', 'IntegerDivider'])
     SimObject('FuncUnitConfig.py', sim_objects=[])
     SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
         enums=[])

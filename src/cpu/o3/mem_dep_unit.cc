@@ -32,6 +32,9 @@
 #include <memory>
 #include <vector>
 
+#include <algorithm>
+#include <iterator>
+
 #include "base/compiler.hh"
 #include "base/debug.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -121,18 +124,26 @@ MemDepUnit::MemDepUnitStats::MemDepUnitStats(statistics::Group *parent)
                "Number of conflicting stores."),
       ADD_STAT(independencePredictions, statistics::units::Count::get(),
                "Loads admitted past unresolved stores by local prediction"),
+      ADD_STAT(localQueries, statistics::units::Count::get(),
+               "Local MDP queries at new AGU effective-address attempts"),
       ADD_STAT(addressWaits, statistics::units::Count::get(),
                "Loads waiting for older store address resolution"),
       ADD_STAT(resolvedIndependentLoads, statistics::units::Count::get(),
                "Actual nondependent loads training the local predictor"),
       ADD_STAT(resolvedDependentLoads, statistics::units::Count::get(),
                "Actual dependent loads training the local predictor"),
+      ADD_STAT(coveredLoads, statistics::units::Count::get(),
+               "AGU observations skipped because younger stores cover all U bytes"),
       ADD_STAT(watchdogBlocks, statistics::units::Count::get(),
                "Locally independent loads blocked by the global watchdog"),
       ADD_STAT(watchdogDisables, statistics::units::Count::get(),
                "Memory-disambiguation watchdog disable transitions"),
       ADD_STAT(watchdogRecoveries, statistics::units::Count::get(),
-               "Watchdog credit increments after 64 eligible safe outcomes")
+               "Watchdog credit increments after 64 eligible safe outcomes"),
+      ADD_STAT(watchdogFailures, statistics::units::Count::get(),
+               "Actual MDP bypass failures charged once to the global watchdog"),
+      ADD_STAT(watchdogSafeOpportunities, statistics::units::Count::get(),
+               "Eligible safe relationships after all older store ordering checks")
 {
 }
 
@@ -251,33 +262,9 @@ MemDepUnit::insert(const DynInstPtr &inst)
     }
 
     std::vector<MemDepEntryPtr> store_entries;
-    std::vector<MemDepEntryPtr> address_entries;
 
-    if (sprPredictor && inst->isLoad() && !inst->isDataPrefetch()) {
-        observeLoad(inst);
-        const auto &observation = loadObservations.at(inst->seqNum);
-        const bool local = observation.localPrediction;
-        const bool speculate = local && speculationCredit >= 0 &&
-            lsq->memorySpeculationAllowed(inst);
-        // FSFP predicts a producer, rather than independence.  Architectural
-        // barriers above still apply, and LSQ validates this separate path.
-        const bool forward = lsq->hasFastForwardingPrediction(inst);
-        if (!speculate && !forward) {
-            for (const auto &store : observation.olderStores) {
-                auto found = memDepHash.find(store->seqNum);
-                if (found != memDepHash.end() &&
-                    !found->second->addressResolved && !store->effAddrValid())
-                    address_entries.push_back(found->second);
-            }
-            if (!address_entries.empty()) {
-                ++stats.addressWaits;
-                if (local && speculationCredit < 0)
-                    ++stats.watchdogBlocks;
-            }
-        } else if (speculate && observation.hadUnresolvedStore) {
-            ++stats.independencePredictions;
-        }
-    }
+    // Ordinary SPR loads reach the AGU when their operands and architectural
+    // barriers are ready. Prediction and store-address waiting belong to LSU.
 
     // If there is a producing store, try to find the entry.
     for (auto producing_store : producing_stores) {
@@ -293,7 +280,7 @@ MemDepUnit::insert(const DynInstPtr &inst)
 
     // If no store entry, then instruction can issue as soon as the registers
     // are ready.
-    if (store_entries.empty() && address_entries.empty()) {
+    if (store_entries.empty()) {
         DPRINTF(MemDepUnit, "No dependency for inst PC "
                 "%s [sn:%lli].\n", inst->pcState(), inst->seqNum);
 
@@ -321,10 +308,7 @@ MemDepUnit::insert(const DynInstPtr &inst)
         // Add this instruction to the list of dependents.
         for (auto store_entry : store_entries)
             store_entry->dependInsts.push_back(inst_entry);
-        for (auto store_entry : address_entries)
-            store_entry->addressDependents.push_back(inst_entry);
-
-        inst_entry->memDeps = store_entries.size() + address_entries.size();
+        inst_entry->memDeps = store_entries.size();
 
         if (inst->isLoad()) {
             ++stats.conflictingLoads;
@@ -369,8 +353,6 @@ MemDepUnit::insertNonSpec(const DynInstPtr &inst)
 
         ++stats.insertedStores;
     } else if (inst->isLoad()) {
-        if (sprPredictor && !inst->isDataPrefetch())
-            observeLoad(inst);
         ++stats.insertedLoads;
     } else {
         panic("Unknown type! (most likely a barrier).");
@@ -657,13 +639,17 @@ MemDepUnit::violation(const DynInstPtr &store_inst,
 {
     if (sprPredictor) {
         auto found = loadObservations.find(violating_load->seqNum);
-        if (found != loadObservations.end() && found->second.violationCharged)
+        if (found == loadObservations.end())
             return;
-        independence[violating_load->pcState().instAddr() & 511] = 0;
-        if (found != loadObservations.end()) {
-            found->second.dependent = true;
-            found->second.violationCharged = true;
-        }
+        auto &observation = found->second;
+        observation.orderingFailed = true;
+        // Actual violation recovery is independent of local learning. A store
+        // outside the original U cannot turn that sample into a dependency.
+        trainLoad(observation);
+        if (!observation.bypassAdmitted || observation.violationCharged)
+            return;
+        observation.violationCharged = true;
+        ++stats.watchdogFailures;
         if (speculationCredit == 0)
             ++stats.watchdogDisables;
         speculationCredit = std::max(-1, speculationCredit - 1);
@@ -692,71 +678,185 @@ void
 MemDepUnit::observeLoad(const DynInstPtr &inst)
 {
     assert(lsq);
-    auto [it, inserted] = loadObservations.try_emplace(inst->seqNum);
-    if (!inserted)
-        return;
-    auto &observation = it->second;
+    // Called once for each new effective-address attempt, never for an LSU
+    // continuation. Previous completed learning remains predictor state.
+    auto &observation = loadObservations.insert_or_assign(
+        inst->seqNum, LoadObservation{}).first->second;
     observation.load = inst;
+    ++stats.localQueries;
     observation.localPrediction =
         independence[inst->pcState().instAddr() & 511] == 15;
-    observation.olderStores = lsq->olderStores(inst);
-    for (const auto &store : observation.olderStores) {
+    for (const auto &store : lsq->olderStores(inst)) {
         auto entry = memDepHash.find(store->seqNum);
-        if (entry != memDepHash.end() && !entry->second->addressResolved &&
-            !store->effAddrValid()) {
-            ++observation.unresolved;
-            entry->second->observingLoads.push_back(inst->seqNum);
-        }
+        const bool member = entry != memDepHash.end() ?
+            !entry->second->addressGenerated : !store->translationStarted();
+        StoreObservation sample{store, member, false, {}};
+        sample.orderingChecked = entry != memDepHash.end() ?
+            entry->second->orderingChecked : store->effAddrValid();
+        if (store->translationStarted() && store->savedRequest)
+            sample.physicalReady =
+                store->savedRequest->physicalBytes(sample.bytes);
+        observation.hadUnresolvedStore |= member;
+        observation.olderStores.push_back(std::move(sample));
     }
-    observation.hadUnresolvedStore = observation.unresolved != 0;
 }
 
 void
 MemDepUnit::trainLoad(LoadObservation &observation)
 {
-    if (observation.trained || !observation.addressObserved ||
-        observation.unresolved || observation.load->isSquashed() ||
-        !observation.load->effAddrValid() ||
-        observation.load->fault != NoFault ||
-        observation.load->strictlyOrdered() || !observation.load->effSize)
+    if (observation.result != ObservationResult::Pending) {
+        recoverWatchdog(observation);
         return;
-    const auto &load = observation.load;
-    const Addr begin = load->effAddr;
-    const Addr end = begin + load->effSize;
-    for (const auto &store : observation.olderStores) {
-        if (!store->isSquashed() && store->effAddrValid() &&
-            store->effSize && store->effAddr < end &&
-            begin < store->effAddr + store->effSize)
-            observation.dependent = true;
     }
-    auto &counter = independence[load->pcState().instAddr() & 511];
-    if (observation.dependent) {
+    if (!observation.physicalReady || observation.load->isSquashed() ||
+        observation.load->fault != NoFault ||
+        observation.load->strictlyOrdered())
+        return;
+    if (!observation.hadUnresolvedStore || observation.bytes.empty()) {
+        observation.result = ObservationResult::Cancelled;
+        return;
+    }
+    bool pending = false;
+    bool intersection = false;
+    bool dependent = false;
+    const auto &stores = observation.olderStores;
+    for (size_t i = 0; i < stores.size(); ++i) {
+        const auto &sample = stores[i];
+        if (!sample.member || sample.store->isSquashed())
+            continue;
+        if (!sample.physicalReady) {
+            pending = true;
+            continue;
+        }
+        std::vector<Addr> remaining;
+        std::set_intersection(observation.bytes.begin(), observation.bytes.end(),
+            sample.bytes.begin(), sample.bytes.end(),
+            std::back_inserter(remaining));
+        intersection |= !remaining.empty();
+        bool unknownCover = false;
+        for (size_t j = i + 1; j < stores.size() && !remaining.empty(); ++j) {
+            const auto &cover = stores[j];
+            if (cover.store->isSquashed())
+                continue;
+            if (!cover.physicalReady) {
+                unknownCover = true;
+                continue;
+            }
+            std::vector<Addr> uncovered;
+            std::set_difference(remaining.begin(), remaining.end(),
+                cover.bytes.begin(), cover.bytes.end(),
+                std::back_inserter(uncovered));
+            remaining = std::move(uncovered);
+        }
+        if (!remaining.empty()) {
+            if (unknownCover)
+                pending = true;
+            else
+                dependent = true;
+        }
+    }
+    if (!dependent && pending)
+        return;
+    auto &counter = independence[observation.load->pcState().instAddr() & 511];
+    if (dependent) {
+        observation.result = ObservationResult::Dependent;
         counter = 0;
         ++stats.resolvedDependentLoads;
     } else {
-        counter = std::min<unsigned>(15, counter + 1);
-        ++stats.resolvedIndependentLoads;
-        // Continue observing safe local predictions while global speculation
-        // is inhibited; otherwise the watchdog could never recover.
-        if (observation.localPrediction && observation.hadUnresolvedStore &&
-            ++safePredictions == 64) {
-            if (speculationCredit < 3) {
-                ++speculationCredit;
-                ++stats.watchdogRecoveries;
-            }
-            safePredictions = 0;
+        if (intersection) {
+            observation.result = ObservationResult::Covered;
+            ++stats.coveredLoads;
+        } else {
+            observation.result = ObservationResult::Independent;
+            counter = std::min<unsigned>(15, counter + 1);
+            ++stats.resolvedIndependentLoads;
         }
     }
-    observation.trained = true;
-    observation.olderStores.clear();
+    recoverWatchdog(observation);
+}
+
+void
+MemDepUnit::recoverWatchdog(LoadObservation &observation)
+{
+    // Local U learning may finish before an outside-U store's translation.
+    // Global safety is known only after all older store ordering checks;
+    // an independent local sample must not forgive a real outside-U failure.
+    if (observation.watchdogObserved || !observation.localPrediction ||
+        !observation.hadUnresolvedStore || observation.violationCharged ||
+        observation.orderingFailed ||
+        observation.load->isSquashed() || observation.load->fault != NoFault ||
+        (observation.result != ObservationResult::Independent &&
+         observation.result != ObservationResult::Covered))
+        return;
+    for (const auto &sample : observation.olderStores)
+        if (!sample.store->isSquashed() &&
+            (!sample.physicalReady || !sample.orderingChecked))
+            return;
+    observation.watchdogObserved = true;
+    ++stats.watchdogSafeOpportunities;
+    // These opportunities do not require actual speculative admission, so
+    // inhibited loads can restore the watchdog after ordinary LSU waiting.
+    if (++safePredictions == 64) {
+        if (speculationCredit < 3) {
+            ++speculationCredit;
+            ++stats.watchdogRecoveries;
+        }
+        safePredictions = 0;
+    }
 }
 
 bool
-MemDepUnit::canSpeculate(const DynInstPtr &inst) const
+MemDepUnit::canSpeculate(const DynInstPtr &inst)
 {
-    return !sprPredictor || (speculationCredit >= 0 &&
-        independence[inst->pcState().instAddr() & 511] == 15 &&
-        lsq->memorySpeculationAllowed(inst));
+    if (!sprPredictor)
+        return true;
+    auto found = loadObservations.find(inst->seqNum);
+    if (found == loadObservations.end())
+        return false;
+    auto &observation = found->second;
+    if (observation.result == ObservationResult::Dependent)
+        return false;
+    if (observation.bypassAdmitted)
+        return true;
+    if (observation.localPrediction && speculationCredit >= 0 &&
+        lsq->memorySpeculationAllowed(inst)) {
+        observation.bypassAdmitted = true;
+        if (observation.hadUnresolvedStore)
+            ++stats.independencePredictions;
+        return true;
+    }
+    return false;
+}
+
+const std::vector<Addr> *
+MemDepUnit::physicalReadBytes(const DynInstPtr &inst) const
+{
+    auto found = loadObservations.find(inst->seqNum);
+    return found != loadObservations.end() && found->second.physicalReady ?
+        &found->second.bytes : nullptr;
+}
+
+void
+MemDepUnit::addressGenerated(const DynInstPtr &inst)
+{
+    if (!sprPredictor)
+        return;
+    if (inst->isLoad() && !inst->isDataPrefetch()) {
+        observeLoad(inst);
+    } else if (inst->isStore() || inst->isAtomic()) {
+        auto entry = memDepHash.find(inst->seqNum);
+        if (entry != memDepHash.end()) {
+            entry->second->addressGenerated = true;
+            entry->second->orderingChecked = false;
+        }
+        for (auto &[sequence, observation] : loadObservations)
+            for (auto &sample : observation.olderStores)
+                if (sample.store == inst) {
+                    sample.physicalReady = false;
+                    sample.orderingChecked = false;
+                    sample.bytes.clear();
+                }
+    }
 }
 
 void
@@ -767,41 +867,51 @@ MemDepUnit::addressReady(const DynInstPtr &inst)
     if (inst->isLoad()) {
         auto found = loadObservations.find(inst->seqNum);
         if (found != loadObservations.end()) {
-            found->second.addressObserved = true;
+            if (inst->savedRequest)
+                found->second.physicalReady = inst->savedRequest->physicalBytes(
+                    found->second.bytes);
             trainLoad(found->second);
         }
         return;
     }
-    auto found = memDepHash.find(inst->seqNum);
-    if (found == memDepHash.end() || found->second->addressResolved)
-        return;
-    auto &entry = found->second;
-    entry->addressResolved = true;
-    for (auto &dependent : entry->addressDependents) {
-        if (dependent->squashed || !dependent->inst)
-            continue;
-        assert(dependent->memDeps > 0);
-        if (--dependent->memDeps == 0 && dependent->regsReady)
-            moveToReady(dependent);
+    for (auto &[sequence, observation] : loadObservations) {
+        for (auto &sample : observation.olderStores)
+            if (sample.store == inst && inst->savedRequest)
+                sample.physicalReady =
+                    inst->savedRequest->physicalBytes(sample.bytes);
+        trainLoad(observation);
     }
-    entry->addressDependents.clear();
-    for (auto sequence : entry->observingLoads) {
-        auto load = loadObservations.find(sequence);
-        if (load == loadObservations.end())
-            continue;
-        assert(load->second.unresolved > 0);
-        --load->second.unresolved;
-        trainLoad(load->second);
-    }
-    entry->observingLoads.clear();
 }
 
 void
-MemDepUnit::noteForwarding(const DynInstPtr &load)
+MemDepUnit::storeOrderChecked(const DynInstPtr &inst, InstSeqNum firstViolation)
+{
+    if (!sprPredictor)
+        return;
+    auto entry = memDepHash.find(inst->seqNum);
+    if (entry != memDepHash.end())
+        entry->second->orderingChecked = true;
+    for (auto &[sequence, observation] : loadObservations) {
+        for (auto &sample : observation.olderStores)
+            if (sample.store == inst)
+                sample.orderingChecked = true;
+        if (firstViolation && sequence >= firstViolation)
+            observation.orderingFailed = true;
+        else
+            recoverWatchdog(observation);
+    }
+}
+
+void
+MemDepUnit::noteAddressWait(const DynInstPtr &load)
 {
     auto found = loadObservations.find(load->seqNum);
-    if (found != loadObservations.end())
-        found->second.dependent = true;
+    if (found == loadObservations.end() || found->second.addressWaitObserved)
+        return;
+    found->second.addressWaitObserved = true;
+    ++stats.addressWaits;
+    if (found->second.localPrediction && speculationCredit < 0)
+        ++stats.watchdogBlocks;
 }
 
 void

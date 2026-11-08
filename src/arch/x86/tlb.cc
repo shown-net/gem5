@@ -328,6 +328,8 @@ void
 TLB::flushAll()
 {
     ++invalidationGeneration;
+    if (walker->pagingStructureCache)
+        walker->pagingStructureCache->invalidate();
     if (codeInvalidation) codeInvalidation();
     if (nextLevel()) static_cast<TLB *>(nextLevel())->flushAll();
     DPRINTF(TLB, "Invalidating all entries.\n");
@@ -351,6 +353,8 @@ void
 TLB::flushNonGlobal(int pcid)
 {
     ++invalidationGeneration;
+    if (walker->pagingStructureCache)
+        walker->pagingStructureCache->invalidate(pcid);
     if (codeInvalidation) codeInvalidation();
     if (nextLevel()) static_cast<TLB *>(nextLevel())->flushNonGlobal(pcid);
     DPRINTF(TLB, "Invalidating all non global entries.\n");
@@ -383,6 +387,10 @@ void
 TLB::invalidatePage(Addr va, uint16_t pcid, bool include_global)
 {
     ++invalidationGeneration;
+    // INVLPG clears all upper-prefix entries for the PCID, independently of
+    // VA. Architectural page faults may conservatively use this same scope.
+    if (walker->pagingStructureCache)
+        walker->pagingStructureCache->invalidate(pcid);
     if (codeInvalidation) codeInvalidation();
     if (nextLevel())
         static_cast<TLB *>(nextLevel())->invalidatePage(va, pcid, include_global);
@@ -807,6 +815,13 @@ TLB::translate(const RequestPtr &req,
             }
             if (entry->uncacheable)
                 req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+            if (req->getFlags() & Request::REP_BULK) {
+                const unsigned pat_index = (unsigned(entry->patBit) << 2) |
+                    (unsigned(entry->uncacheable) << 1) | unsigned(entry->pwt);
+                const RegVal pat = tc->readMiscRegNoEffect(misc_reg::Pat);
+                if (((pat >> (8 * pat_index)) & 0xff) != 6)
+                    return std::make_shared<RepRestart>();
+            }
         } else {
             //Use the address which already has segmentation applied.
             DPRINTF(TLB, "Paging disabled.\n");
@@ -829,6 +844,13 @@ TLB::translate(const RequestPtr &req,
         req->setExtension(extension);
     }
     Fault finalFault = finalizePhysical(req, tc, mode);
+    if (finalFault == NoFault && (req->getFlags() & Request::REP_BULK)) {
+        const Addr paddr = req->getPaddr();
+        if (req->isUncacheable() || req->isStrictlyOrdered() ||
+            req->isLocalAccess() || !tc->getSystemPtr()->isMemAddr(paddr) ||
+            !tc->getSystemPtr()->isMemAddr(paddr + req->getSize() - 1))
+            finalFault = std::make_shared<RepRestart>();
+    }
     if (finalFault != NoFault)
         req->removeExtension<FunctionalTranslationExtension>();
     return finalFault;

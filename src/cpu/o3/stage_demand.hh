@@ -18,6 +18,7 @@ struct StageDemand
     unsigned idqUnits = 1;
     unsigned allocationUnits = 1;
     unsigned robUnits = 1;
+    unsigned schedulerUnits = 1;
     unsigned schedulerActions = 1;
     unsigned retirementUnits = 1;
     // Wide-capability entries are a subset of the shared vector allocation
@@ -28,6 +29,7 @@ struct StageDemand
     InstSeqNum allocationLast = 0;
     InstSeqNum robGroup = 0;
     InstSeqNum robLast = 0;
+    InstSeqNum schedulerGroup = 0;
     InstSeqNum retirementGroup = 0;
     InstSeqNum retirementLast = 0;
 };

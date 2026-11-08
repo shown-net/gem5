@@ -123,11 +123,29 @@ class DynInst : public ExecContext, public RefCounted
     void evaluateResultValues(Tick available_at);
     void writeResultValues();
     bool hasResultValue(RegIndex index) const
-    { return index < resultValues.size() && resultValues[index].isValid(); }
+    { return index < resultValues.size() && resultValues[index].isValid() &&
+        (!divisionManaged || divideAvailableTicks.at(index) != MaxTick); }
     RegVal resultValue(RegIndex index) const
     { return resultValues.at(index).asRegVal(); }
     Tick resultAvailableAt() const { return resultAvailableTick; }
+    Tick resultAvailableAt(RegIndex index) const
+    { return divisionManaged ? divideAvailableTicks.at(index) : resultAvailableTick; }
     Tick resultNominalAt() const { return resultNominalTick; }
+    Tick resultNominalAt(RegIndex index) const
+    { return divisionManaged ? divideNominalTicks.at(index) : resultNominalTick; }
+    bool divisionManaged = false;
+    void prepareDivideValues(const std::array<Tick, 2> &times)
+    {
+        divideNominalTicks = times;
+        prepareResultValues(1, std::max(times[0], times[1]));
+    }
+    void publishDivideResult(RegIndex index, Tick time)
+    { divideAvailableTicks.at(index) = time; divideNominalTicks.at(index) = time; }
+    bool divideResultWoken(RegIndex index) const { return divideWakeMask & (1u << index); }
+    void markDivideResultWoken(RegIndex index) { divideWakeMask |= 1u << index; }
+    bool allDivideResultsWoken() const { return divideWakeMask == 3; }
+    void writeResultValue(RegIndex index)
+    { cpu->setReg(renamedDestIdx(index), resultValues.at(index).asRegVal(), threadNumber); }
     unsigned resultProducerPort() const { return resultPort; }
     const auto &sourceResults() const { return sourceResultValues; }
     bool wasEvaluatedByResource() const { return resourceEvaluated; }
@@ -143,6 +161,9 @@ class DynInst : public ExecContext, public RefCounted
     Tick resultAvailableTick = 0;
     Tick resultNominalTick = 0;
     unsigned resultPort = 0;
+    std::array<Tick, 2> divideAvailableTicks{MaxTick, MaxTick};
+    std::array<Tick, 2> divideNominalTicks{};
+    unsigned divideWakeMask = 0;
 
   public:
 
@@ -250,6 +271,7 @@ class DynInst : public ExecContext, public RefCounted
      * the instruction is out of its speculative state.
      */
     std::vector<short> _destMiscRegIdx;
+    std::vector<std::pair<int, RegVal>> _orMiscRegs;
 
     size_t _numSrcs;
     size_t _numDests;
@@ -371,6 +393,7 @@ class DynInst : public ExecContext, public RefCounted
     int boundExecutionPort = -1;
     // Earliest completion notification; bypass data may be usable sooner.
     Tick completionNotBefore = 0;
+    unsigned hardwareDestEntries(RegClassType type) const;
     unsigned allocationSlots() const
     { return stageDemand.allocationUnits; }
     InstSeqNum allocationKey() const
@@ -393,13 +416,32 @@ class DynInst : public ExecContext, public RefCounted
     unsigned backendSlots() const
     { return stageDemand.robUnits; }
     unsigned iqSlots() const
+    { return stageDemand.schedulerUnits; }
+    unsigned issueSlots() const
     { return stageDemand.schedulerActions; }
+    InstSeqNum schedulerKey() const
+    { return stageDemand.schedulerGroup ? stageDemand.schedulerGroup : seqNum; }
     bool fusedLeader() const
     { return allocationGroup && allocationGroup->branch && allocationGroup->branchProducer == seqNum; }
     bool fusedFollower() const
     { return allocationGroup && allocationGroup->branch && allocationGroup->branch == seqNum; }
     bool executionBranchMispredicted = false;
     uint64_t fetchedAddressSpaceId = 0;
+    std::array<Addr, 2> fetchedCodeBlocks{};
+    unsigned fetchedCodeBlockCount = 0;
+    bool staleCode = false;
+
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+    {
+        if (threadNumber != tid || seqNum <= after || isSquashed()) return false;
+        for (unsigned i = 0; i < fetchedCodeBlockCount; ++i) {
+            if (fetchedCodeBlocks[i] == block) {
+                staleCode = true;
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -426,7 +468,7 @@ class DynInst : public ExecContext, public RefCounted
     std::vector<fastsim::fst::TranslationFragment> functionalTranslations;
 
     /** The memory request flags (from translation). */
-    unsigned memReqFlags = 0;
+    Request::FlagsType memReqFlags = 0;
 
     /** The size of the request */
     unsigned effSize;
@@ -448,7 +490,7 @@ class DynInst : public ExecContext, public RefCounted
      * Saved memory request (needed when the DTB address translation is
      * delayed due to a hw page table walk).
      */
-    LSQ::LSQRequest *savedRequest;
+    LSQ::LSQRequest *savedRequest = nullptr;
 
     /////////////////////// Checker //////////////////////
     // Need a copy of main request pointer to verify on writes.
@@ -716,7 +758,8 @@ class DynInst : public ExecContext, public RefCounted
     bool isSyscall() const { return staticInst->isSyscall(); }
     bool isMacroop() const { return staticInst->isMacroop(); }
     bool isMicroop() const { return staticInst->isMicroop(); }
-    bool isDelayedCommit() const { return staticInst->isDelayedCommit(); }
+    bool repFunctional() const;
+    bool isDelayedCommit() const;
     bool isLastMicroop() const { return staticInst->isLastMicroop(); }
     bool isFirstMicroop() const { return staticInst->isFirstMicroop(); }
     // hardware transactional memory
@@ -910,7 +953,7 @@ class DynInst : public ExecContext, public RefCounted
     void clearCanCommit() { status.reset(CanCommit); }
 
     /** Returns whether or not this instruction is ready to commit. */
-    bool readyToCommit() const { return status[CanCommit]; }
+    bool readyToCommit() const { return status[CanCommit] || staleCode; }
 
     void setAtCommit() { status.set(AtCommit); }
 
@@ -1197,6 +1240,15 @@ class DynInst : public ExecContext, public RefCounted
         _destMiscRegVal.push_back(val);
     }
 
+    void orMiscReg(int misc_reg, RegVal bits) override
+    {
+        if (!bits) return;
+        for (auto &entry : _orMiscRegs) {
+            if (entry.first == misc_reg) { entry.second |= bits; return; }
+        }
+        _orMiscRegs.emplace_back(misc_reg, bits);
+    }
+
     /** Reads a misc. register, including any side-effects the read
      * might have as defined by the architecture.
      */
@@ -1250,6 +1302,10 @@ class DynInst : public ExecContext, public RefCounted
         for (int i = 0; i < _destMiscRegIdx.size(); i++)
             cpu->setMiscReg(
                 _destMiscRegIdx[i], _destMiscRegVal[i], threadNumber);
+        for (const auto &entry : _orMiscRegs)
+            cpu->setMiscReg(entry.first,
+                cpu->readMiscRegNoEffect(entry.first, threadNumber) | entry.second,
+                threadNumber);
 
         thread->noSquashFromTC = no_squash_from_TC;
     }
@@ -1304,7 +1360,7 @@ class DynInst : public ExecContext, public RefCounted
         if (idx < sourceResultValues.size() && sourceResultValues[idx].producer) {
             const auto &ref = sourceResultValues[idx];
             panic_if(!ref.producer->hasResultValue(ref.destination) ||
-                     ref.producer->resultAvailableAt() > curTick(),
+                     ref.producer->resultAvailableAt(ref.destination) > curTick(),
                      "Consumer read a result before its value was available");
             value = ref.producer->resultValue(ref.destination);
         } else {

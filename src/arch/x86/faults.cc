@@ -59,6 +59,26 @@ namespace X86ISA
 {
 
 void
+RepRestart::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    PCState pc = tc->pcState().as<PCState>();
+    pc.upc(0);
+    pc.nupc(1);
+    tc->pcState(pc);
+}
+
+void
+SSEArithmeticFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    tc->setMiscReg(misc_reg::Mxcsr,
+        tc->readMiscRegNoEffect(misc_reg::Mxcsr) | status);
+    if (invalidOpcode)
+        InvalidOpcode().invoke(tc, inst);
+    else
+        SIMDFloatingPointFault::invoke(tc, inst);
+}
+
+void
 X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     if (!FullSystem) {
@@ -138,7 +158,9 @@ PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     if (FullSystem) {
         // Invalidate any matching TLB entries before handling the page fault.
-        tc->getMMUPtr()->demapPage(addr, 0);
+        const CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+        const CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+        tc->getMMUPtr()->demapPage(addr, cr4.pcide ? uint64_t(cr3.pcid) : 0);
         HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
         X86FaultBase::invoke(tc);
         // If something bad happens while trying to enter the page fault

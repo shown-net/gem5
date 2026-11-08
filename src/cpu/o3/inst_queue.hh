@@ -86,9 +86,13 @@ class IQUnit : public SimObject
 
     void insert(const DynInstPtr &inst);
     void remove(const DynInstPtr &inst);
+    unsigned releaseOneAction(const DynInstPtr &inst);
     void reserve(const DynInstPtr &inst);
     void cancelReservation(InstSeqNum sequence);
     bool hasReservation(InstSeqNum sequence) const;
+    bool hasGroup(InstSeqNum group) const { return allocations.count(group); }
+    unsigned reservationDemand(const DynInstPtr &inst) const;
+    unsigned groupMembers(InstSeqNum group) const { return allocations.at(group).members; }
     void cancelReservations(ThreadID tid, InstSeqNum through);
 
     unsigned
@@ -167,10 +171,18 @@ class IQUnit : public SimObject
     struct SchedulerEntry
     {
         ThreadID thread;
-        unsigned slots;
+        InstSeqNum allocation;
         bool resident = false;
     };
+    struct SchedulerAllocation
+    {
+        ThreadID thread;
+        unsigned slots;
+        unsigned members;
+    };
     std::map<InstSeqNum, SchedulerEntry> entries;
+    std::map<InstSeqNum, SchedulerAllocation> allocations;
+    void releaseAllocation(InstSeqNum key);
 };
 
 /**
@@ -407,6 +419,10 @@ class InstructionQueue
   private:
     /** Does the actual squashing. */
     void doSquash(ThreadID tid);
+
+    // Reacquire one existing scheduler credit for an older suspended action.
+    IQUnit *findOrReclaimIQ(const DynInstPtr &inst);
+    void restoreAllocation(IQUnit *iq, const DynInstPtr &inst);
 
     /////////////////////////
     // Various pointers

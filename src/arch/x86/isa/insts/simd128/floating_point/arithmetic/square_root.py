@@ -35,72 +35,66 @@
 
 microcode = """
 def macroop SQRTSS_XMM_XMM {
-    msqrt xmml, xmmlm, size=4, ext=Scalar
+    mxmmsqrtss xmml, xmmh, xmml, xmmh, xmmlm, size=4
 };
 
 def macroop SQRTSS_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    msqrt xmml, ufp1, size=4, ext=Scalar
+    .microfused_load
+    ldfp ufp1, seg, sib, disp, dataSize=4
+    mxmmsqrtss xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop SQRTSS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    msqrt xmml, ufp1, size=4, ext=Scalar
+    .microfused_load
+    ldfprip ufp1, seg, riprel, disp, dataSize=4
+    mxmmsqrtss xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop SQRTPS_XMM_XMM {
-    msqrt xmml, xmmlm, size=4, ext=0
-    msqrt xmmh, xmmhm, size=4, ext=0
+    mxmmsqrtf xmml, xmmh, xmmlm, xmmhm, size=4
 };
 
 def macroop SQRTPS_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    msqrt xmml, ufp1, size=4, ext=0
-    msqrt xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmsqrtf xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop SQRTPS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    msqrt xmml, ufp1, size=4, ext=0
-    msqrt xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmsqrtf xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop SQRTSD_XMM_XMM {
-    msqrt xmml, xmmlm, size=8, ext=Scalar
+    mxmmsqrtd xmml, xmmh, xmmlm, xmmh, size=8
 };
 
 def macroop SQRTSD_XMM_M {
+    .microfused_load
     ldfp ufp1, seg, sib, disp, dataSize=8
-    msqrt xmml, ufp1, size=8, ext=Scalar
+    mxmmsqrtd xmml, xmmh, ufp1, xmmh, size=8
 };
 
 def macroop SQRTSD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    msqrt xmml, ufp1, size=8, ext=Scalar
+    .microfused_load
+    ldfprip ufp1, seg, riprel, disp, dataSize=8
+    mxmmsqrtd xmml, xmmh, ufp1, xmmh, size=8
 };
 
 def macroop SQRTPD_XMM_XMM {
-    msqrt xmml, xmmlm, size=8, ext=0
-    msqrt xmmh, xmmhm, size=8, ext=0
+    mxmmsqrtf xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop SQRTPD_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    msqrt xmml, ufp1, size=8, ext=0
-    msqrt xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmsqrtf xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop SQRTPD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    msqrt xmml, ufp1, size=8, ext=0
-    msqrt xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmsqrtf xmml, xmmh, ufp1, ufp2, size=8
 };
 """

@@ -39,9 +39,12 @@
  */
 
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/frontend_record.hh"
 #include "cpu/o3/stack_engine.hh"
 
 #include <algorithm>
+#include <set>
+#include "arch/x86/regs/int.hh"
 
 #include "base/intmath.hh"
 #include "debug/DynInst.hh"
@@ -53,6 +56,49 @@ namespace gem5
 
 namespace o3
 {
+
+bool
+DynInst::repFunctional() const
+{
+    return repStringKind(macroop.get()) != RepStringKind::None &&
+        !staticInst->isMemRef() && !staticInst->isFirstMicroop() &&
+        !staticInst->isLastMicroop();
+}
+
+bool
+DynInst::isDelayedCommit() const
+{
+    // The ordinary loop has updated count and both pointers by its final ADD.
+    // It is an architectural progress boundary, including unsupported fast
+    // directions/forms. No speculative progress is committed here.
+    if (repFunctional() && staticInst->getName() == "add" && numDestRegs() == 1) {
+        const auto dest = destRegIdx(0);
+        const auto kind = repStringKind(macroop.get());
+        if (dest.is(IntRegClass) &&
+            ((kind == RepStringKind::Copy && dest == X86ISA::int_reg::Rsi) ||
+             (kind == RepStringKind::Store && dest == X86ISA::int_reg::Rdi)))
+            return false;
+    }
+    return staticInst->isDelayedCommit();
+}
+
+unsigned
+DynInst::hardwareDestEntries(RegClassType type) const
+{
+    if (eliminatedMove)
+        return 0;
+    auto *isa = tcBase()->getIsaPtr();
+    std::set<RegIndex> groups;
+    for (unsigned i = 0; i < numDestRegs(); ++i) {
+        const auto reg = destRegIdx(i).flatten(*isa);
+        if (!reg.is(type) || reg.regClass().isFunctional(reg) ||
+            (stackTrackedWrite && reg == X86ISA::int_reg::Rsp.flatten(*isa)))
+            continue;
+        groups.insert(reg.regClass().regAllocationGroup(reg));
+    }
+    return type == FloatRegClass && !groups.empty() && stageDemand.floatWideEntries ?
+        stageDemand.floatWideEntries : groups.size();
+}
 
 DynInst::DynInst(const Arrays &arrays, const StaticInstPtr &static_inst,
         const StaticInstPtr &_macroop, InstSeqNum seq_num, CPU *_cpu)

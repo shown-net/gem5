@@ -47,8 +47,14 @@ def macroop STOS_M {
 };
 
 def macroop STOS_E_M {
-    and t0, rcx, rcx, flags=(EZF,), dataSize=asz
-    br label("end"), flags=(CEZF,)
+    repstart label("end"), dataSize=asz
+batch:
+    repselectstos label("ordinary"), dataSize=asz
+bulk:
+    stosrep t0, es, [1, t0, rdi]
+    repprogressstos label("bulk"), label("ordinary"), dataSize=asz
+    br label("end")
+ordinary:
     # Find the constant we need to either add or subtract from rdi
     ruflag t0, 10
     movi t3, t3, dsz, flags=(CEZF,), dataSize=asz
@@ -60,7 +66,9 @@ topOfLoop:
 
     subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
     add rdi, rdi, t3, dataSize=asz
-    br label("topOfLoop"), flags=(nCEZF,)
+    br label("end"), flags=(CEZF,)
+    br label("batch"), flags=(CECF,)
+    br label("topOfLoop")
 end:
     fault "NoFault"
 };

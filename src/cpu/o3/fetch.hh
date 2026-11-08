@@ -42,6 +42,7 @@
 #ifndef __CPU_O3_FETCH_HH__
 #define __CPU_O3_FETCH_HH__
 
+#include <array>
 #include <optional>
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"
@@ -235,6 +236,10 @@ class Fetch
     { toRename = queue->getWire(0); }
     void invalidateTranslations();
     void invalidateCode(Addr physical_block);
+
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block);
+
+    bool pendingCodeWrite(ThreadID tid, Addr physical_block);
     void resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next);
 
     /** Sets pointer to branch address calculation stage and FTQ */
@@ -447,6 +452,17 @@ class Fetch
     std::unique_ptr<PCStateBase> pc[MaxThreads];
 
     Addr fetchOffset[MaxThreads];
+    std::array<Addr, 2> decodedCodeBlocks[MaxThreads]{};
+    unsigned decodedCodeBlockCount[MaxThreads]{};
+    bool codeDecodeInProgress[MaxThreads]{};
+    bool expansionCodeStale[MaxThreads]{};
+
+    void clearCodeDecode(ThreadID tid)
+    {
+        decodedCodeBlockCount[tid] = 0;
+        codeDecodeInProgress[tid] = false;
+        expansionCodeStale[tid] = false;
+    }
 
     StaticInstPtr macroop[MaxThreads];
 
@@ -585,6 +601,10 @@ class Fetch
         statistics::Scalar predictedBranches;
         /** Frontend batches which consumed more than one taken target. */
         statistics::Scalar multiTakenBatches;
+        /** Selected-thread fetch attempts blocked by an internal control. */
+        statistics::Scalar microcodeControlWaitCycles;
+        /** The subset whose retained parent is REP MOVS/STOS. */
+        statistics::Scalar repControlWaitCycles;
         /** Total number of cycles spent in any other state. */
         statistics::Scalar miscStallCycles;
         /** Total number of cycles spent in waiting for drains. */

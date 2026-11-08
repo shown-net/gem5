@@ -33,62 +33,21 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-microcode = """
-def macroop HADDPS_XMM_XMM {
-    shuffle ufp1, xmml, xmmh, ext=((0 << 0) | (2 << 2)), size=4
-    shuffle ufp2, xmml, xmmh, ext=((1 << 0) | (3 << 2)), size=4
-    shuffle ufp3, xmmlm, xmmhm, ext=((0 << 0) | (2 << 2)), size=4
-    shuffle ufp4, xmmlm, xmmhm, ext=((1 << 0) | (3 << 2)), size=4
-
-    maddf xmml, ufp1, ufp2, size=4
-    maddf xmmh, ufp3, ufp4, size=4
-};
-
-def macroop HADDPS_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT+8", dataSize=8
-
-    shuffle ufp3, xmml, xmmh, ext=((0 << 0) | (2 << 2)), size=4
-    shuffle ufp4, xmml, xmmh, ext=((1 << 0) | (3 << 2)), size=4
-    shuffle ufp5, ufp1, ufp2, ext=((0 << 0) | (2 << 2)), size=4
-    shuffle ufp6, ufp1, ufp2, ext=((1 << 0) | (3 << 2)), size=4
-
-    maddf xmml, ufp3, ufp4, size=4
-    maddf xmmh, ufp5, ufp6, size=4
-};
-
-def macroop HADDPS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT+8", dataSize=8
-
-    shuffle ufp3, xmml, xmmh, ext=((0 << 0) | (2 << 2)), size=4
-    shuffle ufp4, xmml, xmmh, ext=((1 << 0) | (3 << 2)), size=4
-    shuffle ufp5, ufp1, ufp2, ext=((0 << 0) | (2 << 2)), size=4
-    shuffle ufp6, ufp1, ufp2, ext=((1 << 0) | (3 << 2)), size=4
-
-    maddf xmml, ufp3, ufp4, size=4
-    maddf xmmh, ufp5, ufp6, size=4
-};
-
-def macroop HADDPD_XMM_XMM {
-    maddf ufp1, xmmh , xmml, size=8, ext=Scalar
-    maddf xmmh, xmmlm, xmmhm, size=8, ext=Scalar
-    movfp xmml, ufp1
-};
-
-def macroop HADDPD_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT+8", dataSize=8
-    maddf xmml, xmmh, xmml, size=8, ext=Scalar
-    maddf xmmh, ufp1, ufp2, size=8, ext=Scalar
-};
-
-def macroop HADDPD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, disp, dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT+8", dataSize=8
-    maddf xmml, xmmh, xmml, size=8, ext=Scalar
-    maddf xmmh, ufp1, ufp2, size=8, ext=Scalar
-};
+# Two p5 shuffle actions prepare one full-width Fast Adder action. The
+# intermediate words are functional storage for those hardware actions.
+microcode = ""
+for instruction, size in (("HADDPS", 4), ("HADDPD", 8)):
+    for form in ("XMM", "M", "P"):
+        source = "xmmlm, xmmhm"
+        load = ""
+        if form != "XMM":
+            operation = "ldfpxmmrip" if form == "P" else "ldfpxmm"
+            address = "riprel" if form == "P" else "sib"
+            load = f"    {operation} (ufp5, ufp6), seg, {address}, disp\n"
+            source = "ufp5, ufp6"
+        microcode += f"""def macroop {instruction}_XMM_{form} {{
+{load}    mxmmhselect ufp1, ufp2, xmml, xmmh, {source}, size={size}, ext=0
+    mxmmhselect ufp3, ufp4, xmml, xmmh, {source}, size={size}, ext=1
+    mxmmaddf xmml, xmmh, ufp1, ufp2, ufp3, ufp4, size={size}
+}};
 """

@@ -144,12 +144,14 @@ let {{
                               'Mmulf': 'FloatMultOp', 'Mdivf': 'FloatDivOp',
                               'Mxmmaddf': 'FloatAddOp',
                               'Mxmmsubf': 'FloatAddOp',
+                              'Mxmmaddsubf': 'FloatAddOp',
                               'Mxmmmulf': 'FloatMultOp',
                               'Mxmmdivf': 'FloatDivOp',
                               'Mxmmadds': 'FloatAddOp',
                               'Mxmmsubs': 'FloatAddOp',
                               'Mxmmmuls': 'FloatMultOp',
-                              'Mxmmdivs': 'FloatDivOp'}
+                              'Mxmmdivs': 'FloatDivOp',
+                              'Mxmmsqrtf': 'X86FloatSqrt64Op'}
             if Name in scalar_classes:
                 iop.op_class = '(src_size == 8 ? %s : %s)' % (
                     scalar_classes[Name], self.op_class)
@@ -528,6 +530,30 @@ let {{
     class Mxmmor(Mxmmxor):
         code = Mxmmxor.code.replace('^', '|')
 
+    class Mxmmpmaddwd(Mxmmxor):
+        # Four signed word pairs produce four wrapped dwords as one action.
+        op_class = 'SimdMultAccOp'
+        code = '''
+            auto pair = [](uint64_t left, uint64_t right) {
+                uint64_t result = 0;
+                for (unsigned lane = 0; lane < 2; ++lane) {
+                    int64_t sum = 0;
+                    for (unsigned word = 0; word < 2; ++word) {
+                        const unsigned shift = (2 * lane + word) * 16;
+                        const uint32_t l = (left >> shift) & 0xffff;
+                        const uint32_t r = (right >> shift) & 0xffff;
+                        const int32_t ls = l < 0x8000 ? l : int32_t(l) - 0x10000;
+                        const int32_t rs = r < 0x8000 ? r : int32_t(r) - 0x10000;
+                        sum += int64_t(ls) * rs;
+                    }
+                    result |= uint64_t(uint32_t(sum)) << (lane * 32);
+                }
+                return result;
+            };
+            FpDestReg_uqw = pair(FpSrcReg1_uqw, FpSrcReg3_uqw);
+            FpDestHiReg_uqw = pair(FpSrcReg2_uqw, FpSrcReg4_uqw);
+        '''
+
     class Mxmmshuffle(Mxmmxor):
         op_class = 'SimdMiscOp'
         code = '''
@@ -650,46 +676,73 @@ let {{
             FpDestHiReg_uqw = selected ? result : lanes[1];
         '''
 
+    class Mxmmhselect(Mxmmxor):
+        # Existing one-cycle p5 lane-rearrangement capacity. SimdPack's
+        # generic three-cycle latency does not describe these two shuffles.
+        op_class = 'SimdInsertOp'
+        code = '''
+            assert(srcSize == 4 || srcSize == 8);
+            const bool odd = ext & 1;
+            if (srcSize == 8) {
+                FpDestReg_uqw = odd ? FpSrcReg2_uqw : FpSrcReg1_uqw;
+                FpDestHiReg_uqw = odd ? FpSrcReg4_uqw : FpSrcReg3_uqw;
+            } else {
+                const unsigned shift = odd ? 32 : 0;
+                FpDestReg_uqw = uint32_t(FpSrcReg1_uqw >> shift) |
+                    (uint64_t(uint32_t(FpSrcReg2_uqw >> shift)) << 32);
+                FpDestHiReg_uqw = uint32_t(FpSrcReg3_uqw >> shift) |
+                    (uint64_t(uint32_t(FpSrcReg4_uqw >> shift)) << 32);
+            }
+        '''
+
     class Mxmmaddf(Mxmmxor):
         op_class = 'SimdFloatAddOp'
         code = '''
             assert(srcSize == destSize);
             assert(srcSize == 4 || srcSize == 8);
-            auto calculate = [this](uint64_t left, uint64_t right) {
-                if (srcSize == 8) {
-                    union doubleInt { double d; uint64_t i; };
-                    doubleInt arg1, arg2;
-                    arg1.i = left;
-                    arg2.i = right;
-                    arg1.d += arg2.d;
-                    return arg1.i;
-                }
-                union floatInt { float f; uint32_t i; };
-                uint64_t result = 0;
-                for (unsigned i = 0; i < 2; ++i) {
-                    floatInt arg1, arg2;
-                    arg1.i = bits(left, i * 32 + 31, i * 32);
-                    arg2.i = bits(right, i * 32 + 31, i * 32);
-                    arg1.f += arg2.f;
-                    result = insertBits(result, i * 32 + 31, i * 32, arg1.i);
-                }
-                return result;
-            };
-            FpDestReg_uqw = calculate(FpSrcReg1_uqw, FpSrcReg3_uqw);
-            FpDestHiReg_uqw = calculate(FpSrcReg2_uqw, FpSrcReg4_uqw);
+            SSEMath math(xc);
+            FpDestReg_uqw = math.packedBinary(FpSrcReg1_uqw, FpSrcReg3_uqw,
+                                             srcSize, SSEOperation::Add);
+            FpDestHiReg_uqw = math.packedBinary(FpSrcReg2_uqw, FpSrcReg4_uqw,
+                                               srcSize, SSEOperation::Add);
+            fault = math.finish(xc);
         '''
 
     class Mxmmsubf(Mxmmaddf):
         op_class = 'SimdFloatAddOp'
-        code = Mxmmaddf.code.replace('+=', '-=')
+        code = Mxmmaddf.code.replace('SSEOperation::Add', 'SSEOperation::Subtract')
+
+    class Mxmmaddsubf(Mxmmaddf):
+        op_class = 'SimdFloatAddOp'
+        code = '''
+            assert(srcSize == destSize && (srcSize == 4 || srcSize == 8));
+            SSEMath math(xc);
+            if (srcSize == 8) {
+                FpDestReg_uqw = math.binary(FpSrcReg1_uqw, FpSrcReg3_uqw,
+                                            8, SSEOperation::Subtract);
+                FpDestHiReg_uqw = math.binary(FpSrcReg2_uqw, FpSrcReg4_uqw,
+                                              8, SSEOperation::Add);
+            } else {
+                auto pair = [&math](uint64_t left, uint64_t right) {
+                    const uint64_t low = math.binary(uint32_t(left),
+                        uint32_t(right), 4, SSEOperation::Subtract);
+                    const uint64_t high = math.binary(left >> 32,
+                        right >> 32, 4, SSEOperation::Add);
+                    return low | (high << 32);
+                };
+                FpDestReg_uqw = pair(FpSrcReg1_uqw, FpSrcReg3_uqw);
+                FpDestHiReg_uqw = pair(FpSrcReg2_uqw, FpSrcReg4_uqw);
+            }
+            fault = math.finish(xc);
+        '''
 
     class Mxmmmulf(Mxmmaddf):
         op_class = 'SimdFloatMultOp'
-        code = Mxmmaddf.code.replace('+=', '*=')
+        code = Mxmmaddf.code.replace('SSEOperation::Add', 'SSEOperation::Multiply')
 
     class Mxmmdivf(Mxmmaddf):
         op_class = 'SimdFloatDivOp'
-        code = Mxmmaddf.code.replace('+=', '/=')
+        code = Mxmmaddf.code.replace('SSEOperation::Add', 'SSEOperation::Divide')
 
     class Mxmmadds(MediaOp):
         operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op,
@@ -698,35 +751,26 @@ let {{
         code = '''
             assert(srcSize == destSize);
             assert(srcSize == 4 || srcSize == 8);
-            if (srcSize == 8) {
-                union doubleInt { double d; uint64_t i; };
-                doubleInt arg1, arg2;
-                arg1.i = FpSrcReg1_uqw;
-                arg2.i = FpSrcReg3_uqw;
-                arg1.d += arg2.d;
-                FpDestReg_uqw = arg1.i;
-            } else {
-                union floatInt { float f; uint32_t i; };
-                floatInt arg1, arg2;
-                arg1.i = bits(FpSrcReg1_uqw, 31, 0);
-                arg2.i = bits(FpSrcReg3_uqw, 31, 0);
-                arg1.f += arg2.f;
-                FpDestReg_uqw = insertBits(FpSrcReg1_uqw, 31, 0, arg1.i);
-            }
+            SSEMath math(xc);
+            const uint64_t result = math.binary(FpSrcReg1_uqw, FpSrcReg3_uqw,
+                                                srcSize, SSEOperation::Add);
+            FpDestReg_uqw = srcSize == 8 ? result :
+                insertBits(FpSrcReg1_uqw, 31, 0, result);
             FpDestHiReg_uqw = FpSrcReg2_uqw;
+            fault = math.finish(xc);
         '''
 
     class Mxmmsubs(Mxmmadds):
         op_class = 'SimdFloatAddOp'
-        code = Mxmmadds.code.replace('+=', '-=')
+        code = Mxmmadds.code.replace('SSEOperation::Add', 'SSEOperation::Subtract')
 
     class Mxmmmuls(Mxmmadds):
         op_class = 'SimdFloatMultOp'
-        code = Mxmmadds.code.replace('+=', '*=')
+        code = Mxmmadds.code.replace('SSEOperation::Add', 'SSEOperation::Multiply')
 
     class Mxmmdivs(Mxmmadds):
         op_class = 'SimdFloatDivOp'
-        code = Mxmmadds.code.replace('+=', '/=')
+        code = Mxmmadds.code.replace('SSEOperation::Add', 'SSEOperation::Divide')
 
     class Mxor(Media3Op):
         def __init__(self, dest, src1, src2):
@@ -980,6 +1024,38 @@ let {{
                 result = insertBits(result, hiIndex, loIndex, argBits);
             }
             FpDestReg_uqw = result;
+        '''
+
+    class Mxmmsqrtf(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'X86FloatSqrt32Op'
+        code = '''
+            SSEMath math(xc);
+            FpDestReg_uqw = math.packedSqrt(FpSrcReg1_uqw, srcSize);
+            FpDestHiReg_uqw = math.packedSqrt(FpSrcReg2_uqw, srcSize);
+            fault = math.finish(xc);
+        '''
+
+    class Mxmmsqrtd(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'X86FloatSqrt64Op'
+        code = '''
+            SSEMath math(xc);
+            FpDestReg_uqw = math.sqrt(FpSrcReg1_uqw, 8);
+            FpDestHiReg_uqw = FpSrcReg2_uqw;
+            fault = math.finish(xc);
+        '''
+
+    class Mxmmsqrtss(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op,
+                         FloatSrc2Op, FloatSrc3Op)
+        op_class = 'X86FloatSqrt32Op'
+        code = '''
+            SSEMath math(xc);
+            FpDestReg_uqw = insertBits(FpSrcReg1_uqw, 31, 0,
+                                      math.sqrt(FpSrcReg3_uqw, 4));
+            FpDestHiReg_uqw = FpSrcReg2_uqw;
+            fault = math.finish(xc);
         '''
 
     # compute approximate reciprocal --- single-precision only
@@ -2177,10 +2253,10 @@ let {{
             }
         '''
 
-    # Reuse the established element arithmetic while scheduling the entire
-    # XMM operation once. Both halves are read before either destination writes.
-    for lane_class in (Maddi, Mmuli, Mcmpi2r, Maddf, Msubf, Mmulf, Mdivf,
-                       Msrl, Msra, Msll):
+    # Integer lane arithmetic is evaluated as one XMM operation. FP arithmetic
+    # uses the SSEMath classes above, including one instruction's MXCSR/fault
+    # boundary; it must not be regenerated from the old host-FP lane helpers.
+    for lane_class in (Maddi, Mmuli, Mcmpi2r, Msrl, Msra, Msll):
         is_shift = lane_class in (Msrl, Msra, Msll)
         lane_code = lane_class.code.replace('FpDestReg_uqw', 'result_lane')
         lane_code = lane_code.replace('FpSrcReg1_uqw', 'left_lane')
@@ -2200,9 +2276,7 @@ let {{
                'op2_uqw' if is_shift else 'FpSrcReg4_uqw')
         operands = ((FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc3Op, Op2)
                     if is_shift else Mxmmxor.operand_types)
-        prefix = ('Mxmmps' if lane_class in (Maddf, Msubf, Mmulf, Mdivf)
-                  else 'Mxmm')
-        MediaOpMeta(prefix + lane_class.__name__[1:], (MediaOp,),
+        MediaOpMeta('Mxmm' + lane_class.__name__[1:], (MediaOp,),
                     {'code': code, 'op_class': ('SimdCmpOp'
                                                if lane_class == Mcmpi2r
                                                else lane_class.op_class),

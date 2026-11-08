@@ -39,6 +39,7 @@
 #define __CPU_O3_BAC_HH__
 
 #include <list>
+#include <deque>
 
 #include "base/statistics.hh"
 #include "cpu/o3/comm.hh"
@@ -373,6 +374,15 @@ class BAC
     /** The decoupled PC which runs ahead of fetch */
     std::unique_ptr<PCStateBase> bacPC[MaxThreads];
     uint64_t targetReadyCycle[MaxThreads] = {};
+    struct LateTarget {
+        FetchTargetPtr owner;
+        StaticInstPtr instruction;
+        std::unique_ptr<PCStateBase> branchPC;
+        uint64_t ready;
+        bool discovery;
+    };
+    std::deque<LateTarget> lateTargets[MaxThreads];
+    void completeLateTargets(ThreadID tid, uint64_t cycle);
 
     /** Variable that tracks if BAC has written to the time buffer this
      * cycle. Used to tell CPU if there is activity this cycle.
@@ -449,6 +459,8 @@ class BAC
 
         /** Stat for total number fetch targets created. */
         statistics::Scalar fetchTargets;
+        statistics::Scalar lateDiscoveries, lateIndirectTargets;
+        statistics::Scalar lateRedirects, staleLateTargets;
         /** Total number of branches detected. */
         statistics::Scalar branches;
         /** Total number of branches predicted taken. */

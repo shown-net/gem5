@@ -81,6 +81,7 @@ class InstructionDeliveryQueue : public SimObject
     unsigned freeEntries() const { return capacity - occupied(); }
     bool empty() const { return records.empty() && inFlight.empty(); }
     void enqueue(FrontendRecordPtr record, uint64_t ready, uint64_t cycle);
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block);
     bool headReady(uint64_t cycle) const;
     unsigned headSlots() const { return records.front().record->demand.idqUnits; }
     FrontendRecordPtr send(uint64_t cycle);
@@ -117,6 +118,8 @@ class MiteService : public SimObject
   public:
     MiteService(const MiteServiceParams &p);
     bool idle() const { return pending.empty(); }
+    bool preparingHead(uint64_t cycle) const
+    { return !pending.empty() && pending.front().ready > cycle; }
     unsigned freeBatchOps() const { return batchLimit - pending.size(); }
     InstSeqNum lastDelivered() const { return deliveredThrough; }
     unsigned maxInstructions() const { return instructionBudget; }
@@ -125,6 +128,7 @@ class MiteService : public SimObject
     InstSeqNum headSequence() const
     { return pending.empty() ? ~InstSeqNum(0) : pending.front().record->sequence; }
     void refreshDemands();
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block);
     void submit(std::vector<FrontendRecordPtr> records,
                 unsigned instructions, uint64_t cycle);
     unsigned deliver(InstructionDeliveryQueue &idq, uint64_t cycle,
@@ -163,7 +167,7 @@ struct FrontendTemplate
     unsigned bytes;
     std::vector<Addr> physicalBlocks;
     uint64_t available;
-    bool sharedAllocation;
+    unsigned encodedSlots() const;
     // A fill-time path boundary; not a claim about undisclosed hardware tags.
     bool endsEntry = false;
 };
@@ -211,12 +215,6 @@ class FrontendCoordinator : public SimObject
     const bool enableLsdReplay;
     FrontendSource selected = FrontendSource::Mite;
     bool haveSource = false, stoppedThisCycle = false;
-    const Cycles switchDelay;
-    struct SwitchWait {
-        InstSeqNum first;
-        uint64_t begin, end;
-    };
-    std::deque<SwitchWait> switchWaits;
     struct PendingFill {
         InstSeqNum through;
         uint64_t epoch;
@@ -234,7 +232,7 @@ class FrontendCoordinator : public SimObject
     void fuseAcrossBatches(std::vector<FrontendRecordPtr> &records);
     struct Stats : statistics::Group
     {
-        statistics::Scalar sourceTransitions, extraSwitchCycles;
+        statistics::Scalar sourceTransitions;
         statistics::Scalar switchWaitCycles, switchWaitRenameBlocked;
         statistics::Scalar switchWaitIdqFull;
         statistics::Scalar outputs, redirects, translationValidations;
@@ -288,6 +286,7 @@ class FrontendCoordinator : public SimObject
     { deliveryObserver = std::move(observer); }
     Addr validationAddress(Addr address, uint64_t cycle) const;
     void invalidateCode(Addr physical_block);
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block);
     void invalidateTranslations();
     DrainState drain() override;
 };

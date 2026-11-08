@@ -52,6 +52,9 @@ class RubyCache(SimObject):
     fill_stats_clock = Param.ClockDomain(
         NULL, "Optional core clock domain for data-fill occupancy statistics"
     )
+    fill_install_bytes_per_cycle = Param.Unsigned(
+        64, "L1 data refill bytes accepted per fill_stats_clock cycle"
+    )
 
     # Atomic parameters only applicable to GPU atomics
     # Zero atomic latency corresponds to instantanous atomic ALU operations

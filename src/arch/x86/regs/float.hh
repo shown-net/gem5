@@ -124,6 +124,8 @@ enum FloatRegIndex
 class FlatFloatRegClassOps : public RegClassOps
 {
   public:
+    bool isFunctional(const RegId &id) const override
+    { return id.index() >= float_reg::MicrofpBase; }
     RegIndex
     regAllocationGroup(const RegId &id) const override
     {

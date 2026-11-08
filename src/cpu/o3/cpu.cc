@@ -57,6 +57,7 @@
 #include "cpu/simple_thread.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Activity.hh"
+#include "debug/Fetch.hh"
 #include "debug/Drain.hh"
 #include "debug/O3CPU.hh"
 #include "debug/Quiesce.hh"
@@ -111,7 +112,7 @@ CPU::CPU(const BaseO3CPUParams &params)
               params.isa[0]->regClasses()),
 
       freeList(name() + ".freelist", &regFile, params.numPhysFloatRegEntries,
-               params.numPhysFloatWideEntries),
+               params.numPhysFloatWideEntries, params.numPhysIntRegEntries),
 
       rob(this, params),
 
@@ -301,7 +302,8 @@ CPU::CPU(const BaseO3CPUParams &params)
                 const auto group = id.regClass().regAllocationGroup(id);
                 auto peer = type == FloatRegClass && group == previous_group ?
                     previous : nullptr;
-                PhysRegIdPtr phys_reg = freeList.getReg(type, peer);
+                PhysRegIdPtr phys_reg = freeList.getReg(
+                    type, peer, !id.regClass().isFunctional(id));
                 renameMap[tid].setEntry(id, phys_reg);
                 commitRenameMap[tid].setEntry(id, phys_reg);
                 previous = phys_reg;
@@ -390,6 +392,28 @@ CPU::regProbePoints()
     rename.regProbePoints();
     iew.regProbePoints();
     commit.regProbePoints();
+}
+
+bool
+CPU::hasPendingCodeWrite(ThreadID tid, Addr physical_block)
+{
+    return iew.hasPendingCodeWrite(tid, physical_block);
+}
+
+void
+CPU::noteCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block)
+{
+    bool matched = fetch.markCodeWrite(tid, after, physical_block);
+    for (const auto &inst : instList)
+        matched |= inst->markCodeWrite(tid, after, physical_block);
+    if (matched) {
+        DPRINTF(Fetch, "[tid:%i] Code write line %#x after [sn:%llu] "
+                "marked younger fetched instructions for replay\n",
+                tid, physical_block, after);
+        fetch.invalidateCode(physical_block);
+        wakeCPU();
+        activityThisCycle();
+    }
 }
 
 CPU::CPUStats::CPUStats(CPU *cpu)

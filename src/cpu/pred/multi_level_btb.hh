@@ -86,6 +86,7 @@ class MultiLevelBTB : public BranchTargetBuffer
 
     void memInvalidate() override;
     bool valid(ThreadID tid, Addr instPC) override;
+    bool earlyValid(ThreadID tid, Addr instPC) override;
     void invalidate(ThreadID tid, Addr instPC) override;
     Cycles lookupLatency(ThreadID tid, Addr instPC) const override;
 

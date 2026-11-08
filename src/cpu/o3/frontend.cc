@@ -12,7 +12,7 @@ namespace gem5::o3
 namespace {
 void describeDemand(FrontendRecord &r)
 {
-    r.demand = StageDemand{};
+    r.demand = initialDemand(*r.instruction, r.macroop.get());
     if (!r.allocationGroup) return;
     const auto &g = *r.allocationGroup;
     const bool first = r.sequence == g.leader;
@@ -25,6 +25,7 @@ void describeDemand(FrontendRecord &r)
         r.demand.robUnits = first;
         r.demand.robGroup = g.leader;
         r.demand.robLast = g.end;
+        r.demand.schedulerGroup = g.leader;
     }
     r.demand.retirementGroup = g.leader;
     r.demand.retirementLast = g.end;
@@ -498,6 +499,27 @@ DsbTemplates::lookup(const FrontendCodeIdentity &identity,
     return &entry->members[member_index];
 }
 
+unsigned
+FrontendTemplate::encodedSlots() const
+{
+    // Decode/encoding qualification owns storage. Backend allocation groups
+    // are deliberately not consulted: an unlaminated memory form can retain
+    // one encoded slot while allocating separate backend entries.
+    if (macroop && (macroop->isMicroFusedMemory() || macroop->isStackRegAllocation()))
+        return 1;
+    unsigned slots = 0;
+    for (const auto &op : operations) {
+        const auto divide = op->intDivide();
+        if (divide.bytes)
+            slots += divide.bytes == 8 ? 5 : 4;
+        else
+            // Effective fallback for forms not yet given a distinct encoding
+            // description; this is not evidence of physical uop count.
+            ++slots;
+    }
+    return slots;
+}
+
 bool
 DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
         uint64_t cycle)
@@ -508,10 +530,7 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
     }
     if (value.operations.empty() || value.physicalBlocks.empty())
         return false;
-    auto allocationUnits = [](const FrontendTemplate &entry) {
-        return entry.sharedAllocation ? size_t(1) : entry.operations.size();
-    };
-    if (allocationUnits(value) > opsPerEntry) {
+    if (value.encodedSlots() > opsPerEntry) {
         ++cacheStats.oversizeTemplates;
         return false;
     }
@@ -527,7 +546,7 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
     // Pack consecutive instructions from the same observed path. A taken
     // branch seals its entry; this is an effective model, not a physical tag.
     const unsigned set = setIndex(value.identity.address);
-    const unsigned units = allocationUnits(value);
+    const unsigned units = value.encodedSlots();
     auto target = entries.end();
     unsigned occupied = 0;
     for (auto it = entries.begin(); it != entries.end(); ++it) {
@@ -603,9 +622,7 @@ DsbTemplates::invalidateAll()
 FrontendCoordinator::Stats::Stats(statistics::Group *parent)
     : statistics::Group(parent),
       ADD_STAT(sourceTransitions, statistics::units::Count::get(),
-               "Source changes at batch boundaries"),
-      ADD_STAT(extraSwitchCycles, statistics::units::Cycle::get(),
-               "Configured extra DSB to MITE source wait"),
+               "Source changes at actual IDQ handoff"),
       ADD_STAT(switchWaitCycles, statistics::units::Cycle::get(),
                "Observed frontend cycles in a DSB to MITE wait; not a certified hardware penalty"),
       ADD_STAT(switchWaitRenameBlocked, statistics::units::Cycle::get(),
@@ -644,7 +661,7 @@ FrontendCoordinator::Stats::Stats(statistics::Group *parent)
 
 FrontendCoordinator::FrontendCoordinator(const FrontendCoordinatorParams &p)
     : SimObject(p), enableLsdReplay(p.enableLsdReplay),
-      switchDelay(p.dsbToMiteDelay), stats(this),
+      stats(this),
       instructionBytes(p.instructionBytes), mite(p.mite), dsb(p.dsb),
       ms(p.ms), lsd(p.lsd), idq(p.idq)
 {}
@@ -720,23 +737,12 @@ void
 FrontendCoordinator::advance(uint64_t cycle, bool rename_blocked,
         const std::function<bool(FrontendRecordPtr)> &emit)
 {
-    // submit() occurs after advance() in the fetch tick. Count subsequent
-    // active frontend cycles, once per cycle even if waits overlap. A wait
-    // cancelled by a redirect is removed by cancelAfter().
-    while (!switchWaits.empty() && switchWaits.front().end <= cycle)
-        switchWaits.pop_front();
-    const bool switch_wait = std::any_of(switchWaits.begin(), switchWaits.end(),
-        [cycle](const auto &wait) { return wait.begin <= cycle && cycle < wait.end; });
-    if (switch_wait) {
-        ++stats.switchWaitCycles;
-        if (rename_blocked) ++stats.switchWaitRenameBlocked;
-        if (!idq->freeEntries()) ++stats.switchWaitIdqFull;
-    }
     stoppedThisCycle = false;
     unsigned sent = 0, sent_records = 0;
     auto output = [&] {
         while (!rename_blocked && !stoppedThisCycle && sent_records < MaxWidth &&
                idq->headReady(cycle)) {
+            if (idq->headSlots() > outputWidth - sent) break;
             if (sent == outputWidth) {
                 // A zero-cost follower completes the last accepted group.
                 // The IDQ's ordered head determines its remaining cost.
@@ -768,7 +774,19 @@ FrontendCoordinator::advance(uint64_t cycle, bool rename_blocked,
         if (fusionTail)
             before = std::min(before, fusionTail->allocationGroup ?
                 fusionTail->allocationGroup->leader : fusionTail->sequence);
-        if (oldest) oldest->deliver(*idq, cycle, before, deliveryObserver);
+        if (haveSource && selected == FrontendSource::Dsb && oldest == mite &&
+            mite->preparingHead(cycle)) {
+            ++stats.switchWaitCycles;
+            if (rename_blocked) ++stats.switchWaitRenameBlocked;
+            if (!idq->freeEntries()) ++stats.switchWaitIdqFull;
+        }
+        auto observe = [this](const FrontendRecord &record, uint64_t at) {
+            if (haveSource && selected != record.source) ++stats.sourceTransitions;
+            selected = record.source;
+            haveSource = true;
+            if (deliveryObserver) deliveryObserver(record, at);
+        };
+        if (oldest) oldest->deliver(*idq, cycle, before, observe);
         const InstSeqNum delivered = std::max({mite->lastDelivered(),
             dsb->lastDelivered(), ms->lastDelivered(), lsd->lastDelivered()});
         while (!pendingFills.empty() && pendingFills.front().through <= delivered) {
@@ -793,25 +811,10 @@ FrontendCoordinator::submit(FrontendSource source,
         describeDemand(*record);
         observeLoop(*record);
     }
-    Cycles wait(0);
-    if (haveSource && selected != source) {
-        ++stats.sourceTransitions;
-        if (selected == FrontendSource::Dsb && source == FrontendSource::Mite) {
-            wait = switchDelay;
-            stats.extraSwitchCycles += uint64_t(wait);
-            if (wait != Cycles(0)) {
-                const uint64_t first = cycle + 1;
-                switchWaits.push_back({records.front()->sequence, first,
-                                       first + uint64_t(wait)});
-            }
-        }
-    }
-    selected = source;
-    haveSource = true;
     if (!fills.empty())
         pendingFills.push_back({records.back()->sequence, dsb->epoch(), std::move(fills)});
     auto *service = sourceService(source);
-    service->submit(std::move(records), instructions, cycle + uint64_t(wait));
+    service->submit(std::move(records), instructions, cycle);
 }
 
 void FrontendCoordinator::accepted(InstSeqNum sequence)
@@ -821,9 +824,6 @@ void FrontendCoordinator::accepted(InstSeqNum sequence)
 }
 void FrontendCoordinator::cancelAfter(InstSeqNum through)
 {
-    switchWaits.erase(std::remove_if(switchWaits.begin(), switchWaits.end(),
-        [through](const auto &wait) { return wait.first > through; }),
-        switchWaits.end());
     fusionTail = nullptr;
     mite->cancelAfter(through);
     dsb->cancelAfter(through);
@@ -918,6 +918,36 @@ void FrontendCoordinator::invalidateCode(Addr block)
         [&](const CodeLease &lease) { return lease.physicalBlock == block; }), leases.end());
     if (instructionBytes->matchesPhysicalBlock(block, lineSize))
         instructionBytes->invalidate();
+}
+
+bool
+InstructionDeliveryQueue::markCodeWrite(ThreadID tid, InstSeqNum after,
+                                         Addr block)
+{
+    bool matched = false;
+    for (auto &entry : records)
+        matched |= entry.record->markCodeWrite(tid, after, block);
+    return matched;
+}
+
+bool
+MiteService::markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+{
+    bool matched = false;
+    for (auto &entry : pending)
+        matched |= entry.record->markCodeWrite(tid, after, block);
+    return matched;
+}
+
+bool
+FrontendCoordinator::markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+{
+    bool matched = idq->markCodeWrite(tid, after, block);
+    matched |= mite->markCodeWrite(tid, after, block);
+    matched |= dsb->markCodeWrite(tid, after, block);
+    matched |= ms->markCodeWrite(tid, after, block);
+    matched |= lsd->markCodeWrite(tid, after, block);
+    return matched;
 }
 void FrontendCoordinator::invalidateTranslations()
 {
@@ -1030,7 +1060,7 @@ void FrontendCoordinator::observeLoop(const FrontendRecord &record)
         }
         loopBuilding = FrontendTemplate{identity(record.pc->instAddr()),
             record.macroop ? record.macroop : op, {}, bytes,
-            std::move(blocks), 0, bool(record.allocationGroup)};
+            std::move(blocks), 0};
     }
     loopBuilding->operations.push_back(op);
     loopCaptureUnits += record.demand.idqUnits;

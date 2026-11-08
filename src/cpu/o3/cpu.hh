@@ -298,6 +298,9 @@ class CPU : public BaseCPU
 
     /** Get the current instruction sequence number, and increment it. */
     unsigned instSeqStride() const { return stackEngine ? 2 : 1; }
+
+    bool hasPendingCodeWrite(ThreadID tid, Addr physical_block);
+    void noteCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block);
     InstSeqNum getAndIncrementInstSeq()
     {
         const auto result = globalSeqNum;

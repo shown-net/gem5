@@ -165,6 +165,7 @@ BAC::resetStage()
     // Setup PC and nextPC with initial state.
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
         clearStates(tid);
+        lateTargets[tid].clear();
     }
 
     wroteToTimeBuffer = false;
@@ -199,7 +200,7 @@ BAC::isDrained() const
     // Make sure the FTQ is empty and the state of all threads is idle.
     for (ThreadID i = 0; i < numThreads; ++i) {
         // Verify the FTQ is drained
-        if (!ftq->isEmpty(i)) {
+        if (!ftq->isEmpty(i) || !lateTargets[i].empty()) {
             return false;
         }
 
@@ -496,9 +497,63 @@ BAC::squash(const PCStateBase &new_pc, ThreadID tid)
     // Set the new PC
     set(bacPC[tid], new_pc);
     targetReadyCycle[tid] = 0;
+    lateTargets[tid].clear();
 
     // Then squash all fetch targets
     ftq->squash(tid);
+}
+
+void
+BAC::completeLateTargets(ThreadID tid, uint64_t cycle)
+{
+    if (stalls[tid].drain) { lateTargets[tid].clear(); return; }
+    const size_t pending = lateTargets[tid].size();
+    for (size_t i = 0; i < pending; ++i) {
+        auto late = std::move(lateTargets[tid].front());
+        lateTargets[tid].pop_front();
+        if (late.ready > cycle) {
+            lateTargets[tid].push_back(std::move(late));
+            continue;
+        }
+        auto ft = late.owner;
+        if (!ftq->contains(tid, ft->ftNum()) || ft->decodedBranch ||
+            (!late.discovery && (!ft->bpuHistory || !ft->bpuHistory->pendingTarget))) {
+            ++stats.staleLateTargets;
+            continue;
+        }
+        if (!late.discovery && *ft->bpuHistory->target == *ft->bpuHistory->pendingTarget) {
+            bpu->completeStagedTarget(tid, ft->bpuHistory);
+            ++stats.lateIndirectTargets;
+            continue;
+        }
+        // The correction propagates in BAC/FTQ. A branch already confirmed
+        // by predecode owns the later pipeline and rejects this old result.
+        ftq->forAllBackward(tid, [this, tid, ft](FetchTargetPtr &younger) {
+            if (younger->ftNum() > ft->ftNum() && younger->bpuHistory)
+                bpu->squashHistory(tid, younger->bpuHistory);
+        });
+        ftq->squashAfter(tid, ft->ftNum());
+        std::unique_ptr<PCStateBase> target(late.branchPC->clone());
+        bool taken;
+        if (late.discovery) {
+            if (ft->bpuHistory) bpu->squashHistory(tid, ft->bpuHistory);
+            taken = predict(tid, late.instruction, ft, *target);
+            if (!taken) target->set(late.branchPC->instAddr() + minInstSize);
+            ++stats.lateDiscoveries;
+        } else {
+            taken = ft->bpuHistory->predTaken;
+            bpu->completeStagedTarget(tid, ft->bpuHistory);
+            set(target, *ft->bpuHistory->target);
+            ++stats.lateIndirectTargets;
+        }
+        ft->finalize(*late.branchPC, true, taken, *target);
+        ft->setReadyCycle(cycle + 1);
+        set(bacPC[tid], *target);
+        targetReadyCycle[tid] = cycle + 1;
+        bacStatus[tid] = Running;
+        wroteToTimeBuffer = true;
+        ++stats.lateRedirects;
+    }
 }
 
 void
@@ -516,6 +571,7 @@ BAC::tick()
         for (const ThreadID tid : *activeThreads) {
             // Check stall and squash signals first.
             status_change = status_change || checkSignalsAndUpdate(tid);
+            completeLateTargets(tid, uint64_t(cpu->curCycle()));
 
             // Generate fetch targets if BAC is in running state
             if (bacStatus[tid] == Running) {
@@ -578,7 +634,11 @@ BAC::predict(ThreadID tid, const StaticInstPtr &inst, const FetchTargetPtr &ft,
      * main history of the BPU and insert these missing histories.
      */
     assert(ft->bpuHistory == nullptr);
-    bool taken = bpu->predict(inst, ft->ftNum(), pc, tid, ft->bpuHistory);
+    auto branch_pc = std::unique_ptr<PCStateBase>(pc.clone());
+    bool taken = bpu->predict(inst, ft->ftNum(), pc, tid, ft->bpuHistory, true);
+    if (ft->bpuHistory->pendingTarget)
+        lateTargets[tid].push_back({ft, inst, std::move(branch_pc),
+                                   uint64_t(cpu->curCycle()) + 1, false});
 
     DPRINTF(Branch, "[tid:%i, ftn:%llu] History added.\n", tid, ft->ftNum());
     return taken;
@@ -640,6 +700,9 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         bool branch_found = false;
         bool predict_taken = false;
         Cycles target_latency(0);
+        StaticInstPtr late_inst;
+        std::unique_ptr<PCStateBase> late_pc;
+        Cycles late_latency(0);
 
         // Scan through the instruction stream and search for branches.
         // The BTB contains only branches where taken at least once.
@@ -651,7 +714,13 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
 
             // Check if the current search address can be found in the BTB
             // indicating the end of the branch.
-            branch_found = bpu->BTBValid(tid, search_addr);
+            branch_found = bpu->BTBEarlyValid(tid, search_addr);
+            if (!branch_found && !late_inst && bpu->BTBValid(tid, search_addr)) {
+                late_inst = bpu->BTBGetInst(tid, search_addr);
+                late_pc.reset(cur_pc.clone());
+                late_pc->set(search_addr);
+                late_latency = btbLookupLatency(tid, search_addr);
+            }
 
             // If its a branch stop searching
             if (branch_found) {
@@ -751,6 +820,9 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         }
 
         ftq->insert(tid, curFT);
+        if (late_inst)
+            lateTargets[tid].push_back({curFT, late_inst, std::move(late_pc),
+                                       cycle + uint64_t(late_latency), true});
         wroteToTimeBuffer = true;
 
         DPRINTF(BAC,
@@ -787,6 +859,7 @@ BAC::updatePreDecode(ThreadID tid, const InstSeqNum seqNum,
                      const FetchTargetPtr &ft)
 {
     assert(ft != nullptr);
+    ft->decodedBranch = true;
     // The PC must be in the range of the fetch target.
     assert(ft->inRange(pc.instAddr()));
 
@@ -1035,6 +1108,14 @@ BAC::BACStats::BACStats(o3::CPU *cpu, BAC *bac)
                "Number of cycles BAC in state"),
       ADD_STAT(fetchTargets, statistics::units::Count::get(),
                "Number of fetch targets created "),
+      ADD_STAT(lateDiscoveries, statistics::units::Count::get(),
+               "Branches discovered by a later BTB level"),
+      ADD_STAT(lateIndirectTargets, statistics::units::Count::get(),
+               "Indirect target results completed after metadata readiness"),
+      ADD_STAT(lateRedirects, statistics::units::Count::get(),
+               "Late predictor results which replaced an actual earlier FTQ path"),
+      ADD_STAT(staleLateTargets, statistics::units::Count::get(),
+               "Late results rejected after decode confirmation or path removal"),
       ADD_STAT(branches, statistics::units::Count::get(),
                "Number of branches that BAC encountered"),
       ADD_STAT(predTakenBranches, statistics::units::Count::get(),

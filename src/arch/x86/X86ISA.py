@@ -86,8 +86,9 @@ class X86ISA(BaseISA):
     )
     # 0000_0007h
     ExtendedFeatures = VectorParam.UInt32(
-        # FSGSBASE, INVPCID and ADCX/ADOX. The partial BMI1 set stays hidden.
-        [0x00000000, 0x01880401, 0x00000000, 0x00000000], "feature flags"
+        # FSGSBASE, INVPCID, ERMS and ADCX/ADOX. REP retains ordinary semantics
+        # when its bounded path cannot accept an access. FSRM stays hidden.
+        [0x00000000, 0x01880601, 0x00000000, 0x00000000], "feature flags"
     )
     # 0000_000Dh - This uses ECX index, so the last entry must be all zeros
     ExtendedState = VectorParam.UInt32(

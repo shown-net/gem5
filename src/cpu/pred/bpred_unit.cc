@@ -120,7 +120,8 @@ BPredUnit::insertPredictorHistory(ThreadID tid, PredictorHistory *&bpu_history)
 
 bool
 BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
-                   PCStateBase &pc, ThreadID tid, PredictorHistory* &hist)
+                   PCStateBase &pc, ThreadID tid, PredictorHistory* &hist,
+                   bool staged_targets)
 {
     assert(hist == nullptr);
 
@@ -269,8 +270,12 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
         if (itarget) {
             // Indirect predictor hit
             ++stats.indirectHits;
-            hist->targetProvider = TargetProvider::Indirect;
-            set(hist->target, *itarget);
+            if (staged_targets && hist->targetProvider != TargetProvider::NoTarget) {
+                hist->pendingTarget.reset(itarget->clone());
+            } else {
+                hist->targetProvider = TargetProvider::Indirect;
+                set(hist->target, *itarget);
+            }
 
             DPRINTF(Branch,
                     "[tid:%i, sn:%llu] Instruction %s predicted "
@@ -337,6 +342,26 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
     return hist->predTaken;
 }
 
+
+bool
+BPredUnit::completeStagedTarget(ThreadID tid, PredictorHistory *hist)
+{
+    if (!hist || !hist->pendingTarget) return false;
+    const bool changed = *hist->target != *hist->pendingTarget;
+    hist->target = std::move(hist->pendingTarget);
+    hist->targetProvider = TargetProvider::Indirect;
+    if (changed) {
+        // Younger speculative histories have already been removed by BAC.
+        // Retarget this transaction without a second lookup, RAS action or
+        // prediction-table training operation.
+        cPred->update(tid, hist->pc, hist->predTaken, hist->bpHistory,
+                      true, hist->inst, hist->target->instAddr());
+        if (iPred)
+            iPred->update(tid, hist->seqNum, hist->pc, true, hist->predTaken,
+                          *hist->target, hist->type, hist->indirectHistory);
+    }
+    return changed;
+}
 
 void
 BPredUnit::update(const InstSeqNum &done_sn, ThreadID tid)

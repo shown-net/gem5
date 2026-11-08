@@ -67,6 +67,8 @@ namespace gem5
 namespace ruby
 {
 
+class AbstractController;
+
 class CacheMemory : public SimObject
 {
   public:
@@ -133,7 +135,8 @@ class CacheMemory : public SimObject
     bool isBlockNotBusy(int64_t cache_set, int64_t loc);
 
     // Hook for checkpointing the contents of the cache
-    void recordCacheContents(int cntrl, CacheRecorder* tr) const;
+    void recordCacheContents(int cntrl, CacheRecorder* tr,
+                             AbstractController *owner) const;
 
     // Set this address to most recently used
     void setMRU(Addr address);
@@ -175,6 +178,10 @@ class CacheMemory : public SimObject
     void finishDataFill(Addr address);
     void recordDemandFillBlocked();
     bool dataFillPending(Addr address) const;
+    bool dataFillPresent(Addr address) const;
+    bool dataFillReady(Addr address) const;
+    bool advanceDataFillInstall(Addr address);
+    void installDataFill(Addr address);
     void observeDataFillDemandRead(Addr address);
     bool hasReadableData(Addr address) const;
 
@@ -242,6 +249,8 @@ class CacheMemory : public SimObject
     std::unique_ptr<DataFillClock> dataFillClock;
     uint64_t lastDataFillCycle = 0;
     uint64_t lastDemandFillBlockedCycle = uint64_t(-1);
+    uint64_t nextDataFillInstallCycle = 0;
+    const unsigned dataFillInstallBytesPerCycle;
     uint64_t currentDataFillCycle() const;
     void accountDataFillCycles();
 
@@ -295,6 +304,11 @@ class CacheMemory : public SimObject
           statistics::Scalar dataFillDemandBlockedCycles;
           statistics::Scalar dataFillDemandReadPending;
           statistics::Scalar dataFillDemandReadPendingCycles;
+          statistics::Scalar dataFillReadyEntryCycles;
+          statistics::Scalar dataFillInstalls;
+          statistics::Scalar dataFillCancellations;
+          statistics::Scalar dataFillInstallBlocked;
+          statistics::Scalar dataFillInstallServiceCycles;
           statistics::Scalar demandDataReadHits, demandDataReadTrueMisses;
           statistics::Scalar dataLineFills;
 

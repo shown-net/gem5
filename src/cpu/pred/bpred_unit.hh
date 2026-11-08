@@ -137,6 +137,7 @@ class BPredUnit : public SimObject
     {
         return btb->valid(tid, pc);
     }
+    bool BTBEarlyValid(ThreadID tid, Addr pc) { return btb->earlyValid(tid, pc); }
 
     void invalidateBTB(ThreadID tid, Addr pc)
     {
@@ -362,6 +363,7 @@ class BPredUnit : public SimObject
 
         /** The predicted target */
         std::unique_ptr<PCStateBase> target;
+        std::unique_ptr<PCStateBase> pendingTarget;
 
         /**
          * Pointer to the history objects passed back from the branch
@@ -390,7 +392,9 @@ class BPredUnit : public SimObject
      * Internal prediction function.
      */
     bool predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
-               PCStateBase &pc, ThreadID tid, PredictorHistory* &bpu_history);
+               PCStateBase &pc, ThreadID tid, PredictorHistory* &bpu_history,
+               bool staged_targets = false);
+    bool completeStagedTarget(ThreadID tid, PredictorHistory *history);
 
     /**
      * Squashes a particular branch instance. Reverts

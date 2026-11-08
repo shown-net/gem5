@@ -270,7 +270,7 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
     """Selected SPR private caches with system-supplied LLC geometry."""
 
     def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int,
-                 uncore_clock: str = "2.5GHz"):
+                 uncore_clock: str = "2.5GHz", l1_refill_bytes_per_cycle: int = 64):
         super().__init__(
             l1i_size="32KiB", l1i_assoc=8,
             l1d_size="48KiB", l1d_assoc=12,
@@ -278,3 +278,9 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
             l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
             uncore_clock=uncore_clock,
         )
+        self._l1_refill_bytes_per_cycle = l1_refill_bytes_per_cycle
+
+    def incorporate_cache(self, board: AbstractBoard) -> None:
+        super().incorporate_cache(board)
+        for controller in self._l1_controllers:
+            controller.Dcache.fill_install_bytes_per_cycle = self._l1_refill_bytes_per_cycle

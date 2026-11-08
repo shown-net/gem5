@@ -101,6 +101,15 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     // write permission.
     SM, AccessPermission:Read_Only, desc="Issued GETX, have not seen response yet";
 
+    // Data and permission are available in the FB. A reserved tag/backing
+    // DataBlk is not yet an installed, ordinary L1 hit. The TBE retains
+    // coherence ownership until the finite refill path accepts the line.
+    FB_S, AccessPermission:Busy, desc="Shared FB data awaiting L1 installation";
+    FB_E, AccessPermission:Busy, desc="Exclusive FB data awaiting L1 installation";
+    FB_M, AccessPermission:Busy, desc="Modified FB data awaiting L1 installation";
+    FB_LLSC_E, AccessPermission:Busy, desc="Locked exclusive FB data awaiting installation";
+    FB_LLSC_M, AccessPermission:Busy, desc="Locked modified FB data awaiting installation";
+
     // Transient states in which block is being prefetched
     PF_Inst_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
     PF_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
@@ -122,6 +131,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     Load,            desc="Load request from the home processor";
     Ifetch,          desc="I-fetch request from the home processor";
     Store,           desc="Store request from the home processor";
+    Fill_Install,    desc="Refill path accepted data-ready FB line";
+    Fill_Retry,      desc="Refill path is occupied this cycle";
 
     // invalidations from L1 (due to self or other core)
     InvOwn,          desc="Invalidate request from L1 (own)";
@@ -201,6 +212,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   TBETable TBEs, template="<L0Cache_TBE>", constructor="m_number_of_TBEs";
   TimerTable llscLockTimerTable;
+  TimerTable dataFillInstallTimerTable;
 
   Tick clockEdge();
   Tick cyclesToTicks(Cycles c);
@@ -262,6 +274,16 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   AccessPermission getAccessPermission(Addr addr) {
     TBE tbe := TBEs[addr];
     if(is_valid(tbe)) {
+      // Functional access follows actual coherence permission and data
+      // readiness. CacheMemory's tag permission remains Busy until install,
+      // so timing requests still take the explicit FB path.
+      if (tbe.TBEState == State:FB_M || tbe.TBEState == State:FB_LLSC_M) {
+        return AccessPermission:Read_Write;
+      }
+      if (tbe.TBEState == State:FB_S || tbe.TBEState == State:FB_E ||
+          tbe.TBEState == State:FB_LLSC_E) {
+        return AccessPermission:Read_Only;
+      }
       DPRINTF(RubySlicc, "%s\n", L0Cache_State_to_permission(tbe.TBEState));
       return L0Cache_State_to_permission(tbe.TBEState);
     }
@@ -292,6 +314,12 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     if(is_valid(tbe)) {
       num_functional_writes := num_functional_writes +
         testAndWrite(addr, tbe.DataBlk, pkt);
+      // The allocated cache DataBlk is FB backing storage while Busy.
+      // Keep functional writes coherent with callbacks and installation.
+      Entry cache_entry := getCacheEntry(addr);
+      if (is_valid(cache_entry)) {
+        testAndWrite(addr, cache_entry.DataBlk, pkt);
+      }
       return num_functional_writes;
     }
 
@@ -363,6 +391,19 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   // Use Timer
+  in_port(dataFillInstallTimerTable_in, Addr, dataFillInstallTimerTable, rank = 3) {
+    if (dataFillInstallTimerTable_in.isReady(clockEdge())) {
+      Addr readyAddress := dataFillInstallTimerTable.nextAddress();
+      if (Dcache.advanceDataFillInstall(readyAddress)) {
+        trigger(Event:Fill_Install, readyAddress, getCacheEntry(readyAddress),
+                TBEs.lookup(readyAddress));
+      } else {
+        trigger(Event:Fill_Retry, readyAddress, getCacheEntry(readyAddress),
+                TBEs.lookup(readyAddress));
+      }
+    }
+  }
+
   in_port(llscLockTimerTable_in, Addr, llscLockTimerTable, rank = 4) {
     if (llscLockTimerTable_in.isReady(clockEdge())) {
         Addr readyAddress := llscLockTimerTable.nextAddress();
@@ -922,6 +963,50 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
       Dcache.setMRU(cache_entry);
       cache_entry.Dirty := true;
     }
+    if (is_valid(tbe)) {
+      tbe.DataBlk := cache_entry.DataBlk;
+      tbe.Dirty := cache_entry.Dirty;
+    }
+  }
+
+  action(hf_load_ready_fill, "hfd", desc="Supply a request from permission-ready FB data") {
+    assert(is_valid(cache_entry));
+    assert(is_valid(tbe));
+    if (Dcache.dataFillPresent(address)) {
+      assert(Dcache.dataFillReady(address));
+      Dcache.profileDemandMiss();
+      Dcache.observeDataFillDemandRead(address);
+      peek(mandatoryQueue_in, RubyRequest) {
+        sequencer.registerReadFill(in_msg.getRequestPtr(), true, true);
+        nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
+            in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 3);
+      }
+      if (tbe.SourceReliable) {
+        sequencer.readFillCallback(address, cache_entry.DataBlk,
+            tbe.ServiceSource, tbe.ServiceL2Outcome, tbe.ServiceL3Outcome);
+      } else {
+        sequencer.readFillCallback(address, cache_entry.DataBlk, 0, 0, 0);
+      }
+    } else {
+      // A permission-only upgrade does not create an FB data source.
+      Dcache.profileDemandHit();
+      peek(mandatoryQueue_in, RubyRequest) {
+        nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
+            in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 0);
+        sequencer.readRequestCallback(address, cache_entry.DataBlk,
+                                      in_msg.getRequestPtr());
+      }
+    }
+  }
+
+  action(hf_store_ready_fill, "hfs", desc="Write permission-ready FB data in TSO order") {
+    assert(is_valid(cache_entry));
+    assert(is_valid(tbe));
+    if (sequencer.writeCallback(address, cache_entry.DataBlk, true)) {
+      cache_entry.Dirty := true;
+    }
+    tbe.DataBlk := cache_entry.DataBlk;
+    tbe.Dirty := cache_entry.Dirty;
   }
 
   action(f_flush_complete, "fcm", desc="Notify sequencer that flush completed") {
@@ -983,11 +1068,33 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     Dcache.finishDataFill(address);
   }
 
+  action(ri_scheduleDataFillInstall, "ri", desc="Offer data to the L1 refill path without a residence delay") {
+    assert(is_valid(tbe));
+    dataFillInstallTimerTable.setReady(address, clockEdge());
+  }
+
+  action(rr_retryDataFillInstall, "rr", desc="Retry installation after occupied refill service") {
+    dataFillInstallTimerTable.unset(address);
+    dataFillInstallTimerTable.set(address, clockEdge() + cyclesToTicks(intToCycles(1)));
+  }
+
+  action(rf_installDataFill, "rf", desc="Install FB data and release its data-fetch responsibility") {
+    Dcache.installDataFill(address);
+    Dcache.setMRU(cache_entry);
+    dataFillInstallTimerTable.unset(address);
+  }
+
+  action(rc_cancelDataFillInstall, "rc", desc="Cancel pending L1 installation after coherence or eviction") {
+    dataFillInstallTimerTable.unset(address);
+    Dcache.finishDataFill(address);
+  }
+
   action(u_writeDataToCache, "u", desc="Write data to cache") {
     peek(messgeBuffer_in, CoherenceMsg) {
       assert(is_valid(cache_entry));
       assert(is_valid(tbe));
       cache_entry.DataBlk := in_msg.DataBlk;
+      tbe.DataBlk := in_msg.DataBlk;
       tbe.ServiceSource := in_msg.ServiceSource;
       tbe.ServiceL2Outcome := in_msg.ServiceL2Outcome;
       tbe.ServiceL3Outcome := in_msg.ServiceL3Outcome;
@@ -1234,6 +1341,168 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   //*****************************************************
 
   // Transitions for Load/Store/Replacement/WriteBack from transient states
+  transition(FB_S, Fill_Install, S) {
+    rf_installDataFill;
+    s_deallocateTBE;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_E, Fill_Install, E) {
+    rf_installDataFill;
+    s_deallocateTBE;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_M, Fill_Install, M) {
+    rf_installDataFill;
+    s_deallocateTBE;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_LLSC_E, Fill_Install, LLSC_E) {
+    rf_installDataFill;
+    s_deallocateTBE;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_LLSC_M, Fill_Install, LLSC_M) {
+    rf_installDataFill;
+    s_deallocateTBE;
+    kd_wakeUpDependents;
+  }
+
+  transition({FB_S, FB_E, FB_M, FB_LLSC_E, FB_LLSC_M}, Fill_Retry) {
+    rr_retryDataFillInstall;
+  }
+
+  transition({FB_S, FB_E, FB_M, FB_LLSC_E, FB_LLSC_M}, Load) {
+    pd_observeDataAccess;
+    hf_load_ready_fill;
+    k_popMandatoryQueue;
+  }
+
+  transition({FB_E, FB_M}, Store, FB_M) {
+    hf_store_ready_fill;
+    k_popMandatoryQueue;
+  }
+
+  transition({FB_LLSC_E, FB_LLSC_M}, Store, FB_LLSC_M) {
+    hf_store_ready_fill;
+    k_popMandatoryQueue;
+  }
+
+  transition(FB_E, Load_Linked, FB_LLSC_E) {
+    hf_load_ready_fill;
+    ll_scheduleLoadLinkedLockTimeout;
+    k_popMandatoryQueue;
+  }
+
+  transition(FB_M, Load_Linked, FB_LLSC_M) {
+    hf_load_ready_fill;
+    ll_scheduleLoadLinkedLockTimeout;
+    k_popMandatoryQueue;
+  }
+
+  transition({FB_LLSC_E, FB_LLSC_M}, Load_Linked) {
+    hf_load_ready_fill;
+    k_popMandatoryQueue;
+  }
+
+  transition(FB_LLSC_E, LLSC_Timeout, FB_E) {
+    ll_unsetLoadLinkedLockTimer;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_LLSC_M, LLSC_Timeout, FB_M) {
+    ll_unsetLoadLinkedLockTimer;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_S, {Store, Load_Linked}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition({FB_S, FB_E, FB_M, FB_LLSC_E, FB_LLSC_M}, {Ifetch, Flush}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition(FB_S, {L0_Replacement, PF_L0_Replacement}, I) {
+    forward_eviction_to_cpu;
+    rc_cancelDataFillInstall;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    kd_wakeUpDependents;
+  }
+
+  transition({FB_E, FB_M}, {L0_Replacement, PF_L0_Replacement}, I) {
+    forward_eviction_to_cpu;
+    g_issuePUTX;
+    rc_cancelDataFillInstall;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_S, {InvOwn, InvElse}, I) {
+    forward_eviction_to_cpu;
+    fi_sendInvAck;
+    rc_cancelDataFillInstall;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    l_popRequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_E, {InvOwn, InvElse, Fwd_GETX}, I) {
+    forward_eviction_to_cpu;
+    fi_sendInvAck;
+    rc_cancelDataFillInstall;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    l_popRequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(FB_M, {InvOwn, InvElse, Fwd_GETX}, I) {
+    forward_eviction_to_cpu;
+    f_sendDataToL1;
+    rc_cancelDataFillInstall;
+    s_deallocateTBE;
+    ff_deallocateCacheBlock;
+    l_popRequestQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition({FB_E, FB_M}, {Fwd_GETS, Fwd_GET_INSTR}, FB_S) {
+    f_sendDataToL1;
+    l_popRequestQueue;
+  }
+
+  transition({FB_LLSC_E, FB_LLSC_M}, L0_Replacement) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition({FB_LLSC_E, FB_LLSC_M}, PF_L0_Replacement) {
+    z_stallAndWaitOptionalQueue;
+  }
+
+  transition({FB_LLSC_E, FB_LLSC_M}, {Fwd_GETS, Fwd_GETX, Fwd_GET_INSTR, InvOwn, InvElse}) {
+    z_stallAndWaitMessageBufferQueue;
+  }
+
+  transition(FB_S, Store_Prepare) {
+    z_stallAndWaitOptionalQueue;
+  }
+
+  transition({FB_E, FB_M, FB_LLSC_E, FB_LLSC_M}, Store_Prepare) {
+    sp_completeStorePrepare;
+    pq_popPrefetchQueue;
+  }
+
+  transition({FB_S, FB_E, FB_M, FB_LLSC_E, FB_LLSC_M}, {PF_Load, PF_Store, PF_Ifetch}) {
+    pq_popPrefetchQueue;
+  }
+
   transition({Inst_IS, IM, SM, I_F, V_F}, {Load, Ifetch, Store, L0_Replacement, Load_Linked}) {
     z_stallAndWaitMandatoryQueue;
   }
@@ -1446,29 +1715,26 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     k_popMandatoryQueue;
   }
 
-  transition(IS, Data, S) {
+  transition(IS, Data, FB_S) {
     u_writeDataToCache;
     hx_load_hit;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
   }
 
-  transition(IS, Data_Exclusive, E) {
+  transition(IS, Data_Exclusive, FB_E) {
     u_writeDataToCache;
     hx_load_hit;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
   }
 
-  transition(IS, LLSC_Data_Exclusive, LLSC_E) {
+  transition(IS, LLSC_Data_Exclusive, FB_LLSC_E) {
     u_writeDataToCache;
     hx_load_hit;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     ll_scheduleLoadLinkedLockTimeout;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
@@ -1510,20 +1776,18 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     kd_wakeUpDependents;
   }
 
-  transition({IM,SM}, Data_Exclusive, M) {
+  transition({IM,SM}, Data_Exclusive, FB_M) {
     u_writeDataToCache;
     hhx_store_hit;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
   }
 
-  transition({IM, SM}, LLSC_Data_Exclusive, LLSC_M) {
+  transition({IM, SM}, LLSC_Data_Exclusive, FB_LLSC_M) {
     u_writeDataToCache;
     hx_load_hit;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     ll_scheduleLoadLinkedLockTimeout;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
@@ -1531,7 +1795,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   // store conditionals
 
-  transition({I,S,E,M,LLSC_E,LLSC_M}, Failed_SC) {
+  transition({I,S,E,M,LLSC_E,LLSC_M,FB_S,FB_E,FB_M,FB_LLSC_E,FB_LLSC_M}, Failed_SC) {
     // IS,IM,SM don't handle store conditionals
     hhc_storec_fail;
     k_popMandatoryQueue;
@@ -1630,19 +1894,17 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     l_popRequestQueue;
   }
 
-  transition(PF_IS, Data, S) {
+  transition(PF_IS, Data, FB_S) {
     u_writeDataToCache;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     mp_markPrefetched;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
   }
 
-  transition(PF_IS, Data_Exclusive, E) {
+  transition(PF_IS, Data_Exclusive, FB_E) {
     u_writeDataToCache;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     mp_markPrefetched;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
@@ -1674,19 +1936,17 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     kd_wakeUpDependents;
   }
 
-  transition(PF_IE, Data_Exclusive, E) {
+  transition(PF_IE, Data_Exclusive, FB_E) {
     u_writeDataToCache;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     mp_markPrefetched;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;
   }
 
-  transition(SP_IE, Data_Exclusive, E) {
+  transition(SP_IE, Data_Exclusive, FB_E) {
     u_writeDataToCache;
-    fr_finishDataFill;
-    s_deallocateTBE;
+    ri_scheduleDataFillInstall;
     sp_completeStorePrepare;
     o_popIncomingResponseQueue;
     kd_wakeUpDependents;

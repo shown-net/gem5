@@ -159,8 +159,6 @@ struct TimeStruct
 
         // Allocation units forwarded by IEW; fused followers cost zero.
         unsigned dispatched = 0;
-        unsigned noIQDispatched = 0;
-        unsigned extraIQDispatched = 0;
         bool usedIQ = false;
         bool usedLSQ = false;
     };

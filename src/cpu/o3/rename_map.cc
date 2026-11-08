@@ -89,7 +89,8 @@ SimpleRenameMap::rename(const RegId& arch_reg, PhysRegIdPtr entry_peer)
         renamed_reg = prev_reg;
         renamed_reg->decrNumPinnedWrites();
     } else {
-        renamed_reg = freeList->getReg(entry_peer);
+        renamed_reg = freeList->getReg(entry_peer,
+                                     !arch_reg.regClass().isFunctional(arch_reg));
         map[arch_reg.index()] = renamed_reg;
         renamed_reg->setNumPinnedWrites(arch_reg.getNumPinnedWrites());
         renamed_reg->setNumPinnedWritesToComplete(
@@ -145,13 +146,13 @@ UnifiedRenameMap::canRename(DynInstPtr inst, RegClassType type) const
     }
     if (fragments > renameMaps[type].numFreeEntries())
         return false;
-    if (type == FloatRegClass) {
-        const unsigned entries = inst->stageDemand.floatWideEntries ?
-            inst->stageDemand.floatWideEntries :
-            inst->staticInst->numFloatDestEntries();
+    if (type == IntRegClass || type == FloatRegClass) {
+        const unsigned entries = inst->hardwareDestEntries(type);
+        if (type == IntRegClass)
+            return entries <= freeList->numFreeIntEntries();
+        const unsigned wide = entries ? inst->stageDemand.floatWideEntries : 0;
         return entries <= freeList->numFreeFloatEntries() &&
-            inst->stageDemand.floatWideEntries <=
-                freeList->numFreeFloatWideEntries();
+            wide <= freeList->numFreeFloatWideEntries();
     }
     return true;
 }

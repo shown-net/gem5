@@ -102,6 +102,7 @@ def template MicroRegOpDeclare {{
         }
 
         Fault execute(ExecContext *, trace::InstRecord *) const override;
+        %(int_divide)s
     };
 }};
 
@@ -388,6 +389,21 @@ let {{
 
             # Generate the actual code (finally!)
             for iop in iops:
+                iop.snippets['int_divide'] = ''
+                if Name in ('Divresult32', 'Divresult64',
+                            'Idivresult32', 'Idivresult64'):
+                    low = iop.operands.find_base('Rax')
+                    high = iop.operands.find_base('Rdx')
+                    divisor = iop.operands.find_base('PSrcReg1')
+                    iop.snippets['int_execution'] = (
+                        'intExecutionInfo = {IntExecutionFamily::Divider, 0x863, 1}')
+                    iop.snippets['int_divide'] = '''
+                        IntDivideInfo intDivide() const override {
+                            return {dataSize, %d, %d, %d, %d, %d};
+                        }
+                    ''' % (low.src_reg_idx, high.src_reg_idx,
+                           divisor.src_reg_idx, low.dest_reg_idx,
+                           high.dest_reg_idx)
                 header_output += templates[0].subst(iop)
                 if templates[1]:
                     decoder_output += templates[1].subst(iop)
@@ -1865,6 +1881,12 @@ let {{
 
     class Rdval(RegOp):
         operand_types = (FoldedDestOp, MiscSrc1Op)
+        cond_control_flag_init = '''
+            // STMXCSR/FXSAVE must observe sticky updates of older arithmetic,
+            // which are merged at retirement rather than serializing the FP
+            // execution stream itself.
+            if (src1 == misc_reg::Mxcsr) flags[IsNonSpeculative] = true;
+        '''
         def __init__(self, dest, src1, flags=None, dataSize="env.dataSize"):
             super().__init__(dest, src1, flags=flags, dataSize=dataSize)
         code = '''
@@ -1876,7 +1898,10 @@ let {{
         def __init__(self, dest, src1, flags=None, dataSize="env.dataSize"):
             super().__init__(dest, src1, flags=flags, dataSize=dataSize)
         code = '''
-            MiscRegDest = SrcReg1;
+            if (dest == misc_reg::Mxcsr && (SrcReg1 & ~uint64_t(0xffff)))
+                fault = std::make_shared<GeneralProtection>(0);
+            else
+                MiscRegDest = SrcReg1;
         '''
 
     class Chks(RegOp):
@@ -2554,4 +2579,150 @@ let {{
     class Muluproductflags(RegOp):
         operand_types = ()
         code = '{ const uint64_t flagsValue = (ProdHi & mask(dataSize * 8)) ? CfofMask : 0; cfBit = flagsValue & CFBit; ofBit = flagsValue & OFBit; }'
+}};
+
+let {{
+    # Select a bounded access using only resident translation facts. A miss,
+    # unsupported direction/segment, or special mapping keeps ordinary REP.
+    # Selection does not translate memory or reserve a different resource pool.
+    rep_select = '''
+        RepCount = 0;
+        bool missingTranslation = false;
+        auto *tc = xc->tcBase();
+        auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+        CpuidResult features{};
+        const bool enabled = isa->cpuid->doCpuid(
+            tc, ExtendedFeatures, 0, features) && (features.rbx & (1U << 9)) &&
+            (tc->readMiscRegNoEffect(misc_reg::MiscEnable) & 1);
+        // Byte string forms are selected by A4/AA. The decoder's generic
+        // operand size remains the prefix-derived default even for MOVSB.
+        const bool byte_form = machInst.opcode.op == 0xa4 || machInst.opcode.op == 0xaa;
+        const bool basic = enabled && byte_form && dataSize == 8 &&
+            machInst.mode.submode == SixtyFourBitMode &&
+            machInst.legacy.seg == 0 && !(dfBit & DFBit) && Rcx != 0;
+        if (basic) {
+            auto *mmu = dynamic_cast<MMU *>(tc->getMMUPtr());
+            auto *tlb = mmu ? mmu->dataTlb() : nullptr;
+            CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+            CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+            const uint16_t pcid = cr4.pcide ? cr3.pcid : 0;
+            auto resident = [&](Addr va, bool write, unsigned bytes,
+                                Addr &physical) {
+                if (!tlb) return false;
+                auto *entry = tlb->lookup(TLB::concAddrPcid(va & ~Addr(4095), pcid),
+                                          false, write ? BaseMMU::Write : BaseMMU::Read);
+                if (!entry) { missingTranslation = true; return false; }
+                if (entry->uncacheable ||
+                    (write && !entry->writable) ||
+                    (machInst.mode.cpl == 3 && !entry->user)) return false;
+                const unsigned pat_index = (unsigned(entry->patBit) << 2) |
+                    (unsigned(entry->uncacheable) << 1) | unsigned(entry->pwt);
+                const RegVal pat = tc->readMiscRegNoEffect(misc_reg::Pat);
+                if (((pat >> (8 * pat_index)) & 0xff) != 6) return false;
+                physical = entry->paddr | (va & mask(entry->logBytes));
+                auto *system = tc->getSystemPtr();
+                LocalApicBase apic = tc->readMiscRegNoEffect(misc_reg::ApicBase);
+                const Addr apic_start = Addr(apic.base) * PageBytes;
+                return system->isMemAddr(physical) &&
+                    system->isMemAddr(physical + bytes - 1) &&
+                    !system->m5opRange().contains(physical) &&
+                    !system->m5opRange().contains(physical + bytes - 1) &&
+                    !(physical >= apic_start && physical < apic_start + PageBytes) &&
+                    !(physical < 0xc0000 && physical + bytes > 0xa0000);
+            };
+            unsigned bytes = std::min<uint64_t>(Rcx, 64 - (Rdi & 63));
+            bytes = std::min<unsigned>(bytes, 4096 - (Rdi & 4095));
+            COPY_BOUND
+            Addr dest_physical = 0;
+            if (resident(Rdi, true, bytes, dest_physical)) {
+                COPY_ADMISSION
+            }
+        }
+        ezfBit = RepCount == 0 ? EZFBit : 0;
+        // A translation miss uses one real ordinary access, then retries
+        // batch selection with the newly installed mapping. Special mappings
+        // and unsupported forms retain the ordinary loop for the whole tail.
+        ecfBit = missingTranslation ? ECFBit : 0;
+        DPRINTF(X86, "REP select opcode=%#x address_bytes=%u ERMS=%u "
+                "remaining=%llu batch=%llu missing_translation=%u\\n",
+                uint8_t(machInst.opcode.op), dataSize, enabled, Rcx, RepCount,
+                missingTranslation);
+        // Selection already knows the admission decision. Continue from
+        // these renamed operands, without a separate flag-dependent Br.
+        nuIP = RepCount == 0 ? imm64 : nuIP;
+    '''
+
+    class Repselectcopy(RegOp):
+        operand_types = (Imm64Op,)
+        op_class = 'No_OpClass'
+        cond_control_flag_init = '''
+            flags[IsMicrocodeControl] = true;
+            flags[IsCondControl] = true;
+            flags[IsDelayedCommit] = false;
+        '''
+        code = rep_select.replace('COPY_BOUND', '''
+            bytes = std::min<unsigned>(bytes, 64 - (Rsi & 63));
+            bytes = std::min<unsigned>(bytes, 4096 - (Rsi & 4095));
+        ''').replace('COPY_ADMISSION', '''
+            // Reject overlapping architectural buffers and within-batch
+            // physical aliases that would change byte-wise forward semantics.
+            const bool overflow = Rcx > std::numeric_limits<Addr>::max() - Rsi ||
+                                  Rcx > std::numeric_limits<Addr>::max() - Rdi;
+            const bool overlap = Rsi != Rdi &&
+                (Rsi < Rdi ? Rdi - Rsi < Rcx : Rsi - Rdi < Rcx);
+            Addr source_physical = 0;
+            if (!overflow && !overlap &&
+                resident(Rsi, false, bytes, source_physical)) {
+                const bool alias = source_physical != dest_physical &&
+                    (source_physical < dest_physical ?
+                        dest_physical - source_physical < bytes :
+                        source_physical - dest_physical < bytes);
+                if (!alias) RepCount = bytes;
+            }
+        ''')
+
+    class Repselectstos(RegOp):
+        operand_types = (Imm64Op,)
+        op_class = 'No_OpClass'
+        cond_control_flag_init = Repselectcopy.cond_control_flag_init
+        code = rep_select.replace('COPY_BOUND', '').replace(
+            'COPY_ADMISSION', 'RepCount = bytes;')
+
+    class Repstart(RegOp):
+        operand_types = (Imm64Op,)
+        op_class = 'No_OpClass'
+        cond_control_flag_init = Repselectcopy.cond_control_flag_init
+        code = '''
+            // REP's zero-count test consumes only the address-sized count.
+            // Architectural arithmetic flags do not participate in admission.
+            nuIP = (Rcx & mask(dataSize * 8)) == 0 ? imm64 : nuIP;
+        '''
+
+    rep_progress = '''
+        assert(RepCount && RepCount <= Rcx);
+        // The ISA operand scanner recognizes explicit assignments as
+        // destinations; compound assignments omit architectural writes.
+        Rcx = Rcx - RepCount;
+        Rdi = Rdi + RepCount;
+        Rsi = Rsi + RepCount;
+    '''
+
+    rep_next_control = '''
+        // Select the next access from the complete renamed progress update.
+        // A zero count falls through to the end; a failed admission uses the
+        // same ordinary path as initial selection.
+        nuIP = Rcx == 0 ? nuIP : (RepCount != 0 ? imm64 : imm8);
+    '''
+
+    class Repprogresscopy(RegOp):
+        operand_types = (Imm64Op, Imm8Op)
+        op_class = 'No_OpClass'
+        cond_control_flag_init = Repselectcopy.cond_control_flag_init
+        code = rep_progress + Repselectcopy.code.replace(
+            'nuIP = RepCount == 0 ? imm64 : nuIP;', rep_next_control)
+
+    class Repprogressstos(Repprogresscopy):
+        code = rep_progress.replace('Rsi = Rsi + RepCount;', '') + \
+            Repselectstos.code.replace(
+                'nuIP = RepCount == 0 ? imm64 : nuIP;', rep_next_control)
 }};

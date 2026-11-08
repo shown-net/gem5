@@ -460,11 +460,6 @@ IEW::squash(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched += skidBuffer[tid].front()->backendSlots();
-        if (!skidBuffer[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].extraIQDispatched +=
-                skidBuffer[tid].front()->iqSlots() - skidBuffer[tid].front()->backendSlots();
-        if (skidBuffer[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].noIQDispatched += skidBuffer[tid].front()->backendSlots();
 
         skidBuffer[tid].pop();
     }
@@ -718,10 +713,6 @@ IEW::checkStall(ThreadID tid)
 {
     bool ret_val(false);
 
-    if (fromCommit->commitInfo[tid].robSquashing) {
-        DPRINTF(IEW,"[tid:%i] Stall from Commit stage detected.\n",tid);
-        ret_val = true;
-    }
 
     return ret_val;
 }
@@ -750,13 +741,6 @@ IEW::checkSignalsAndUpdate(ThreadID tid)
         return;
     }
 
-    if (fromCommit->commitInfo[tid].robSquashing) {
-        DPRINTF(IEW, "[tid:%i] ROB is still squashing.\n", tid);
-
-        dispatchStatus[tid] = Squashing;
-        emptyRenameInsts(tid);
-        wroteToTimeBuffer = true;
-    }
 
     if (checkStall(tid)) {
         block(tid);
@@ -818,11 +802,6 @@ IEW::emptyRenameInsts(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched += insts[tid].front()->backendSlots();
-        if (!insts[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].extraIQDispatched +=
-                insts[tid].front()->iqSlots() - insts[tid].front()->backendSlots();
-        if (insts[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].noIQDispatched += insts[tid].front()->backendSlots();
 
         insts[tid].pop();
     }
@@ -954,11 +933,6 @@ IEW::dispatchInsts(ThreadID tid)
             }
 
             toRename->iewInfo[tid].dispatched += inst->backendSlots();
-            if (!inst->bypassesIQ())
-                toRename->iewInfo[tid].extraIQDispatched +=
-                    inst->iqSlots() - inst->backendSlots();
-            if (inst->bypassesIQ())
-                toRename->iewInfo[tid].noIQDispatched += inst->backendSlots();
 
             continue;
         }
@@ -1141,11 +1115,6 @@ IEW::dispatchInsts(ThreadID tid)
         insts_to_dispatch.pop();
 
         toRename->iewInfo[tid].dispatched += inst->backendSlots();
-        if (!inst->bypassesIQ())
-            toRename->iewInfo[tid].extraIQDispatched +=
-                inst->iqSlots() - inst->backendSlots();
-        if (inst->bypassesIQ())
-            toRename->iewInfo[tid].noIQDispatched += inst->backendSlots();
 
         ++iewStats.dispatchedInsts;
 

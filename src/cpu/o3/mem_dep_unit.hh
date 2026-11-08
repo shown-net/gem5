@@ -122,10 +122,13 @@ class MemDepUnit
 
     /** Address resolution is distinct from store data/completion. */
     void setLSQ(LSQ *lsq_ptr) { lsq = lsq_ptr; }
+    void addressGenerated(const DynInstPtr &inst);
     void addressReady(const DynInstPtr &inst);
-    void noteForwarding(const DynInstPtr &load);
+    void storeOrderChecked(const DynInstPtr &inst, InstSeqNum firstViolation = 0);
+    void noteAddressWait(const DynInstPtr &load);
     void loadRetired(const DynInstPtr &load);
-    bool canSpeculate(const DynInstPtr &inst) const;
+    bool canSpeculate(const DynInstPtr &inst);
+    const std::vector<Addr> *physicalReadBytes(const DynInstPtr &inst) const;
 
     /** Inserts a memory instruction. */
     void insert(const DynInstPtr &inst);
@@ -209,9 +212,8 @@ class MemDepUnit
 
         /** A vector of any dependent instructions. */
         std::vector<MemDepEntryPtr> dependInsts;
-        std::vector<MemDepEntryPtr> addressDependents;
-        std::vector<InstSeqNum> observingLoads;
-        bool addressResolved = false;
+        bool addressGenerated = false;
+        bool orderingChecked = false;
 
         /** If the registers are ready or not. */
         bool regsReady = false;
@@ -263,20 +265,33 @@ class MemDepUnit
     std::array<uint8_t, 512> independence{};
     int speculationCredit = 3;
     unsigned safePredictions = 0;
+    enum class ObservationResult { Pending, Independent, Dependent, Covered,
+                                   Cancelled };
+    struct StoreObservation {
+        DynInstPtr store;
+        bool member = false;
+        bool physicalReady = false;
+        std::vector<Addr> bytes;
+        bool orderingChecked = false;
+    };
     struct LoadObservation {
         DynInstPtr load;
-        std::vector<DynInstPtr> olderStores;
-        unsigned unresolved = 0;
-        bool addressObserved = false;
-        bool dependent = false;
-        bool trained = false;
+        std::vector<StoreObservation> olderStores;
+        std::vector<Addr> bytes;
+        bool physicalReady = false;
+        ObservationResult result = ObservationResult::Pending;
         bool localPrediction = false;
         bool hadUnresolvedStore = false;
+        bool bypassAdmitted = false;
+        bool addressWaitObserved = false;
         bool violationCharged = false;
+        bool orderingFailed = false;
+        bool watchdogObserved = false;
     };
     std::unordered_map<InstSeqNum, LoadObservation, SNHash> loadObservations;
     void observeLoad(const DynInstPtr &inst);
     void trainLoad(LoadObservation &observation);
+    void recoverWatchdog(LoadObservation &observation);
 
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;
@@ -312,12 +327,16 @@ class MemDepUnit
          *  store. */
         statistics::Scalar conflictingStores;
         statistics::Scalar independencePredictions;
+        statistics::Scalar localQueries;
         statistics::Scalar addressWaits;
         statistics::Scalar resolvedIndependentLoads;
         statistics::Scalar resolvedDependentLoads;
+        statistics::Scalar coveredLoads;
         statistics::Scalar watchdogBlocks;
         statistics::Scalar watchdogDisables;
         statistics::Scalar watchdogRecoveries;
+        statistics::Scalar watchdogFailures;
+        statistics::Scalar watchdogSafeOpportunities;
     } stats;
 };
 

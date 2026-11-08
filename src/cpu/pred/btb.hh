@@ -79,6 +79,8 @@ class BranchTargetBuffer : public ClockedObject
     {
         return Cycles(0);
     }
+    virtual bool earlyValid(ThreadID tid, Addr instPC)
+    { return valid(tid, instPC); }
 
     /** Looks up an address in the BTB to get the target of the branch.
      *  @param inst_PC The address of the branch to look up.

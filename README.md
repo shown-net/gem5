@@ -10,6 +10,27 @@ system software changes, and compile-time and run-time system optimizations.
 
 The main website can be found at <http://www.gem5.org>.
 
+## Local SPR calibration
+
+The current local changes implement the SPR component redesign in the companion
+[CPU calibration repository](../../calibration/cpu_microarchitecture/README.md).
+Its [validation page](../../calibration/cpu_microarchitecture/docs/calibration/spr-component-redesign-validation.md)
+owns the 29-item scope, retained evidence, workload comparisons, and open gaps.
+
+Changes cover memory dependence and forwarding, logical store credits and early
+prepare, staged fill-buffer service, paging-prefix caching, frontend supply and
+recovery, Stack Engine and code replay, grouped IQ and physical-value accounting,
+SSE XMM arithmetic, integer division, bounded REP, and Ruby checkpoint handling.
+FMA, wide-vector, and mask instruction extensions are outside this round.
+
+Use the companion repository's `compile_gem5.sh` for serial builds and its public
+build/collect CLI with explicit frozen inputs. The canonical local build remains
+`build/X86`; completed evidence remains under the CPU repository's `output`.
+On 2026-11-08 the session jobs were stopped and obsolete exploration artifacts
+were cleaned. The latest REP zero-count UPC source fix has not been rebuilt;
+the retained fast and opt binaries represent earlier source states. Component
+validation and the complete five-workload calibration remain unfinished.
+
 ## Testing status
 
 **Note**: These regard tests run on the develop branch of gem5:

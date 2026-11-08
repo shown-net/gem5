@@ -57,10 +57,6 @@ _families = {
     "PMULLW": ("mxmmmuli", 2, 0),
     "PMULHUW": ("mxmmmuli", 2, "MultHi"),
     "PMULUDQ": ("mxmmmuli", 4, "Scalar"),
-    "ADDPS": ("mxmmpsaddf", 4, 0),
-    "SUBPS": ("mxmmpssubf", 4, 0),
-    "MULPS": ("mxmmpsmulf", 4, 0),
-    "DIVPS": ("mxmmpsdivf", 4, 0),
 }
 
 

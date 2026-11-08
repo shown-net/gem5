@@ -571,6 +571,15 @@ void
 ROB::squash(InstSeqNum squash_num, ThreadID tid)
 {
     cancelReservations(tid, squash_num);
+    // Include materialized records still between Fetch, Rename and the ROB.
+    // Commit receives correct-path messages during cleanup, so an old Rename
+    // message arriving in this cycle must already be invalid.
+    for (const auto &inst : cpu->instList) {
+        if (inst->threadNumber == tid && inst->seqNum > squash_num) {
+            inst->setSquashed();
+            inst->setCanCommit();
+        }
+    }
     if (isEmpty(tid)) {
         DPRINTF(ROB, "Does not need to squash due to being empty "
                 "[sn:%llu]\n",
@@ -586,6 +595,10 @@ ROB::squash(InstSeqNum squash_num, ThreadID tid)
     doneSquashing[tid] = false;
 
     squashedSeqNum[tid] = squash_num;
+
+    // The bandwidth-limited walk owns the remaining tracking cleanup. A
+    // nested redirect can replace its cursor; invalid records are already
+    // retireable once their thread leaves this cleanup phase.
 
     if (!instList[tid].empty()) {
         InstIt tail_thread = instList[tid].end();

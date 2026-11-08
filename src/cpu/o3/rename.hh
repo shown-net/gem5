@@ -377,8 +377,6 @@ class Rename
      * and ROB, but are not yet included in their occupancy counts.
      */
     int instsInProgress[MaxThreads];
-    int noIQInstsInProgress[MaxThreads];
-    int extraIQInstsInProgress[MaxThreads];
 
     /** Count of Load instructions in progress that have been sent off to the
      * IQ and ROB, but are not yet included in their occupancy counts.
@@ -507,6 +505,7 @@ class Rename
         statistics::Vector status;
         /** Stat for total number of renamed instructions. */
         statistics::Scalar renamedInsts;
+        statistics::Scalar recoveryAllocationSlots;
         /** Implicit PUSH updates, including wrong-path operations. */
         statistics::Scalar pushUpdatesComputed;
         statistics::Scalar pushUpdatesDeferred;

@@ -282,6 +282,10 @@ class UnifiedRenameMap
             if (map.numArchRegs())
                 min_free = std::min(min_free, map.numFreeEntries());
         }
+        if (renameMaps[IntRegClass].numArchRegs())
+            min_free = std::min(min_free, freeList->numFreeIntEntries());
+        if (renameMaps[FloatRegClass].numArchRegs())
+            min_free = std::min(min_free, freeList->numFreeFloatEntries());
         return min_free;
     }
 

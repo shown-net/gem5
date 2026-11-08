@@ -93,6 +93,7 @@ parseFamily(const std::string &name)
     if (name == "SlowInt") return IntExecutionFamily::SlowInt;
     if (name == "BM") return IntExecutionFamily::BM;
     if (name == "Branch") return IntExecutionFamily::Branch;
+    if (name == "Divider") return IntExecutionFamily::Divider;
     fatal("Unknown result-path execution family: %s", name);
 }
 
@@ -166,9 +167,9 @@ ExecutionPorts::Stats::Stats(statistics::Group *parent)
                "Shared grants by execution family and port")
 {
     accepted.init(12);
-    acceptedByFamily.init(6, 12);
-    const char *families[] = {"none", "alu", "shft", "slow", "bm", "branch"};
-    for (unsigned i = 0; i < 6; ++i) acceptedByFamily.subname(i, families[i]);
+    acceptedByFamily.init(7, 12);
+    const char *families[] = {"none", "alu", "shft", "slow", "bm", "branch", "divider"};
+    for (unsigned i = 0; i < 7; ++i) acceptedByFamily.subname(i, families[i]);
     for (unsigned i = 0; i < 12; ++i)
     {
         accepted.subname(i, "p" + std::to_string(i));
@@ -222,9 +223,9 @@ ResultForwarding::Stats::Stats(statistics::Group *parent)
       ADD_STAT(unissuedCancelled, statistics::units::Count::get(), "Cancelled unissued result producers"),
       ADD_STAT(lateSources, statistics::units::Count::get(), "Source bindings after producer PRF writeback")
 {
-    lateSources.init(6);
-    const char *names[] = {"None", "ALU", "SHFT", "SlowInt", "BM", "Branch"};
-    for (unsigned i = 0; i < 6; ++i) lateSources.subname(i, names[i]);
+    lateSources.init(7);
+    const char *names[] = {"None", "ALU", "SHFT", "SlowInt", "BM", "Branch", "Divider"};
+    for (unsigned i = 0; i < 7; ++i) lateSources.subname(i, names[i]);
 }
 
 ResultForwarding::ResultForwarding(const ResultForwardingParams &p)
@@ -316,8 +317,18 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
                 return std::numeric_limits<Tick>::max();
             const Cycles latency = inst->iq ?
                 inst->iq->fuPool()->getOpLatency(inst->opClass()) : Cycles(0);
-            const int adjustment = vectorBypass(ref.vectorResult->domain,
-                vectorDomain(inst, consumer_port, latency));
+            const auto consumer = vectorDomain(inst, consumer_port, latency);
+            int adjustment = vectorBypass(ref.vectorResult->domain, consumer);
+            // These legacy SSE forms use the instruction package's complete
+            // 4-cycle MUL latency. Native destination/second-source MUL
+            // chains and non-identity ADD/MUL chains confirm no additional
+            // cycle on these paths. Keep other Table 2-5 cells unchanged.
+            const auto &name = inst->staticInst->getName();
+            if (consumer == VectorDomain::Mul &&
+                (ref.vectorResult->domain == VectorDomain::Mul ||
+                 ref.vectorResult->domain == VectorDomain::FastAdder) &&
+                (name == "mxmmmulf" || name == "mxmmmuls"))
+                adjustment = 0;
             const Tick delta = std::abs(adjustment) * cpu->clockPeriod();
             const Tick at = adjustment < 0 ?
                 ref.vectorResult->nominalAt - delta :
@@ -336,7 +347,7 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
                 return std::numeric_limits<Tick>::max();
             family = ref.producer->staticInst->intExecution().family;
             port = ref.producer->resultProducerPort();
-            nominal = ref.producer->resultNominalAt();
+            nominal = ref.producer->resultNominalAt(ref.destination);
         }
         int adjustment = 0;
         bool matched = false;
@@ -355,7 +366,7 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
             Tick(signed_delta < 0 ? -signed_delta : signed_delta) * cpu->clockPeriod();
         panic_if(signed_delta < 0 && nominal < delta, "Result path precedes simulation start");
         const Tick at = signed_delta < 0 ? nominal - delta : nominal + delta;
-        panic_if(ref.producer && at < ref.producer->resultAvailableAt(),
+        panic_if(ref.producer && at < ref.producer->resultAvailableAt(ref.destination),
                  "Result path precedes production of its real value");
         ready = std::max(ready, at);
         ++source;
@@ -451,7 +462,7 @@ ResultForwarding::release(const DynInstPtr &inst)
                 reference.vectorResult->ready = true;
             } else {
                 reference.port = inst->resultProducerPort();
-                reference.nominal = inst->resultNominalAt();
+                reference.nominal = inst->resultNominalAt(i);
                 reference.producer = nullptr;
             }
         }
@@ -493,7 +504,7 @@ ResultForwarding::empty() const
 void
 ResultForwarding::checkDrain()
 {
-    if (empty() && drainState() == DrainState::Draining) signalDrainDone();
+    if (drainState() == DrainState::Draining && empty()) signalDrainDone();
 }
 
 DrainState
@@ -605,6 +616,178 @@ DrainState
 IntExecutionResource::drain()
 {
     return empty() ? DrainState::Drained : DrainState::Draining;
+}
+
+IntegerDivider::Stats::Stats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(admitted, statistics::units::Count::get(), "Integer divide instructions admitted"),
+      ADD_STAT(evaluated, statistics::units::Count::get(), "Integer divide values formed once"),
+      ADD_STAT(cancelled, statistics::units::Count::get(), "Integer divide instructions cancelled before completion"),
+      ADD_STAT(actions, statistics::units::Count::get(), "Preparation, divide launch and two further p1 action grants")
+{
+    actions.init(4);
+}
+
+IntegerDivider::IntegerDivider(const IntegerDividerParams &p)
+    : SimObject(p), serviceEvent([this] { service(); }, name() + ".service", false,
+                               Event::Priority(0)), stats(this)
+{}
+
+void
+IntegerDivider::releaseAction(const DynInstPtr &inst)
+{
+    if (inst->isInIQ() && inst->iq->releaseOneAction(inst) == 0)
+        inst->clearInIQ();
+}
+
+bool
+IntegerDivider::issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
+    const DynInstPtr &inst, std::function<void()> available,
+    std::function<void()> complete, std::function<void()> issued_action)
+{
+    fatal_if(cpu && cpu != owner, "Integer divider shared between different cores");
+    cpu = owner;
+    const auto info = inst->staticInst->intDivide();
+    assert((info.bytes == 4 || info.bytes == 8) && inst->numDestRegs() == 2);
+    const unsigned candidates = inst->boundExecutionPort >= 0 ?
+        1u << inst->boundExecutionPort : inst->staticInst->intExecution().ports;
+    unsigned eligible = 0;
+    for (unsigned p = 0; p < 12; ++p)
+        if ((candidates & (1u << p)) && pool->portAvailable(p, curTick()) &&
+            forwarding->availableAt(inst, p) <= curTick())
+            eligible |= 1u << p;
+    const int port = pool->sharedPorts()->probe(IntExecutionFamily::Divider,
+                                               candidates, curTick(), eligible);
+    if (port < 0) return false;
+    pool->sharedPorts()->commit(IntExecutionFamily::Divider, candidates, port, curTick());
+    cpu->recordExecutedUops(1, inst->threadNumber);
+    cpu->recordDispatchedPort(port);
+    pool->releasePortBinding(inst);
+    inst->divisionManaged = true;
+    auto op = std::make_shared<Operation>();
+    op->inst = inst;
+    op->pool = pool;
+    op->forwarding = forwarding;
+    op->available = available;
+    op->complete = complete;
+    op->issuedAction = issued_action;
+    op->admitted = curTick();
+    op->inputs = {inst->renamedSrcIdx(info.lowSource)->valueReadyAt(),
+                  inst->renamedSrcIdx(info.highSource)->valueReadyAt(),
+                  inst->renamedSrcIdx(info.divisorSource)->valueReadyAt()};
+    for (const Tick at : op->inputs)
+        panic_if(at == MaxTick, "Divide input has no published physical value");
+    operations.push_back(op);
+    ++stats.admitted;
+    ++stats.actions[0];
+    releaseAction(inst);
+    arm();
+    return true;
+}
+
+void
+IntegerDivider::arm()
+{
+    if (!operations.empty() && !serviceEvent.scheduled())
+        schedule(serviceEvent, cpu->clockEdge(Cycles(1)));
+}
+
+void
+IntegerDivider::finish(const std::shared_ptr<Operation> &op)
+{
+    if (op->inst->isSquashed() || op->inst->getFault() != NoFault) {
+        if (op->inst->isInIQ()) op->inst->clearInIQ();
+        op->forwarding->cancel(op->inst);
+        ++stats.cancelled;
+    } else {
+        op->forwarding->release(op->inst);
+    }
+    op->complete();
+    operations.remove(op);
+    cpu->wakeCPU();
+    if (operations.empty()) {
+        if (serviceEvent.scheduled()) deschedule(serviceEvent);
+        if (drainState() == DrainState::Draining) signalDrainDone();
+    }
+}
+
+void
+IntegerDivider::service()
+{
+    const Tick now = curTick();
+    const Tick period = cpu->clockPeriod();
+    for (auto it = operations.begin(); it != operations.end();) {
+        const auto op = *it++;
+        auto inst = op->inst;
+        if (inst->isSquashed()) { finish(op); continue; }
+        const auto info = inst->staticInst->intDivide();
+        if (!op->launched) {
+            if (now < nextLaunch || now < op->admitted + period ||
+                !op->pool->portAvailable(1, now)) continue;
+            op->pool->sharedPorts()->commit(IntExecutionFamily::Divider, 2, 1, now);
+            cpu->recordExecutedUops(1, inst->threadNumber);
+            cpu->recordDispatchedPort(1);
+            op->issuedAction();
+            ++stats.actions[1];
+            nextLaunch = now + period * (info.bytes == 4 ? 6 : 10);
+            op->launched = true;
+            // EMR input -> output matrices, ordered low dividend, high
+            // dividend, divisor. They are parameter priors, not an SPR
+            // value-dependent duration function or a sum of duop latencies.
+            const std::array<std::array<unsigned, 3>, 2> matrix = info.bytes == 4 ?
+                std::array<std::array<unsigned, 3>, 2>{{{11,15,10}, {15,15,14}}} :
+                std::array<std::array<unsigned, 3>, 2>{{{14,18,14}, {18,18,18}}};
+            const Tick wait = now - (op->admitted + period);
+            for (unsigned result = 0; result < 2; ++result) {
+                const auto &row = matrix[result];
+                Tick ready = op->admitted + period * *std::min_element(row.begin(), row.end());
+                for (unsigned input = 0; input < 3; ++input)
+                    ready = std::max(ready, op->inputs[input] + period * row[input]);
+                op->outputs[result] = ready + wait;
+            }
+            std::array<Tick, 2> times;
+            times[info.quotientDest] = op->outputs[0];
+            times[info.remainderDest] = op->outputs[1];
+            inst->prepareDivideValues(times);
+            inst->evaluateResultValues(now);
+            ++stats.evaluated;
+            releaseAction(inst);
+            if (inst->getFault() != NoFault) { finish(op); continue; }
+        }
+        // The published duop list gives three p1 actions but does not give
+        // their internal graph. Use a bounded sequence of port grants, then
+        // apply the independent input/output matrix to result publication.
+        if (op->internalStages < 2 && op->pool->portAvailable(1, now)) {
+            op->pool->sharedPorts()->commit(IntExecutionFamily::Divider, 2, 1, now);
+            cpu->recordExecutedUops(1, inst->threadNumber);
+            cpu->recordDispatchedPort(1);
+            op->issuedAction();
+            ++stats.actions[2 + op->internalStages];
+            ++op->internalStages;
+            releaseAction(inst);
+        }
+        for (unsigned result = 0; result < 2; ++result) {
+            if (op->internalStages != 2 || (op->transferred & (1u << result)) ||
+                now < op->outputs[result]) continue;
+            const unsigned dest = result == 0 ? info.quotientDest : info.remainderDest;
+            op->transferred |= 1u << result;
+            inst->publishDivideResult(dest, now);
+            op->available();
+            cpu->schedule(new EventFunctionWrapper([this, op, dest, result] {
+                if (!op->inst->isSquashed() && op->inst->getFault() == NoFault)
+                    op->inst->writeResultValue(dest);
+                op->written |= 1u << result;
+                if (op->written == 3) finish(op);
+            }, name() + ".prf", true, Event::Priority(1)), now);
+        }
+    }
+    arm();
+}
+
+DrainState
+IntegerDivider::drain()
+{
+    return operations.empty() ? DrainState::Drained : DrainState::Draining;
 }
 
 IntegerALU::IntegerALU(const IntegerALUParams &p)

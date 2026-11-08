@@ -232,6 +232,9 @@ class IEW
     /** Returns if the LSQ has any stores to writeback. */
     bool hasStoresToWB(ThreadID tid) { return ldstQueue.hasStoresToWB(tid); }
 
+    bool hasPendingCodeWrite(ThreadID tid, Addr physical_block)
+    { return ldstQueue.hasPendingCodeWrite(tid, physical_block); }
+
     /** Check misprediction  */
     void checkMisprediction(const DynInstPtr &inst);
 

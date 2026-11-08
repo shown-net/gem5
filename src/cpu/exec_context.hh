@@ -106,6 +106,10 @@ class ExecContext
      */
     virtual void setMiscReg(int misc_reg, RegVal val) = 0;
 
+    /** Merge sticky architectural status bits at this operation's commit. */
+    virtual void orMiscReg(int misc_reg, RegVal bits)
+    { setMiscReg(misc_reg, readMiscReg(misc_reg) | bits); }
+
     /** @} */
 
     /**

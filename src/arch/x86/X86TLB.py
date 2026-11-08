@@ -35,8 +35,16 @@
 
 from m5.objects.BaseTLB import BaseTLB
 from m5.objects.ClockedObject import ClockedObject
+from m5.SimObject import SimObject
 from m5.params import *
 from m5.proxy import *
+
+
+class X86PagingStructureCache(SimObject):
+    type = "X86PagingStructureCache"
+    cxx_class = "gem5::X86ISA::PagingStructureCache"
+    cxx_header = "arch/x86/paging_structure_cache.hh"
+    entriesPerLevel = Param.Unsigned(16, "Shared entries per upper paging level; engineering prior")
 
 
 class X86PagetableWalker(ClockedObject):
@@ -50,6 +58,8 @@ class X86PagetableWalker(ClockedObject):
         4, "Number of outstanding walks that can be squashed per cycle"
     )
     max_active_walks = Param.Unsigned(1, "Concurrent timing page walks")
+    paging_structure_cache = Param.X86PagingStructureCache(NULL, "Optional shared virtual-prefix cache")
+    prefix_hit_latency = Param.Cycles(1, "Upper-prefix hit service latency")
 
 
 class X86TLB(BaseTLB):

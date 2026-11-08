@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Native request and x86 functional-decode adapter for the component frontend.
 #include "cpu/o3/fetch.hh"
+#include <algorithm>
 #include <cstring>
 #include "arch/x86/decoder.hh"
 #include "arch/x86/pcstate.hh"
@@ -53,7 +54,12 @@ Fetch::fetchFrontend(bool &status_change)
         return;
     }
     if (uint64_t(cpu->curCycle()) < btbReadyCycle[tid]) return;
-    if (microcodeControl[tid]) return;
+    if (microcodeControl[tid]) {
+        ++fetchStats.microcodeControlWaitCycles;
+        if (repStringKind(macroop[tid].get()) != RepStringKind::None)
+            ++fetchStats.repControlWaitCycles;
+        return;
+    }
     if (!frontend->canAccept() || checkStall(tid)) return;
     if (fetchStatus[tid] == IcacheAccessComplete) {
         fetchStatus[tid] = Running;
@@ -92,6 +98,16 @@ Fetch::fetchFrontend(bool &status_change)
     if (checkInterrupt(at.instAddr()) && !delayedCommit[tid]) return;
 
     const uint64_t cycle = uint64_t(cpu->curCycle());
+    auto pendingTemplateWrite = [&](const FrontendTemplate *value) {
+        if (!value) return false;
+        const auto count = value->physicalBlocks.size();
+        for (size_t i = 0; i < count; ++i) {
+            // Invalidation can destroy value, so return immediately on a hit.
+            const Addr block = value->physicalBlocks[i];
+            if (pendingCodeWrite(tid, block)) return true;
+        }
+        return false;
+    };
     auto lookupValidated = [&]() -> const FrontendTemplate * {
         // A synchronous native ITLB hit completes now. Do not insert a
         // Fetch bubble solely because the code lease needed refreshing.
@@ -116,6 +132,7 @@ Fetch::fetchFrontend(bool &status_change)
         loop_replay = cached != nullptr;
         if (!cached) cached = lookupValidated();
         if (fetchStatus[tid] != Running) return;
+        if (pendingTemplateWrite(cached)) return;
     }
     FrontendSource source = in_rom ? FrontendSource::Microcode :
         current_macro ? expansionSource :
@@ -158,6 +175,13 @@ Fetch::fetchFrontend(bool &status_change)
                 if (!cached) cached = source == FrontendSource::Lsd ?
                     frontend->loopCandidate(at.instAddr()) : lookupValidated();
                 if (!cached) break;
+                if (pendingTemplateWrite(cached)) break;
+                panic_if(cached->physicalBlocks.size() > decodedCodeBlocks[tid].size(),
+                         "Template spans too many physical code blocks");
+                decodedCodeBlockCount[tid] = cached->physicalBlocks.size();
+                std::copy(cached->physicalBlocks.begin(), cached->physicalBlocks.end(),
+                          decodedCodeBlocks[tid].begin());
+                codeDecodeInProgress[tid] = false;
                 root = cached->macroop;
                 auto &xpc = at.as<X86ISA::PCState>();
                 xpc.size(cached->bytes);
@@ -174,8 +198,26 @@ Fetch::fetchFrontend(bool &status_change)
                         fetchCacheLine(address, tid, at.instAddr());
                         break;
                     }
+                    if (pendingCodeWrite(tid,
+                            frontend->instructionBytes->physical(chunk))) {
+                        dec->reset();
+                        offset = 0;
+                        clearCodeDecode(tid);
+                        expansionTemplate.reset();
+                        break;
+                    }
                     if (!frontend->instructionBytes->serve(chunk, instSize, cycle))
                         break;
+                    const Addr block = frontend->instructionBytes->physical(chunk) &
+                                       ~(cacheBlkSize - 1);
+                    auto begin = decodedCodeBlocks[tid].begin();
+                    auto end = begin + decodedCodeBlockCount[tid];
+                    if (std::find(begin, end, block) == end) {
+                        panic_if(decodedCodeBlockCount[tid] == decodedCodeBlocks[tid].size(),
+                                 "Instruction decode spans too many code blocks");
+                        decodedCodeBlocks[tid][decodedCodeBlockCount[tid]++] = block;
+                    }
+                    codeDecodeInProgress[tid] = true;
                     decodeCanReuse &= frontend->instructionBytes->canReuse();
                     std::memcpy(dec->moreBytesPtr(),
                                 frontend->instructionBytes->at(chunk), instSize);
@@ -184,13 +226,14 @@ Fetch::fetchFrontend(bool &status_change)
                 }
                 if (!dec->instReady()) break;
                 root = dec->decode(at);
+                codeDecodeInProgress[tid] = false;
                 if (decodeCanReuse) {
                     std::vector<Addr> blocks;
                     const unsigned bytes = at.as<X86ISA::PCState>().size();
                     if (frontend->physicalBlocks(at.instAddr(), bytes, blocks)) {
                         expansionTemplate = FrontendTemplate{
                             frontend->identity(at.instAddr()), root, {},
-                            bytes, std::move(blocks), 0, sharesAllocation(root)};
+                            bytes, std::move(blocks), 0};
                     }
                 }
                 decodeCanReuse = true;
@@ -230,6 +273,42 @@ Fetch::fetchFrontend(bool &status_change)
 
         auto record = std::make_unique<FrontendRecord>(cpu, tid, op, current_macro,
             at, in_rom ? FrontendSource::Microcode : source, true);
+        std::vector<Addr> code_blocks;
+        const unsigned code_bytes = at.as<X86ISA::PCState>().size();
+        bool have_code_blocks = decodedCodeBlockCount[tid] != 0;
+        if (have_code_blocks) {
+            code_blocks.assign(decodedCodeBlocks[tid].begin(),
+                               decodedCodeBlocks[tid].begin() + decodedCodeBlockCount[tid]);
+        } else {
+            have_code_blocks = frontend->physicalBlocks(
+                at.instAddr(), code_bytes, code_blocks);
+        }
+        if (!have_code_blocks && code_bytes &&
+            frontend->instructionBytes->contains(at.instAddr()) &&
+            frontend->instructionBytes->contains(at.instAddr() + code_bytes - 1)) {
+            // A same-line D-cache replacement can invalidate the lease after
+            // translation but before the I-fetch response. The returned byte
+            // buffer still identifies the physical bytes actually decoded.
+            const Addr first = frontend->instructionBytes->physical(at.instAddr()) &
+                               ~(cacheBlkSize - 1);
+            const Addr last = frontend->instructionBytes->physical(
+                at.instAddr() + code_bytes - 1) & ~(cacheBlkSize - 1);
+            code_blocks.clear();
+            code_blocks.push_back(first);
+            if (last != first) code_blocks.push_back(last);
+            have_code_blocks = true;
+        }
+        if (have_code_blocks) {
+            panic_if(code_blocks.size() > record->codeBlocks.size(),
+                     "Instruction spans too many physical code blocks");
+            record->codeBlockCount = code_blocks.size();
+            std::copy(code_blocks.begin(), code_blocks.end(),
+                      record->codeBlocks.begin());
+            record->staleCode = expansionCodeStale[tid];
+        } else {
+            DPRINTF(Fetch, "[tid:%i] No physical code identity for [sn:%llu] PC %s\n",
+                    tid, record->sequence, at);
+        }
         if (sharesAllocation(current_macro) &&
             current_macro->functionalMicroops() > 1) {
             if (!memoryGroup) {
@@ -253,8 +332,20 @@ Fetch::fetchFrontend(bool &status_change)
             bac->btbLookupLatency(tid, at.instAddr()) : Cycles(0);
         const bool supplied_target = curFT &&
             curFT->isExitBranch(at.instAddr()) && curFT->ready(cycle);
+        const bool static_rep_jump =
+            repStringKind(current_macro.get()) != RepStringKind::None &&
+            op->isMicrocodeControl() && !op->isCondCtrl() &&
+            !op->isLastMicroop();
         if (op->isMicrocodeControl()) {
-            op->advancePC(*record->predictedPC);
+            if (static_rep_jump) {
+                // This internal jump has no operand-dependent decision.
+                // Keep its functional record and commit order, but do not
+                // wait for a backend round trip to learn the constant UPC.
+                auto target = op->branchTarget(at);
+                set(record->predictedPC, *target);
+            } else {
+                op->advancePC(*record->predictedPC);
+            }
         } else record->prediction = decoupledFrontEnd ?
             bac->predictFrontendInstruction(op, record->sequence, tid,
                                              *record->predictedPC, curFT) :
@@ -265,7 +356,7 @@ Fetch::fetchFrontend(bool &status_change)
         if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
             bac->discardNonBranchTarget(tid, at.instAddr());
         stop = at.branching() || record->prediction.taken;
-        if (op->isMicrocodeControl()) {
+        if (op->isMicrocodeControl() && !static_rep_jump) {
             microcodeControl[tid] = record->sequence;
             stop = true;
         }
@@ -326,6 +417,7 @@ Fetch::fetchFrontend(bool &status_change)
             current_macro = nullptr;
             memoryGroup.reset();
             offset = 0;
+            clearCodeDecode(tid);
             if (expansionTemplate) {
                 fills.push_back(std::move(*expansionTemplate));
                 expansionTemplate.reset();
@@ -367,9 +459,50 @@ void
 Fetch::invalidateCode(Addr physical_block)
 {
     if (!frontend) return;
+    if (frontend->instructionBytes->matchesPhysicalBlock(
+            physical_block, cacheBlkSize)) {
+        for (ThreadID tid = 0; tid < numThreads; ++tid)
+            fetchBufferValid[tid] = false;
+    }
     frontend->invalidateCode(physical_block);
     expansionTemplate.reset();
     decodeCanReuse = false;
+}
+
+bool
+Fetch::markCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block)
+{
+    bool matched = false;
+    for (auto &record : pendingMemoryExpansion)
+        matched |= record->markCodeWrite(tid, after, physical_block);
+    if (frontend)
+        matched |= frontend->markCodeWrite(tid, after, physical_block);
+    auto begin = decodedCodeBlocks[tid].begin();
+    auto end = begin + decodedCodeBlockCount[tid];
+    if (std::find(begin, end, physical_block) != end) {
+        if (codeDecodeInProgress[tid] && !macroop[tid]) {
+            decoder[tid]->reset();
+            fetchOffset[tid] = 0;
+            clearCodeDecode(tid);
+            expansionTemplate.reset();
+        } else if (macroop[tid]) {
+            expansionCodeStale[tid] = true;
+        }
+        matched = true;
+    }
+    return matched;
+}
+
+bool
+Fetch::pendingCodeWrite(ThreadID tid, Addr physical_block)
+{
+    physical_block &= ~(cacheBlkSize - 1);
+    if (!cpu->hasPendingCodeWrite(tid, physical_block)) return false;
+    invalidateCode(physical_block);
+    fetchBufferValid[tid] = false;
+    DPRINTF(Fetch, "[tid:%i] Waiting for an older write to code line %#x\n",
+            tid, physical_block);
+    return true;
 }
 
 void

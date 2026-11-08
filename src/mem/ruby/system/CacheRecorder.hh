@@ -51,6 +51,8 @@ namespace ruby
 
 class Sequencer;
 class RubyPort;
+class RubySystem;
+class AbstractController;
 /*!
  * Class for recording cache contents. Note that the last element of the
  * class is an array of length zero. It is used for creating variable
@@ -88,6 +90,9 @@ class CacheRecorder
     uint64_t aggregateRecords(uint8_t **data, uint64_t size);
 
     uint64_t getNumRecords() const;
+    uint64_t getTraceSize() const { return m_uncompressed_trace_size; }
+    void functionalWriteback(RubySystem &system,
+        const std::vector<AbstractController *> &controllers);
 
     /*!
      * Function for flushing the memory contents of the caches to the

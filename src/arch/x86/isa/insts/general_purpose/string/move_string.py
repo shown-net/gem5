@@ -49,8 +49,15 @@ def macroop MOVS_M_M {
 };
 
 def macroop MOVS_E_M_M {
-    and t0, rcx, rcx, flags=(EZF,), dataSize=asz
-    br label("end"), flags=(CEZF,)
+    repstart label("end"), dataSize=asz
+batch:
+    repselectcopy label("ordinary"), dataSize=asz
+bulk:
+    ldrep t0, seg, [1, t0, rsi]
+    strep t0, es, [1, t0, rdi]
+    repprogresscopy label("bulk"), label("ordinary"), dataSize=asz
+    br label("end")
+ordinary:
     # Find the constant we need to either add or subtract from rdi
     ruflag t0, 10
     movi t3, t3, dsz, flags=(CEZF,), dataSize=asz
@@ -64,7 +71,9 @@ topOfLoop:
     subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
     add rdi, rdi, t3, dataSize=asz
     add rsi, rsi, t3, dataSize=asz
-    br label("topOfLoop"), flags=(nCEZF,)
+    br label("end"), flags=(CEZF,)
+    br label("batch"), flags=(CECF,)
+    br label("topOfLoop")
 end:
     fault "NoFault"
 };

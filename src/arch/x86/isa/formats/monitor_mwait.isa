@@ -12,7 +12,13 @@ output header {{
         MonitorInst(const char *_mnemonic, ExtMachInst _machInst,
                 OpClass __opClass) :
             X86ISA::X86StaticInst(_mnemonic, _machInst, __opClass)
-        { }
+        {
+            // Arming the monitor is an architectural side effect, not a
+            // speculative action on a path which may later be squashed.
+            // A following condition check must not run before it is armed.
+            flags[IsNonSpeculative] = 1;
+            flags[IsSerializeAfter] = 1;
+        }
 
         std::string generateDisassembly(Addr pc,
                 const loader::SymbolTable *symtab) const override;
@@ -65,6 +71,9 @@ def template MwaitInitiateAcc {{
         unsigned s = 0x8;        //size
         unsigned f = 0;          //flags
         if (!xc->getAddrMonitor()->armed) {
+            // No request will arrive to complete this load. Tell the CPU to
+            // complete the no-op through its ordinary predicated-load path.
+            xc->setMemAccPredicate(false);
             return NoFault;
         }
         initiateMemRead(xc, traceData, xc->getAddrMonitor()->vAddr, s, f);
@@ -76,6 +85,8 @@ def template MwaitCompleteAcc {{
     Fault %(class_name)s::completeAcc(PacketPtr pkt, ExecContext *xc,
             trace::InstRecord *traceData) const
     {
+        if (!pkt)
+            return NoFault;
         MicroHalt hltObj(machInst, mnemonic, 0x0);
         if(xc->mwait(pkt)) {
             hltObj.execute(xc, traceData);
@@ -95,6 +106,12 @@ output header {{
             X86ISA::X86StaticInst(_mnemonic, _machInst, __opClass)
         {
             flags[IsLoad] = 1;
+            // Sleeping is a side effect. Prevent execution on a wrong path,
+            // and hold younger instructions until this wait has retired.
+            // IsQuiesce is unsuitable because MWAIT can also return without
+            // suspending, in which case no wakeup would restart fetch.
+            flags[IsNonSpeculative] = 1;
+            flags[IsSerializeAfter] = 1;
         }
 
         std::string generateDisassembly(Addr pc,

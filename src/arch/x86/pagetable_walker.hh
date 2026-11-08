@@ -49,6 +49,7 @@
 #include "sim/clocked_object.hh"
 #include "sim/faults.hh"
 #include "sim/system.hh"
+#include "arch/x86/paging_structure_cache.hh"
 
 namespace gem5
 {
@@ -117,6 +118,9 @@ namespace X86ISA
             bool retrying;
             bool started;
             bool squashed;
+            bool prefixHit = false;
+            bool cacheablePrefix = true;
+            unsigned physicalAddressBits = 48;
             uint64_t translationGeneration = 0;
             uint64_t walkCr3 = 0;
             uint64_t walkCr4 = 0;
@@ -152,6 +156,7 @@ namespace X86ISA
             void setupWalk(Addr vaddr);
             Fault stepWalk(PacketPtr &write);
             void sendPackets();
+            void sendPrefixResponse();
             void endWalk();
             void releaseFollowers(bool completed);
             Fault pageFault(bool present, bool reserved = false);
@@ -172,6 +177,9 @@ namespace X86ISA
         };
 
       public:
+
+        PagingStructureCache *pagingStructureCache;
+        const Cycles prefixHitLatency;
         // Kick off the state machine.
         Fault start(ThreadContext * _tc, BaseMMU::Translation *translation,
                 const RequestPtr &req, BaseMMU::Mode mode);
@@ -244,7 +252,9 @@ namespace X86ISA
 
         Walker(const Params &params) :
             ClockedObject(params), port(name() + ".port", this),
-            funcState(this, NULL, NULL, true), tlb(NULL), sys(params.system),
+            funcState(this, NULL, NULL, true),
+            pagingStructureCache(params.paging_structure_cache),
+            prefixHitLatency(params.prefix_hit_latency), tlb(NULL), sys(params.system),
             requestorId(sys->getRequestorId(this)),
             numSquashable(params.num_squash_per_cycle),
             maxActiveWalks(params.max_active_walks), itlbStats(this),
@@ -253,6 +263,8 @@ namespace X86ISA
             startWalkWrapperEvent([this]{ startWalkWrapper(); }, name())
         {
             fatal_if(!maxActiveWalks, "Page walker needs an active walk slot");
+            fatal_if(pagingStructureCache && !prefixHitLatency,
+                     "Prefix-cache service needs a positive latency");
         }
     };
 

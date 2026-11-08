@@ -71,10 +71,15 @@ class TimerTable
     Addr nextAddress() const;
     bool isSet(Addr address) const { return !!m_map.count(address); }
     void set(Addr address, Tick ready_time);
+    // For a controller which is already executing its in-port loop. The
+    // ready entry will be consumed there, without scheduling a duplicate
+    // Consumer wakeup at the current tick.
+    void setReady(Addr address, Tick ready_time);
     void unset(Addr address);
     void print(std::ostream& out) const;
 
   private:
+    void insert(Addr address, Tick ready_time);
     void updateNext() const;
 
     // Private copy constructor and assignment operator

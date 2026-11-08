@@ -92,6 +92,7 @@ class LSQUnit
     static constexpr auto MaxDataBytes = MaxVecRegLenInBytes;
 
     using LSQRequest = LSQ::LSQRequest;
+    void noteSplitTranslation(const std::vector<RequestPtr> &fragments);
   private:
     struct CommittedStoreEntry
     {
@@ -411,6 +412,9 @@ class LSQUnit
     /** Returns if there are any stores to writeback. */
     bool hasStoresToWB() { return storesToWB || !committedStoreBuffer.empty(); }
 
+    /** Whether a translated, unfinished store targets this code line. */
+    bool hasPendingCodeWrite(Addr physical_block);
+
     /** Returns the number of stores to writeback. */
     int numStoresToWB() { return storesToWB + committedStoreCount(); }
 
@@ -533,6 +537,7 @@ class LSQUnit
 
         /** The pointer to the LSQ unit that issued the store. */
         LSQUnit *lsqPtr;
+        LSQRequest *request;
     };
 
   public:
@@ -614,10 +619,12 @@ class LSQUnit
     std::map<InstSeqNum, SelectiveBlockedLoad> selectiveBlockedLoads;
     void resumeSelectiveBlockedLoad(const SelectiveBlockedLoad &wait);
     void rescheduleRetainedLoad(const DynInstPtr &load);
+    bool canRetainLoadRequest(LSQRequest *request) const;
     struct PartialForwarding {
         std::vector<uint8_t> data;
         std::vector<bool> mask;
         std::vector<InstSeqNum> sourceSequence;
+        Addr physicalStart = 0;
     };
     std::map<InstSeqNum, PartialForwarding> partialForwarding;
     std::map<InstSeqNum, InstSeqNum> fullForwardingSource;
@@ -656,10 +663,7 @@ class LSQUnit
     bool tsoInFlightSecure = false;
     std::map<Addr, unsigned> tsoLinesInFlight;
     Addr tsoLastIssuedLine = 0;
-    Cycles tsoLastIssuedLineCycle = Cycles(0);
-    bool tsoLastIssuedLineValid = false;
 
-    unsigned tsoOrderedStoreLineWindow;
 
     /** The oldest load that caused a memory ordering violation. */
     DynInstPtr memDepViolator;
@@ -681,6 +685,9 @@ class LSQUnit
         statistics::Scalar fastForwardPredictions;
         statistics::Scalar fastForwardValidated;
         statistics::Scalar fastForwardFailures;
+        statistics::Scalar noncontiguousTranslations;
+        statistics::Scalar repReadBatches, repWriteBatches;
+        statistics::Scalar repReadBytes, repWriteBytes;
 
         /** Total number of squashed loads. */
         statistics::Scalar squashedLoads;
@@ -718,7 +725,6 @@ class LSQUnit
         statistics::Scalar sharedStoreFullCycles;
         statistics::Scalar storeDrainCacheBlocked;
         statistics::Scalar storeDrainPortBlocked;
-        statistics::Scalar storeDrainLineWindowBlocked;
 
         /** Number of times the LSQ is blocked due to the cache. */
         statistics::Scalar blockedByCache;

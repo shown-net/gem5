@@ -45,7 +45,7 @@ from m5.objects.BaseCPU import BaseCPU
 from m5.objects.BranchPredictor import *
 from m5.objects.FUPool import *
 from m5.objects.Frontend import FrontendCoordinator
-from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, ResultForwarding
+from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, IntegerDivider, ResultForwarding
 from m5.objects.ZeroIdiom import ZeroIdiom
 from m5.objects.StackEngine import StackEngine
 from m5.objects.IndexingPolicies import *
@@ -72,6 +72,7 @@ class BaseO3CPU(BaseCPU):
     intSlow = Param.IntExecutionResource(NULL, "Slow integer execution family")
     intBM = Param.IntExecutionResource(NULL, "Bit-manipulation execution family")
     intBranch = Param.IntExecutionResource(NULL, "Branch resolution execution family")
+    intDivider = Param.IntegerDivider(NULL, "Shared integer divider and output actions")
 
     @classmethod
     def memory_mode(cls):
@@ -200,6 +201,9 @@ class BaseO3CPU(BaseCPU):
     numPhysIntRegs = Param.Unsigned(
         256, "Number of physical integer registers"
     )
+    numPhysIntRegEntries = Param.Unsigned(
+        0, "Integer value allocation entries, separate from functional storage; zero uses storage count"
+    )
     numPhysFloatRegs = Param.Unsigned(
         256, "Number of physical floating point registers"
     )
@@ -240,9 +244,6 @@ class BaseO3CPU(BaseCPU):
         "Branch Predictor",
     )
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
-    tsoOrderedStoreLineWindow = Param.Unsigned(
-        4, "Maximum distinct cache lines awaiting ordered TSO store completion"
-    )
 
     recvRespThrottling = Param.Bool(
         False, "Enable load receive response throttling in the LSQ"

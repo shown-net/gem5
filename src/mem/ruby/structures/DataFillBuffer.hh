@@ -20,6 +20,8 @@ class DataFillBuffer
     {
         bool dataReady = false;
         bool demandRead = false;
+        bool installStarted = false;
+        uint64_t installCompleteCycle = 0;
     };
 
     unsigned capacity = 0;
@@ -32,6 +34,33 @@ class DataFillBuffer
     bool contains(Addr line) const { return entries.count(line) != 0; }
     size_t size() const { return entries.size(); }
     unsigned demandReadCount() const { return demandReads; }
+    unsigned readyCount() const
+    {
+        unsigned count = 0;
+        for (const auto &[line, entry] : entries) count += entry.dataReady;
+        return count;
+    }
+    bool ready(Addr line) const
+    {
+        auto it = entries.find(line);
+        return it != entries.end() && it->second.dataReady;
+    }
+    bool installStarted(Addr line) const
+    {
+        return entries.at(line).installStarted;
+    }
+    bool installComplete(Addr line, uint64_t cycle) const
+    {
+        const auto &entry = entries.at(line);
+        return entry.installStarted && cycle >= entry.installCompleteCycle;
+    }
+    void startInstall(Addr line, uint64_t complete_cycle)
+    {
+        auto &entry = entries.at(line);
+        assert(entry.dataReady && !entry.installStarted);
+        entry.installStarted = true;
+        entry.installCompleteCycle = complete_cycle;
+    }
 
     void allocate(Addr line, bool demand_read)
     {

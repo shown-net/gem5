@@ -115,6 +115,7 @@ output exec {{
 #include "arch/x86/faults.hh"
 #include "arch/x86/memhelpers.hh"
 #include "arch/x86/mmu.hh"
+#include "arch/x86/sse_math.hh"
 #include "arch/x86/pseudo_inst_abi.hh"
 #include "arch/x86/regs/misc.hh"
 #include "arch/x86/tlb.hh"
@@ -129,6 +130,7 @@ output exec {{
 #include "mem/request.hh"
 #include "sim/pseudo_inst.hh"
 #include "sim/sim_exit.hh"
+#include "sim/system.hh"
 
 namespace gem5::X86ISAInst
 {

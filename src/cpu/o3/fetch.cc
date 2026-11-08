@@ -206,6 +206,10 @@ Fetch::FetchStatGroup::FetchStatGroup(CPU *cpu, Fetch *fetch)
                "Number of branches that fetch has predicted taken"),
       ADD_STAT(multiTakenBatches, statistics::units::Count::get(),
                "Component frontend batches with more than one taken target"),
+      ADD_STAT(microcodeControlWaitCycles, statistics::units::Cycle::get(),
+               "Selected-thread fetch cycles waiting for internal control resolution"),
+      ADD_STAT(repControlWaitCycles, statistics::units::Cycle::get(),
+               "Internal control wait cycles with a retained REP MOVS/STOS parent"),
       ADD_STAT(
           miscStallCycles, statistics::units::Cycle::get(),
           "Number of cycles fetch has spent waiting on interrupts, or bad "
@@ -311,6 +315,7 @@ Fetch::clearStates(ThreadID tid)
     fetchStatus[tid] = Running;
     set(pc[tid], cpu->pcState(tid));
     fetchOffset[tid] = 0;
+    clearCodeDecode(tid);
     macroop[tid] = NULL;
     delayedCommit[tid] = false;
     memReq[tid] = NULL;
@@ -353,6 +358,7 @@ Fetch::resetStage()
         fetchStatus[tid] = Running;
         set(pc[tid], cpu->pcState(tid));
         fetchOffset[tid] = 0;
+        clearCodeDecode(tid);
         macroop[tid] = NULL;
 
         delayedCommit[tid] = false;
@@ -391,6 +397,20 @@ Fetch::processCacheCompletion(PacketPtr pkt)
             uint64_t(curTick()));
         ++fetchStats.icacheSquashes;
         delete pkt;
+        return;
+    }
+
+    // A response can race a store that was translated after the I-fetch was
+    // issued. Do not decode the old bytes while the same-line write is pending.
+    if (pendingCodeWrite(tid, pkt->req->getPaddr())) {
+        TaoTraceFrontendRegistry::noteTerminal(
+            pkt->req, TaoTraceFrontendRegistry::Terminal::SquashedResponse,
+            uint64_t(curTick()));
+        delete pkt;
+        memReq[tid] = nullptr;
+        fetchStatus[tid] = checkStall(tid) ? Blocked : Running;
+        cpu->wakeCPU();
+        switchToActive();
         return;
     }
 
@@ -657,6 +677,15 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
 
     // If translation was successful, attempt to read the icache block.
     if (fault == NoFault) {
+        if (pendingCodeWrite(tid, mem_req->getPaddr())) {
+            memReq[tid] = nullptr;
+            fetchStatus[tid] = Running;
+            TaoTraceFrontendRegistry::noteTerminal(mem_req,
+                TaoTraceFrontendRegistry::Terminal::TranslationSquash,
+                uint64_t(curTick()));
+            _status = updateFetchStatus();
+            return;
+        }
         if (frontend) {
             frontend->translated(mem_req->getVaddr(), mem_req->getPaddr());
             // A validated DSB hit consumes no native I-cache request.
@@ -815,6 +844,14 @@ Fetch::squashFromCommit(const PCStateBase &new_pc, const InstSeqNum seq_num,
 
     doSquash(new_pc, squashInst, tid);
 
+    if (squashInst && squashInst->isSquashAfter() &&
+        squashInst->isSerializing()) {
+        // A serializing instruction requires later code to be fetched after
+        // it completes, including bytes and templates fetched speculatively.
+        fetchBufferValid[tid] = false;
+        invalidateTranslations();
+    }
+
     if (frontend) frontend->redirect(seq_num);
 
     // Tell the CPU to remove any instructions that are not in the ROB.
@@ -837,6 +874,7 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
 
     set(pc[tid], new_pc);
     fetchOffset[tid] = 0;
+    clearCodeDecode(tid);
     if (squashInst && squashInst->pcState().instAddr() == new_pc.instAddr() &&
         !squashInst->isLastMicroop())
         macroop[tid] = squashInst->macroop;

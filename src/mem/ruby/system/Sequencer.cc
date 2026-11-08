@@ -1604,7 +1604,7 @@ Sequencer::makeRequest(PacketPtr pkt)
         const Addr line = makeLineAddress(pkt->getAddr());
         // A request merged before any FB admission remains unknown. Never
         // infer its source from the leading request's eventual response.
-        if (m_dataCache_ptr->dataFillPending(line)) {
+        if (m_dataCache_ptr->dataFillPresent(line)) {
             const bool joins = status != RequestStatus_Aliased ||
                 tailCanFollow(line);
             if (joins)

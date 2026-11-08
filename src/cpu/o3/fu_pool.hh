@@ -83,6 +83,7 @@ class FUPool : public SimObject
     std::array<IntExecutionResource *, 6> integerResources{};
     std::array<IntegerALU *, 12> integerALUs{};
     bool individualALUs = false;
+    IntegerDivider *integerDivider = nullptr;
     /** Maximum op execution latencies, per op class. */
     std::array<Cycles, Num_OpClasses> maxOpLatencies;
     /** Whether op is pipelined or not. */
@@ -96,6 +97,9 @@ class FUPool : public SimObject
     std::vector<int> pairedUnit;
     std::vector<std::array<Cycles, Num_OpClasses>> issueIntervals;
     std::vector<std::array<Cycles, Num_OpClasses>> nextIssue;
+    // Scalar/double and packed/single op classes reach the same FP divider
+    // on a port. Their per-class intervals cannot create two dividers.
+    std::vector<Cycles> fpDividerNextIssue;
     std::array<uint16_t, Num_OpClasses> capablePorts{};
     std::array<unsigned, 12> pendingPortLoads{};
     std::array<unsigned, 12> allocationLoadSnapshot{};
@@ -154,6 +158,7 @@ class FUPool : public SimObject
     {
         explicit PoolStats(FUPool *pool);
         statistics::Vector issuedByUnit;
+        statistics::Scalar fpDividerCrossClassBlocked;
     } stats;
 
   public:
@@ -164,10 +169,15 @@ class FUPool : public SimObject
                               IntExecutionResource *alu, IntExecutionResource *shift,
                               IntExecutionResource *slow, IntExecutionResource *bm,
                               IntExecutionResource *branch,
+                              IntegerDivider *divider,
                               const std::vector<IntegerALU *> &alus);
     bool usesIntegerResources(const DynInstPtr &inst) const;
     bool issueInteger(CPU *cpu, const DynInstPtr &inst,
-                      std::function<void()> available, std::function<void()> complete);
+                      std::function<void()> available, std::function<void()> complete,
+                      std::function<void()> issued_action);
+    bool portAvailable(unsigned port, Tick now) const
+    { return executionPorts && !unitBusy.at(port) && executionPorts->get(port)->available(now); }
+    ExecutionPorts *sharedPorts() const { return executionPorts; }
     void bindPort(const DynInstPtr &inst, Cycles cycle);
     void startAllocationCycle(Cycles cycle);
     void releasePortBinding(const DynInstPtr &inst);
@@ -201,6 +211,9 @@ class FUPool : public SimObject
 
     /** Returns true if the FU has the required capability */
     bool isCapable(OpClass capability);
+
+    /** Skip a divider class for this cycle when no candidate can accept it. */
+    bool fpDividerReady(OpClass capability, Cycles cycle);
 
     /**
      * Gets a FU providing the requested capability. Will mark the

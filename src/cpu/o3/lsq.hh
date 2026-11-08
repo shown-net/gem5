@@ -383,6 +383,10 @@ class LSQ
 
         bool hasStaleTranslation() const { return _hasStaleTranslation; }
 
+        // A complete physical byte set, including split-page mappings and
+        // byte enables. Partial translation success is not a complete access.
+        bool physicalBytes(std::vector<Addr> &bytes) const;
+
         virtual void markAsStaleTranslation() = 0;
 
         /** Set up virtual request.
@@ -888,6 +892,8 @@ class LSQ
      * to memory.
      */
     bool hasStoresToWB(ThreadID tid);
+
+    bool hasPendingCodeWrite(ThreadID tid, Addr physical_block);
 
     /** Returns the number of stores a specific thread has to write back. */
     int numStoresToWB(ThreadID tid);

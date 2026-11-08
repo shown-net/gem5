@@ -104,6 +104,10 @@ enum : RegIndex
 
 class FlatIntRegClassOps : public RegClassOps
 {
+  public:
+    bool isFunctional(const RegId &id) const override
+    { return id.index() >= int_reg::NumArchRegs; }
+  private:
     std::string regName(const RegId &id) const override;
 };
 

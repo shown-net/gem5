@@ -256,6 +256,10 @@ structure (CacheMemory, external = "yes") {
   void finishDataFill(Addr);
   void recordDemandFillBlocked();
   void observeDataFillDemandRead(Addr);
+  bool dataFillPresent(Addr);
+  bool dataFillReady(Addr);
+  bool advanceDataFillInstall(Addr);
+  void installDataFill(Addr);
 
   // hardware transactional memory
   void htmCommitTransaction();
@@ -286,6 +290,7 @@ structure (TimerTable, inport="yes", external = "yes") {
   bool isReady(Tick);
   Addr nextAddress();
   void set(Addr, Tick);
+  void setReady(Addr, Tick);
   void unset(Addr);
   bool isSet(Addr);
 }

@@ -95,6 +95,7 @@ class StaticInst : public RefCounted, public StaticInstFlags
 
   public:
     const IntExecutionInfo &intExecution() const { return intExecutionInfo; }
+    virtual IntDivideInfo intDivide() const { return {}; }
     void clearIntExecution() { intExecutionInfo = {}; }
     virtual bool usesMicrocodeService() const { return false; }
     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
@@ -407,7 +408,7 @@ class StaticInst : public RefCounted, public StaticInstFlags
     void printFlags(std::ostream &outs, const std::string &separator) const;
 
     /// Return name of machine instruction
-    std::string getName() { return mnemonic; }
+    std::string getName() const { return mnemonic; }
 
   protected:
     template<typename T>

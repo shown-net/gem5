@@ -43,6 +43,7 @@
 
 #include "base/intmath.hh"
 #include "base/logging.hh"
+#include "mem/ruby/slicc_interface/AbstractController.hh"
 #include "debug/HtmMem.hh"
 #include "debug/RubyCache.hh"
 #include "debug/RubyCacheTrace.hh"
@@ -72,6 +73,7 @@ CacheMemory::CacheMemory(const Params &p)
     dataArray(p.dataArrayBanks, p.dataAccessLatency, p.start_index_bit),
     tagArray(p.tagArrayBanks, p.tagAccessLatency, p.start_index_bit),
     atomicALUArray(p.atomicALUs, p.atomicLatency),
+    dataFillInstallBytesPerCycle(p.fill_install_bytes_per_cycle),
     cacheMemoryStats(this)
 {
     m_cache_size = p.size;
@@ -85,6 +87,8 @@ CacheMemory::CacheMemory(const Params &p)
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
     m_fill_capacity = p.fill_capacity;
     dataFillBuffer.setCapacity(p.fill_capacity);
+    fatal_if(dataFillInstallBytesPerCycle == 0,
+             "L1 refill bandwidth must be positive");
     if (p.fill_stats_clock)
         dataFillClock = std::make_unique<DataFillClock>(*p.fill_stats_clock);
     m_use_occupancy = dynamic_cast<replacement_policy::WeightedLRU*>(
@@ -136,6 +140,8 @@ CacheMemory::accountDataFillCycles()
     const uint64_t elapsed = now - lastDataFillCycle;
     cacheMemoryStats.dataFillDemandReadPending +=
         elapsed * dataFillBuffer.demandReadCount();
+    cacheMemoryStats.dataFillReadyEntryCycles +=
+        elapsed * dataFillBuffer.readyCount();
     if (dataFillBuffer.demandReadCount())
         cacheMemoryStats.dataFillDemandReadPendingCycles += elapsed;
     lastDataFillCycle = now;
@@ -160,6 +166,7 @@ CacheMemory::allocateDataFill(Addr address, bool demand_read)
 void
 CacheMemory::markDataFillReady(Addr address)
 {
+    accountDataFillCycles();
     dataFillBuffer.markReady(makeLineAddress(address));
 }
 
@@ -178,8 +185,56 @@ CacheMemory::finishDataFill(Addr address)
     // Permission-only transactions do not own a data fill. The protocol
     // calls this after its data action and local callbacks, independently of
     // deallocating the coherence transaction.
-    if (dataFillBuffer.contains(makeLineAddress(address)))
+    if (dataFillBuffer.contains(makeLineAddress(address))) {
+        ++cacheMemoryStats.dataFillCancellations;
         releaseDataFill(address);
+    }
+}
+
+bool
+CacheMemory::dataFillPresent(Addr address) const
+{
+    return dataFillBuffer.contains(makeLineAddress(address));
+}
+
+bool
+CacheMemory::dataFillReady(Addr address) const
+{
+    return dataFillBuffer.ready(makeLineAddress(address));
+}
+
+bool
+CacheMemory::advanceDataFillInstall(Addr address)
+{
+    // Permission-only responses consume no refill service. Reserve actual
+    // transfer beats, independently of the load issue pipeline latency.
+    const Addr line = makeLineAddress(address);
+    if (!dataFillBuffer.contains(line)) return true;
+    const uint64_t now = currentDataFillCycle();
+    if (!dataFillBuffer.installStarted(line)) {
+        if (now < nextDataFillInstallCycle) {
+            ++cacheMemoryStats.dataFillInstallBlocked;
+            return false;
+        }
+        const unsigned bytes = m_ruby_system->getBlockSizeBytes();
+        const unsigned beats = (bytes + dataFillInstallBytesPerCycle - 1) /
+                               dataFillInstallBytesPerCycle;
+        dataFillBuffer.startInstall(line, now + beats - 1);
+        nextDataFillInstallCycle = now + beats;
+    }
+    const bool complete = dataFillBuffer.installComplete(line, now);
+    if (!complete) ++cacheMemoryStats.dataFillInstallServiceCycles;
+    return complete;
+}
+
+void
+CacheMemory::installDataFill(Addr address)
+{
+    if (!dataFillPresent(address)) return;
+    assert(dataFillReady(address) && dataFillBuffer.installComplete(
+        makeLineAddress(address), currentDataFillCycle()));
+    ++cacheMemoryStats.dataFillInstalls;
+    releaseDataFill(address);
 }
 
 void
@@ -616,7 +671,8 @@ CacheMemory::getReplacementWeight(int64_t set, int64_t loc)
 }
 
 void
-CacheMemory::recordCacheContents(int cntrl, CacheRecorder* tr) const
+CacheMemory::recordCacheContents(int cntrl, CacheRecorder* tr,
+                                 AbstractController *owner) const
 {
     uint64_t warmedUpBlocks = 0;
     [[maybe_unused]] uint64_t totalBlocks = (uint64_t)m_cache_num_sets *
@@ -626,6 +682,12 @@ CacheMemory::recordCacheContents(int cntrl, CacheRecorder* tr) const
         for (int j = 0; j < m_cache_assoc; j++) {
             if (m_cache[i][j] != NULL) {
                 AccessPermission perm = m_cache[i][j]->m_Permission;
+                if (perm != AccessPermission_Invalid &&
+                    perm != AccessPermission_NotPresent) {
+                    // The controller knows whether a Busy tag is already
+                    // data/permission-ready in an FB, or still unavailable.
+                    perm = owner->getAccessPermission(m_cache[i][j]->m_Address);
+                }
                 RubyRequestType request_type = RubyRequestType_NULL;
                 if (perm == AccessPermission_Read_Only) {
                     if (m_is_instruction_only_cache) {
@@ -743,6 +805,11 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
       ADD_STAT(dataFillDemandBlockedCycles, "Candidate cycles a demand request waits for data fill-buffer capacity"),
       ADD_STAT(dataFillDemandReadPending, "Integral of L0 data fill entries containing a demand read"),
       ADD_STAT(dataFillDemandReadPendingCycles, "Cycles with at least one L0 demand-read data fill"),
+      ADD_STAT(dataFillReadyEntryCycles, "Integral of data-ready fill entries awaiting L1 installation"),
+      ADD_STAT(dataFillInstalls, "Data fill entries released by L1 installation"),
+      ADD_STAT(dataFillCancellations, "Data fill entries released without L1 installation"),
+      ADD_STAT(dataFillInstallBlocked, "L1 installation attempts waiting for refill bandwidth"),
+      ADD_STAT(dataFillInstallServiceCycles, "Data-ready FB line cycles spent transferring into L1"),
       ADD_STAT(demandDataReadHits, "Candidate cacheable demand data read requests observed hitting the private L2"),
       ADD_STAT(demandDataReadTrueMisses, "Candidate cacheable demand data read requests observed missing the private L2, excluding merges and upgrades"),
       ADD_STAT(dataLineFills, "Data lines installed by private L2 line-fill transactions"),

@@ -174,6 +174,8 @@ using RegVal = uint64_t;
 
 // Logical register index type.
 using RegIndex = uint16_t;
+// A physical data store may contain more fragments than the logical ISA file.
+using PhysRegIndex = uint32_t;
 
 static inline uint32_t
 floatToBits32(float val)

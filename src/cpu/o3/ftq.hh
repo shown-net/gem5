@@ -118,6 +118,7 @@ class FetchTarget
     /** Anchor point to attach a branch predictor history.
      * Will carry information while FT is waiting in th FTQ. */
     branch_prediction::BPredUnit::PredictorHistory *bpuHistory;
+    bool decodedBranch = false;
 
     /* Start address of the basic block */
     Addr
@@ -317,6 +318,8 @@ class FTQ
 
     /** Squashes all fetch targets in the FTQ for a specific thread. */
     void squash(ThreadID tid);
+    void squashAfter(ThreadID tid, FTSeqNum through);
+    bool contains(ThreadID tid, FTSeqNum sequence) const;
 
     /** Sanity check to verify that the fetch targets in the ftq do not
      * have a valid `bpu_history`. It should be set to `nullptr` on squash.

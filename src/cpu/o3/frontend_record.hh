@@ -2,6 +2,7 @@
 #ifndef __CPU_O3_FRONTEND_RECORD_HH__
 #define __CPU_O3_FRONTEND_RECORD_HH__
 
+#include <array>
 #include <memory>
 #include "arch/generic/pcstate.hh"
 #include "cpu/inst_seq.hh"
@@ -40,6 +41,9 @@ struct FrontendRecord
     Tick fetchedAt;
     bool fromUser = false;
     uint64_t addressSpace = 0;
+    std::array<Addr, 2> codeBlocks{};
+    unsigned codeBlockCount = 0;
+    bool staleCode = false;
     bool notAnInstruction = false;
     Fault fault = NoFault;
     std::unique_ptr<trace::InstRecord> traceData;
@@ -50,8 +54,23 @@ struct FrontendRecord
                    const StaticInstPtr &macro, const PCStateBase &at,
                    FrontendSource supply, bool trace);
     DynInstPtr materialize(CPU *cpu);
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+    {
+        if (thread != tid || sequence <= after) return false;
+        for (unsigned i = 0; i < codeBlockCount; ++i) {
+            if (codeBlocks[i] == block) {
+                staleCode = true;
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 using FrontendRecordPtr = std::unique_ptr<FrontendRecord>;
+enum class RepStringKind { None, Copy, Store };
+RepStringKind repStringKind(const StaticInst *macro);
+StageDemand initialDemand(const StaticInst &instruction,
+                          const StaticInst *macro = nullptr);
 }
 #endif

@@ -42,6 +42,7 @@
 #include "cpu/o3/rename.hh"
 
 #include <list>
+#include <map>
 
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -130,8 +131,6 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
         renameStatus[tid] = Idle;
         renameMap[tid] = nullptr;
         instsInProgress[tid] = 0;
-        noIQInstsInProgress[tid] = 0;
-        extraIQInstsInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
         freeEntries[tid] = {0, 0, 0, 0};
@@ -166,6 +165,8 @@ Rename::RenameStats::RenameStats(statistics::Group *parent)
                "Number of cycles spent in each rename state"),
       ADD_STAT(renamedInsts, statistics::units::Count::get(),
                "Number of instructions processed by rename"),
+      ADD_STAT(recoveryAllocationSlots, statistics::units::Count::get(),
+               "Correct-path allocation slots accepted while old ROB tracking cleanup continues"),
       ADD_STAT(pushUpdatesComputed, statistics::units::Count::get(),
                "Implicit 64-bit register PUSH updates computed at rename"),
       ADD_STAT(pushUpdatesDeferred, statistics::units::Count::get(),
@@ -317,8 +318,6 @@ Rename::clearStates(ThreadID tid)
     serializeInst[tid] = NULL;
 
     instsInProgress[tid] = 0;
-    noIQInstsInProgress[tid] = 0;
-    extraIQInstsInProgress[tid] = 0;
     loadsInProgress[tid] = 0;
     storesInProgress[tid] = 0;
 
@@ -365,8 +364,6 @@ Rename::resetStage()
         serializeInst[tid] = NULL;
 
         instsInProgress[tid] = 0;
-        noIQInstsInProgress[tid] = 0;
-        extraIQInstsInProgress[tid] = 0;
         loadsInProgress[tid] = 0;
         storesInProgress[tid] = 0;
 
@@ -404,8 +401,7 @@ bool
 Rename::isDrained() const
 {
     for (ThreadID tid = 0; tid < numThreads; tid++) {
-        if (instsInProgress[tid] != 0 || extraIQInstsInProgress[tid] != 0 ||
-            !historyBuffer[tid].empty() ||
+        if (instsInProgress[tid] != 0 || !historyBuffer[tid].empty() ||
             !skidBuffer[tid].empty() ||
             !insts[tid].empty() ||
             (renameStatus[tid] != Idle && renameStatus[tid] != Running))
@@ -428,7 +424,6 @@ Rename::drainSanityCheck() const
         assert(insts[tid].empty());
         assert(skidBuffer[tid].empty());
         assert(instsInProgress[tid] == 0);
-        assert(extraIQInstsInProgress[tid] == 0);
     }
 }
 
@@ -519,8 +514,7 @@ Rename::tick()
             if (stalls[tid].iew || renameStatus[tid] == Blocked)
                 frontend_blocked |= FrontendCoordinator::RenameSignal;
             if (renameStatus[tid] == Squashing ||
-                fromCommit->commitInfo[tid].squash ||
-                fromCommit->commitInfo[tid].robSquashing)
+                fromCommit->commitInfo[tid].squash)
                 frontend_blocked |= FrontendCoordinator::Recovery;
             if (renameStatus[tid] == SerializeStall)
                 frontend_blocked |= FrontendCoordinator::Serialize;
@@ -537,11 +531,12 @@ Rename::tick()
         unsigned issued_slots = 0;
         for (unsigned i = first_output; i < toIEWIndex; ++i)
             issued_slots += toIEW->insts[i]->allocationSlots();
+        if (fromCommit->commitInfo[tid].robSquashing)
+            stats.recoveryAllocationSlots += issued_slots;
         if (issued_slots < renameWidth && toIEWIndex < MaxWidth &&
             renameStatus[tid] != Squashing &&
             renameStatus[tid] != SerializeStall &&
-            !fromCommit->commitInfo[tid].squash &&
-            !fromCommit->commitInfo[tid].robSquashing)
+            !fromCommit->commitInfo[tid].squash)
         {
             const auto reasons = storeStallReasons(tid);
             store_stall_reasons |= reasons;
@@ -602,15 +597,11 @@ Rename::tick()
     // @todo: make into updateProgress function
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         instsInProgress[tid] -= fromIEW->iewInfo[tid].dispatched;
-        noIQInstsInProgress[tid] -= fromIEW->iewInfo[tid].noIQDispatched;
-        extraIQInstsInProgress[tid] -= fromIEW->iewInfo[tid].extraIQDispatched;
         loadsInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToLQ;
         storesInProgress[tid] -= fromIEW->iewInfo[tid].dispatchedToSQ;
         assert(loadsInProgress[tid] >= 0);
         assert(storesInProgress[tid] >= 0);
         assert(instsInProgress[tid] >=0);
-        assert(noIQInstsInProgress[tid] >= 0);
-        assert(extraIQInstsInProgress[tid] >= 0);
     }
 
 }
@@ -778,6 +769,7 @@ Rename::renameInsts(ThreadID tid)
             if (inst->stackAbsorbed) {
                 inst->stageDemand.robUnits = 0;
                 inst->stageDemand.schedulerActions = 0;
+                inst->stageDemand.schedulerUnits = 0;
             }
         }
         if (!inst->isSquashed() &&
@@ -812,8 +804,11 @@ Rename::renameInsts(ThreadID tid)
             }
         }
         const unsigned slots = inst->allocationSlots();
+        if (slots > renameWidth - renamed_slots) {
+            blockThisCycle = true;
+            break;
+        }
         const unsigned backend_slots = inst->backendSlots();
-        const unsigned iq_slots = inst->iqSlots();
         std::vector<DynInstPtr> admission_batch;
         auto &rob = commit_ptr->reorderBuffer();
         if (!inst->isSquashed() && !rob.hasReservation(inst)) {
@@ -828,6 +823,7 @@ Rename::renameInsts(ThreadID tid)
                     if (member->stackAbsorbed) {
                         member->stageDemand.robUnits = 0;
                         member->stageDemand.schedulerActions = 0;
+                        member->stageDemand.schedulerUnits = 0;
                     }
                 }
                 if ((!cpu->stackEngine || !cpu->stackEngine->enabled()) &&
@@ -839,6 +835,8 @@ Rename::renameInsts(ThreadID tid)
                         !source->isPinned() && scoreboard->getReg(source);
                     member->stageDemand.schedulerActions =
                         member->renameComputed ? 0 : 1;
+                    member->stageDemand.schedulerUnits =
+                        member->stageDemand.schedulerActions;
                 }
                 admission_batch.push_back(member);
                 if (member->seqNum == inst->allocationEnd())
@@ -859,7 +857,7 @@ Rename::renameInsts(ThreadID tid)
                 incrFullStat(IQ);
                 break;
             }
-            unsigned loads = 0, stores = 0, float_entries = 0, wide = 0;
+            unsigned loads = 0, stores = 0, int_entries = 0, float_entries = 0, wide = 0;
             std::array<unsigned, CCRegClass + 1> fragments{};
             for (const auto &member : admission_batch) {
                 loads += member->isLoad();
@@ -875,10 +873,10 @@ Rename::renameInsts(ThreadID tid)
                             X86ISA::int_reg::Rsp.flatten(*isa))
                             --fragments[IntRegClass];
                 }
-                float_entries += member->stageDemand.floatWideEntries ?
-                    member->stageDemand.floatWideEntries :
-                    member->staticInst->numFloatDestEntries();
-                wide += member->stageDemand.floatWideEntries;
+                int_entries += member->hardwareDestEntries(IntRegClass);
+                const auto fp = member->hardwareDestEntries(FloatRegClass);
+                float_entries += fp;
+                if (fp) wide += member->stageDemand.floatWideEntries;
             }
             if (calcFreeLQEntries(tid) < int(loads) ||
                 calcFreeSQEntries(tid) < int(stores)) {
@@ -887,8 +885,14 @@ Rename::renameInsts(ThreadID tid)
                 break;
             }
             bool registers_available =
+                int_entries <= freeList->numFreeIntEntries() &&
                 float_entries <= freeList->numFreeFloatEntries() &&
                 wide <= freeList->numFreeFloatWideEntries();
+            if (int_entries > freeList->numFreeIntEntries())
+                ++stats.fullRegistersByClass[IntRegClass];
+            if (float_entries > freeList->numFreeFloatEntries() ||
+                wide > freeList->numFreeFloatWideEntries())
+                ++stats.fullRegistersByClass[FloatRegClass];
             for (unsigned c = 0; c < fragments.size(); ++c) {
                 if (fragments[c] > renameMap[tid]->numFreeEntries(RegClassType(c))) {
                     registers_available = false;
@@ -1063,7 +1067,6 @@ Rename::renameInsts(ThreadID tid)
             inst->pendingFrontendAcceptance = false;
         }
         if (inst->bypassesIQ()) {
-            noIQInstsInProgress[tid] += backend_slots;
             if (inst->staticInst->isZeroIdiom() && inst->getFault() == NoFault) {
                 cpu->zeroIdiom->admit(inst);
                 if (cpu->resultForwarding)
@@ -1071,8 +1074,6 @@ Rename::renameInsts(ThreadID tid)
                 for (RegIndex i = 0; i < inst->numDestRegs(); ++i)
                     scoreboard->setReg(inst->renamedDestIdx(i));
             }
-        } else {
-            extraIQInstsInProgress[tid] += int(iq_slots) - int(backend_slots);
         }
 
         if (inst->isAtomic() || inst->isStore()) {
@@ -1458,7 +1459,7 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
     UnifiedRenameMap *map = renameMap[tid];
     unsigned num_dest_regs = inst->numDestRegs();
     auto *isa = tc->getIsaPtr();
-    PhysRegIdPtr float_entry_peer = nullptr;
+    std::map<std::pair<RegClassType, RegIndex>, PhysRegIdPtr> entry_peers;
 
     // Rename the destination registers.
     for (int dest_idx = 0; dest_idx < num_dest_regs; dest_idx++) {
@@ -1485,14 +1486,18 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
             map->setEntry(flat_dest_regid, source);
             rename_result = {source, previous};
         } else {
-            const bool paired = (inst->staticInst->isFullXmmWrite() ||
-                                 inst->stageDemand.floatWideEntries) &&
-                flat_dest_regid.is(FloatRegClass);
+            const bool entry = (flat_dest_regid.is(IntRegClass) ||
+                                flat_dest_regid.is(FloatRegClass)) &&
+                !flat_dest_regid.regClass().isFunctional(flat_dest_regid);
+            const auto group = flat_dest_regid.is(FloatRegClass) &&
+                inst->stageDemand.floatWideEntries == 1 ? 0 :
+                flat_dest_regid.regClass().regAllocationGroup(flat_dest_regid);
+            const auto key = std::make_pair(flat_dest_regid.classValue(), group);
             rename_result = map->rename(flat_dest_regid,
-                                       paired ? float_entry_peer : nullptr);
-            if (paired && rename_result.first != rename_result.second)
-                float_entry_peer = rename_result.first;
-            if (inst->stageDemand.floatWideEntries &&
+                                       entry ? entry_peers[key] : nullptr);
+            if (entry && rename_result.first != rename_result.second)
+                entry_peers[key] = rename_result.first;
+            if (entry && inst->stageDemand.floatWideEntries &&
                 flat_dest_regid.is(FloatRegClass) &&
                 rename_result.first != rename_result.second)
                 freeList->markFloatWide(rename_result.first);
@@ -1711,8 +1716,7 @@ Rename::checkSignalsAndUpdate(ThreadID tid)
         squash(fromCommit->commitInfo[tid].doneSeqNum, tid);
 
         return true;
-    } else if (!fromCommit->commitInfo[tid].robSquashing &&
-            !freeingInProgress[tid].empty()) {
+    } else if (!freeingInProgress[tid].empty()) {
         DPRINTF(Rename, "[tid:%i] Freeing phys regs of misspeculated "
                 "instructions.\n", tid);
 

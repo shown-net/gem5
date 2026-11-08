@@ -211,9 +211,27 @@ FTQ::squash(ThreadID tid)
 void
 FTQ::squashSanityCheck(ThreadID tid)
 {
-    for (auto ft : ftq[tid]) {
+    for (auto ft : ftq[tid]) assert(ft->bpuHistory == nullptr);
+}
+
+bool
+FTQ::contains(ThreadID tid, FTSeqNum sequence) const
+{
+    for (const auto &ft : ftq[tid]) if (ft->ftNum() == sequence) return true;
+    return false;
+}
+
+void
+FTQ::squashAfter(ThreadID tid, FTSeqNum through)
+{
+    while (!ftq[tid].empty() && ftq[tid].back()->ftNum() > through) {
+        auto ft = ftq[tid].back();
         assert(ft->bpuHistory == nullptr);
+        ppFTQRemove->notify(ft);
+        ftq[tid].pop_back();
     }
+    ftqStatus[tid] = Valid;
+    ++stats.squashes;
 }
 
 bool
