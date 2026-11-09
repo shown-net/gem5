@@ -712,16 +712,21 @@ X86KvmCPU::dumpMSRs() const
     const Kvm::MSRIndexVector &supported_msrs = vm->kvm->getSupportedMSRs();
     auto msrs = newVarStruct<struct kvm_msrs, struct kvm_msr_entry>(
             supported_msrs.size());
-
     msrs->nmsrs = supported_msrs.size();
-    for (int i = 0; i < supported_msrs.size(); ++i) {
-        struct kvm_msr_entry &e(msrs->entries[i]);
-        e.index = supported_msrs[i];
-        e.reserved = 0;
-        e.data = 0;
+    for (size_t i = 0; i < supported_msrs.size(); ++i) {
+        msrs->entries[i].index = supported_msrs[i];
+        msrs->entries[i].reserved = 0;
+        msrs->entries[i].data = 0;
     }
-    getMSRs(*msrs.get());
-
+    const int transferred = ioctl(KVM_GET_MSRS, msrs.get());
+    if (transferred < 0) {
+        warn("KVM diagnostic MSR read failed (errno: %i)\n", errno);
+        return;
+    }
+    if (transferred != static_cast<int>(msrs->nmsrs))
+        inform("KVM diagnostic MSRs: read %i of %zu entries.\n",
+               transferred, supported_msrs.size());
+    msrs->nmsrs = transferred;
     dumpKvm(*msrs.get());
 }
 
@@ -1712,6 +1717,9 @@ X86KvmCPU::getMsrIntersection() const
             if (reg != X86ISA::msrMap.end()) {
                 // Commands have no architectural value to capture/restore.
                 // SPEC_CTRL remains in the ordinary state intersection.
+                // TODO(SPR MSR calibration): SPEC_CTRL and MISC_ENABLE are
+                // present in the measured host's KVM list and msrMap; verify
+                // actual guest values across the timing switch and ROI.
                 if (reg->second == X86ISA::misc_reg::PredCmd)
                     continue;
                 cachedMsrIntersection.push_back(*it);

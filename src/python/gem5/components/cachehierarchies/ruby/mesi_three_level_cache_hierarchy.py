@@ -100,6 +100,8 @@ class MESIThreeLevelCacheHierarchy(
         cache_line_size = board.get_cache_line_size()
 
         self.ruby_system = RubySystem()
+        # TODO(SPR-MSR): Validate native ROI core/uncore frequencies before
+        # considering HWP, power limits or idle-state timing in this baseline.
         self.ruby_system.clk_domain = (
             SrcClockDomain(clock=self._uncore_clock,
                            voltage_domain=board.get_clock_domain().voltage_domain)
@@ -270,7 +272,11 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
     """Selected SPR private caches with system-supplied LLC geometry."""
 
     def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int,
-                 uncore_clock: str = "2.5GHz", l1_refill_bytes_per_cycle: int = 64):
+                 uncore_clock: str = "2.5GHz", l1_refill_bytes_per_cycle: int = 64,
+                 l1_fill_response_width: int = 0, l1_fill_capacity: int = 16,
+                 store_prepare_outstanding: int = 16,
+                 l1_write_fill_capacity: int = 0,
+                 l1d_data_access_cycles: int = 3):
         super().__init__(
             l1i_size="32KiB", l1i_assoc=8,
             l1d_size="48KiB", l1d_assoc=12,
@@ -279,8 +285,21 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
             uncore_clock=uncore_clock,
         )
         self._l1_refill_bytes_per_cycle = l1_refill_bytes_per_cycle
+        self._l1_fill_response_width = l1_fill_response_width
+        self._l1_fill_capacity = l1_fill_capacity
+        self._l1_write_fill_capacity = l1_write_fill_capacity
+        self._store_prepare_outstanding = store_prepare_outstanding
+        self._l1d_data_access_cycles = l1d_data_access_cycles
 
     def incorporate_cache(self, board: AbstractBoard) -> None:
         super().incorporate_cache(board)
         for controller in self._l1_controllers:
+            # Native dependent L1 loads take five issue-to-issue cycles.
+            # Three Ruby service cycles plus the AGU/LSU handoffs reproduce
+            # that interval; independent three-load throughput is unchanged.
+            controller.Dcache.dataAccessLatency = self._l1d_data_access_cycles
             controller.Dcache.fill_install_bytes_per_cycle = self._l1_refill_bytes_per_cycle
+            controller.Dcache.fill_capacity = self._l1_fill_capacity
+            controller.Dcache.write_fill_capacity = self._l1_write_fill_capacity
+            controller.sequencer.data_fill_response_width = self._l1_fill_response_width
+            controller.sequencer.max_store_prepare_outstanding = self._store_prepare_outstanding

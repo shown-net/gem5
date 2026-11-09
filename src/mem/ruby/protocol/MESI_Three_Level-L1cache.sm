@@ -481,6 +481,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         NodeID nid := machineIDToNodeID(mid);
         if (IDToInt(nid) >= machineCount(MachineType:Directory) ||
             pf_state != State:I) {
+          if (is_valid(pf_entry) && is_invalid(pf_tbe)) {
+            cache.profileNativeRequest(7, false, false);
+          }
           prefetcher.prefetchDequeued(in_msg.LineAddress);
           prefetchQueue_in.dequeue(clockEdge());
         } else if (bufferFromL0.isReady(clockEdge()) ||
@@ -514,6 +517,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   // ACTIONS
   action(pa_issuePrefetchGETS, "pa", desc="Issue a private L2 prefetch") {
+    cache.profileNativeRequest(7, true, false);
     enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceRequestType:GETS;
@@ -540,6 +544,12 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(pl_observeLatePrefetch, "pl", desc="Observe demand merging into an L2 prefetch") {
     prefetcher.observePfMiss(address);
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 3);
+      perfCacheNativeLookup(in_msg.PerfTransactionId, version,
+          in_msg.Prefetch, 1, 3);
+    }
   }
 
   action(a_issueGETS, "a", desc="Issue GETS") {
@@ -567,6 +577,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(b_issueGETX, "b", desc="Issue GETX") {
     peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.beginOffcoreOwnership(address, in_msg.FillAuditRole);
       enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:GETX;
@@ -591,6 +602,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(c_issueUPGRADE, "c", desc="Issue GETX") {
     peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.beginOffcoreOwnership(address, in_msg.FillAuditRole);
       enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:UPGRADE;
@@ -1026,6 +1038,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(s_deallocateTBE, "s", desc="Deallocate TBE") {
+    cache.endOffcoreOwnership(address);
     if (tbe.countsLineFill) {
       cache.releaseFill();
     }
@@ -1117,9 +1130,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
     cache.profileDemandMiss();
     peek(messageBufferFromL0_in, CoherenceMsg) {
-      if (in_msg.Class == CoherenceClass:GETS && in_msg.TrainPrefetch) {
-        cache.profileDemandDataReadMiss();
-      }
+      cache.profileNativeRequest(in_msg.FillAuditRole, true,
+          in_msg.Class == CoherenceClass:GETX);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
       perfCacheNativeLookup(in_msg.PerfTransactionId, version,
@@ -1134,9 +1146,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
     cache.profileDemandHit();
     peek(messageBufferFromL0_in, CoherenceMsg) {
-      if (in_msg.Class == CoherenceClass:GETS && in_msg.TrainPrefetch) {
-        cache.profileDemandDataReadHit();
-      }
+      cache.profileNativeRequest(in_msg.FillAuditRole, false,
+          in_msg.Class == CoherenceClass:GETX);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 0);
       perfCacheNativeLookup(in_msg.PerfTransactionId, version,
@@ -1156,6 +1167,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   action(uu_profileUpgrade, "\uu", desc="Profile permission upgrade") {
     cache.profileDemandMiss();
     peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.profileNativeRequest(in_msg.FillAuditRole, false, true);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 2);
       perfCacheNativeLookup(in_msg.PerfTransactionId, version,
@@ -1207,7 +1219,6 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(PF_IS, Load, IS) {
-    uu_profileMiss;
     pl_observeLatePrefetch;
     k_popL0RequestQueue;
   }

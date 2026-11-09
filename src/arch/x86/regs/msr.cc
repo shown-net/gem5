@@ -36,6 +36,12 @@ namespace X86ISA
 
 typedef MsrMap::value_type MsrVal;
 
+// SPR-MSR decisions: cpu_microarchitecture/docs/calibration/
+// spr-msr-controls-component-alignment.md.
+// TODO(SPR-MSR): When a target workload uses resource control, establish
+// guest CLOS and CAT/MBA/STLB masks before routing allocation controls.
+// Also check TSX, XFD, wait and power controls against guest CPUID and use;
+// an MSR mapping alone does not implement its component behavior.
 const MsrMap::value_type msrMapData[] = {
     MsrVal(0x10, misc_reg::Tsc),
     MsrVal(0x1B, misc_reg::ApicBase),
@@ -49,6 +55,8 @@ const MsrMap::value_type msrMapData[] = {
     MsrVal(0x17A, misc_reg::McgStatus),
     MsrVal(0x17B, misc_reg::McgCtl),
     MsrVal(0x1A0, misc_reg::MiscEnable),
+    // TODO(SPR-MSR): For triggering workloads, check DEBUGCTL bus-lock and
+    // unmapped MEMORY_CTRL split-lock exception policy, not just this state.
     MsrVal(0x1D9, misc_reg::DebugCtlMsr),
     MsrVal(0x1DB, misc_reg::LastBranchFromIp),
     MsrVal(0x1DC, misc_reg::LastBranchToIp),

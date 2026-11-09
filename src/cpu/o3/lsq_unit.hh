@@ -108,6 +108,8 @@ class LSQUnit
         std::vector<bool> mask;
         // Byte provenance survives combining distinct architectural stores.
         std::vector<Addr> sourceStart;
+        std::vector<InstSeqNum> sourceSequence;
+        std::vector<Addr> sourcePC;
         unsigned logicalStores = 1;
         bool issued = false;
         bool completed = false;
@@ -437,6 +439,7 @@ class LSQUnit
 
     void completeStoreBufferWrite(uint64_t entry_id);
     void sampleStoreOccupancy();
+    unsigned demandLoadStages() const;
 
     unsigned int cacheLineSize();
   private:
@@ -454,6 +457,8 @@ class LSQUnit
     bool forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx);
     bool collectSameStartForwarding(LSQRequest *request, ssize_t load_idx);
     bool tryFastForwarding(LSQRequest *request, ssize_t load_idx);
+    bool startFastForwarding(const DynInstPtr &load, unsigned size);
+    void predictUnreadyLoadAddresses();
     void validateFastForwarding();
     void refreshForwardingContext();
     void rememberForwarding(const DynInstPtr &load, const DynInstPtr &store);
@@ -573,6 +578,8 @@ class LSQUnit
     bool sprStoreBuffer = false;
     bool sprEarlyStorePrepare = false;
     bool sprRetiredStorePrepare = true;
+    bool sprStorePrepareDemandPriority = true;
+    Cycles sprClflushMinCycles = Cycles(0);
     bool sprMemoryDependence = false;
     bool sprFastStoreForwarding = false;
     uint64_t nextStoreBufferId = 1;
@@ -630,7 +637,13 @@ class LSQUnit
     std::map<InstSeqNum, InstSeqNum> fullForwardingSource;
     // Unbounded engineering history, deliberately unrelated to the 512-entry
     // MDP. No capacity or associativity is attributed to physical hardware.
-    std::map<std::pair<uint64_t, Addr>, Addr> forwardingHistory;
+    struct ForwardingHistory {
+        Addr storePC;
+        uint8_t confidence = 0;
+    };
+    std::map<std::pair<uint64_t, Addr>, ForwardingHistory> forwardingHistory;
+    std::map<InstSeqNum, Addr> forwardingTraining;
+    void trainForwarding(const DynInstPtr &load, bool failed = false);
     uint64_t lastForwardingContext = 0;
     bool forwardingContextValid = false;
     struct FastForwarding {
@@ -641,9 +654,14 @@ class LSQUnit
         bool valueReady = false;
         bool validated = false;
         bool failed = false;
-        bool sourceVerified = false;
-        std::map<InstSeqNum,
-            std::vector<std::pair<Addr, unsigned>>> physicalStores{};
+        unsigned size = 0;
+        std::vector<uint8_t> value;
+        struct StoreBytes {
+            std::vector<Addr> bytes;
+            bool secure = false;
+            bool ordinary = false;
+        };
+        std::map<InstSeqNum, StoreBytes> physicalStores{};
     };
     std::map<InstSeqNum, FastForwarding> fastForwarding;
 
@@ -683,6 +701,7 @@ class LSQUnit
         statistics::Scalar forwLoads;
         statistics::Scalar sameStartPartialLoads;
         statistics::Scalar fastForwardPredictions;
+        statistics::Scalar fastForwardLoadAddressPredictions;
         statistics::Scalar fastForwardValidated;
         statistics::Scalar fastForwardFailures;
         statistics::Scalar noncontiguousTranslations;

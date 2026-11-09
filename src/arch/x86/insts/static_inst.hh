@@ -101,9 +101,101 @@ struct SegRegIndex
 class X86StaticInst : public StaticInst
 {
   public:
+    bool hasKnownMicrocodeIdentity() const override
+    {
+        return (machInst.opcode.type == TwoByteOpcode &&
+                uint8_t(machInst.opcode.op) == 0xa2) ||
+            (machInst.opcode.type == OneByteOpcode &&
+             uint8_t(machInst.opcode.op) == 0xfc) ||
+            (machInst.opcode.type == OneByteOpcode &&
+             (machInst.legacy.rep || machInst.legacy.repne) &&
+             ((uint8_t(machInst.opcode.op) >= 0xa4 &&
+               uint8_t(machInst.opcode.op) <= 0xa7) ||
+              (uint8_t(machInst.opcode.op) >= 0xaa &&
+               uint8_t(machInst.opcode.op) <= 0xaf)));
+    }
+    bool usesMicrocodeService() const override
+    { return hasKnownMicrocodeIdentity(); }
+    unsigned microcodePrefixOps() const override
+    {
+        // One cached/decoded invocation operation followed by the CLD
+        // body is an effective mixed-source prior, not a measured SPR split.
+        return machInst.opcode.type == OneByteOpcode &&
+            uint8_t(machInst.opcode.op) == 0xfc ? 1 : 0;
+    }
+    unsigned softwarePrefetchKind() const override
+    {
+        if (machInst.opcode.type != TwoByteOpcode || machInst.modRM.mod == 3)
+            return 0;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (opcode == 0x0d)
+            return machInst.modRM.reg == 1 ? 4 :
+                   machInst.modRM.reg == 0 ? 2 : 0;
+        if (opcode != 0x18) return 0;
+        switch (machInst.modRM.reg) {
+          case 0: return 1;
+          case 1: return 2;
+          case 2: case 3: return 3;
+          default: return 0;
+        }
+    }
+    unsigned sseArithmeticKind() const override
+    {
+        if (machInst.vex.present || machInst.opcode.type != TwoByteOpcode)
+            return 0;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        // Horizontal and alternating operations use F2 for packed single,
+        // unlike the scalar-double meaning of F2 on ordinary arithmetic.
+        if (opcode == 0x7c || opcode == 0x7d || opcode == 0xd0)
+            return machInst.legacy.op ? 3 : machInst.legacy.repne ? 4 : 0;
+        if (opcode == 0x53)
+            return machInst.legacy.rep ? 2 :
+                !machInst.legacy.op && !machInst.legacy.repne ? 4 : 0;
+        if (opcode != 0x51 && opcode != 0x58 && opcode != 0x59 &&
+            opcode != 0x5c && opcode != 0x5d && opcode != 0x5e &&
+            opcode != 0x5f) return 0;
+        if (machInst.legacy.repne) return 1;
+        if (machInst.legacy.rep) return 2;
+        return machInst.legacy.op ? 3 : 4;
+    }
+    bool hasLengthChangingPrefix() const override
+    {
+        // VEX's normalized mandatory prefixes do not change encoded length.
+        // Qualify operand-sized immediates only; fixed imm8, ordinary 66,
+        // address-size overrides and REX.W alone are not LCP candidates.
+        if (machInst.vex.present || !machInst.legacy.op || machInst.rex.w ||
+            machInst.opcode.type != OneByteOpcode) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if ((opcode <= 0x3d && (opcode & 7) == 5) ||
+            (opcode >= 0xb8 && opcode <= 0xbf) ||
+            opcode == 0x68 || opcode == 0x69 || opcode == 0x81 ||
+            opcode == 0xa9 || opcode == 0xc7)
+            return machInst.opSize == 2 || machInst.opSize == 4;
+        if (opcode == 0xf7 && machInst.modRM.reg <= 1)
+            return machInst.opSize == 2 || machInst.opSize == 4;
+        return false;
+    }
+    bool isArchitecturalNop() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (machInst.opcode.type == OneByteOpcode)
+            return opcode == 0x90 && !machInst.legacy.rep &&
+                !(machInst.mode.submode == SixtyFourBitMode && machInst.rex.b);
+        if (machInst.opcode.type != TwoByteOpcode) return false;
+        // ENDBR32/64 are in the SPR NOP population. PAUSE, prefetch hints
+        // and functional helper NOPs are not inferred from their OpClass.
+        return (opcode == 0x1f && machInst.modRM.reg == 0) ||
+            (opcode == 0x1e && machInst.legacy.rep &&
+             (uint8_t(machInst.modRM) == 0xfa || uint8_t(machInst.modRM) == 0xfb));
+    }
+    bool isArchitecturalX87() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return machInst.opcode.type == OneByteOpcode &&
+            opcode >= 0xd8 && opcode <= 0xdf;
+    }
     bool isArchitecturalBranch() const override
     {
-        if (!isControl()) return false;
         const auto opcode = uint8_t(machInst.opcode.op);
         if (machInst.opcode.type == TwoByteOpcode)
             return (opcode >= 0x80 && opcode <= 0x8f) || opcode == 0x05 ||
@@ -124,6 +216,35 @@ class X86StaticInst : public StaticInst
               ((opcode >= 0x70 && opcode <= 0x7f) ||
                (opcode >= 0xe0 && opcode <= 0xe3))) ||
              (machInst.opcode.type == TwoByteOpcode && opcode >= 0x80 && opcode <= 0x8f));
+    }
+    bool isArchitecturalNearCall() const override
+    {
+        if (machInst.opcode.type != OneByteOpcode) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return opcode == 0xe8 || (opcode == 0xff && machInst.modRM.reg == 2);
+    }
+    bool isArchitecturalNearReturn() const override
+    {
+        if (machInst.opcode.type != OneByteOpcode) return false;
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return opcode == 0xc2 || opcode == 0xc3;
+    }
+    bool isArchitecturalNearIndirectBranch() const override
+    {
+        return machInst.opcode.type == OneByteOpcode &&
+            uint8_t(machInst.opcode.op) == 0xff &&
+            (machInst.modRM.reg == 2 || machInst.modRM.reg == 4);
+    }
+    bool isArchitecturalFarBranch() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        if (machInst.opcode.type == TwoByteOpcode)
+            return opcode == 0x05 || opcode == 0x07 ||
+                opcode == 0x34 || opcode == 0x35;
+        return machInst.opcode.type == OneByteOpcode &&
+            (opcode == 0x9a || opcode == 0xea || opcode == 0xca ||
+             opcode == 0xcb || opcode == 0xcf ||
+             (opcode == 0xff && (machInst.modRM.reg == 3 || machInst.modRM.reg == 5)));
     }
     bool isRasCall() const override
     {
@@ -163,6 +284,14 @@ class X86StaticInst : public StaticInst
         return machInst.opcode.type == OneByteOpcode &&
             (opcode == 0x89 || opcode == 0x8b) && machInst.modRM.mod == 3 &&
             machInst.rex.w && machInst.mode.submode == SixtyFourBitMode;
+    }
+
+    bool isZeroExtendingGprMove() const override
+    {
+        const auto opcode = uint8_t(machInst.opcode.op);
+        return machInst.opcode.type == OneByteOpcode &&
+            (opcode == 0x89 || opcode == 0x8b) && machInst.modRM.mod == 3 &&
+            machInst.opSize == 4 && machInst.mode.submode == SixtyFourBitMode;
     }
 
     bool isByteTestRegisterFusionCandidate() const

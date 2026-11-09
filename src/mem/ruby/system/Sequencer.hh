@@ -274,6 +274,9 @@ class Sequencer : public RubyPort
                            bool isExternalHit, Cycles initialRequestTime,
                            Cycles forwardRequestTime,
                            Cycles firstResponseTime);
+    void completeDataFillRead(SequencerRequest &request, DataBlock &data);
+    void supplyDataFillRead(SequencerRequest &request, DataBlock &data);
+    void serviceDataFillReads();
 
   private:
     // Private copy constructor and assignment operator
@@ -283,6 +286,17 @@ class Sequencer : public RubyPort
   protected:
     // Retain packets and preserve same-line ordering independently of FBs.
     SequencerRequestTable m_RequestTable;
+    // Data was read at the cache callback. Hold the packet credit and its
+    // value until the finite fill-return path can deliver it to the core.
+    struct PendingDataFillRead
+    {
+        SequencerRequest request;
+        DataBlock data;
+    };
+    std::deque<PendingDataFillRead> m_pendingDataFillReads;
+    unsigned m_dataFillResponseWidth;
+    unsigned m_dataFillResponsesUsed = 0;
+    uint64_t m_dataFillResponseCycle = uint64_t(-1);
     std::deque<const Request *> m_orderedStores;
     std::unordered_set<Addr> m_parkedOrderedLines;
     void wakeParkedOrderedHead();
@@ -381,11 +395,17 @@ class Sequencer : public RubyPort
         statistics::Scalar demandDataFullRequests, demandDataFullCycles;
         explicit SaturationStats(Sequencer *owner);
     } saturationStats;
+    struct DataFillServiceStats : statistics::Group
+    {
+        statistics::Scalar queued, delivered, blockedCycles;
+        explicit DataFillServiceStats(Sequencer *owner);
+    } dataFillServiceStats;
     uint64_t lastBufferFullCycle = uint64_t(-1);
     uint64_t lastDemandDataFullCycle = uint64_t(-1);
     std::vector<statistics::Counter> m_IncompleteTimes;
 
     EventFunctionWrapper deadlockCheckEvent;
+    EventFunctionWrapper dataFillResponseEvent;
 
     // support for LL/SC
 

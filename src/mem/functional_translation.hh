@@ -13,6 +13,19 @@ namespace gem5
 {
 class Request;
 
+// Request-local timing facts, kept separate from the serialized functional
+// translation mapping. A delayed STLB hit is not a second-level miss.
+class TranslationMissExtension
+    : public Extension<Request, TranslationMissExtension>
+{
+  public:
+    bool stlbMiss = false;
+    std::unique_ptr<ExtensionBase> clone() const override
+    {
+        return std::make_unique<TranslationMissExtension>(*this);
+    }
+};
+
 inline void
 beginFunctionalTranslationWalk(fastsim::fst::TranslationMapping &mapping,
                                uint64_t root)

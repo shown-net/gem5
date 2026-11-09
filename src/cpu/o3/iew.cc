@@ -483,7 +483,10 @@ IEW::squashDueToBranch(const DynInstPtr& inst, ThreadID tid)
         set(toCommit->pc[tid], inst->pcState());
         inst->staticInst->advancePC(*toCommit->pc[tid]);
 
-        toCommit->mispredictInst[tid] = inst;
+        const bool internal = inst->staticInst->isMicrocodeControl();
+        toCommit->mispredictInst[tid] = internal ? nullptr : inst;
+        toCommit->recoveryCause[tid] = internal ?
+            RecoveryCause::Microcode : RecoveryCause::Branch;
         toCommit->includeSquashInst[tid] = false;
 
         wroteToTimeBuffer = true;
@@ -492,7 +495,8 @@ IEW::squashDueToBranch(const DynInstPtr& inst, ThreadID tid)
 }
 
 void
-IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
+IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid,
+                        RecoveryCause cause)
 {
     DPRINTF(IEW, "[tid:%i] Memory violation, squashing violator and younger "
             "insts, PC: %s [sn:%llu].\n", tid, inst->pcState(), inst->seqNum);
@@ -509,6 +513,7 @@ IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
         toCommit->squashedSeqNum[tid] = inst->seqNum;
         set(toCommit->pc[tid], inst->pcState());
         toCommit->mispredictInst[tid] = NULL;
+        toCommit->recoveryCause[tid] = cause;
 
         // Must include the memory violator in the squash.
         toCommit->includeSquashInst[tid] = true;
@@ -596,7 +601,7 @@ IEW::cacheUnblocked()
 void
 IEW::squashFastForwarding(const DynInstPtr &inst)
 {
-    squashDueToMemOrder(inst, inst->threadNumber);
+    squashDueToMemOrder(inst, inst->threadNumber, RecoveryCause::FastForward);
 }
 
 void
@@ -1050,6 +1055,9 @@ IEW::dispatchInsts(ThreadID tid)
             inst->setCanCommit();
             instQueue.insertBarrier(inst);
             add_to_iq = false;
+        } else if (inst->moveProjection) {
+            instQueue.insertMoveProjection(inst);
+            add_to_iq = false;
         } else if (inst->renameComputed) {
             // Rename produced a new physical register value; publish it to
             // the IQ scoreboard without occupying an execution resource.
@@ -1313,13 +1321,7 @@ IEW::executeInsts()
         // instruction first, so the branch resolution order will be correct.
         ThreadID tid = inst->threadNumber;
 
-        if (inst->staticInst->isMicrocodeControl() && inst->isExecuted() && inst->getFault() == NoFault) {
-            auto next = inst->pcState().clone();
-            inst->staticInst->advancePC(*next);
-            cpu->resolveMicrocodeControl(inst, *next);
-            inst->setPredTarg(*next);
-        }
-
+        inst->recordExecutionBranch();
         if (!fetchRedirect[tid] ||
             !toCommit->squash[tid] ||
             toCommit->squashedSeqNum[tid] > inst->seqNum) {
@@ -1328,7 +1330,7 @@ IEW::executeInsts()
             // that have not been executed.
             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
 
-            if (!inst->staticInst->isMicrocodeControl() && inst->mispredicted() && !loadNotExecuted) {
+            if (inst->mispredicted() && !loadNotExecuted) {
                 inst->executionBranchMispredicted =
                     inst->mispredictedArchitecturalAddress();
                 inst->setBranchPredMispredicted();
@@ -1372,7 +1374,8 @@ IEW::executeInsts()
                 instQueue.violation(inst, violator);
 
                 // Squash.
-                squashDueToMemOrder(violator, tid);
+                squashDueToMemOrder(violator, tid, inst->isLoad() ?
+                    RecoveryCause::Snoop : RecoveryCause::MemoryOrdering);
 
                 ++iewStats.memOrderViolationEvents;
             }
@@ -1485,6 +1488,9 @@ IEW::tick()
         dispatch(tid);
     }
 
+    // RS residence is observed after dispatch and before scheduling, including
+    // cycles in which recovery suppresses scheduling.
+    cpu->executionActivityStats.observe();
     if (exeStatus != Squashing) {
         executeInsts();
 
@@ -1630,16 +1636,7 @@ void
 IEW::checkMisprediction(const DynInstPtr& inst)
 {
     ThreadID tid = inst->threadNumber;
-    if (inst->staticInst->isMicrocodeControl()) {
-        if (inst->getFault() == NoFault) {
-            auto next = inst->pcState().clone();
-            inst->staticInst->advancePC(*next);
-            cpu->resolveMicrocodeControl(inst, *next);
-            inst->setPredTarg(*next);
-        }
-        return;
-    }
-
+    inst->recordExecutionBranch();
     if (!fetchRedirect[tid] ||
         !toCommit->squash[tid] ||
         toCommit->squashedSeqNum[tid] > inst->seqNum) {

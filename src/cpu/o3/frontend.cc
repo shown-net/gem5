@@ -29,6 +29,7 @@ void describeDemand(FrontendRecord &r)
     }
     r.demand.retirementGroup = g.leader;
     r.demand.retirementLast = g.end;
+    r.demand.retirementUops = first;
     r.demand.schedulerActions = r.sequence != g.branch;
 }
 }
@@ -49,10 +50,15 @@ InstructionBytes::Stats::Stats(statistics::Group *parent)
 {}
 
 InstructionBytes::InstructionBytes(const InstructionBytesParams &p)
-    : SimObject(p), budget(p.bytesPerCycle), data(p.bufferBytes), stats(this)
+    : SimObject(p), budget(p.bytesPerCycle), blocks(p.residentBlocks), stats(this),
+      lookaheadEnabled(p.lookaheadEnabled), requestDepth(p.requestDepth)
 {
-    fatal_if(!budget || (budget & (budget - 1)) || data.empty() ||
-             data.size() % budget, "Invalid instruction byte geometry");
+    fatal_if(!budget || (budget & (budget - 1)) || !p.bufferBytes ||
+             p.bufferBytes % budget || !requestDepth ||
+             blocks.size() < requestDepth + 1,
+             "Invalid instruction byte geometry");
+    for (auto &block : blocks)
+        block.data.resize(p.bufferBytes);
 }
 
 void
@@ -67,33 +73,48 @@ void
 InstructionBytes::complete(Addr va, Addr pa, const uint8_t *bytes,
         unsigned count, uint64_t cycle, bool can_reuse)
 {
-    fatal_if(count != data.size(), "Instruction response size mismatch");
-    std::memcpy(data.data(), bytes, count);
-    virtualBase = va;
-    physicalBase = pa;
-    valid = true;
-    reusable = can_reuse;
-    readyCycle = cycle + 1;
+    auto &block = blocks[nextBlock];
+    nextBlock = (nextBlock + 1) % blocks.size();
+    fatal_if(count != block.data.size(), "Instruction response size mismatch");
+    std::memcpy(block.data.data(), bytes, count);
+    block.virtualBase = va;
+    block.physicalBase = pa;
+    block.valid = true;
+    block.reusable = can_reuse;
+    block.readyCycle = cycle + 1;
     stats.returnedBytes += count;
+}
+
+const InstructionBytes::Block *
+InstructionBytes::find(Addr address) const
+{
+    for (const auto &block : blocks)
+        if (block.valid && address >= block.virtualBase &&
+            address - block.virtualBase < block.data.size())
+            return &block;
+    return nullptr;
 }
 
 bool
 InstructionBytes::contains(Addr address) const
 {
-    return valid && address >= virtualBase && address - virtualBase < data.size();
+    return find(address);
 }
 
 bool
 InstructionBytes::matchesPhysicalBlock(Addr block, unsigned size) const
 {
-    return valid && physicalBase / size == block / size;
+    return std::any_of(blocks.begin(), blocks.end(), [&](const auto &entry) {
+        return entry.valid && entry.physicalBase / size == block / size;
+    });
 }
 
 bool
 InstructionBytes::serve(Addr address, unsigned count, uint64_t cycle)
 {
-    if (!count || !contains(address) || !contains(address + count - 1) ||
-        cycle < readyCycle)
+    const auto *resident = find(address);
+    if (!count || !resident || find(address + count - 1) != resident ||
+        cycle < resident->readyCycle)
         return false;
     const Addr block = address & ~Addr(budget - 1);
     if ((address + count - 1) / budget != address / budget)
@@ -109,23 +130,28 @@ InstructionBytes::serve(Addr address, unsigned count, uint64_t cycle)
 const uint8_t *
 InstructionBytes::at(Addr address) const
 {
-    assert(contains(address));
-    return data.data() + address - virtualBase;
+    const auto *block = find(address);
+    assert(block);
+    return block->data.data() + address - block->virtualBase;
 }
 
 Addr
 InstructionBytes::physical(Addr address) const
 {
-    assert(contains(address));
-    return physicalBase + address - virtualBase;
+    const auto *block = find(address);
+    assert(block);
+    return block->physicalBase + address - block->virtualBase;
 }
 
 void
 InstructionBytes::invalidate()
 {
-    if (valid)
-        ++stats.invalidations;
-    valid = reusable = false;
+    for (auto &block : blocks) {
+        if (block.valid)
+            ++stats.invalidations;
+        block.valid = block.reusable = false;
+    }
+    nextBlock = 0;
 }
 
 InstructionDeliveryQueue::Stats::Stats(statistics::Group *parent, unsigned cap)
@@ -446,7 +472,7 @@ DsbTemplates::CacheStats::CacheStats(statistics::Group *parent)
 
 DsbTemplates::DsbTemplates(const DsbTemplatesParams &p)
     : MiteService(p), numSets(p.numSets), associativity(p.associativity),
-      opsPerEntry(p.opsPerEntry), cacheStats(this)
+      opsPerEntry(p.opsPerEntry), maxRegionOps(p.maxRegionOps), cacheStats(this)
 {
     fatal_if(!numSets || (numSets & (numSets - 1)) || !associativity ||
              !opsPerEntry, "DSB needs nonzero power-of-two sets and geometry");
@@ -502,6 +528,8 @@ DsbTemplates::lookup(const FrontendCodeIdentity &identity,
 unsigned
 FrontendTemplate::encodedSlots() const
 {
+    if (macroop && macroop->usesMicrocodeService())
+        return std::max(1U, macroop->microcodePrefixOps());
     // Decode/encoding qualification owns storage. Backend allocation groups
     // are deliberately not consulted: an unlaminated memory form can retain
     // one encoded slot while allocating separate backend entries.
@@ -528,7 +556,9 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
         ++cacheStats.staleFills;
         return false;
     }
-    if (value.operations.empty() || value.physicalBlocks.empty())
+    if ((value.operations.empty() &&
+         !(value.macroop && value.macroop->usesMicrocodeService())) ||
+        value.physicalBlocks.empty())
         return false;
     if (value.encodedSlots() > opsPerEntry) {
         ++cacheStats.oversizeTemplates;
@@ -543,6 +573,30 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
     auto existing = index.find(value.identity);
     if (existing != index.end())
         erase(existing->second.entry);
+    const auto same_region = [&value](const CacheEntry &entry) {
+        const auto &identity = entry.members.front().identity;
+        return identity.addressSpace == value.identity.addressSpace &&
+            identity.decoderContext == value.identity.decoderContext &&
+            (identity.address >> 6) == (value.identity.address >> 6);
+    };
+    if (maxRegionOps) {
+        unsigned region_units = value.encodedSlots();
+        for (const auto &entry : entries)
+            if (same_region(entry))
+                region_units += entry.units;
+        if (region_units > maxRegionOps) {
+            // A failed region qualification discards its partial templates.
+            // The bounded cache itself owns this state; redecoding on the
+            // next traversal may qualify a different observed path.
+            for (auto it = entries.begin(); it != entries.end();) {
+                auto entry = it++;
+                if (same_region(*entry))
+                    erase(entry);
+            }
+            ++cacheStats.oversizeTemplates;
+            return false;
+        }
+    }
     // Pack consecutive instructions from the same observed path. A taken
     // branch seals its entry; this is an effective model, not a physical tag.
     const unsigned set = setIndex(value.identity.address);
@@ -638,25 +692,31 @@ FrontendCoordinator::Stats::Stats(statistics::Group *parent)
       ADD_STAT(allocationSlots, statistics::units::Count::get(),
                "Allocation units accepted by Rename, including fused pairs"),
       ADD_STAT(notDeliveredSlots, statistics::units::Count::get(),
-               "Missing allocation units while the backend can accept"),
+               "Missing IDQ output units within the delayed receiver-capacity candidate"),
       ADD_STAT(allocationCycles, statistics::units::Cycle::get(),
                "Observed active Rename cycles"),
       ADD_STAT(backendAcceptingCycles, statistics::units::Cycle::get(),
-               "Rename cycles with full-width resource headroom and no block"),
+               "IDQ output cycles with positive receiver capacity and no backward block"),
       ADD_STAT(backendBlockedCycles, statistics::units::Cycle::get(),
-               "Rename cycles excluded from frontend delivery shortage"),
+               "IDQ output cycles excluded by actual backward block or zero receiver capacity"),
       ADD_STAT(notDeliveredOps, statistics::units::Count::get(),
-               "Missing frontend records, clipped to allocation width, while the model backend can accept"),
+               "Missing IDQ output records, clipped to the receiver-capacity candidate"),
       ADD_STAT(zeroDeliveryCycles, statistics::units::Cycle::get(),
-               "Backend-accepting cycles with no actual Rename acceptance"),
+               "Receiver-accepting cycles with no actual IDQ output"),
+      ADD_STAT(fullDeliveryCycles, statistics::units::Cycle::get(),
+               "Receiver-accepting IDQ output cycles delivering the configured full width"),
+      ADD_STAT(receiverUnknownCycles, statistics::units::Cycle::get(),
+               "IDQ output cycles without a valid delayed receiver observation"),
+      ADD_STAT(partialReceiverCycles, statistics::units::Cycle::get(),
+               "Receiver-accepting IDQ output cycles with capacity below the full width"),
       ADD_STAT(allocationWidths, statistics::units::Count::get(),
-               "Actual Rename acceptance width on backend-accepting cycles"),
+               "Actual Rename acceptance width, independently of IDQ output"),
       ADD_STAT(backendBlocks, statistics::units::Cycle::get(),
                "Exclusion reasons; multiple reasons may overlap"),
       ADD_STAT(sqHeadroomAcceptingCycles, statistics::units::Cycle::get(),
-               "Backend-accepting cycles by free SQ entries before Rename"),
+               "Receiver-accepting IDQ output cycles by delayed free SQ entries"),
       ADD_STAT(sqHeadroomMissingSlots, statistics::units::Count::get(),
-               "Missing slots by free SQ entries before Rename; correlation only")
+               "Missing IDQ output units by delayed free SQ entries; correlation only")
 {}
 
 FrontendCoordinator::FrontendCoordinator(const FrontendCoordinatorParams &p)
@@ -705,27 +765,13 @@ bool FrontendCoordinator::canAccept(FrontendSource source) const
 {
     return !stoppedThisCycle && sourceService(source)->freeBatchOps();
 }
-void FrontendCoordinator::allocation(unsigned accepted, unsigned slots,
-                                     unsigned blocked, unsigned sq_headroom)
+void FrontendCoordinator::allocation(unsigned accepted, unsigned slots)
 {
     panic_if(slots > outputWidth, "Rename acceptance exceeds allocation width");
     ++stats.allocationCycles;
     stats.allocationOps += accepted;
     stats.allocationSlots += slots;
-    if (blocked) {
-        ++stats.backendBlockedCycles;
-        for (unsigned i = 0; i < 7; ++i)
-            if (blocked & (1U << i)) ++stats.backendBlocks[i];
-    } else {
-        ++stats.backendAcceptingCycles;
-        const unsigned sq_bin = std::min(sq_headroom, outputWidth);
-        ++stats.sqHeadroomAcceptingCycles[sq_bin];
-        stats.sqHeadroomMissingSlots[sq_bin] += outputWidth - slots;
-        ++stats.allocationWidths[accepted];
-        stats.notDeliveredOps += accepted < outputWidth ? outputWidth - accepted : 0;
-        stats.notDeliveredSlots += outputWidth - slots;
-        if (!slots) ++stats.zeroDeliveryCycles;
-    }
+    ++stats.allocationWidths[accepted];
 }
 bool FrontendCoordinator::empty() const
 {
@@ -735,6 +781,7 @@ bool FrontendCoordinator::empty() const
 
 void
 FrontendCoordinator::advance(uint64_t cycle, bool rename_blocked,
+        const TimeStruct::RenameComm &receiver,
         const std::function<bool(FrontendRecordPtr)> &emit)
 {
     stoppedThisCycle = false;
@@ -796,6 +843,44 @@ FrontendCoordinator::advance(uint64_t cycle, bool rename_blocked,
         }
         output();
     }
+    if (!receiver.receiverValid) {
+        ++stats.receiverUnknownCycles;
+    } else if (rename_blocked || !receiver.receiverCapacity) {
+        ++stats.backendBlockedCycles;
+        const unsigned reasons = receiver.receiverBlocks |
+            (rename_blocked ? unsigned(RenameSignal) : 0U);
+        for (unsigned i = 0; i < 7; ++i)
+            if (reasons & (1U << i)) ++stats.backendBlocks[i];
+    } else {
+        ++stats.backendAcceptingCycles;
+        const unsigned capacity = std::min(receiver.receiverCapacity, outputWidth);
+        const unsigned missing = capacity - std::min(sent, capacity);
+        if (missing) {
+            // An unfinished decode or the oldest unready source can expose
+            // this miss. Ready queued records hiding the delay do not.
+            if (decodingMiss && idq->occupied() == 0 &&
+                mite->idle() && dsb->idle() && ms->idle())
+                *decodingMiss = true;
+            MiteService *head = nullptr;
+            for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                                  static_cast<MiteService *>(ms), lsd}) {
+                if (service->idle()) continue;
+                if (!head || service->headSequence() < head->headSequence())
+                    head = service;
+            }
+            if (head && head->preparingHead(cycle) &&
+                head->headRecord()->dsbMissExposed)
+                *head->headRecord()->dsbMissExposed = true;
+        }
+        stats.notDeliveredSlots += missing;
+        stats.notDeliveredOps += capacity - std::min(sent_records, capacity);
+        if (!sent) ++stats.zeroDeliveryCycles;
+        if (sent == outputWidth) ++stats.fullDeliveryCycles;
+        if (capacity < outputWidth) ++stats.partialReceiverCycles;
+        const unsigned sq_bin = std::min(receiver.freeSQEntries, outputWidth);
+        ++stats.sqHeadroomAcceptingCycles[sq_bin];
+        stats.sqHeadroomMissingSlots[sq_bin] += missing;
+    }
     idq->sample();
     checkDrain();
 }
@@ -815,6 +900,7 @@ FrontendCoordinator::submit(FrontendSource source,
         pendingFills.push_back({records.back()->sequence, dsb->epoch(), std::move(fills)});
     auto *service = sourceService(source);
     service->submit(std::move(records), instructions, cycle);
+    decodingMiss.reset();
 }
 
 void FrontendCoordinator::accepted(InstSeqNum sequence)
@@ -824,6 +910,7 @@ void FrontendCoordinator::accepted(InstSeqNum sequence)
 }
 void FrontendCoordinator::cancelAfter(InstSeqNum through)
 {
+    decodingMiss.reset();
     fusionTail = nullptr;
     mite->cancelAfter(through);
     dsb->cancelAfter(through);
@@ -864,8 +951,10 @@ FrontendCoordinator::translated(Addr va, Addr pa)
     leases.erase(std::remove_if(leases.begin(), leases.end(),
         [&](const CodeLease &lease) { return lease.virtualBlock == va; }), leases.end());
     leases.push_back({va, pa});
-    // Two adjacent blocks suffice for a maximum-length x86 instruction.
-    while (leases.size() > 2) leases.pop_front();
+    // Predicted translations must not evict the current decode's lease
+    // before its resident bytes can be turned into a DSB template.
+    while (leases.size() > instructionBytes->residentCapacity())
+        leases.pop_front();
     ++stats.translationValidations;
 }
 

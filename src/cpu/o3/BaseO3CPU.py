@@ -104,6 +104,15 @@ class BaseO3CPU(BaseCPU):
     sprRetiredStorePrepare = Param.Bool(
         True, "Allow prepare hints for stores eligible for post-retirement writeback"
     )
+    sprStorePrepareDemandPriority = Param.Bool(
+        True, "Defer younger store hints behind ready ordinary demand loads"
+    )
+    sprFullFenceServiceCycles = Param.Cycles(
+        0, "Additional service for an architectural x86 MFENCE after stores drain"
+    )
+    sprClflushMinCycles = Param.Cycles(
+        0, "Minimum architectural CLFLUSH issue-to-completion service"
+    )
 
     # Backward pipeline delays
     fetchToBacDelay = Param.Cycles(1, "Fetch to Branch address calc. delay")

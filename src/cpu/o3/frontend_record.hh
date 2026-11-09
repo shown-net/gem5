@@ -23,6 +23,7 @@ struct FrontendPrediction
     bool directionValid = false;
     bool originalDirection = false;
     bool btbHit = false;
+    bool untrackedBranch = false;
 };
 
 enum class FrontendSource { Mite, Dsb, Microcode, Lsd };
@@ -45,6 +46,8 @@ struct FrontendRecord
     unsigned codeBlockCount = 0;
     bool staleCode = false;
     bool notAnInstruction = false;
+    bool dsbMiss = false;
+    std::shared_ptr<bool> dsbMissExposed;
     Fault fault = NoFault;
     std::unique_ptr<trace::InstRecord> traceData;
     AllocationGroupPtr allocationGroup;

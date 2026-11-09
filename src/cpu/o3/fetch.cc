@@ -305,6 +305,7 @@ Fetch::startupStage()
 void
 Fetch::clearStates(ThreadID tid)
 {
+    discardByteLookahead(tid);
     btbReadyCycle[tid] = 0;
     if (frontend) {
         frontend->reset();
@@ -353,6 +354,7 @@ Fetch::resetStage()
 
     // Setup PC and nextPC with initial state.
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        discardByteLookahead(tid);
         btbReadyCycle[tid] = 0;
         microcodeControl[tid] = 0;
         fetchStatus[tid] = Running;
@@ -369,6 +371,7 @@ Fetch::resetStage()
 
         fetchBufferPC[tid] = 0;
         fetchBufferValid[tid] = false;
+        byteLookahead[tid] = false;
 
         fetchQueue[tid].clear();
 
@@ -382,6 +385,9 @@ Fetch::resetStage()
 void
 Fetch::processCacheCompletion(PacketPtr pkt)
 {
+    accountIcacheStalls();
+    if (completeByteLookahead(pkt))
+        return;
     ThreadID tid = cpu->contextToThread(pkt->req->contextId());
 
     DPRINTF(Fetch, "[tid:%i] Waking up from cache miss.\n", tid);
@@ -474,11 +480,13 @@ Fetch::drainSanityCheck() const
         assert(!memReq[i]);
         assert(fetchStatus[i] == Idle || stalls[i].drain);
     }
+    assert(byteRequests.empty());
 }
 
 bool
 Fetch::isDrained() const
 {
+    if (!byteRequests.empty()) return false;
     if (frontend && !frontend->empty()) return false;
     /* Make sure that threads are either idle of that the commit stage
      * has signaled that draining has completed by setting the drain
@@ -585,11 +593,15 @@ Fetch::ftqReady(ThreadID tid, bool &status_change)
 }
 
 bool
-Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
+Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
 {
     Fault fault = NoFault;
 
     assert(!cpu->switchedOut());
+    if (frontend && byteRequestPending(vaddr, tid))
+        return false;
+    if (frontend && memReq[tid])
+        return false;
 
     // @todo: not sure if these should block translation.
     //AlphaDep
@@ -629,6 +641,7 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
     mem_req->taskId(cpu->taskId());
 
     memReq[tid] = mem_req;
+    byteLookahead[tid] = lookahead;
     if (frontend) requestEpoch[tid] = frontend->dsb->epoch();
 
     // Initiate translation of the icache block
@@ -642,6 +655,10 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc)
 void
 Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
 {
+    if (byteRequests.count(mem_req)) {
+        finishByteTranslation(fault, mem_req);
+        return;
+    }
     ThreadID tid = cpu->contextToThread(mem_req->contextId());
     Addr fetchBufferBlockPC = mem_req->getVaddr();
 
@@ -675,6 +692,19 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         return;
     }
 
+    // A predicted successor must not inject a fault ahead of the current
+    // decode path. Demand translation will reproduce it if that path is used.
+    if (frontend && byteLookahead[tid] && fault != NoFault) {
+        memReq[tid] = nullptr;
+        byteLookahead[tid] = false;
+        fetchStatus[tid] = Running;
+        TaoTraceFrontendRegistry::noteTerminal(mem_req,
+            TaoTraceFrontendRegistry::Terminal::TranslationFault,
+            uint64_t(curTick()));
+        _status = updateFetchStatus();
+        return;
+    }
+
     // If translation was successful, attempt to read the icache block.
     if (fault == NoFault) {
         if (pendingCodeWrite(tid, mem_req->getPaddr())) {
@@ -689,7 +719,8 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
         if (frontend) {
             frontend->translated(mem_req->getVaddr(), mem_req->getPaddr());
             // A validated DSB hit consumes no native I-cache request.
-            const auto identity = frontend->identity(pc[tid]->instAddr());
+            const auto identity = frontend->identity(byteLookahead[tid] ?
+                mem_req->getPC() : pc[tid]->instAddr());
             const auto *value = frontend->dsb->candidate(identity,
                 uint64_t(cpu->curCycle()));
             std::vector<Addr> blocks;
@@ -828,6 +859,7 @@ Fetch::squashFromDecode(const PCStateBase &new_pc, const DynInstPtr squashInst,
     DPRINTF(Fetch, "[tid:%i] Squashing from decode.\n", tid);
 
     doSquash(new_pc, squashInst, tid);
+    cpu->recoveryStats.restarted(tid);
 
     if (frontend) frontend->redirect(seq_num);
 
@@ -843,6 +875,7 @@ Fetch::squashFromCommit(const PCStateBase &new_pc, const InstSeqNum seq_num,
     DPRINTF(Fetch, "[tid:%i] Squash from commit.\n", tid);
 
     doSquash(new_pc, squashInst, tid);
+    cpu->recoveryStats.restarted(tid);
 
     if (squashInst && squashInst->isSquashAfter() &&
         squashInst->isSerializing()) {
@@ -862,15 +895,20 @@ void
 Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
         ThreadID tid)
 {
+    accountIcacheStalls();
     memoryExpansionGroup.reset();
     pendingMemoryExpansion.clear();
     btbReadyCycle[tid] = 0;
     microcodeControl[tid] = 0;
+    lcpDecoded[tid] = nullptr;
+    lcpReadyCycle[tid] = 0;
+    dsbMissExposed[tid].reset();
     DPRINTF(Fetch, "[tid:%i] Squashing, setting PC to: %s.\n",
             tid, new_pc);
 
     TaoTraceFrontendRegistry::noteSquash(
         uint32_t(cpu->thread[tid]->contextId()), memReq[tid] != nullptr);
+    discardByteLookahead(tid);
 
     set(pc[tid], new_pc);
     fetchOffset[tid] = 0;
@@ -885,13 +923,11 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     expansionSource = FrontendSource::Mite;
     decodeCanReuse = true;
 
-    // Clear the icache miss if it's outstanding.
-    if (fetchStatus[tid] == IcacheWaitResponse) {
-        DPRINTF(Fetch, "[tid:%i] Squashing outstanding Icache miss.\n",
-                tid);
-        memReq[tid] = NULL;
-    } else if (fetchStatus[tid] == ItlbWait) {
-        DPRINTF(Fetch, "[tid:%i] Squashing outstanding ITLB miss.\n",
+    // A trap-pending signal may have replaced the request's wait status.
+    // Revoke its identity regardless of that status; late translation and
+    // cache responses already compare against memReq before being consumed.
+    if (memReq[tid]) {
+        DPRINTF(Fetch, "[tid:%i] Squashing outstanding instruction request.\n",
                 tid);
         memReq[tid] = NULL;
     }
@@ -911,6 +947,7 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     }
 
     fetchStatus[tid] = Squashing;
+    byteLookahead[tid] = false;
 
     // Empty fetch queue
     fetchQueue[tid].clear();
@@ -953,6 +990,12 @@ Fetch::checkStall(ThreadID tid) const
 Fetch::FetchStatus
 Fetch::updateFetchStatus()
 {
+    if (frontend && frontend->instructionBytes->lookaheadEnabled &&
+        frontend->instructionBytes->requestDepth > 1 &&
+        (!byteRequests.empty() || memReq[0])) {
+        if (_status == Inactive) cpu->activateStage(CPU::FetchIdx);
+        return Active;
+    }
     if (frontend && !frontend->empty()) {
         if (_status == Inactive) cpu->activateStage(CPU::FetchIdx);
         return Active;
@@ -961,7 +1004,11 @@ Fetch::updateFetchStatus()
     for (ThreadID tid : *activeThreads) {
         if (fetchStatus[tid] == Running ||
             fetchStatus[tid] == Squashing ||
-            fetchStatus[tid] == IcacheAccessComplete) {
+            fetchStatus[tid] == IcacheAccessComplete ||
+            (frontend && byteLookahead[tid] &&
+             (fetchStatus[tid] == ItlbWait ||
+              fetchStatus[tid] == IcacheWaitResponse ||
+              fetchStatus[tid] == IcacheWaitRetry))) {
 
             if (_status == Inactive) {
                 DPRINTF(Activity, "[tid:%i] Activating stage.\n",tid);
@@ -991,6 +1038,7 @@ Fetch::updateFetchStatus()
 void
 Fetch::tick()
 {
+    accountIcacheStalls();
     bool status_change = false;
 
     wroteToTimeBuffer = false;
@@ -1019,9 +1067,23 @@ Fetch::tick()
     }
 
     if (frontend) {
-        frontend->instructionBytes->waiting(fetchStatus[0] == ItlbWait,
-            fetchStatus[0] == IcacheWaitResponse, fetchStatus[0] == IcacheWaitRetry);
+        bool translation = fetchStatus[0] == ItlbWait;
+        bool response = fetchStatus[0] == IcacheWaitResponse;
+        bool retry = fetchStatus[0] == IcacheWaitRetry;
+        const Addr address = pc[0]->instAddr() + fetchOffset[0];
+        if (!frontend->instructionBytes->contains(address)) {
+            for (const auto &[request, state] : byteRequests) {
+                if (request->getVaddr() != fetchBufferAlignPC(address)) continue;
+                const bool retrying = retryPkt && retryPkt->req == request;
+                retry |= retrying;
+                response |= state.response;
+                translation |= !state.response && !retrying;
+                break;
+            }
+        }
+        frontend->instructionBytes->waiting(translation, response, retry);
         frontend->advance(uint64_t(cpu->curCycle()), stalls[0].decode,
+            fromRename->renameInfo[0],
             [this](FrontendRecordPtr record) {
                 return emitFrontendRecord(std::move(record));
             });
@@ -1629,12 +1691,16 @@ Fetch::recvReqRetry()
     if (retryPkt != NULL) {
         assert(cacheBlocked);
         assert(retryTid != InvalidThreadID);
-        assert(fetchStatus[retryTid] == IcacheWaitRetry);
+        const bool predicted = byteRequests.count(retryPkt->req);
+        assert(predicted || fetchStatus[retryTid] == IcacheWaitRetry);
 
         const bool accepted = icachePort.sendTimingReq(retryPkt);
         TaoTraceFrontendRegistry::noteSendAttempt(retryPkt->req, accepted);
         if (accepted) {
-            fetchStatus[retryTid] = IcacheWaitResponse;
+            if (predicted)
+                byteRequests.at(retryPkt->req).response = true;
+            else
+                fetchStatus[retryTid] = IcacheWaitResponse;
             // Notify Fetch Request probe when a retryPkt is successfully sent.
             // Note that notify must be called before retryPkt is set to NULL.
             ppFetchRequestSent->notify(retryPkt->req);
@@ -1681,7 +1747,11 @@ Fetch::getFetchingThread()
 
         if (fetchStatus[tid] == Running ||
             fetchStatus[tid] == IcacheAccessComplete ||
-            fetchStatus[tid] == Idle) {
+            fetchStatus[tid] == Idle ||
+            (frontend && byteLookahead[tid] &&
+             (fetchStatus[tid] == ItlbWait ||
+              fetchStatus[tid] == IcacheWaitResponse ||
+              fetchStatus[tid] == IcacheWaitRetry))) {
             return tid;
         } else {
             return InvalidThreadID;

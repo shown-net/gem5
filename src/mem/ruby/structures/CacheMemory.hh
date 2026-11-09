@@ -171,8 +171,10 @@ class CacheMemory : public SimObject
 
     // L0 data fill-buffer ownership is distinct from the protocol TBE and
     // from the legacy lower-level fill budget. Addresses are cache lines.
-    bool canAllocateDataFill() const;
-    void allocateDataFill(Addr address, bool demand_read);
+    bool canAllocateDataFill(bool write_initiated) const;
+    void allocateDataFill(Addr address, bool demand_read, bool write_initiated);
+    void markSoftwarePrefetchFill(Addr address);
+    void observeSoftwarePrefetchHit(Addr address);
     void markDataFillReady(Addr address);
     void releaseDataFill(Addr address);
     void finishDataFill(Addr address);
@@ -237,6 +239,8 @@ class CacheMemory : public SimObject
     int m_block_size;
     unsigned m_fill_capacity;
     unsigned m_fill_in_flight = 0;
+    std::unordered_map<Addr, int> offcoreOwnership;
+    unsigned offcoreDemandRfos = 0;
 
     DataFillBuffer dataFillBuffer;
     // The L1 controller can use a different clock from RubySystem. Keep the
@@ -310,7 +314,16 @@ class CacheMemory : public SimObject
           statistics::Scalar dataFillInstallBlocked;
           statistics::Scalar dataFillInstallServiceCycles;
           statistics::Scalar demandDataReadHits, demandDataReadTrueMisses;
+          statistics::Scalar codeReadHits, codeReadTrueMisses;
+          statistics::Scalar rfoHits, rfoTrueMisses;
+          statistics::Scalar softwarePrefetchHits, softwarePrefetchTrueMisses;
+          statistics::Scalar hardwarePrefetchHits, hardwarePrefetchTrueMisses;
+          statistics::Scalar storePrepareHits, storePrepareTrueMisses;
           statistics::Scalar dataLineFills;
+          statistics::Scalar dataReplacements, allRfo, softwarePrefetchRfo;
+          statistics::Scalar softwarePrefetchFillHits;
+          statistics::Scalar offcoreDemandRfoRequests, offcoreDemandRfoCycles;
+          statistics::Scalar offcorePrepareRequests, offcoreSoftwareRfoRequests;
 
           // hardware transactional memory
           statistics::Histogram htmTransCommitReadSet;
@@ -334,8 +347,10 @@ class CacheMemory : public SimObject
       // each time they are called
       void profileDemandHit();
       void profileDemandMiss();
-      void profileDemandDataReadHit();
-      void profileDemandDataReadMiss();
+      void profileNativeRequest(int role, bool miss, bool ownership);
+    void beginOffcoreOwnership(Addr address, int role);
+    void endOffcoreOwnership(Addr address);
+    void profileDataReplacement(Addr address);
       void profileDataLineFill();
       void profilePrefetchHit();
       void profilePrefetchMiss();

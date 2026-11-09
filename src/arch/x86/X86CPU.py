@@ -234,6 +234,9 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     sprL1WidthService = True
     sprStoreBuffer = True
     sprEarlyStorePrepare = True
+    # Native 8457C fence controls distinguish architectural MFENCE service
+    # from SFENCE and from the embedded fences of locked microcode.
+    sprFullFenceServiceCycles = 34
     branchPred = BranchPredictor(
         conditionalBranchPred=GoldenCoveBP(), btb=MultiLevelBTB(),
         indirectBranchPred=GoldenCoveIndirectPredictor(),

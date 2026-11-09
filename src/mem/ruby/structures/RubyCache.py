@@ -49,6 +49,9 @@ class RubyCache(SimObject):
     fill_capacity = Param.Unsigned(
         0, "Maximum tracked line fills; zero leaves the fill budget unlimited"
     )
+    write_fill_capacity = Param.Unsigned(
+        0, "Candidate bound on write-initiated L0 fills; zero disables it"
+    )
     fill_stats_clock = Param.ClockDomain(
         NULL, "Optional core clock domain for data-fill occupancy statistics"
     )

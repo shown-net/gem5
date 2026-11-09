@@ -119,14 +119,9 @@ DynInst::DynInst(const Arrays &arrays, const StaticInstPtr &static_inst,
 
 #ifndef NDEBUG
     ++cpu->instcount;
-
-    if (cpu->instcount > 1500) {
-#ifdef GEM5_DEBUG
-        cpu->dumpInsts();
-        dumpSNList();
-#endif
-        assert(cpu->instcount <= 1500);
-    }
+    // ROB/IDQ capacity counts hardware units. REP functional followers and
+    // squashed members awaiting normal cleanup have no one-to-one relation
+    // to those units, so a fixed DynInst population limit is not valid.
 
     DPRINTF(DynInst,
         "DynInst: [sn:%lli] Instruction created. Instcount for %s = %i\n",

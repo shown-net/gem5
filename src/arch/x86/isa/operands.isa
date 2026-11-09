@@ -268,6 +268,7 @@ def operands {{
         'FSW':           ControlReg('X86ISA::misc_reg::Fsw', 67, ctype='uw'),
         'FTW':           ControlReg('X86ISA::misc_reg::Ftw', 68, ctype='uw'),
         'FCW':           ControlReg('X86ISA::misc_reg::Fcw', 69, ctype='uw'),
+        'CR0Op':         ControlReg('X86ISA::misc_reg::Cr0', 215),
 
         # The segment base as used by memory instructions.
         'SegBase':       ControlReg('X86ISA::misc_reg::segEffBase(segment)',

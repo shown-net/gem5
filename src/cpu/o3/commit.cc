@@ -113,6 +113,7 @@ Commit::Commit(CPU *_cpu, const BaseO3CPUParams &params)
       fetchToCommitDelay(params.commitToFetchDelay),
       renameWidth(params.renameWidth),
       commitWidth(params.commitWidth),
+      fullFenceServiceCycles(params.sprFullFenceServiceCycles),
       numThreads(params.numThreads),
       drainPending(false),
       drainImminent(false),
@@ -510,6 +511,8 @@ void
 Commit::squashAll(ThreadID tid)
 {
     cpu->discardMemoryRetirement(tid);
+    cpu->discardBranchRetirement(tid);
+    cpu->discardRetirement(tid);
     // If we want to include the squashing instruction in the squash,
     // then use one older sequence number.
     // Hopefully this doesn't mess things up.  Basically I want to squash
@@ -857,8 +860,11 @@ Commit::commit()
                                          oracle_cause_inst->pcState().instAddr());
             }
 
+            const auto cause = fromIEW->mispredictInst[tid] ?
+                RecoveryCause::Branch : fromIEW->recoveryCause[tid];
+            cpu->recoveryStats.accept(tid, cause_seq, cause);
             if (tid == 0) cpu->tmaStats.squashAfter(
-                squashed_inst, true, bool(fromIEW->mispredictInst[tid]));
+                squashed_inst, true, cause == RecoveryCause::Branch);
 
             TaoTrace::traceSquashEpisode(
                 cpu, uint32_t(tid),
@@ -1095,6 +1101,10 @@ Commit::commitInsts()
                     head_inst->prepareResultValues(12, curTick());
                     head_inst->evaluateResultValues(curTick());
                     ++cpu->moveEliminationStats.retired;
+                } else if ((head_inst->renameComputed ||
+                            head_inst->moveProjection) &&
+                           head_inst->staticInst->isZeroExtendingGprMove()) {
+                    ++cpu->moveEliminationStats.retired;
                 }
                 const unsigned retired_slots = head_inst->retirementSlots();
                 num_committed += retired_slots;
@@ -1103,7 +1113,7 @@ Commit::commitInsts()
                 following_retirement = follow_thread != InvalidThreadID ?
                     head_inst->retirementKey() : 0;
                 cpu->tmaStats.onRetire(head_inst);
-                cpu->recordRetiredUops(retired_slots, commit_thread);
+                cpu->recordRetiredUops(head_inst);
                 cpu->recordBranchRetirement(head_inst);
                 cpu->recordMemoryRetirement(head_inst);
                 cpu->commitStats[tid]
@@ -1261,6 +1271,22 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
             return false;
         }
 
+        if (fullFenceServiceCycles > Cycles(0) &&
+            head_inst->isFullMemBarrier() &&
+            !head_inst->staticInst->isMicroop() &&
+            head_inst->staticInst->getName() == "MFENCE") {
+            // This form-specific service begins only after ordinary store
+            // completion. Embedded fences in locked operations retain their
+            // own execution service.
+            if (!head_inst->completionNotBefore)
+                head_inst->completionNotBefore =
+                    cpu->clockEdge(fullFenceServiceCycles);
+            if (curTick() < head_inst->completionNotBefore) {
+                cpu->activityThisCycle();
+                return false;
+            }
+        }
+
         toIEW->commitInfo[tid].nonSpecSeqNum = head_inst->seqNum;
 
         // Change the instruction so it won't try to commit again until
@@ -1312,6 +1338,8 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
 
     if (inst_fault != NoFault) {
         cpu->discardMemoryRetirement(tid);
+        cpu->discardBranchRetirement(tid);
+        cpu->discardRetirement(tid, true);
         DPRINTF(Commit, "Inst [tid:%i] [sn:%llu] PC %s has a fault\n",
                 tid, head_inst->seqNum, head_inst->pcState());
 
@@ -1344,6 +1372,13 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         // needed to update the state as soon as possible.  This
         // prevents external agents from changing any specific state
         // that the trap need.
+        if (dynamic_cast<ReExec *>(inst_fault.get())) {
+            const auto cause = head_inst->staleCode ? RecoveryCause::Code :
+                                                      head_inst->replayCause;
+            cpu->recoveryStats.accept(tid, head_inst->seqNum, cause);
+            if (tid == 0) cpu->tmaStats.squashAfter(
+                head_inst->seqNum - 1, true, false);
+        }
         ppKernelEntry->notify(KernelEntryEvent{
             uint32_t(cpu->cpuId()), tid, inst_fault,
             KernelEntrySource::SynchronousFault, curTick(),
@@ -1493,9 +1528,13 @@ Commit::updateComInstStats(const DynInstPtr &inst)
 
     // Count number of instructions, ensure we don't
     // double count Microops as insts.
-    if (!inst->isMicroop() || inst->isLastMicroop()) {
+    if (!inst->notAnInst() &&
+        (!inst->isMicroop() || inst->isLastMicroop())) {
         cpu->commitStats[tid]->numInsts++;
         ++cpu->instRetiredStats.ANY;
+        const auto &architecture = inst->macroop ? inst->macroop : inst->staticInst;
+        if (architecture->isArchitecturalNop())
+            ++cpu->instRetiredStats.NOP;
         cpu->baseStats.numInsts++;
         if (in_user_mode) {
             cpu->commitStats[tid]->numUserInsts++;

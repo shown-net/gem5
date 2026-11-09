@@ -87,6 +87,7 @@ CacheMemory::CacheMemory(const Params &p)
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
     m_fill_capacity = p.fill_capacity;
     dataFillBuffer.setCapacity(p.fill_capacity);
+    dataFillBuffer.setWriteCapacity(p.write_fill_capacity);
     fatal_if(dataFillInstallBytesPerCycle == 0,
              "L1 refill bandwidth must be positive");
     if (p.fill_stats_clock)
@@ -144,21 +145,22 @@ CacheMemory::accountDataFillCycles()
         elapsed * dataFillBuffer.readyCount();
     if (dataFillBuffer.demandReadCount())
         cacheMemoryStats.dataFillDemandReadPendingCycles += elapsed;
+    if (offcoreDemandRfos) cacheMemoryStats.offcoreDemandRfoCycles += elapsed;
     lastDataFillCycle = now;
 }
 
 bool
-CacheMemory::canAllocateDataFill() const
+CacheMemory::canAllocateDataFill(bool write_initiated) const
 {
-    return dataFillBuffer.canAllocate();
+    return dataFillBuffer.canAllocate(write_initiated);
 }
 
 void
-CacheMemory::allocateDataFill(Addr address, bool demand_read)
+CacheMemory::allocateDataFill(Addr address, bool demand_read, bool write_initiated)
 {
-    assert(canAllocateDataFill());
+    assert(canAllocateDataFill(write_initiated));
     accountDataFillCycles();
-    dataFillBuffer.allocate(makeLineAddress(address), demand_read);
+    dataFillBuffer.allocate(makeLineAddress(address), demand_read, write_initiated);
     ++cacheMemoryStats.fillAllocations;
     cacheMemoryStats.fillOccupancy = dataFillBuffer.size();
 }
@@ -168,6 +170,19 @@ CacheMemory::markDataFillReady(Addr address)
 {
     accountDataFillCycles();
     dataFillBuffer.markReady(makeLineAddress(address));
+}
+
+void
+CacheMemory::markSoftwarePrefetchFill(Addr address)
+{
+    dataFillBuffer.markSoftwarePrefetch(makeLineAddress(address));
+}
+
+void
+CacheMemory::observeSoftwarePrefetchHit(Addr address)
+{
+    if (dataFillBuffer.fromSoftwarePrefetch(makeLineAddress(address)))
+        ++cacheMemoryStats.softwarePrefetchFillHits;
 }
 
 void
@@ -485,6 +500,8 @@ CacheMemory::cacheAvail(Addr address) const
 AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
 {
+    // TODO(SPR-MSR): If CAT is used, characterize CLOS fill eligibility;
+    // changing cache size does not reproduce dynamic masks or existing lines.
     assert(address == makeLineAddress(address));
     assert(!isTagPresent(address));
     assert(cacheAvail(address));
@@ -812,7 +829,25 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
       ADD_STAT(dataFillInstallServiceCycles, "Data-ready FB line cycles spent transferring into L1"),
       ADD_STAT(demandDataReadHits, "Candidate cacheable demand data read requests observed hitting the private L2"),
       ADD_STAT(demandDataReadTrueMisses, "Candidate cacheable demand data read requests observed missing the private L2, excluding merges and upgrades"),
-      ADD_STAT(dataLineFills, "Data lines installed by private L2 line-fill transactions"),
+      ADD_STAT(codeReadHits, "Private L2 instruction read hits"),
+      ADD_STAT(codeReadTrueMisses, "Private L2 instruction read true misses"),
+      ADD_STAT(rfoHits, "Private L2 demand and prefetch ownership hits, including permission upgrades"),
+      ADD_STAT(rfoTrueMisses, "Private L2 demand and prefetch ownership true misses, excluding pending merges"),
+      ADD_STAT(softwarePrefetchHits, "Private L2 software-prefetch hits"),
+      ADD_STAT(softwarePrefetchTrueMisses, "Private L2 software-prefetch true misses"),
+      ADD_STAT(hardwarePrefetchHits, "Private L2 hardware-prefetch hits"),
+      ADD_STAT(hardwarePrefetchTrueMisses, "Private L2 hardware-prefetch true misses"),
+      ADD_STAT(storePrepareHits, "Private L2 store-prepare ownership hits, also included in RFO hits"),
+      ADD_STAT(storePrepareTrueMisses, "Private L2 early store-prepare true misses"),
+      ADD_STAT(dataLineFills, "Lines installed by private L2 line-fill transactions, including code and data"),
+      ADD_STAT(dataReplacements, "Readable data lines evicted for capacity replacement; excludes empty insertions and invalidations"),
+      ADD_STAT(allRfo, "Private L2 demand and prefetch ownership lookups, including Store_Prepare"),
+      ADD_STAT(softwarePrefetchRfo, "Private L2 PREFETCHW ownership lookups"),
+      ADD_STAT(softwarePrefetchFillHits, "Demand reads accepted while an FB from software prefetch exists"),
+      ADD_STAT(offcoreDemandRfoRequests, "Private L2 ownership transactions sent to the shared hierarchy, including Store_Prepare and PREFETCHW"),
+      ADD_STAT(offcoreDemandRfoCycles, "Core cycles with a private L2 demand ownership transaction pending"),
+      ADD_STAT(offcorePrepareRequests, "Store_Prepare ownership transactions sent to the shared hierarchy"),
+      ADD_STAT(offcoreSoftwareRfoRequests, "Software-prefetch ownership transactions sent to the shared hierarchy"),
       ADD_STAT(htmTransCommitReadSet, "Read set size of a committed "
                                       "transaction"),
       ADD_STAT(htmTransCommitWriteSet, "Write set size of a committed "
@@ -1078,21 +1113,84 @@ CacheMemory::profileDemandMiss()
 }
 
 void
-CacheMemory::profileDemandDataReadHit()
+CacheMemory::profileNativeRequest(int role, bool miss, bool ownership)
 {
-    ++cacheMemoryStats.demandDataReadHits;
-}
-
-void
-CacheMemory::profileDemandDataReadMiss()
-{
-    ++cacheMemoryStats.demandDataReadTrueMisses;
+    switch (role) {
+      case 1:
+      case 4: // Page-table demand reads also access this private L2.
+        if (ownership) break;
+        if (miss) ++cacheMemoryStats.demandDataReadTrueMisses;
+        else ++cacheMemoryStats.demandDataReadHits;
+        break;
+      case 2:
+        ++cacheMemoryStats.allRfo;
+        if (miss) ++cacheMemoryStats.rfoTrueMisses;
+        else ++cacheMemoryStats.rfoHits;
+        break;
+      case 3:
+        if (miss) ++cacheMemoryStats.codeReadTrueMisses;
+        else ++cacheMemoryStats.codeReadHits;
+        break;
+      case 5:
+        if (miss) ++cacheMemoryStats.softwarePrefetchTrueMisses;
+        else ++cacheMemoryStats.softwarePrefetchHits;
+        break;
+      case 6:
+        // Store_Prepare sends a real GetX for an ordinary store. SPR's
+        // L2_RQSTS RFO events include L1D demand RFOs and RFO prefetches.
+        ++cacheMemoryStats.allRfo;
+        if (miss) ++cacheMemoryStats.rfoTrueMisses;
+        else ++cacheMemoryStats.rfoHits;
+        if (miss) ++cacheMemoryStats.storePrepareTrueMisses;
+        else ++cacheMemoryStats.storePrepareHits;
+        break;
+      case 7:
+        if (miss) ++cacheMemoryStats.hardwarePrefetchTrueMisses;
+        else ++cacheMemoryStats.hardwarePrefetchHits;
+        break;
+      case 8:
+        ++cacheMemoryStats.allRfo;
+        if (miss) ++cacheMemoryStats.rfoTrueMisses;
+        else ++cacheMemoryStats.rfoHits;
+        ++cacheMemoryStats.softwarePrefetchRfo;
+        break;
+    }
 }
 
 void
 CacheMemory::profileDataLineFill()
 {
     ++cacheMemoryStats.dataLineFills;
+}
+
+void
+CacheMemory::beginOffcoreOwnership(Addr address, int role)
+{
+    if (role != 2 && role != 6 && role != 8) return;
+    accountDataFillCycles();
+    const bool inserted = offcoreOwnership.emplace(makeLineAddress(address), role).second;
+    panic_if(!inserted, "Duplicate ownership transaction for the same private L2 line");
+    ++offcoreDemandRfos;
+    ++cacheMemoryStats.offcoreDemandRfoRequests;
+    if (role == 6) ++cacheMemoryStats.offcorePrepareRequests;
+    else if (role == 8) ++cacheMemoryStats.offcoreSoftwareRfoRequests;
+}
+
+void
+CacheMemory::endOffcoreOwnership(Addr address)
+{
+    const auto it = offcoreOwnership.find(makeLineAddress(address));
+    if (it == offcoreOwnership.end()) return;
+    accountDataFillCycles();
+    assert(offcoreDemandRfos);
+    --offcoreDemandRfos;
+    offcoreOwnership.erase(it);
+}
+
+void
+CacheMemory::profileDataReplacement(Addr address)
+{
+    if (hasReadableData(address)) ++cacheMemoryStats.dataReplacements;
 }
 
 void

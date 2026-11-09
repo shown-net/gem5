@@ -9,10 +9,46 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "debug/Fetch.hh"
+#include "mem/inst_code.hh"
 #include "params/BaseO3CPU.hh"
 
 namespace gem5::o3
 {
+void
+Fetch::accountIcacheStalls()
+{
+    const uint64_t now = uint64_t(cpu->curCycle());
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        if (!cpu->unhaltedClockStats.running[tid] || stalls[tid].decode)
+            continue;
+        RequestPtr waiting = fetchStatus[tid] == IcacheWaitResponse ?
+                             memReq[tid] : nullptr;
+        if (!waiting && frontend) {
+            const Addr address = pc[tid]->instAddr() + fetchOffset[tid];
+            if (!frontend->instructionBytes->contains(address)) {
+                for (const auto &[request, state] : byteRequests)
+                    if (state.response &&
+                        cpu->contextToThread(request->contextId()) == tid &&
+                        request->getVaddr() == fetchBufferAlignPC(address)) {
+                        waiting = request;
+                        break;
+                    }
+            }
+        }
+        if (!waiting) continue;
+        const auto facts = waiting->getExtension<TaoTraceRubyResponseExtension>();
+        if (!facts || !facts->hasL1MissTick) continue;
+        if (frontend && frontend->readySupply(lastIcacheAccounting)) continue;
+        const uint64_t began = uint64_t(cpu->ticksToCycles(facts->firstL1MissTick));
+        const uint64_t start = std::max(lastIcacheAccounting, began);
+        if (now > start) {
+            cpu->icacheDataStats.STALLS += now - start;
+            cpu->icacheTagStats.STALLS += now - start;
+        }
+    }
+    lastIcacheAccounting = now;
+}
+
 bool
 Fetch::emitFrontendRecord(FrontendRecordPtr record)
 {
@@ -27,6 +63,9 @@ Fetch::emitFrontendRecord(FrontendRecordPtr record)
         auto target = inst->branchTarget();
         if (*target != inst->readPredTarg()) {
             inst->setBranchPredMispredicted();
+            const auto cause = inst->untrackedFrontendBranch ?
+                RecoveryCause::UnknownBranch : RecoveryCause::FrontendBranch;
+            cpu->recoveryStats.accept(inst->threadNumber, inst->seqNum, cause);
             auto &info = toBAC->decodeInfo[inst->threadNumber];
             info.branchMispredict = true;
             info.controlMispredict = false;
@@ -47,6 +86,20 @@ Fetch::emitFrontendRecord(FrontendRecordPtr record)
 void
 Fetch::fetchFrontend(bool &status_change)
 {
+    if (frontend->instructionBytes->lookaheadEnabled &&
+        frontend->instructionBytes->requestDepth > 1 &&
+        !activeThreads->empty()) {
+        const ThreadID waiting_tid = activeThreads->front();
+        const auto status = fetchStatus[waiting_tid];
+        if (status == ItlbWait || status == IcacheWaitResponse ||
+            status == IcacheWaitRetry) {
+            auto head = ftq->readHead(waiting_tid);
+            if (head && !frontend->dsb->candidate(
+                    frontend->identity(pc[waiting_tid]->instAddr()),
+                    uint64_t(cpu->curCycle())))
+                fetchPredictedBytes(waiting_tid, head);
+        }
+    }
     const ThreadID tid = getFetchingThread();
     if (tid == InvalidThreadID) {
         threadFetched = numFetchingThreads;
@@ -65,9 +118,15 @@ Fetch::fetchFrontend(bool &status_change)
         fetchStatus[tid] = Running;
         status_change = true;
     }
-    if (fetchStatus[tid] != Running) return;
+    const bool fetching_successor = byteLookahead[tid] &&
+        (fetchStatus[tid] == ItlbWait ||
+         fetchStatus[tid] == IcacheWaitResponse ||
+         fetchStatus[tid] == IcacheWaitRetry);
+    if (fetchStatus[tid] != Running && !fetching_successor) return;
 
-    if (decoupledFrontEnd && !ftqReady(tid, status_change)) {
+    if (decoupledFrontEnd && !ftq->isHeadReady(tid)) {
+        if (!fetching_successor)
+            ftqReady(tid, status_change);
         fetchStats.status[FtqWait]++;
         return;
     }
@@ -98,6 +157,10 @@ Fetch::fetchFrontend(bool &status_change)
     if (checkInterrupt(at.instAddr()) && !delayedCommit[tid]) return;
 
     const uint64_t cycle = uint64_t(cpu->curCycle());
+    if (lcpDecoded[tid] && cycle < lcpReadyCycle[tid]) {
+        ++cpu->decodeStats.LCP;
+        return;
+    }
     auto pendingTemplateWrite = [&](const FrontendTemplate *value) {
         if (!value) return false;
         const auto count = value->physicalBlocks.size();
@@ -127,19 +190,37 @@ Fetch::fetchFrontend(bool &status_change)
     };
     const FrontendTemplate *cached = nullptr;
     bool loop_replay = false;
-    if (!current_macro && !in_rom) {
+    if (!current_macro && !in_rom && !lcpDecoded[tid]) {
         cached = frontend->loopCandidate(at.instAddr());
         loop_replay = cached != nullptr;
         if (!cached) cached = lookupValidated();
-        if (fetchStatus[tid] != Running) return;
+        if (fetchStatus[tid] != Running && !fetching_successor) return;
         if (pendingTemplateWrite(cached)) return;
     }
-    FrontendSource source = in_rom ? FrontendSource::Microcode :
+    const bool ms_body = current_macro && current_macro->usesMicrocodeService() &&
+        at.microPC() >= current_macro->microcodePrefixOps();
+    FrontendSource source = in_rom || ms_body ? FrontendSource::Microcode :
         current_macro ? expansionSource :
         (loop_replay ? FrontendSource::Lsd :
          cached ? FrontendSource::Dsb : FrontendSource::Mite);
+    if (frontend->instructionBytes->lookaheadEnabled &&
+        frontend->instructionBytes->requestDepth > 1 &&
+        source == FrontendSource::Mite && curFT)
+        fetchPredictedBytes(tid, curFT);
+    if (frontend->instructionBytes->lookaheadEnabled &&
+        frontend->instructionBytes->requestDepth == 1 &&
+        source == FrontendSource::Mite && curFT && !memReq[tid] &&
+        frontend->instructionBytes->contains(at.instAddr())) {
+        const Addr successor = curFT->readPredTarg().instAddr();
+        if (fetchBufferAlignPC(successor) !=
+                fetchBufferAlignPC(at.instAddr()) &&
+            !frontend->instructionBytes->contains(successor))
+            fetchCacheLine(successor, tid, successor, true);
+    }
     if (!frontend->canAccept(source)) return;
     unsigned limit = frontend->sourceService(source)->freeBatchOps();
+    if (source == FrontendSource::Microcode)
+        limit = std::min(limit, frontend->ms->extractionWidth());
     unsigned instruction_limit = frontend->sourceService(source)->maxInstructions();
     unsigned accepted_instructions = pendingMemoryExpansion.empty() ? 0 : 1;
     unsigned consumed_targets = 0;
@@ -189,7 +270,13 @@ Fetch::fetchFrontend(bool &status_change)
                 offset = 0;
                 dec->reset();
                 cached = nullptr;
+            } else if (lcpDecoded[tid]) {
+                root = std::move(lcpDecoded[tid]);
             } else {
+                if (!dsbMissExposed[tid]) {
+                    dsbMissExposed[tid] = std::make_shared<bool>(false);
+                    frontend->decodingDsbMiss(dsbMissExposed[tid]);
+                }
                 while (!dec->instReady()) {
                     const Addr address = (at.instAddr() + offset) & dec->pcMask();
                     const Addr chunk = address & ~Addr(instSize - 1);
@@ -218,7 +305,7 @@ Fetch::fetchFrontend(bool &status_change)
                         decodedCodeBlocks[tid][decodedCodeBlockCount[tid]++] = block;
                     }
                     codeDecodeInProgress[tid] = true;
-                    decodeCanReuse &= frontend->instructionBytes->canReuse();
+                    decodeCanReuse &= frontend->instructionBytes->canReuse(chunk);
                     std::memcpy(dec->moreBytesPtr(),
                                 frontend->instructionBytes->at(chunk), instSize);
                     dec->moreBytes(at, address);
@@ -237,22 +324,40 @@ Fetch::fetchFrontend(bool &status_change)
                     }
                 }
                 decodeCanReuse = true;
+                if (root->hasLengthChangingPrefix()) {
+                    // Every qualified encoding in a traversed 16-byte block
+                    // consumes its own ILD service. The retained decoded root
+                    // prevents retries from charging this occurrence again.
+                    lcpDecoded[tid] = root;
+                    lcpReadyCycle[tid] = cycle + 3;
+                    ++cpu->decodeStats.LCP;
+                    break;
+                }
+            }
+            const bool microcoded = root->usesMicrocodeService();
+            if (microcoded && !root->microcodePrefixOps() &&
+                source != FrontendSource::Microcode) {
+                if (!records.empty() ||
+                    !frontend->canAccept(FrontendSource::Microcode)) {
+                    lcpDecoded[tid] = root;
+                    break;
+                }
+                source = FrontendSource::Microcode;
+                limit = std::min(frontend->ms->freeBatchOps(),
+                                 frontend->ms->extractionWidth());
+                instruction_limit = frontend->ms->maxInstructions();
             }
             ++accepted_instructions;
             ++cpu->fetchStats[tid]->numInsts;
-            const bool microcoded = root->usesMicrocodeService();
-            expansionSource = microcoded ? FrontendSource::Microcode : source;
+            expansionSource = source;
             if (root->isMacroop()) current_macro = root;
             else { op = root; offset = 0; }
-            if (microcoded && source != FrontendSource::Microcode) {
-                expansionTemplate.reset();
-                if (!records.empty() ||
-                    !frontend->canAccept(FrontendSource::Microcode)) break;
-                source = FrontendSource::Microcode;
-                limit = frontend->ms->freeBatchOps();
-                instruction_limit = frontend->ms->maxInstructions();
-            }
         }
+
+        if (current_macro && current_macro->usesMicrocodeService() &&
+            at.microPC() >= current_macro->microcodePrefixOps() &&
+            source != FrontendSource::Microcode)
+            break;
 
         if (sharesAllocation(current_macro) &&
             !memoryGroup && at.microPC() != 0) {
@@ -273,6 +378,8 @@ Fetch::fetchFrontend(bool &status_change)
 
         auto record = std::make_unique<FrontendRecord>(cpu, tid, op, current_macro,
             at, in_rom ? FrontendSource::Microcode : source, true);
+        record->dsbMiss = dsbMissExposed[tid] != nullptr;
+        record->dsbMissExposed = dsbMissExposed[tid];
         std::vector<Addr> code_blocks;
         const unsigned code_bytes = at.as<X86ISA::PCState>().size();
         bool have_code_blocks = decodedCodeBlockCount[tid] != 0;
@@ -332,12 +439,10 @@ Fetch::fetchFrontend(bool &status_change)
             bac->btbLookupLatency(tid, at.instAddr()) : Cycles(0);
         const bool supplied_target = curFT &&
             curFT->isExitBranch(at.instAddr()) && curFT->ready(cycle);
-        const bool static_rep_jump =
-            repStringKind(current_macro.get()) != RepStringKind::None &&
-            op->isMicrocodeControl() && !op->isCondCtrl() &&
-            !op->isLastMicroop();
+        const bool static_microcode_jump =
+            op->isMicrocodeControl() && !op->isCondCtrl();
         if (op->isMicrocodeControl()) {
-            if (static_rep_jump) {
+            if (static_microcode_jump) {
                 // This internal jump has no operand-dependent decision.
                 // Keep its functional record and commit order, but do not
                 // wait for a backend round trip to learn the constant UPC.
@@ -356,10 +461,8 @@ Fetch::fetchFrontend(bool &status_change)
         if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
             bac->discardNonBranchTarget(tid, at.instAddr());
         stop = at.branching() || record->prediction.taken;
-        if (op->isMicrocodeControl() && !static_rep_jump) {
-            microcodeControl[tid] = record->sequence;
-            stop = true;
-        }
+        // Conditional internal branches use static fall-through prediction.
+        // Wrong-path records use normal ROB/LSQ squash before any retirement.
         if (record->prediction.taken && target_delay > Cycles(0) && !supplied_target)
             btbReadyCycle[tid] = cycle + uint64_t(target_delay) + 1;
         if (op->isControl()) ++cpu->fetchStats[tid]->numBranches;
@@ -418,6 +521,7 @@ Fetch::fetchFrontend(bool &status_change)
             memoryGroup.reset();
             offset = 0;
             clearCodeDecode(tid);
+            dsbMissExposed[tid].reset();
             if (expansionTemplate) {
                 fills.push_back(std::move(*expansionTemplate));
                 expansionTemplate.reset();
@@ -455,6 +559,146 @@ Fetch::fetchFrontend(bool &status_change)
     fetchStats.status[Running]++;
 }
 
+bool
+Fetch::byteRequestPending(Addr address, ThreadID tid) const
+{
+    const Addr block = fetchBufferAlignPC(address);
+    for (const auto &[request, state] : byteRequests)
+        if (cpu->contextToThread(request->contextId()) == tid &&
+            request->getVaddr() == block)
+            return true;
+    return false;
+}
+
+void
+Fetch::discardByteLookahead(ThreadID tid)
+{
+    if (retryPkt && retryTid == tid && byteRequests.count(retryPkt->req)) {
+        TaoTraceFrontendRegistry::noteTerminal(retryPkt->req,
+            TaoTraceFrontendRegistry::Terminal::RetryDiscard,
+            uint64_t(curTick()));
+        delete retryPkt;
+        retryPkt = nullptr;
+        retryTid = InvalidThreadID;
+    }
+    for (auto it = byteRequests.begin(); it != byteRequests.end();) {
+        if (cpu->contextToThread(it->first->contextId()) == tid)
+            it = byteRequests.erase(it);
+        else
+            ++it;
+    }
+}
+
+bool
+Fetch::startByteLookahead(Addr address, ThreadID tid)
+{
+    const uint64_t cycle = uint64_t(cpu->curCycle());
+    const Addr block = fetchBufferAlignPC(address);
+    if (cacheBlocked || checkInterrupt(address) || checkStall(tid) ||
+        lastByteIssue == cycle ||
+        byteRequests.size() >= frontend->instructionBytes->requestDepth - 1 ||
+        frontend->instructionBytes->contains(address) ||
+        byteRequestPending(address, tid) ||
+        (memReq[tid] && memReq[tid]->getVaddr() == block) ||
+        frontend->dsb->candidate(frontend->identity(address), cycle))
+        return false;
+    auto request = std::make_shared<Request>(
+        block, fetchBufferSize, Request::INST_FETCH, cpu->instRequestorId(),
+        address, cpu->thread[tid]->contextId());
+    request->taskId(cpu->taskId());
+    byteRequests.emplace(request, ByteRequest{frontend->dsb->epoch()});
+    lastByteIssue = cycle;
+    TaoTraceFrontendRegistry::noteRequestStart(
+        request, cpu->inUserMode(tid), false, false, uint64_t(curTick()));
+    cpu->mmu->translateTiming(request, cpu->thread[tid]->getTC(),
+                             new FetchTranslation(this), BaseMMU::Execute);
+    return true;
+}
+
+void
+Fetch::fetchPredictedBytes(ThreadID tid, FetchTargetPtr target)
+{
+    // Issue at most one request per cycle from the already predicted FTQ path.
+    // Never walk past a locked target or manufacture an unpredicted address.
+    const Addr next_line = fetchBufferAlignPC(pc[tid]->instAddr()) +
+                           fetchBufferSize;
+    if (next_line <= target->endAddress() &&
+        startByteLookahead(next_line, tid))
+        return;
+    if (ftq->isLocked(tid)) return;
+    if (startByteLookahead(target->readPredTarg().instAddr(), tid))
+        return;
+    for (unsigned i = 1; i <= frontend->instructionBytes->requestDepth; ++i) {
+        auto next = ftq->readAhead(tid, i);
+        if (!next) break;
+        if (startByteLookahead(next->startAddress(), tid))
+            return;
+    }
+}
+
+void
+Fetch::finishByteTranslation(const Fault &fault, const RequestPtr &request)
+{
+    const ThreadID tid = cpu->contextToThread(request->contextId());
+    TaoTraceFrontendRegistry::noteTranslationComplete(request);
+    const auto state = byteRequests.at(request);
+    if (fault != NoFault || state.epoch != frontend->dsb->epoch() ||
+        !cpu->system->isMemAddr(request->getPaddr()) ||
+        pendingCodeWrite(tid, request->getPaddr()) || cacheBlocked) {
+        // Speculative translation faults are reproduced by the demand path.
+        TaoTraceFrontendRegistry::noteTerminal(request,
+            fault != NoFault ? TaoTraceFrontendRegistry::Terminal::TranslationFault :
+                               TaoTraceFrontendRegistry::Terminal::TranslationSquash,
+            uint64_t(curTick()));
+        byteRequests.erase(request);
+        return;
+    }
+    frontend->translated(request->getVaddr(), request->getPaddr());
+    auto *packet = new Packet(request, MemCmd::ReadReq);
+    packet->dataDynamic(new uint8_t[fetchBufferSize]);
+    ++fetchStats.cacheLines;
+    const bool accepted = icachePort.sendTimingReq(packet);
+    TaoTraceFrontendRegistry::noteSendAttempt(request, accepted);
+    if (accepted) {
+        byteRequests.at(request).response = true;
+        ppFetchRequestSent->notify(request);
+    } else {
+        assert(!retryPkt);
+        retryPkt = packet;
+        retryTid = tid;
+        cacheBlocked = true;
+    }
+}
+
+bool
+Fetch::completeByteLookahead(PacketPtr packet)
+{
+    const auto it = byteRequests.find(packet->req);
+    if (it == byteRequests.end()) return false;
+    const ThreadID tid = cpu->contextToThread(packet->req->contextId());
+    const auto validity = packet->req->getExtension<InstructionCodeValidity>();
+    const bool valid = it->second.epoch == frontend->dsb->epoch() &&
+        !(validity && validity->stale) &&
+        !pendingCodeWrite(tid, packet->req->getPaddr());
+    if (valid) {
+        frontend->instructionBytes->complete(packet->req->getVaddr(),
+            packet->req->getPaddr(), packet->getConstPtr<uint8_t>(),
+            fetchBufferSize, uint64_t(cpu->curCycle()),
+            !packet->req->isUncacheable());
+        packet->req->setAccessLatency();
+        cpu->ppInstAccessComplete->notify(packet);
+    }
+    TaoTraceFrontendRegistry::noteTerminal(packet->req,
+        valid ? TaoTraceFrontendRegistry::Terminal::Response :
+                TaoTraceFrontendRegistry::Terminal::SquashedResponse,
+        uint64_t(curTick()));
+    byteRequests.erase(it);
+    delete packet;
+    cpu->wakeCPU();
+    switchToActive();
+    return true;
+}
+
 void
 Fetch::invalidateCode(Addr physical_block)
 {
@@ -480,7 +724,12 @@ Fetch::markCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block)
     auto begin = decodedCodeBlocks[tid].begin();
     auto end = begin + decodedCodeBlockCount[tid];
     if (std::find(begin, end, physical_block) != end) {
-        if (codeDecodeInProgress[tid] && !macroop[tid]) {
+        if ((codeDecodeInProgress[tid] || lcpDecoded[tid]) && !macroop[tid]) {
+            // A decoded root waiting for ILD/MS service is still frontend
+            // work. An older code write must discard it before materializing.
+            lcpDecoded[tid] = nullptr;
+            lcpReadyCycle[tid] = 0;
+            dsbMissExposed[tid].reset();
             decoder[tid]->reset();
             fetchOffset[tid] = 0;
             clearCodeDecode(tid);
@@ -503,18 +752,6 @@ Fetch::pendingCodeWrite(ThreadID tid, Addr physical_block)
     DPRINTF(Fetch, "[tid:%i] Waiting for an older write to code line %#x\n",
             tid, physical_block);
     return true;
-}
-
-void
-Fetch::resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next)
-{
-    const ThreadID tid = inst->threadNumber;
-    if (microcodeControl[tid] != inst->seqNum) return;
-    microcodeControl[tid] = 0;
-    set(pc[tid], next);
-    fetchOffset[tid] = 0;
-    cpu->wakeCPU();
-    cpu->activityThisCycle();
 }
 
 void

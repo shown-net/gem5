@@ -492,6 +492,7 @@ class Rename
         explicit ResourceStallStats(statistics::Group *parent);
         statistics::Scalar SB, SB_ROB_OVERLAP, SB_IQ_OVERLAP;
         statistics::Scalar SB_FRONTEND_BLOCKED;
+        statistics::Scalar SCOREBOARD;
     } resourceStallStats;
 
     struct RenameStats : public statistics::Group

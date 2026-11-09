@@ -7,7 +7,7 @@
 # single_core_mvp/doc/02_gem5_probe_adaptation.md.
 
 from m5.objects.Probe import ProbeListenerObject
-from m5.params import Param, Bool, String
+from m5.params import Param, VectorParam, Bool, String
 from m5.SimObject import PyBindMethod
 
 
@@ -23,6 +23,11 @@ class TaoTrace(ProbeListenerObject):
 
     marker_pc = Param.Addr(0, "CPU calibration Marker PC; zero selects FastSim producer")
     marker_pc_trace_file = Param.String("", "Committed PC protobuf stream")
+    marker_worker = Param.Unsigned(0, "Worker ordinal in the core-window contract")
+    marker_begin_pcs = VectorParam.Addr([], "Fixed-work BEGIN NOP PCs in worker order")
+    marker_end_pcs = VectorParam.Addr([], "Fixed-work END NOP PCs in worker order")
+    marker_workids = VectorParam.UInt64([], "Fixed-work identities in worker order")
+    marker_stat_objects = VectorParam.SimObject([], "This CPU and its actual private cache controllers")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "

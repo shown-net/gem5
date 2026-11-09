@@ -108,6 +108,7 @@ class MacroopBase : public X86StaticInst
 
     bool usesMicrocodeService() const override
     {
+        if (hasKnownMicrocodeIdentity()) return true;
         if (isArchitecturalBranch()) return false;
         for (uint32_t i = 0; i < numMicroops; ++i)
             if (microops[i]->isMicrocodeControl()) return true;

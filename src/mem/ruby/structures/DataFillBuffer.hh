@@ -22,16 +22,31 @@ class DataFillBuffer
         bool demandRead = false;
         bool installStarted = false;
         uint64_t installCompleteCycle = 0;
+        bool softwarePrefetch = false;
+        bool writeInitiated = false;
     };
 
     unsigned capacity = 0;
+    unsigned writeCapacity = 0;
+    unsigned writes = 0;
     unsigned demandReads = 0;
     std::unordered_map<Addr, Entry> entries;
 
   public:
     void setCapacity(unsigned value) { capacity = value; }
-    bool canAllocate() const { return capacity == 0 || entries.size() < capacity; }
+    void setWriteCapacity(unsigned value) { writeCapacity = value; }
+    bool canAllocate(bool write = false) const
+    {
+        return (capacity == 0 || entries.size() < capacity) &&
+            (!write || writeCapacity == 0 || writes < writeCapacity);
+    }
     bool contains(Addr line) const { return entries.count(line) != 0; }
+    void markSoftwarePrefetch(Addr line) { entries.at(line).softwarePrefetch = true; }
+    bool fromSoftwarePrefetch(Addr line) const
+    {
+        const auto it = entries.find(line);
+        return it != entries.end() && it->second.softwarePrefetch;
+    }
     size_t size() const { return entries.size(); }
     unsigned demandReadCount() const { return demandReads; }
     unsigned readyCount() const
@@ -62,13 +77,15 @@ class DataFillBuffer
         entry.installCompleteCycle = complete_cycle;
     }
 
-    void allocate(Addr line, bool demand_read)
+    void allocate(Addr line, bool demand_read, bool write_initiated)
     {
-        assert(canAllocate());
+        assert(canAllocate(write_initiated));
         [[maybe_unused]] const bool inserted =
-            entries.emplace(line, Entry{false, demand_read}).second;
+            entries.emplace(line, Entry{false, demand_read, false, 0, false,
+                                        write_initiated}).second;
         assert(inserted);
         if (demand_read) ++demandReads;
+        if (write_initiated) ++writes;
     }
 
     void markReady(Addr line)
@@ -104,6 +121,10 @@ class DataFillBuffer
         if (it->second.demandRead) {
             assert(demandReads);
             --demandReads;
+        }
+        if (it->second.writeInitiated) {
+            assert(writes);
+            --writes;
         }
         entries.erase(it);
     }

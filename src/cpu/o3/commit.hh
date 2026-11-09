@@ -401,6 +401,7 @@ class Commit
 
     /** Commit width, in instructions. */
     const unsigned commitWidth;
+    const Cycles fullFenceServiceCycles;
 
     /** Number of Active Threads */
     const ThreadID numThreads;

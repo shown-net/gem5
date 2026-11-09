@@ -1904,6 +1904,20 @@ let {{
                 MiscRegDest = SrcReg1;
         '''
 
+    class Verwcheck(RegOp):
+        operand_types = (FoldedSrc1Op, FoldedSrc2Op)
+        def __init__(self, src1, src2, flags=None, dataSize="env.dataSize"):
+            super().__init__(src1, src2, flags=flags, dataSize=dataSize)
+        code = '''
+            const SegSelector selector = SrcReg1;
+            const SegDescriptor desc = SrcReg2;
+            const HandyM5Reg m5reg = M5Reg;
+            const bool writable = desc.s && !desc.type.codeOrData &&
+                desc.type.w && desc.dpl >= m5reg.cpl &&
+                desc.dpl >= selector.rpl;
+            ccFlagBits = (ccFlagBits & ~ZFBit) | (writable ? ZFBit : 0);
+        '''
+
     class Chks(RegOp):
         operand_types = (FoldedSrc1Op, FoldedSrc2Op, Imm8Op)
         def __init__(self, src1, src2, imm=0, flags=None,
@@ -2585,6 +2599,8 @@ let {{
     # Select a bounded access using only resident translation facts. A miss,
     # unsupported direction/segment, or special mapping keeps ordinary REP.
     # Selection does not translate memory or reserve a different resource pool.
+    # TODO(SPR MSR calibration): Verify guest ERMS/MSR state and measure REP
+    # admission, progress, and service; 64 B and WB-only are model boundaries.
     rep_select = '''
         RepCount = 0;
         bool missingTranslation = false;
@@ -2699,7 +2715,11 @@ let {{
         '''
 
     rep_progress = '''
-        assert(RepCount && RepCount <= Rcx);
+        // A fall-through prediction may reach the bulk body after selection
+        // rejected the batch. Treat invalid progress like other speculative
+        // instruction faults, which are discarded by the older redirect.
+        if (!RepCount || RepCount > Rcx)
+            return std::make_shared<InvalidOpcode>();
         // The ISA operand scanner recognizes explicit assignments as
         // destinations; compound assignments omit architectural writes.
         Rcx = Rcx - RepCount;

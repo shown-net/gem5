@@ -85,6 +85,17 @@ class MemOp : public X86MicroopBase
  */
 class LdStOp : public InstOperands<MemOp, FoldedDataOp, AddrOp>
 {
+  public:
+    unsigned earlyForwardingSize() const override
+    {
+        return isLoad() && !isNonSpeculative() &&
+            (dataSize == 4 || dataSize == 8) &&
+            (getName() == "ld" || getName() == "ldrip") &&
+            !(memFlags & ~Request::FlagsType(SegmentFlagMask |
+                CPL0FlagBit | (AddrSizeFlagMask << AddrSizeFlagShift))) ?
+                    dataSize : 0;
+    }
+
   protected:
     LdStOp(ExtMachInst mach_inst, const char *mnem, const char *inst_mnem,
             uint64_t set_flags, GpRegIndex _data,

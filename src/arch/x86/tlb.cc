@@ -235,6 +235,8 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
     }
 
     if (sprSharedDomains) {
+        // TODO(SPR-MSR): If STLB QoS is used, distinguish CLOS fill masks
+        // from this fixed geometry; first verify native/guest effective masks.
         // Two support domains. A: 4K/2M/4M, B: 4K/1G.
         // 4K placement uses VPN[7] for the domain and VPN[6:0] for
         // the set; large-page indexing is an uncalibrated proxy.
@@ -744,6 +746,14 @@ TLB::translate(const RequestPtr &req,
                     }
                 }
                 if (!entry && FullSystem) {
+                    if (timing && translation && mode != BaseMMU::Execute &&
+                        !req->isPrefetch() && nextLevel()) {
+                        auto facts = req->getExtension<TranslationMissExtension>();
+                        if (!facts)
+                            facts = std::make_shared<TranslationMissExtension>();
+                        facts->stlbMiss = true;
+                        req->setExtension(facts);
+                    }
                     Fault fault = walker->start(tc, translation, req, mode);
                     if (timing || fault != NoFault) {
                         // This gets ignored in atomic mode.

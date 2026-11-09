@@ -135,11 +135,17 @@ CPU::CPU(const BaseO3CPUParams &params)
       lastRunningCycle(curCycle()),
       cpuStats(this),
       unhaltedClockStats(this),
+      machineClearStats(this), recoveryStats(this),
       tmaStats(this, params.renameWidth),
       branchInstStats(this), branchMispStats(this), instRetiredStats(this),
+      frontendRetiredStats(this), decodeStats(this),
+      icacheDataStats(this, "ICACHE_DATA"), icacheTagStats(this, "ICACHE_TAG"),
+      baClearStats(this),
+      softwarePrefetchStats(this), fpArithmeticStats(this),
       uopsRetiredStats(this), idqStats(this), lsdStats(this),
       uopsIssuedStats(this), uopsExecutedStats(this),
-      uopsDispatchedStats(this), moveEliminationStats(this),
+      uopsDispatchedStats(this), rsStats(this), executionActivityStats(this),
+      dividerStats(this), moveEliminationStats(this),
       memoryInstRetiredStats(this), memoryLoadRetiredStats(this),
       memoryLoadCompletedStats(this)
 {
@@ -155,6 +161,14 @@ CPU::CPU(const BaseO3CPUParams &params)
         frontend->setDeliveryObserver(
             [this](const FrontendRecord &record, uint64_t cycle) {
                 recordFrontendDelivery(record.source, record.demand.frontendUnits, cycle);
+                const auto &architecture = record.macroop ?
+                    record.macroop : record.instruction;
+                if (architecture->usesMicrocodeService()) {
+                    if (architecture->hasKnownMicrocodeIdentity())
+                        idqStats.knownMicrocodeUnits += record.demand.frontendUnits;
+                    else
+                        idqStats.inferredMicrocodeUnits += record.demand.frontendUnits;
+                }
             });
         auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
         fatal_if(!x86_mmu, "Component frontend requires an x86 MMU");
@@ -1066,6 +1080,8 @@ void
 CPU::setMiscReg(int misc_reg, RegVal val, ThreadID tid)
 {
     executeStats[tid]->numMiscRegWrites++;
+    // TODO(SPR-MSR): IBPB currently clears FSFP state only. Characterize
+    // guest/native barrier use and BPU isolation before modeling its cost.
     if (misc_reg == X86ISA::misc_reg::PredCmd && (val & 1))
         iew.ldstQueue.clearFastForwarding(tid);
     isa[tid]->setMiscReg(misc_reg, val);

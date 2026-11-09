@@ -7,8 +7,11 @@ class InstructionBytes(SimObject):
     type = "InstructionBytes"
     cxx_class = "gem5::o3::InstructionBytes"
     cxx_header = "cpu/o3/frontend.hh"
-    bufferBytes = Param.Unsigned(64, "Resident instruction bytes")
+    bufferBytes = Param.Unsigned(64, "Bytes in each resident refill block")
+    residentBlocks = Param.Unsigned(4, "Bounded resident instruction refill blocks")
+    requestDepth = Param.Unsigned(2, "Maximum demand plus predicted refill requests")
     bytesPerCycle = Param.Unsigned(32, "One aligned byte-service block")
+    lookaheadEnabled = Param.Bool(True, "Overlap the next predicted refill with decode")
 
 
 class InstructionDeliveryQueue(SimObject):
@@ -45,6 +48,8 @@ class DsbTemplates(MiteService):
     numSets = Param.Unsigned(64, "Decoded-template sets, indexed by PC[11:6]")
     associativity = Param.Unsigned(8, "Entries per decoded-template set")
     opsPerEntry = Param.Unsigned(8, "Maximum proxy operations per entry")
+    maxRegionOps = Param.Unsigned(
+        0, "Encoded units per 64-byte code region; zero disables the limit")
 
 
 class FrontendCoordinator(SimObject):

@@ -57,7 +57,13 @@
                     default: Cpl0Inst::LTR(Ew);
                 }
                 0x4: verr_Mw_or_Rv();
-                0x5: verw_Mw_or_Rv();
+                // TODO(SPR-MSR): Check measured ROI use and separately
+                // characterize any VERW buffer-clear behavior and cost.
+                0x5: decode MODE_SUBMODE {
+                    'X86ISA::RealMode',
+                    'X86ISA::Virtual8086Mode': Inst::UD2();
+                    default: Inst::VERW(Ew);
+                }
                 //0x6: jmpe_Ev(); // IA-64
                 default: Inst::UD2();
             }
@@ -75,6 +81,8 @@
                 }
                 0x1: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
+                        // TODO(SPR-MSR): MONITOR/MWAIT here do not establish
+                        // UMONITOR/UMWAIT or IGN_UMONITOR behavior; check use.
                         0x0: MonitorInst::monitor({{
                            xc->armMonitor(Rax);
                         }});
@@ -158,14 +166,24 @@
             // to play with so there can be quite a few pseudo
             // instructions.
             //0x04: loadall_or_reset_or_hang();
-            0x4: BasicOperate::gem5Op({{
-                uint64_t result;
-                bool recognized = pseudo_inst::pseudoInst<X86PseudoInstABI>(
-                        xc->tcBase(), IMMEDIATE, result);
-                Rax = result;
-                if (!recognized)
-                    fault = std::make_shared<InvalidOpcode>();
-            }}, IsNonSpeculative);
+            0x4: decode IMMEDIATE {
+                0x01, 0x02, 0x03: BasicOperate::gem5QuiesceOp({{
+                    uint64_t result;
+                    bool recognized = pseudo_inst::pseudoInst<X86PseudoInstABI>(
+                            xc->tcBase(), IMMEDIATE, result);
+                    Rax = result;
+                    if (!recognized)
+                        fault = std::make_shared<InvalidOpcode>();
+                }}, IsNonSpeculative, IsQuiesce);
+                default: BasicOperate::gem5Op({{
+                    uint64_t result;
+                    bool recognized = pseudo_inst::pseudoInst<X86PseudoInstABI>(
+                            xc->tcBase(), IMMEDIATE, result);
+                    Rax = result;
+                    if (!recognized)
+                        fault = std::make_shared<InvalidOpcode>();
+                }}, IsNonSpeculative);
+            }
             0x05: decode FullSystemInt {
                 0: SyscallInst::syscall({{
                     return std::make_shared<SESyscallFault>();
@@ -195,7 +213,11 @@
             0x2: Inst::UD2();
             0x3: Inst::UD2();
             0x4: Inst::UD2();
-            0x5: Inst::PREFETCH(Mb);
+            0x5: decode MODRM_REG {
+                0x0: Inst::PREFETCH(Mb);
+                0x1: Inst::PREFETCH(Mb);
+                default: HINT_NOP();
+            }
             0x6: FailUnimpl::femms();
             0x7: decode IMMEDIATE {
                 0x0C: pi2fw_Pq_Qq();
@@ -275,10 +297,10 @@
             0x03: decode OPCODE_OP_BOTTOM3 {
                 //group16();
                 0x0: decode MODRM_REG {
-                    0x0: WarnUnimpl::prefetch_nta();
+                    0x0: PREFETCH_T0(Mb);
                     0x1: PREFETCH_T0(Mb);
-                    0x2: WarnUnimpl::prefetch_t1();
-                    0x3: WarnUnimpl::prefetch_t2();
+                    0x2: PREFETCH_T0(Mb);
+                    0x3: PREFETCH_T0(Mb);
                     default: HINT_NOP();
                 }
                 0x1: HINT_NOP();

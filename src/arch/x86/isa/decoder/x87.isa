@@ -165,7 +165,16 @@ format WarnUnimpl {
             }
             0x4: decode MODRM_MOD {
                 0x3: decode MODRM_RM {
-                    0x2: fnclex();
+                    0x2: BasicOperate::FNCLEX({{
+                        CR0 cr0 = CR0Op;
+                        if (machInst.legacy.lock)
+                            fault = std::make_shared<InvalidOpcode>();
+                        else if (cr0.ts || cr0.em)
+                            fault = std::make_shared<DeviceNotAvailable>();
+                        else
+                            FSW = FSW & ~(BusyBit | ErrSummaryBit |
+                                          StackFaultBit | 0x3f);
+                    }}, IsSerializeBefore, IsSerializeAfter);
                     0x3: fninit();
                 }
             }

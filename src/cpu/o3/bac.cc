@@ -1001,6 +1001,9 @@ BAC::predictInstruction(const StaticInstPtr &inst, InstSeqNum sequence,
     bpu->setUserMode(tid, cpu->inUserMode(tid));
     FrontendPrediction result;
     if (inst->isControl()) {
+        result.btbHit = bpu->BTBValid(tid, next_pc.instAddr());
+        result.untrackedBranch = !result.btbHit &&
+            !inst->isMicrocodeControl();
         result.taken = bpu->predict(inst, sequence, next_pc, tid);
         ++stats.branches;
         if (result.taken) ++stats.predTakenBranches;
@@ -1016,9 +1019,13 @@ BAC::predictFrontendInstruction(const StaticInstPtr &inst, InstSeqNum sequence,
                                 const FetchTargetPtr &ft)
 {
     FrontendPrediction result;
-    if (inst->isControl())
+    if (inst->isControl()) {
+        result.btbHit = ft->isExitBranch(next_pc.instAddr()) &&
+            ft->bpuHistory != nullptr;
+        result.untrackedBranch = !result.btbHit &&
+            !inst->isMicrocodeControl();
         result.taken = updatePreDecode(tid, sequence, inst, next_pc, ft);
-    else
+    } else
         inst->advancePC(next_pc);
     return result;
 }

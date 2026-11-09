@@ -31,6 +31,7 @@ initialDemand(const StaticInst &instruction, const StaticInst *macro)
         name.rfind("repprogress", 0) == 0 || rep_helper) {
         demand.frontendUnits = demand.idqUnits = demand.allocationUnits = 0;
         demand.robUnits = demand.retirementUnits = 0;
+        demand.retirementUops = 0;
         demand.schedulerUnits = demand.schedulerActions = 0;
     }
     const auto divide = instruction.intDivide();
@@ -42,6 +43,7 @@ initialDemand(const StaticInst &instruction, const StaticInst *macro)
         demand.frontendUnits = demand.idqUnits = units;
         demand.allocationUnits = demand.robUnits = units;
         demand.retirementUnits = units;
+        demand.retirementUops = units;
         demand.schedulerUnits = 4;
         demand.schedulerActions = 1;
     }
@@ -79,6 +81,9 @@ FrontendRecord::materialize(CPU *cpu)
     inst->setTid(thread);
     inst->setThreadState(cpu->thread[thread]);
     inst->setPredTaken(prediction.taken);
+    inst->untrackedFrontendBranch = prediction.untrackedBranch;
+    inst->frontendDsbMiss = dsbMiss;
+    inst->frontendDsbMissExposed = dsbMissExposed;
     inst->fetchedFromUser = fromUser;
     inst->fetchedAddressSpaceId = addressSpace;
     inst->fetchedCodeBlocks = codeBlocks;

@@ -128,6 +128,7 @@ IQUnit::insert(const DynInstPtr &inst)
     auto &entry = entries.at(inst->seqNum);
     assert(!entry.resident);
     entry.resident = true;
+    ++residentCount[inst->threadNumber];
     inst->setInIQ(this);
 }
 
@@ -136,6 +137,8 @@ IQUnit::remove(const DynInstPtr &inst)
 {
     auto it = entries.find(inst->seqNum);
     assert(it != entries.end() && it->second.resident);
+    assert(residentCount[inst->threadNumber]);
+    --residentCount[inst->threadNumber];
     _fuPool->releasePortBinding(inst);
     releaseAllocation(it->second.allocation);
     entries.erase(it);
@@ -237,6 +240,7 @@ IQUnit::resetState()
 {
     entries.clear();
     allocations.clear();
+    residentCount = {};
     _freeEntries = _numEntries;
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
         count[tid] = 0;
@@ -656,6 +660,8 @@ InstructionQueue::resetState()
     blockedMemInsts.clear();
     retryMemInsts.clear();
     admissionWaitMemInsts.clear();
+    readyMoveProjections.clear();
+    processingMoveProjections = false;
     wbOutstanding = 0;
 }
 
@@ -687,6 +693,7 @@ InstructionQueue::isDrained() const
     bool drained = dependGraph.empty() &&
                    instsToExecute.empty() &&
                    admissionWaitMemInsts.empty() &&
+                   readyMoveProjections.empty() &&
                    wbOutstanding == 0;
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         drained = drained && memDepUnit[tid].isDrained();
@@ -701,6 +708,7 @@ InstructionQueue::drainSanityCheck() const
 {
     assert(dependGraph.empty());
     assert(instsToExecute.empty());
+    assert(readyMoveProjections.empty());
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         memDepUnit[tid].drainSanityCheck();
 }
@@ -1035,6 +1043,45 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
 }
 
 void
+InstructionQueue::insertMoveProjection(const DynInstPtr &inst)
+{
+    panic_if(!inst->moveProjection || inst->isMemRef(),
+             "Invalid zero-extension dependency projection");
+    instList[inst->threadNumber].push_back(inst);
+    addToDependents(inst);
+    addToProducers(inst);
+    addIfReady(inst);
+    completeMoveProjections();
+}
+
+void
+InstructionQueue::completeMoveProjections()
+{
+    if (processingMoveProjections)
+        return;
+    processingMoveProjections = true;
+    while (!readyMoveProjections.empty()) {
+        auto inst = std::move(readyMoveProjections.front());
+        readyMoveProjections.pop_front();
+        if (inst->isSquashed() || inst->isSquashedInIQ())
+            continue;
+        // Source references retain an early forwarded producer's actual
+        // value even if its ordinary PRF writeback has not happened yet.
+        inst->prepareResultValues(12, curTick());
+        inst->evaluateResultValues(curTick());
+        panic_if(inst->getFault() != NoFault,
+                 "Zero-extension dependency projection faulted");
+        inst->writeResultValues();
+        inst->setExecuted();
+        wakeDependents(inst);
+        iewStage->instToCommit(inst);
+        cpu->wakeCPU();
+        cpu->activityThisCycle();
+    }
+    processingMoveProjections = false;
+}
+
+void
 InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
 {
     // @todo: Clean up this code; can do it by setting inst as unable
@@ -1359,7 +1406,7 @@ InstructionQueue::scheduleReadyInsts()
         }
         if (op_class != No_OpClass && !managed && !path_blocked &&
             !issuing_inst->repFunctional()) {
-            idx = fu_pool->getUnit(cpu, tid, op_class, cpu->curCycle(),
+            idx = fu_pool->getUnit(cpu, issuing_inst, op_class, cpu->curCycle(),
                                    issuing_inst->isStore() &&
                                    !issuing_inst->isStoreAddress(),
                                    issuing_inst->isControl() && op_class == IntAluOp,
@@ -1552,6 +1599,28 @@ InstructionQueue::scheduleNonSpec(const InstSeqNum &inst)
     nonSpecInsts.erase(inst_it);
 }
 
+InstSeqNum
+InstructionQueue::oldestReadyDemandLoad(ThreadID tid) const
+{
+    InstSeqNum oldest = std::numeric_limits<InstSeqNum>::max();
+    const auto consider = [&](const DynInstPtr &inst) {
+        if (inst->threadNumber == tid && !inst->isSquashed() &&
+            inst->isLoad() && !inst->isDataPrefetch() &&
+            !inst->isAtomic() && !inst->isNonSpeculative())
+            oldest = std::min(oldest, inst->seqNum);
+    };
+    // Each operation-class head is already dependency-ready. CanIssue alone
+    // is not the memory scheduler's readiness contract.
+    for (const auto &queue : readyInsts)
+        if (!queue.empty())
+            consider(queue.top());
+    for (const auto &inst : retryMemInsts)
+        consider(inst);
+    for (const auto &inst : blockedMemInsts)
+        consider(inst);
+    return oldest;
+}
+
 void
 InstructionQueue::commit(const InstSeqNum &inst, ThreadID tid)
 {
@@ -1678,6 +1747,7 @@ InstructionQueue::wakeDependents(const DynInstPtr &completed_inst,
         cpu->resultForwarding->release(completed_inst);
     if (!completed_inst->divisionManaged || completed_inst->allDivideResultsWoken())
         completed_inst->setResultsWoken();
+    completeMoveProjections();
     return dependents;
 }
 
@@ -1817,6 +1887,14 @@ InstructionQueue::getCount(ThreadID tid) const
     for (auto iq : iqs) {
         count += iq->getCount(tid);
     }
+    return count;
+}
+
+unsigned
+InstructionQueue::getResidentCount(ThreadID tid) const
+{
+    unsigned count = 0;
+    for (auto iq : iqs) count += iq->getResidentCount(tid);
     return count;
 }
 
@@ -2046,6 +2124,7 @@ InstructionQueue::addToProducers(const DynInstPtr &new_inst)
 {
     if (cpu->resultForwarding)
         cpu->resultForwarding->track(new_inst,
+            !new_inst->bypassesIQ() &&
             new_inst->iq->fuPool()->usesIntegerResources(new_inst));
     // Nothing really needs to be marked when an instruction becomes
     // the producer of a register's value, but for convenience a ptr
@@ -2095,6 +2174,14 @@ InstructionQueue::recordCompletedProducer(const DynInstPtr &inst)
 void
 InstructionQueue::addIfReady(const DynInstPtr &inst)
 {
+    if (inst->moveProjection) {
+        if (inst->readyToIssue() && !inst->isIssued() &&
+            !inst->isSquashed()) {
+            inst->setIssued();
+            readyMoveProjections.push_back(inst);
+        }
+        return;
+    }
     // If the instruction now has all of its source registers
     // available, then add it to the list of ready instructions.
     if (inst->readyToIssue()) {

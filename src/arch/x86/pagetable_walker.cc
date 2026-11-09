@@ -79,6 +79,10 @@ Walker::ItlbStats::ItlbStats(Walker *parent)
                "Completed instruction walks with an identified 2 or 4 MiB leaf"),
       ADD_STAT(WALK_COMPLETED, statistics::units::Count::get(),
                "Completed modeled instruction walks including faults"),
+      ADD_STAT(WALK_COMPLETED_1G, statistics::units::Count::get(),
+               "Completed instruction walks with an identified 1 GiB leaf"),
+      ADD_STAT(unclassifiedCompleted, statistics::units::Count::get(),
+               "Completed instruction walks ending before leaf size was established"),
       ADD_STAT(WALK_ACTIVE, statistics::units::Cycle::get(),
                "Cycles with an instruction walk in service"),
       ADD_STAT(WALK_PENDING, statistics::units::Cycle::get(),
@@ -97,6 +101,8 @@ Walker::DtlbWalkStats::DtlbWalkStats(Walker *parent, const char *name)
                "Completed demand walks with an identified 2 or 4 MiB leaf"),
       ADD_STAT(WALK_COMPLETED_1G, statistics::units::Count::get(),
                "Completed demand walks with an identified 1 GiB leaf"),
+      ADD_STAT(unclassifiedCompleted, statistics::units::Count::get(),
+               "Completed demand walks ending before leaf size was established"),
       ADD_STAT(WALK_ACTIVE, statistics::units::Cycle::get(),
                "Cycles with at least one demand walk in service"),
       ADD_STAT(WALK_PENDING, statistics::units::Cycle::get(),
@@ -467,6 +473,13 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     bool uncacheable = pte.pcd;
     Addr nextRead = 0;
     bool doWrite = false;
+    if (state == LongPTE || state == PAEPTE || state == PTE)
+        observedLeafLogBytes = 12;
+    else if (pte.p && pte.ps) {
+        if (state == LongPDP) observedLeafLogBytes = 30;
+        if (state == LongPD || state == PAEPD) observedLeafLogBytes = 21;
+        if (state == PSEPD) observedLeafLogBytes = 22;
+    }
     bool doTLBInsert = false;
     bool doEndWalk = false;
     bool badNX = pte.nx && mode == BaseMMU::Execute && enableNX;
@@ -657,7 +670,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             break;
         } else {
             // 4 MB page
-            entry.logBytes = 21;
+            entry.logBytes = 22;
             entry.paddr = bits(pte, 20, 13) << 32 | mbits(pte, 31, 22);
             entry.uncacheable = uncacheable;
             entry.global = enableGlobal && pte.g;
@@ -771,6 +784,7 @@ Walker::WalkerState::endWalk()
 void
 Walker::WalkerState::setupWalk(Addr vaddr)
 {
+    observedLeafLogBytes = 0;
     prefixHit = false;
     cacheablePrefix = true;
     if (timing) translationGeneration = walker->tlb->generation();
@@ -921,20 +935,27 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
             ++walker->dtlbLoadStats.WALK_COMPLETED;
         if (requestMode == BaseMMU::Write && timing && !req->isPrefetch())
             ++walker->dtlbStoreStats.WALK_COMPLETED;
-        if (timingFault == NoFault) {
-            if (requestMode == BaseMMU::Execute && entry.logBytes == 12)
+        {
+            if (requestMode == BaseMMU::Execute && observedLeafLogBytes == 12)
                 ++walker->itlbStats.WALK_COMPLETED_4K;
             if (requestMode == BaseMMU::Execute &&
-                (entry.logBytes == 21 || entry.logBytes == 22))
+                (observedLeafLogBytes == 21 || observedLeafLogBytes == 22))
                 ++walker->itlbStats.WALK_COMPLETED_2M_4M;
+            if (requestMode == BaseMMU::Execute && observedLeafLogBytes == 30)
+                ++walker->itlbStats.WALK_COMPLETED_1G;
+            if (requestMode == BaseMMU::Execute && !observedLeafLogBytes)
+                ++walker->itlbStats.unclassifiedCompleted;
             if (requestMode != BaseMMU::Execute && timing && !req->isPrefetch()) {
                 auto &stats = requestMode == BaseMMU::Read ?
                     walker->dtlbLoadStats : walker->dtlbStoreStats;
-                if (entry.logBytes == 12) ++stats.WALK_COMPLETED_4K;
-                if (entry.logBytes == 21 || entry.logBytes == 22)
+                if (observedLeafLogBytes == 12) ++stats.WALK_COMPLETED_4K;
+                if (observedLeafLogBytes == 21 || observedLeafLogBytes == 22)
                     ++stats.WALK_COMPLETED_2M_4M;
-                if (entry.logBytes == 30) ++stats.WALK_COMPLETED_1G;
+                if (observedLeafLogBytes == 30) ++stats.WALK_COMPLETED_1G;
+                if (!observedLeafLogBytes) ++stats.unclassifiedCompleted;
             }
+        }
+        if (timingFault == NoFault) {
             /*
              * Finish the translation. Now that we know the right entry is
              * in the TLB, this should work with no memory accesses.

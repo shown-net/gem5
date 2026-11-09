@@ -107,6 +107,7 @@ namespace X86ISA
             bool enableGlobal;
             unsigned inflight;
             TlbEntry entry;
+            unsigned observedLeafLogBytes = 0;
             PacketPtr read;
             std::vector<PacketPtr> writes;
             Fault timingFault;
@@ -207,6 +208,7 @@ namespace X86ISA
             void resetStats() override;
             Walker *owner;
             statistics::Scalar WALK_COMPLETED_4K, WALK_COMPLETED_2M_4M, WALK_COMPLETED;
+            statistics::Scalar WALK_COMPLETED_1G, unclassifiedCompleted;
             statistics::Scalar WALK_ACTIVE, WALK_PENDING;
             statistics::Scalar COALESCED_REQUESTS;
         } itlbStats;
@@ -218,6 +220,7 @@ namespace X86ISA
             Walker *owner;
             statistics::Scalar WALK_COMPLETED, WALK_COMPLETED_4K;
             statistics::Scalar WALK_COMPLETED_2M_4M, WALK_COMPLETED_1G;
+            statistics::Scalar unclassifiedCompleted;
             statistics::Scalar WALK_ACTIVE, WALK_PENDING;
             statistics::Scalar COALESCED_REQUESTS;
         } dtlbLoadStats, dtlbStoreStats;

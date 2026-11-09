@@ -816,6 +816,10 @@ MemDepUnit::canSpeculate(const DynInstPtr &inst)
     auto &observation = found->second;
     if (observation.result == ObservationResult::Dependent)
         return false;
+    // TODO(SPR MSR calibration): Audit already-admitted loads when SSBD changes;
+    // WRMSR serializes after in the current decoder, but other state-transfer
+    // paths and in-flight ordering still need validation. The dynamic control
+    // is consulted only for new admissions below.
     if (observation.bypassAdmitted)
         return true;
     if (observation.localPrediction && speculationCredit >= 0 &&

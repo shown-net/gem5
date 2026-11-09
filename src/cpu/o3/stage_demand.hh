@@ -21,6 +21,9 @@ struct StageDemand
     unsigned schedulerUnits = 1;
     unsigned schedulerActions = 1;
     unsigned retirementUnits = 1;
+    // Model retirement uops are attributed to architectural instructions;
+    // retirement slots remain a separate group-completion quantity.
+    unsigned retirementUops = 1;
     // Wide-capability entries are a subset of the shared vector allocation
     // budget. ISA lowering supplies this demand; functional fragment count is
     // not a substitute for architectural vector width.

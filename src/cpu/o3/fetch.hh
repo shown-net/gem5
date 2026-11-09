@@ -235,12 +235,12 @@ class Fetch
     void setRenameQueue(TimeBuffer<DecodeStruct> *queue)
     { toRename = queue->getWire(0); }
     void invalidateTranslations();
+    void accountIcacheStalls();
     void invalidateCode(Addr physical_block);
 
     bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block);
 
     bool pendingCodeWrite(ThreadID tid, Addr physical_block);
-    void resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next);
 
     /** Sets pointer to branch address calculation stage and FTQ */
     void setBACandFTQPtr(BAC *bac_ptr, FTQ *ftq_ptr);
@@ -310,8 +310,15 @@ class Fetch
      * @param pc The actual PC of the current instruction.
      * @return Any fault that occured.
      */
-    bool fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc);
+    bool fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc,
+                        bool lookahead = false);
     void finishTranslation(const Fault &fault, const RequestPtr &mem_req);
+    bool startByteLookahead(Addr address, ThreadID tid);
+    void finishByteTranslation(const Fault &fault, const RequestPtr &request);
+    bool completeByteLookahead(PacketPtr packet);
+    void fetchPredictedBytes(ThreadID tid, FetchTargetPtr target);
+    bool byteRequestPending(Addr address, ThreadID tid) const;
+    void discardByteLookahead(ThreadID tid);
 
 
     /** Check if an interrupt is pending and that we need to handle
@@ -369,7 +376,7 @@ class Fetch
     void fetch(bool &status_change);
 
     /** Align a PC to the start of a fetch buffer block. */
-    Addr fetchBufferAlignPC(Addr addr)
+    Addr fetchBufferAlignPC(Addr addr) const
     {
         return (addr & ~(fetchBufferMask));
     }
@@ -545,10 +552,22 @@ class Fetch
 
     /** Whether or not the fetch buffer data is valid. */
     bool fetchBufferValid[MaxThreads];
+    bool byteLookahead[MaxThreads]{};
+    struct ByteRequest
+    {
+        uint64_t epoch;
+        bool response = false;
+    };
+    std::map<RequestPtr, ByteRequest> byteRequests;
+    uint64_t lastByteIssue = ~uint64_t(0);
 
     /** Earliest cycle for the next fetch after a coupled BTB prediction. */
     uint64_t btbReadyCycle[MaxThreads]{};
     InstSeqNum microcodeControl[MaxThreads]{};
+    StaticInstPtr lcpDecoded[MaxThreads];
+    uint64_t lcpReadyCycle[MaxThreads]{};
+    std::shared_ptr<bool> dsbMissExposed[MaxThreads];
+    uint64_t lastIcacheAccounting = 0;
 
     /** Size of instructions. */
     int instSize;

@@ -894,6 +894,7 @@ class LSQ
     bool hasStoresToWB(ThreadID tid);
 
     bool hasPendingCodeWrite(ThreadID tid, Addr physical_block);
+    unsigned demandLoadStages(ThreadID tid) const;
 
     /** Returns the number of stores a specific thread has to write back. */
     int numStoresToWB(ThreadID tid);

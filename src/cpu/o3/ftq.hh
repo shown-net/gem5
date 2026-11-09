@@ -334,6 +334,7 @@ class FTQ
      *  @return Pointer to the FetchTarget that is at the head of the FTQ.
      */
     FetchTargetPtr readHead(ThreadID tid);
+    FetchTargetPtr readAhead(ThreadID tid, unsigned index);
 
     /** Pops the head fetch target once its fully processed.
      * In case there is still a branch history attached to the

@@ -348,6 +348,7 @@ let {{
             self.instFlags = ""
             if prefetch:
                 self.memFlags += " | Request::PREFETCH"
+                self.memFlags += " | ((machInst.opcode.type == TwoByteOpcode && uint8_t(machInst.opcode.op) == 0x0d && machInst.modRM.reg == 1) ? Request::PF_EXCLUSIVE : 0)"
                 self.instFlags += " | (1ULL << StaticInst::IsDataPrefetch)"
             if nonSpec:
                 self.instFlags += " | (1ULL << StaticInst::IsNonSpeculative)"
@@ -388,6 +389,7 @@ let {{
             self.instFlags = ""
             if prefetch:
                 self.memFlags += " | Request::PREFETCH"
+                self.memFlags += " | ((machInst.opcode.type == TwoByteOpcode && uint8_t(machInst.opcode.op) == 0x0d && machInst.modRM.reg == 1) ? Request::PF_EXCLUSIVE : 0)"
                 self.instFlags += " | (1ULL << StaticInst::IsDataPrefetch)"
             if nonSpec:
                 self.instFlags += " | (1ULL << StaticInst::IsNonSpeculative)"

@@ -259,8 +259,7 @@ FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
     forwarding->clearWait(inst);
     executionPorts->commit(grant_family, candidates, port, curTick());
     resourceAt(port)->admit(cpu, forwarding, inst, port, available, complete);
-    cpu->recordExecutedUops(1, inst->threadNumber);
-    cpu->recordDispatchedPort(port);
+    cpu->recordExecutionAction(inst, port);
     return true;
 }
 
@@ -400,7 +399,7 @@ FUPool::fpDividerReady(OpClass capability, Cycles cycle)
 }
 
 int
-FUPool::getUnit(CPU *cpu, ThreadID tid, OpClass capability, Cycles cycle,
+FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
                bool store, bool branch,
                int bound_port)
 {
@@ -456,6 +455,15 @@ FUPool::getUnit(CPU *cpu, ThreadID tid, OpClass capability, Cycles cycle,
     nextIssue[fu_idx][capability] = cycle + issueIntervals[fu_idx][capability];
     if (fp_divide)
         fpDividerNextIssue[fu_idx] = nextIssue[fu_idx][capability];
+    if (fp_divide) {
+        cpu->dividerStats.start(true);
+        // The admitted fixed-latency FU operation remains in execution until
+        // its completion/free boundary, including speculative instructions.
+        cpu->schedule(new EventFunctionWrapper([cpu] {
+            cpu->dividerStats.finish(true);
+        }, name() + ".dividerComplete", true),
+            cpu->clockEdge(getOpLatency(capability)));
+    }
     if (executionPorts)
         executionPorts->commit(IntExecutionFamily::None, 1 << fu_idx,
                                fu_idx, curTick());
@@ -469,12 +477,9 @@ FUPool::getUnit(CPU *cpu, ThreadID tid, OpClass capability, Cycles cycle,
         pairedUnit[fu_idx] = data_idx;
     }
 
-    cpu->recordExecutedUops(data_idx >= 0 ? 2 : 1, tid);
-    if (executionPorts) {
-        cpu->recordDispatchedPort(fu_idx);
-        if (data_idx >= 0)
-            cpu->recordDispatchedPort(data_idx);
-    }
+    cpu->recordExecutionAction(inst, executionPorts ? fu_idx : -1);
+    if (data_idx >= 0)
+        cpu->recordExecutionAction(inst, executionPorts ? data_idx : -1);
 
     return fu_idx;
 }

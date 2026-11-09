@@ -196,6 +196,8 @@ class IntegerDivider : public SimObject
         std::array<Tick, 3> inputs;
         std::array<Tick, 2> outputs{};
         bool launched = false;
+        Tick arithmeticEnd = 0;
+        bool arithmeticActive = false;
         unsigned internalStages = 0, transferred = 0, written = 0;
     };
     CPU *cpu = nullptr;

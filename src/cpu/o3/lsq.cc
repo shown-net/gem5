@@ -263,6 +263,12 @@ LSQ::tick()
     usedStorePreparePorts = 0;
 }
 
+unsigned
+LSQ::demandLoadStages(ThreadID tid) const
+{
+    return thread.at(tid).demandLoadStages();
+}
+
 bool
 LSQ::cacheBlocked() const
 {

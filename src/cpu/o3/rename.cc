@@ -150,7 +150,9 @@ Rename::ResourceStallStats::ResourceStallStats(statistics::Group *parent)
       ADD_STAT(SB_IQ_OVERLAP, statistics::units::Cycle::get(),
                "Candidate SB cycles also lacking IQ reservation"),
       ADD_STAT(SB_FRONTEND_BLOCKED, statistics::units::Cycle::get(),
-               "Candidate SB cycles with rename backpressure or IEW stall")
+               "Candidate SB cycles with rename backpressure or IEW stall"),
+      ADD_STAT(SCOREBOARD, statistics::units::Cycle::get(),
+               "Observed rename ticks stalled by a serializing operation; not register dependencies")
 {}
 
 std::string
@@ -518,16 +520,30 @@ Rename::tick()
                 frontend_blocked |= FrontendCoordinator::Recovery;
             if (renameStatus[tid] == SerializeStall)
                 frontend_blocked |= FrontendCoordinator::Serialize;
-            if (calcFreeROBEntries(tid) < int(renameWidth))
+            if (calcFreeROBEntries(tid) <= 0)
                 frontend_blocked |= FrontendCoordinator::FullROB;
-            if (calcFreeIQEntries(tid) < int(renameWidth))
+            if (calcFreeIQEntries(tid) <= 0)
                 frontend_blocked |= FrontendCoordinator::FullIQ;
             if (calcFreeLQEntries(tid) <= 0 && calcFreeSQEntries(tid) <= 0)
                 frontend_blocked |= FrontendCoordinator::FullLSQ;
-            if (renameMap[tid]->minFreeEntries() < renameWidth)
+            if (renameMap[tid]->minFreeEntries() == 0)
                 frontend_blocked |= FrontendCoordinator::FullPRF;
+            auto &receiver = toDecode->renameInfo[tid];
+            receiver.receiverValid = true;
+            receiver.receiverBlocks = frontend_blocked;
+            receiver.freeSQEntries = std::max(0, sq_headroom);
+            receiver.receiverCapacity = frontend_blocked ? 0 :
+                std::min({renameWidth,
+                    unsigned(std::max(0, calcFreeROBEntries(tid))),
+                    unsigned(std::max(0, calcFreeIQEntries(tid))),
+                    renameMap[tid]->minFreeEntries()});
         }
         rename(status_change, tid);
+        if (renameStatus[tid] == SerializeStall)
+            ++resourceStallStats.SCOREBOARD;
+        cpu->recoveryStats.allocatorState(tid,
+            renameStatus[tid] == Squashing ||
+            fromCommit->commitInfo[tid].squash);
         unsigned issued_slots = 0;
         for (unsigned i = first_output; i < toIEWIndex; ++i)
             issued_slots += toIEW->insts[i]->allocationSlots();
@@ -551,9 +567,7 @@ Rename::tick()
             unsigned slots = 0;
             for (unsigned i = first_output; i < toIEWIndex; ++i)
                 slots += toIEW->insts[i]->allocationSlots();
-            cpu->frontend->allocation(toIEWIndex - first_output, slots,
-                                      frontend_blocked,
-                                      sq_headroom > 0 ? sq_headroom : 0);
+            cpu->frontend->allocation(toIEWIndex - first_output, slots);
         }
     }
 
@@ -789,6 +803,30 @@ Rename::renameInsts(ThreadID tid)
                 !renameMap[tid]->lookup(dest_reg)->isPinned();
         }
         if (!inst->isSquashed() && !inst->allocationGroup &&
+            inst->staticInst->isZeroExtendingGprMove() &&
+            inst->numSrcRegs() == 3 && inst->numDestRegs() == 1 &&
+            inst->getFault() == NoFault) {
+            auto *isa = inst->tcBase()->getIsaPtr();
+            const auto source_reg = inst->srcRegIdx(1).flatten(*isa);
+            const auto dest_reg = inst->destRegIdx(0).flatten(*isa);
+            const auto source = renameMap[tid]->lookup(source_reg);
+            // A 32-bit MOV must clear the upper half. Keep ordinary PRF
+            // allocation/history; an unready producer is projected when its
+            // actual value arrives. A self move still executes normally.
+            const bool projection = source_reg.is(IntRegClass) &&
+                dest_reg.is(IntRegClass) && source_reg != dest_reg &&
+                !(stack_decision.sourceMask && cpu->stackEngine &&
+                  cpu->stackEngine->offset(tid) != 0) &&
+                !source->isPinned() &&
+                !renameMap[tid]->lookup(dest_reg)->isPinned();
+            inst->renameComputed = projection && scoreboard->getReg(source);
+            inst->moveProjection = projection && !inst->renameComputed;
+            if (projection) {
+                inst->stageDemand.schedulerActions = 0;
+                inst->stageDemand.schedulerUnits = 0;
+            }
+        }
+        if (!inst->isSquashed() && !inst->allocationGroup &&
             inst->staticInst->isFullXmmMove() &&
             inst->numSrcRegs() == 2 && inst->numDestRegs() == 2 &&
             inst->getFault() == NoFault) {
@@ -1009,20 +1047,26 @@ Rename::renameInsts(ThreadID tid)
         renameSrcRegs(inst, inst->threadNumber);
 
         renameDestRegs(inst, inst->threadNumber);
+        if (inst->moveProjection)
+            ++cpu->moveEliminationStats.accepted;
         if (inst->renameComputed) {
-            // The source was ready before the allocation group was reserved.
-            // Use the normal renamed PRF destination and squash history.
-            panic_if(!scoreboard->getReg(inst->renamedSrcIdx(0)),
-                     "Implicit PUSH source became unready after admission");
+            const bool move = inst->staticInst->isZeroExtendingGprMove();
+            // The source was ready before the allocation was reserved.
+            // Execute the actual zero-extension/update into the new PRF.
+            panic_if(!scoreboard->getReg(inst->renamedSrcIdx(move ? 1 : 0)),
+                     "Rename-computed source became unready after admission");
             inst->execute();
             panic_if(inst->getFault() != NoFault,
-                     "Implicit PUSH update faulted during rename");
+                     "Rename-computed operation faulted");
             if (cpu->resultForwarding)
                 cpu->resultForwarding->track(inst, false);
             scoreboard->setReg(inst->renamedDestIdx(0));
             inst->setExecuted();
             inst->setResultsWoken();
-            ++stats.pushUpdatesComputed;
+            if (move)
+                ++cpu->moveEliminationStats.accepted;
+            else
+                ++stats.pushUpdatesComputed;
         } else if ((!cpu->stackEngine || !cpu->stackEngine->enabled()) &&
                    isImplicitPushUpdate(inst)) {
             ++stats.pushUpdatesDeferred;

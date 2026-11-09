@@ -377,6 +377,7 @@ class DynInst : public ExecContext, public RefCounted
     // Optional Marker observations; none drive the pipeline.
     bool fetchedFromUser = false;
     bool pendingFrontendAcceptance = false;
+    RecoveryCause replayCause = RecoveryCause::OtherMachine;
     // Per-dynamic-operation stack operands and state transitions.
     uint64_t stackSourceMask = 0;
     int64_t stackSourceDelta = 0;
@@ -426,6 +427,16 @@ class DynInst : public ExecContext, public RefCounted
     bool fusedFollower() const
     { return allocationGroup && allocationGroup->branch && allocationGroup->branch == seqNum; }
     bool executionBranchMispredicted = false;
+    bool executionBranchResolved = false;
+    bool executionBranchTaken = false;
+    void recordExecutionBranch()
+    {
+        if (isControl() && !staticInst->isMicrocodeControl() &&
+            isExecuted() && getFault() == NoFault) {
+            executionBranchResolved = true;
+            executionBranchTaken = isUncondCtrl() || pcState().branching();
+        }
+    }
     uint64_t fetchedAddressSpaceId = 0;
     std::array<Addr, 2> fetchedCodeBlocks{};
     unsigned fetchedCodeBlockCount = 0;
@@ -712,11 +723,16 @@ class DynInst : public ExecContext, public RefCounted
     //
     bool isNop()          const { return staticInst->isNop(); }
     bool eliminatedMove = false;
+    bool untrackedFrontendBranch = false;
+    bool frontendDsbMiss = false;
+    std::shared_ptr<bool> frontendDsbMissExposed;
     // A ready implicit PUSH update was evaluated using the normal PRF at rename.
     bool renameComputed = false;
+    // A 32-bit MOV has a new zero-extended PRF value but no execution grant.
+    bool moveProjection = false;
     bool bypassesIQ() const
     { return isNop() || staticInst->isZeroIdiom() || eliminatedMove ||
-             renameComputed || stackAbsorbed; }
+             renameComputed || moveProjection || stackAbsorbed; }
     bool isMemRef()       const { return staticInst->isMemRef(); }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }

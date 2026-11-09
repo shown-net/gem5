@@ -218,6 +218,9 @@ const PCStateBase *GoldenCoveIndirectPredictor::lookup(ThreadID tid,
     h->user = userMode[tid];
     h->indirect = true;
     history = h;
+    // TODO(SPR-MSR): These static thread/user tags are not an IBRS, STIBP,
+    // IPRED, RRSBA or BHI control model; first establish effective states
+    // and affected prediction populations for the calibration workload.
     for (unsigned b = 0; b < 3; ++b)
         for (auto &e : tables[b][index(h->before, lengths[b])])
             if (e.target && e.tag == tag(h->before, pc, lengths[b]) &&

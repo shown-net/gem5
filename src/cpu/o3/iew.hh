@@ -257,7 +257,8 @@ class IEW
     /** Sends commit proper information for a squash due to a memory order
      * violation.
      */
-    void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid);
+    void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid,
+                            RecoveryCause cause = RecoveryCause::MemoryOrdering);
 
     /** Sets Dispatch to blocked, and signals back to other stages to block. */
     void block(ThreadID tid);

@@ -167,6 +167,8 @@ class TaoTraceRubyResponseExtension
     bool terminalNoRuby = false;
     uint32_t terminalReasonMask = 0;
     TaoTraceNativeHierarchyFacts hierarchy;
+    bool hasL1MissTick = false;
+    Tick firstL1MissTick = 0;
     // The same Request can be retried. These snapshots identify observations
     // made after the current admission instead of reusing an earlier attempt.
     std::array<uint32_t, TaoTraceNativeHierarchyFacts::Levels> admissionAccesses{};
@@ -620,7 +622,14 @@ class TaoTraceNativeAccessRegistry
                   TaoTraceNativeCacheOutcome outcome)
     {
         auto extension = ensureExtension(req);
-        if (extension) extension->hierarchy.observe(level, outcome);
+        if (extension) {
+            extension->hierarchy.observe(level, outcome);
+            if (level == 0 && outcome == TaoTraceNativeCacheOutcome::TagMiss &&
+                !extension->hasL1MissTick) {
+                extension->hasL1MissTick = true;
+                extension->firstL1MissTick = curTick();
+            }
+        }
         mutate(req, [level, outcome](Snapshot &facts) {
             facts.hierarchy.observe(level, outcome);
         });

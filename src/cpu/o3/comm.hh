@@ -59,6 +59,11 @@ namespace gem5
 namespace o3
 {
 
+enum class RecoveryCause {
+    None, Branch, MemoryOrdering, FastForward, Snoop, Code, OtherMachine,
+    FrontendBranch, UnknownBranch, Microcode
+};
+
 /** Struct that defines the information passed from fetch to decode. */
 struct FetchStruct
 {
@@ -102,6 +107,7 @@ struct IEWStruct
     bool branchMispredict[MaxThreads];
     bool branchTaken[MaxThreads];
     bool includeSquashInst[MaxThreads];
+    RecoveryCause recoveryCause[MaxThreads]{};
 };
 
 struct IssueStruct
@@ -141,7 +147,15 @@ struct TimeStruct
 
     DecodeComm decodeInfo[MaxThreads];
 
-    struct RenameComm {};
+    struct RenameComm
+    {
+        // Receiver state travels with the existing Rename-to-Fetch delay.
+        // It classifies IDQ output; it is not a second resource reservation.
+        bool receiverValid = false;
+        unsigned receiverCapacity = 0;
+        unsigned receiverBlocks = 0;
+        unsigned freeSQEntries = 0;
+    };
 
     RenameComm renameInfo[MaxThreads];
 

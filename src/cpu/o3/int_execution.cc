@@ -22,6 +22,13 @@ VectorDomain
 vectorDomain(const DynInstPtr &inst, unsigned port, Cycles latency)
 {
     const auto op = inst->opClass();
+    // Partial memory-load merges use the one-cycle register/shuffle path,
+    // not the SIMD ALU bypass penalty. SPR MOVL/HPD dependency controls
+    // distinguish the merge from both load latency and ordinary packing.
+    const auto &name = inst->staticInst->getName();
+    if ((name == "mxmmmergehi" || name == "mxmmmergelo") &&
+        (port == 1 || port == 5) && latency == Cycles(1))
+        return VectorDomain::Shuffle;
     if ((op == FloatAddOp || op == SimdFloatAddOp) &&
         (port == 1 || port == 5) && latency == Cycles(3))
         return VectorDomain::FastAdder;
@@ -660,8 +667,7 @@ IntegerDivider::issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
                                                candidates, curTick(), eligible);
     if (port < 0) return false;
     pool->sharedPorts()->commit(IntExecutionFamily::Divider, candidates, port, curTick());
-    cpu->recordExecutedUops(1, inst->threadNumber);
-    cpu->recordDispatchedPort(port);
+    cpu->recordExecutionAction(inst, port);
     pool->releasePortBinding(inst);
     inst->divisionManaged = true;
     auto op = std::make_shared<Operation>();
@@ -695,6 +701,10 @@ IntegerDivider::arm()
 void
 IntegerDivider::finish(const std::shared_ptr<Operation> &op)
 {
+    if (op->arithmeticActive) {
+        cpu->dividerStats.finish(false);
+        op->arithmeticActive = false;
+    }
     if (op->inst->isSquashed() || op->inst->getFault() != NoFault) {
         if (op->inst->isInIQ()) op->inst->clearInIQ();
         op->forwarding->cancel(op->inst);
@@ -719,18 +729,26 @@ IntegerDivider::service()
     for (auto it = operations.begin(); it != operations.end();) {
         const auto op = *it++;
         auto inst = op->inst;
+        if (op->arithmeticActive && now >= op->arithmeticEnd) {
+            cpu->dividerStats.finish(false);
+            op->arithmeticActive = false;
+        }
         if (inst->isSquashed()) { finish(op); continue; }
         const auto info = inst->staticInst->intDivide();
         if (!op->launched) {
             if (now < nextLaunch || now < op->admitted + period ||
                 !op->pool->portAvailable(1, now)) continue;
             op->pool->sharedPorts()->commit(IntExecutionFamily::Divider, 2, 1, now);
-            cpu->recordExecutedUops(1, inst->threadNumber);
-            cpu->recordDispatchedPort(1);
+            cpu->recordExecutionAction(inst, 1);
             op->issuedAction();
             ++stats.actions[1];
             nextLaunch = now + period * (info.bytes == 4 ? 6 : 10);
             op->launched = true;
+            // Native SPR controls count six/ten arithmetic-active cycles
+            // per 32/64-bit divide, independently of output publication.
+            op->arithmeticEnd = nextLaunch;
+            op->arithmeticActive = true;
+            cpu->dividerStats.start(false);
             // EMR input -> output matrices, ordered low dividend, high
             // dividend, divisor. They are parameter priors, not an SPR
             // value-dependent duration function or a sum of duop latencies.
@@ -759,8 +777,7 @@ IntegerDivider::service()
         // apply the independent input/output matrix to result publication.
         if (op->internalStages < 2 && op->pool->portAvailable(1, now)) {
             op->pool->sharedPorts()->commit(IntExecutionFamily::Divider, 2, 1, now);
-            cpu->recordExecutedUops(1, inst->threadNumber);
-            cpu->recordDispatchedPort(1);
+            cpu->recordExecutionAction(inst, 1);
             op->issuedAction();
             ++stats.actions[2 + op->internalStages];
             ++op->internalStages;

@@ -96,6 +96,9 @@ class RubySequencer(RubyPort):
     max_outstanding_requests = Param.Int(
         16, "max requests (incl. prefetches) outstanding"
     )
+    data_fill_response_width = Param.Unsigned(
+        0, "Ordinary data-fill load responses per core cycle; zero is unlimited"
+    )
     max_store_prepare_outstanding = Param.Unsigned(
         16, "Drop permission-prepare hints above this bound; zero is unlimited"
     )

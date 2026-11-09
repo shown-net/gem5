@@ -334,7 +334,15 @@
                 0x3, 0x4: CALL_FAR_REAL(Iz);
                 default: WarnUnimpl::call_far_Ap();
             }
-            0x3: WarnUnimpl::fwait(); //aka wait
+            0x3: BasicOperate::FWAIT({{
+                CR0 cr0 = CR0Op;
+                if (machInst.legacy.lock)
+                    fault = std::make_shared<InvalidOpcode>();
+                else if (cr0.ts && cr0.mp)
+                    fault = std::make_shared<DeviceNotAvailable>();
+                else if (FSW & ErrSummaryBit)
+                    fault = std::make_shared<X87FpExceptionPending>();
+            }}, IsSerializeBefore, IsSerializeAfter);
             0x4: decode MODE_SUBMODE {
                 0x3: PUSHF_VIRT();
                 default: PUSHF();

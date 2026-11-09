@@ -98,6 +98,18 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual IntDivideInfo intDivide() const { return {}; }
     void clearIntExecution() { intExecutionInfo = {}; }
     virtual bool usesMicrocodeService() const { return false; }
+    // Evidence-backed identity is distinct from the supplying frontend.
+    virtual bool hasKnownMicrocodeIdentity() const { return false; }
+    virtual unsigned microcodePrefixOps() const { return 0; }
+    virtual bool hasLengthChangingPrefix() const { return false; }
+    // 0=none, 1=NTA, 2=T0, 3=T1/T2, 4=PREFETCHW.
+    virtual unsigned softwarePrefetchKind() const { return 0; }
+    // 0=none, 1=scalar double, 2=scalar single, 3=packed double,
+    // 4=packed single. Only supported original SSE arithmetic qualifies.
+    virtual unsigned sseArithmeticKind() const { return 0; }
+    // Nonzero only when completeAcc can produce the entire load result
+    // without reading an unresolved address or a merge destination.
+    virtual unsigned earlyForwardingSize() const { return 0; }
     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
     ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
     bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
@@ -188,6 +200,13 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual bool isRasReturn() const { return isReturn(); }
     virtual bool isArchitecturalBranch() const { return isControl(); }
     virtual bool isArchitecturalConditionalBranch() const { return isCondCtrl(); }
+    virtual bool isArchitecturalNearCall() const { return isCall(); }
+    virtual bool isArchitecturalNearReturn() const { return isReturn(); }
+    virtual bool isArchitecturalNearIndirectBranch() const
+    { return isIndirectCtrl() && !isReturn(); }
+    virtual bool isArchitecturalFarBranch() const { return false; }
+    virtual bool isArchitecturalNop() const { return isNop(); }
+    virtual bool isArchitecturalX87() const { return false; }
     virtual bool isNearIndirectBranch() const
     { return isIndirectCtrl() && !isReturn(); }
 
@@ -218,6 +237,7 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual bool isArchitecturalPortIO() const { return false; }
     virtual bool isArchitecturalLockedMemory() const { return isAtomic(); }
     virtual bool isFullGprMove() const { return false; }
+    virtual bool isZeroExtendingGprMove() const { return false; }
     virtual bool isFullXmmMove() const { return false; }
     /// Two FP data fragments produced as one XMM value, including temporaries.
     virtual bool isFullXmmWrite() const { return false; }

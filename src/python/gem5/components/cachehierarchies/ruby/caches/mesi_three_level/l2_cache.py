@@ -70,6 +70,7 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
             size=l2_size,
             assoc=l2_assoc,
             fill_capacity=48,
+            fill_stats_clock=clk_domain,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
             replacement_policy=(QLRUH00M1R0U1RP() if target_isa == ISA.X86

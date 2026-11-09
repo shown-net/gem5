@@ -2,6 +2,7 @@
 #ifndef __CPU_O3_FRONTEND_HH__
 #define __CPU_O3_FRONTEND_HH__
 
+#include <array>
 #include <deque>
 #include <functional>
 #include <list>
@@ -11,6 +12,7 @@
 #include <tuple>
 #include <vector>
 #include "base/statistics.hh"
+#include "cpu/o3/comm.hh"
 #include "cpu/o3/frontend_record.hh"
 #include "params/DsbTemplates.hh"
 #include "params/FrontendCoordinator.hh"
@@ -25,11 +27,16 @@ namespace gem5::o3
 class InstructionBytes : public SimObject
 {
     const unsigned budget;
-    std::vector<uint8_t> data;
-    bool valid = false;
-    bool reusable = false;
-    Addr virtualBase = 0, physicalBase = 0;
-    uint64_t readyCycle = 0;
+    struct Block
+    {
+        std::vector<uint8_t> data;
+        bool valid = false, reusable = false;
+        Addr virtualBase = 0, physicalBase = 0;
+        uint64_t readyCycle = 0;
+    };
+    std::vector<Block> blocks;
+    unsigned nextBlock = 0;
+    const Block *find(Addr address) const;
     uint64_t serviceCycle = ~uint64_t(0);
     Addr serviceBlock = 0;
     struct Stats : statistics::Group
@@ -39,6 +46,9 @@ class InstructionBytes : public SimObject
         Stats(statistics::Group *parent);
     } stats;
   public:
+    const bool lookaheadEnabled;
+    const unsigned requestDepth;
+    unsigned residentCapacity() const { return blocks.size(); }
     InstructionBytes(const InstructionBytesParams &p);
     void waiting(bool translation, bool response, bool retry);
     void complete(Addr virtual_address, Addr physical_address,
@@ -48,7 +58,11 @@ class InstructionBytes : public SimObject
     const uint8_t *at(Addr address) const;
     bool contains(Addr address) const;
     bool matchesPhysicalBlock(Addr block, unsigned size) const;
-    bool canReuse() const { return valid && reusable; }
+    bool canReuse(Addr address) const
+    {
+        const auto *block = find(address);
+        return block && block->reusable;
+    }
     Addr physical(Addr address) const;
     void invalidate();
 };
@@ -123,6 +137,9 @@ class MiteService : public SimObject
     unsigned freeBatchOps() const { return batchLimit - pending.size(); }
     InstSeqNum lastDelivered() const { return deliveredThrough; }
     unsigned maxInstructions() const { return instructionBudget; }
+    unsigned extractionWidth() const { return outputBudget; }
+    const FrontendRecord *headRecord() const
+    { return pending.empty() ? nullptr : pending.front().record.get(); }
     unsigned maxBatchOps() const { return batchLimit; }
     unsigned maxOpsPerCycle() const { return outputBudget; }
     InstSeqNum headSequence() const
@@ -174,7 +191,7 @@ struct FrontendTemplate
 
 class DsbTemplates : public MiteService
 {
-    const unsigned numSets, associativity, opsPerEntry;
+    const unsigned numSets, associativity, opsPerEntry, maxRegionOps;
     uint64_t codeEpoch = 0;
     struct CacheEntry {
         std::vector<FrontendTemplate> members;
@@ -226,6 +243,7 @@ class FrontendCoordinator : public SimObject
     std::optional<FrontendTemplate> loopBuilding;
     unsigned loopCaptureUnits = 0;
     FrontendRecord *fusionTail = nullptr;
+    std::shared_ptr<bool> decodingMiss;
     std::function<void(const FrontendRecord &, uint64_t)> deliveryObserver;
     void observeLoop(const FrontendRecord &record);
     void clearLoop();
@@ -240,6 +258,8 @@ class FrontendCoordinator : public SimObject
         statistics::Scalar notDeliveredSlots;
         statistics::Scalar backendAcceptingCycles, backendBlockedCycles;
         statistics::Scalar notDeliveredOps, zeroDeliveryCycles;
+        statistics::Scalar fullDeliveryCycles, receiverUnknownCycles;
+        statistics::Scalar partialReceiverCycles;
         statistics::Vector allocationWidths, backendBlocks;
         statistics::Vector sqHeadroomAcceptingCycles, sqHeadroomMissingSlots;
         Stats(statistics::Group *parent);
@@ -262,10 +282,20 @@ class FrontendCoordinator : public SimObject
     bool canAccept() const;
     bool canAccept(FrontendSource source) const;
     MiteService *sourceService(FrontendSource source) const;
-    void allocation(unsigned accepted, unsigned slots, unsigned blocked,
-                    unsigned sq_headroom);
+    void allocation(unsigned accepted, unsigned slots);
+    void decodingDsbMiss(std::shared_ptr<bool> exposed)
+    { decodingMiss = std::move(exposed); }
     bool empty() const;
+    bool readySupply(uint64_t cycle) const
+    {
+        if (idq->headReady(cycle)) return true;
+        for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                              static_cast<MiteService *>(ms), lsd})
+            if (!service->idle() && !service->preparingHead(cycle)) return true;
+        return false;
+    }
     void advance(uint64_t cycle, bool rename_blocked,
+        const TimeStruct::RenameComm &receiver,
         const std::function<bool(FrontendRecordPtr)> &emit);
     void submit(FrontendSource source, std::vector<FrontendRecordPtr> records,
         unsigned instructions, std::vector<FrontendTemplate> fills,

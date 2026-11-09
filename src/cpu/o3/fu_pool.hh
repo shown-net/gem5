@@ -225,7 +225,7 @@ class FUPool : public SimObject
      * capability, NoFreeFU if there is no free FU, and the FU's index
      * otherwise.
      */
-    int getUnit(CPU *cpu, ThreadID tid, OpClass capability, Cycles cycle,
+    int getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
                 bool store = false, bool branch = false, int bound_port = -1);
 
     /** Frees a FU at the end of this cycle. */

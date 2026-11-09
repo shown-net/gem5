@@ -14,8 +14,9 @@ The main website can be found at <http://www.gem5.org>.
 
 The current local changes implement the SPR component redesign in the companion
 [CPU calibration repository](../../calibration/cpu_microarchitecture/README.md).
-Its [validation page](../../calibration/cpu_microarchitecture/docs/calibration/spr-component-redesign-validation.md)
-owns the 29-item scope, retained evidence, workload comparisons, and open gaps.
+Its [component design](../../calibration/cpu_microarchitecture/docs/calibration/spr-component-redesign.md)
+owns the 29-item scope; workload evidence and remaining gaps are maintained in
+the companion calibration reports.
 
 Changes cover memory dependence and forwarding, logical store credits and early
 prepare, staged fill-buffer service, paging-prefix caching, frontend supply and
@@ -26,10 +27,27 @@ FMA, wide-vector, and mask instruction extensions are outside this round.
 Use the companion repository's `compile_gem5.sh` for serial builds and its public
 build/collect CLI with explicit frozen inputs. The canonical local build remains
 `build/X86`; completed evidence remains under the CPU repository's `output`.
-On 2026-11-08 the session jobs were stopped and obsolete exploration artifacts
-were cleaned. The latest REP zero-count UPC source fix has not been rebuilt;
-the retained fast and opt binaries represent earlier source states. Component
-validation and the complete five-workload calibration remain unfinished.
+The public fast binary was rebuilt on 2026-11-09 with validated NOP execution
+membership, REP guards, dependent 32-bit move projection, overlapping instruction
+fetch, request recovery, Ruby store-prepare event membership, architectural
+MFENCE service, integer-divider activity accounting, and partial XMM load
+merges with preserved-half dependencies. SPR's Ruby L1D data service is now
+3 component cycles, with the existing AGU/LSU handoffs contributing to the
+complete load path. The generic hierarchy
+retains its original service. The SPR board now defaults to eight outstanding
+instruction requests and sixteen resident byte blocks. Request overlap and
+resident-byte capacity remain separate resources. These are
+bounded model settings, not a measurement of the physical SPR queue size. L1I hit/miss
+actions also annotate the original request so frontend miss waiting is observed.
+Data/tag stall counters remain a shared candidate proxy, with their hardware
+gating differences unresolved. Public fast SHA-256 is
+`ed665da831012308f73bb9a21000f96132b2ee80b865360677e4ce45f0e8ea30`.
+The companion [final calibration report](../../calibration/cpu_microarchitecture/docs/calibration/spr-long-calibration-20261109.md)
+owns the final r10 data: 21 complete model windows, their native measurements,
+705 event comparisons, current parameters, and acceptance limits. Stockfish has
+a user-path population anomaly, and SQLite has one complete model window.
+Remaining calibration gaps include DSB admission, ownership traffic,
+memory service, and several execution and recovery counters.
 
 ## Testing status
 

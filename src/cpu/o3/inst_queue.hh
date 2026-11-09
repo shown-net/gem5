@@ -42,6 +42,7 @@
 #ifndef __CPU_O3_INST_QUEUE_HH__
 #define __CPU_O3_INST_QUEUE_HH__
 
+#include <array>
 #include <list>
 #include <map>
 #include <queue>
@@ -123,6 +124,7 @@ class IQUnit : public SimObject
     {
         return count[tid];
     };
+    unsigned getResidentCount(ThreadID tid) const { return residentCount[tid]; }
 
     /** Resets all instruction queue state. */
     void resetState();
@@ -163,6 +165,7 @@ class IQUnit : public SimObject
 
     /** Per Thread IQ count */
     unsigned count[MaxThreads];
+    std::array<unsigned, MaxThreads> residentCount{};
 
     /** Function unit pool. */
     FUPool *_fuPool;
@@ -306,12 +309,14 @@ class InstructionQueue
 
     /** Returns if there are any ready instructions in the IQ. */
     bool hasReadyInsts();
+    InstSeqNum oldestReadyDemandLoad(ThreadID tid) const;
 
     /** Find a compatible IQ (e.g. to insert the instruction) */
     IQUnit *findIQ(const DynInstPtr &inst);
 
     /** Inserts a new instruction into the IQ. */
     void insert(const DynInstPtr &new_inst);
+    void insertMoveProjection(const DynInstPtr &inst);
 
     /** Inserts a new, non-speculative instruction into the IQ. */
     void insertNonSpec(const DynInstPtr &new_inst);
@@ -412,6 +417,7 @@ class InstructionQueue
 
     /** Returns the number of used entries for a thread. */
     unsigned getCount(ThreadID tid) const;
+    unsigned getResidentCount(ThreadID tid) const;
 
     /** Debug function to print all instructions. */
     void printInsts();
@@ -473,6 +479,10 @@ class InstructionQueue
     // These records remain owned by the bounded LSQ while waiting for an RS
     // credit. Waiting for data alone never adds an instruction to this list.
     std::list<DynInstPtr> admissionWaitMemInsts;
+    // Each pending projection belongs to an already reserved ROB entry.
+    std::deque<DynInstPtr> readyMoveProjections;
+    bool processingMoveProjections = false;
+    void completeMoveProjections();
 
     /** List of instructions that have been cache blocked. */
     std::list<DynInstPtr> blockedMemInsts;

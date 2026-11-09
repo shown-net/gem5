@@ -53,6 +53,7 @@
 #include "debug/HtmCpu.hh"
 #include "debug/IEW.hh"
 #include "debug/LSQUnit.hh"
+#include "debug/MemoryOrdering.hh"
 #include "mem/packet.hh"
 #include "mem/request.hh"
 #include "mem/tso_ordered_store.hh"
@@ -256,6 +257,8 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
     sprStoreBuffer = params.sprStoreBuffer && needsTSO && !params.checker;
     sprEarlyStorePrepare = params.sprEarlyStorePrepare && sprStoreBuffer;
     sprRetiredStorePrepare = params.sprRetiredStorePrepare;
+    sprStorePrepareDemandPriority = params.sprStorePrepareDemandPriority;
+    sprClflushMinCycles = params.sprClflushMinCycles;
     sprMemoryDependence = params.sprMemoryDependence;
     sprFastStoreForwarding = params.sprFastStoreForwarding && !params.checker;
     iewStage->instQueue.memoryDependence(lsqID).setLSQ(lsq);
@@ -280,6 +283,7 @@ LSQUnit::resetState()
     fullForwardingSource.clear();
     fastForwarding.clear();
     forwardingHistory.clear();
+    forwardingTraining.clear();
     forwardingContextValid = false;
 
     // hardware transactional memory
@@ -313,11 +317,13 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(sameStartPartialLoads, statistics::units::Count::get(),
                "Same-start partial store forwarding merged with cache data"),
       ADD_STAT(fastForwardPredictions, statistics::units::Count::get(),
-               "FSFP proxy values supplied before store address verification"),
+               "FSFP values predicted before physical producer verification"),
+      ADD_STAT(fastForwardLoadAddressPredictions, statistics::units::Count::get(),
+               "FSFP predictions while the load address operands are unready"),
       ADD_STAT(fastForwardValidated, statistics::units::Count::get(),
                "FSFP proxy predictions with verified address and age"),
       ADD_STAT(fastForwardFailures, statistics::units::Count::get(),
-               "FSFP proxy recovery events, excluded from MDP watchdog"),
+               "Failed dynamic FSFP validations; accepted clears are counted separately"),
       ADD_STAT(noncontiguousTranslations, statistics::units::Count::get(),
                "Complete split requests with noncontiguous physical byte mapping"),
       ADD_STAT(repReadBatches, statistics::units::Count::get(),
@@ -626,6 +632,7 @@ void
 LSQUnit::sampleStoreOccupancy()
 {
     refreshForwardingContext();
+    predictUnreadyLoadAddresses();
     validateFastForwarding();
     const auto used = storeQueue.size() + committedStoreCount();
     assert(used <= storeQueue.capacity());
@@ -634,6 +641,24 @@ LSQUnit::sampleStoreOccupancy()
     stats.sharedStoreEntryCycles += used;
     if (used == storeQueue.capacity())
         ++stats.sharedStoreFullCycles;
+}
+
+unsigned
+LSQUnit::demandLoadStages() const
+{
+    unsigned stages = 0;
+    for (const auto &entry : loadQueue) {
+        const auto &inst = entry.instruction();
+        auto *request = inst->savedRequest;
+        if (inst->isSquashed() || inst->isExecuted() || inst->isDataPrefetch() ||
+            inst->fault != NoFault || !request || request->isReleased())
+            continue;
+        if (!request->isTranslationComplete()) stages |= 1;
+        else if (request->_numOutstandingPackets) stages |= 4;
+        else if (request->isComplete()) stages |= 8;
+        else stages |= 2;
+    }
+    return stages;
 }
 
 void
@@ -702,6 +727,7 @@ LSQUnit::checkSnoop(PacketPtr pkt)
 
                 // Mark the load for re-execution
                 ld_inst->fault = std::make_shared<ReExec>();
+                ld_inst->replayCause = RecoveryCause::Snoop;
                 request->setStateToFault();
             } else {
                 DPRINTF(LSQUnit, "HitExternal Snoop for addr %#x [sn:%lli]\n",
@@ -826,6 +852,7 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                                 "and [sn:%lli] at address %#x\n",
                                 inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
                         memDepViolator = ld_inst;
+                        ld_inst->replayCause = RecoveryCause::Snoop;
 
                         ++stats.memOrderViolation;
 
@@ -852,6 +879,19 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                 DPRINTF(LSQUnit, "Detected fault with inst [sn:%lli] and "
                         "[sn:%lli] at address %#x\n",
                         inst->seqNum, ld_inst->seqNum, ld_eff_addr1);
+                DPRINTF(MemoryOrdering,
+                    "store-sn=%llu store-pc=%s store-va=%#llx store-size=%u "
+                    "load-sn=%llu load-pc=%s load-va=%#llx load-size=%u "
+                    "executed=%u outstanding=%u full-forward=%u full-source=%llu "
+                    "partial-forward=%u\n",
+                    inst->seqNum, inst->pcState(), inst->effAddr,
+                    inst->effSize, ld_inst->seqNum, ld_inst->pcState(),
+                    ld_inst->effAddr, ld_inst->effSize, ld_inst->isExecuted(),
+                    loadIt->request() ?
+                        loadIt->request()->_numOutstandingPackets : 0,
+                    fullForwardingSource.count(ld_inst->seqNum) != 0,
+                    full != fullForwardingSource.end() ? full->second : 0,
+                    partialForwarding.count(ld_inst->seqNum) != 0);
                 memDepViolator = ld_inst;
 
                 ++stats.memOrderViolation;
@@ -945,6 +985,7 @@ LSQUnit::executeLoad(const DynInstPtr &inst)
         iewStage->instToCommit(inst);
         iewStage->activityThisCycle();
     } else {
+        validateFastForwarding();
         if (inst->effAddrValid()) {
             iewStage->instQueue.memoryDependence(lsqID).addressReady(inst);
             auto it = inst->lqIt;
@@ -1083,6 +1124,7 @@ LSQUnit::commitLoad()
     panic_if(predicted != fastForwarding.end() &&
              (!predicted->second.validated || predicted->second.failed),
              "FSFP load retired without successful validation");
+    trainForwarding(inst);
     iewStage->instQueue.memoryDependence(lsqID).loadRetired(inst);
     fastForwarding.erase(inst->seqNum);
     partialForwarding.erase(inst->seqNum);
@@ -1201,6 +1243,7 @@ LSQUnit::isCoalescibleStore(StoreQueue::iterator entry)
 void
 LSQUnit::offloadCommittedStores()
 {
+    validateFastForwarding();
     unsigned offloaded = 0;
     while (offloaded < 4 && storesToWB > 0 &&
            storeWBIt.dereferenceable() && storeWBIt == storeQueue.begin() &&
@@ -1236,6 +1279,8 @@ LSQUnit::offloadCommittedStores()
                 inst->seqNum, inst->seqNum,
                 std::vector<uint8_t>(line_size, 0),
                 std::vector<bool>(line_size, false),
+                std::vector<Addr>(line_size, 0),
+                std::vector<InstSeqNum>(line_size, 0),
                 std::vector<Addr>(line_size, 0)});
             target = &committedStoreBuffer.back();
         }
@@ -1246,6 +1291,8 @@ LSQUnit::offloadCommittedStores()
                 0 : static_cast<uint8_t>(storeWBIt->data()[byte]);
             target->mask[offset + byte] = true;
             target->sourceStart[offset + byte] = req->getPaddr();
+            target->sourceSequence[offset + byte] = inst->seqNum;
+            target->sourcePC[offset + byte] = inst->pcState().instAddr();
         }
 
         // The original retired store has been absorbed into the line request;
@@ -1658,6 +1705,9 @@ LSQUnit::issueStorePrepareRequests()
         return;
     }
 
+    const InstSeqNum oldest_demand = sprStorePrepareDemandPriority ?
+        iewStage->instQueue.oldestReadyDemandLoad(lsqID) :
+        std::numeric_limits<InstSeqNum>::max();
     for (auto store_it = storeQueue.begin();
          store_it != storeQueue.end() && lsq->storePreparePortAvailable();
          ++store_it) {
@@ -1666,6 +1716,8 @@ LSQUnit::issueStorePrepareRequests()
             break;
         }
         const DynInstPtr& inst = store_it->instruction();
+        if (inst->seqNum > oldest_demand)
+            break;
         // Do not prepare across an ordering or atomic operation. A missing
         // address for an ordinary speculative store does not block younger
         // independently translated ordinary stores in this candidate.
@@ -1739,7 +1791,7 @@ LSQUnit::issueStorePrepareRequests()
             ++stats.storePrepareSpeculativeIssued;
         if (inst->isStoreAddress() && !store_it->dataReady())
             ++stats.storePrepareBeforeData;
-        // The default two hints/cycle is an engineering traffic limiter,
+        // The configured hints/cycle is an engineering traffic limiter,
         // independent of the two 32-byte L1 store data service units.
         lsq->noteStorePreparePort();
     }
@@ -1762,6 +1814,8 @@ LSQUnit::squash(const InstSeqNum &squashed_num)
                                fullForwardingSource.end());
     fastForwarding.erase(fastForwarding.upper_bound(squashed_num),
                          fastForwarding.end());
+    forwardingTraining.erase(forwardingTraining.upper_bound(squashed_num),
+                             forwardingTraining.end());
 
     while (loadQueue.size() != 0 &&
             loadQueue.back().instruction()->seqNum > squashed_num) {
@@ -2041,6 +2095,21 @@ void
 LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
 {
     assert(store_idx->valid());
+    const auto &inst = store_idx->instruction();
+    if (sprClflushMinCycles > Cycles(0) && inst->macroop &&
+        inst->macroop->getName() == "clflush" &&
+        inst->firstIssue != Tick(-1)) {
+        const Tick ready = inst->firstIssue +
+            cpu->cyclesToTicks(sprClflushMinCycles);
+        if (curTick() < ready) {
+            // Keep the ordinary SQ/TSO reservation until maintenance
+            // completes. Earlier ownership work overlaps this interval.
+            cpu->schedule(new EventFunctionWrapper(
+                [this, store_idx] { completeStore(store_idx); },
+                "architectural CLFLUSH completion", true), ready);
+            return;
+        }
+    }
     const bool tso_issued = store_idx->tsoIssued();
     const bool order_tracked = store_idx->tsoOrderTracked();
     const Addr ordered_line = order_tracked ?
@@ -2121,6 +2190,7 @@ LSQUnit::trySendPacket(bool isLoad, PacketPtr data_pkt)
     LSQRequest *request = dynamic_cast<LSQRequest*>(data_pkt->senderState);
     const bool bank_access = isLoad && request->instruction()->isLoad() &&
         !request->instruction()->isDataPrefetch() &&
+        request->instruction()->effSize < 64 &&
         !data_pkt->req->isUncacheable() && !data_pkt->req->isStrictlyOrdered();
 
     if (!lsq->cacheBlocked() &&
@@ -2269,6 +2339,8 @@ LSQUnit::cacheLineSize()
 bool
 LSQUnit::memorySpeculationAllowed() const
 {
+    // TODO(SPR MSR calibration): Verify guest SSBD state at the ROI and audit
+    // admission and ordinary forwarding against older unresolved stores.
     return !sprMemoryDependence || !(cpu->tcBase(lsqID)->readMiscRegNoEffect(
         X86ISA::misc_reg::SpecCtrl) & (uint64_t(1) << 2)); // SSBD
 }
@@ -2276,6 +2348,8 @@ LSQUnit::memorySpeculationAllowed() const
 bool
 LSQUnit::fastForwardingAllowed() const
 {
+    // TODO(SPR MSR calibration): Compare PSFD/SSBD gate effects, predictor
+    // training, and fence/context boundaries with controlled native results.
     if (!sprFastStoreForwarding)
         return false;
     const auto control = cpu->tcBase(lsqID)->readMiscRegNoEffect(
@@ -2301,6 +2375,7 @@ LSQUnit::refreshForwardingContext()
     if (!forwardingContextValid || context != lastForwardingContext ||
         !fastForwardingAllowed()) {
         forwardingHistory.clear();
+        forwardingTraining.clear();
         lastForwardingContext = context;
         forwardingContextValid = true;
     }
@@ -2314,12 +2389,12 @@ LSQUnit::hasFastForwardingPrediction(const DynInstPtr &load) const
         load->inHtmTransactionalState())
         return false;
     auto history = forwardingHistory.find(
-        {forwardingContext(), load->pcState().instAddr()});
-    if (history == forwardingHistory.end())
+        {forwardingContext(), load->pcState().instAddr() & 0xffff});
+    if (history == forwardingHistory.end() || history->second.confidence != 7)
         return false;
     for (const auto &store : lsq->olderStores(load)) {
         if (store->isStoreAddress() && !store->isSquashed() &&
-            store->pcState().instAddr() == history->second)
+            (store->pcState().instAddr() & 0xffff) == history->second.storePC)
             return true;
     }
     return false;
@@ -2331,59 +2406,65 @@ LSQUnit::rememberForwarding(const DynInstPtr &load, const DynInstPtr &store)
     fullForwardingSource.insert_or_assign(load->seqNum, store->seqNum);
     refreshForwardingContext();
     if (fastForwardingAllowed() && store->isStoreAddress() &&
-        store->effAddr == load->effAddr && store->effSize >= load->effSize)
-        forwardingHistory.insert_or_assign(
-            std::make_pair(forwardingContext(), load->pcState().instAddr()),
-            store->pcState().instAddr());
+        store->savedRequest && load->savedRequest &&
+        !store->savedRequest->isSplit() && !load->savedRequest->isSplit() &&
+        store->savedRequest->mainReq()->getPaddr() ==
+            load->savedRequest->mainReq()->getPaddr())
+        forwardingTraining.insert_or_assign(
+            load->seqNum, store->pcState().instAddr() & 0xffff);
+}
+
+void
+LSQUnit::trainForwarding(const DynInstPtr &load, bool failed)
+{
+    refreshForwardingContext();
+    if (!fastForwardingAllowed()) {
+        forwardingTraining.erase(load->seqNum);
+        return;
+    }
+    const auto key = std::make_pair(
+        forwardingContext(), load->pcState().instAddr() & 0xffff);
+    const auto observed = forwardingTraining.find(load->seqNum);
+    auto history = forwardingHistory.find(key);
+    if (!failed && observed != forwardingTraining.end()) {
+        if (history == forwardingHistory.end() ||
+            history->second.storePC != observed->second)
+            forwardingHistory.insert_or_assign(
+                key, ForwardingHistory{observed->second, 0});
+        else if (history->second.confidence < 7)
+            ++history->second.confidence;
+    } else if (history != forwardingHistory.end() &&
+               history->second.confidence) {
+        --history->second.confidence;
+    }
+    forwardingTraining.erase(load->seqNum);
 }
 
 bool
-LSQUnit::tryFastForwarding(LSQRequest *request, ssize_t load_idx)
+LSQUnit::startFastForwarding(const DynInstPtr &load, unsigned size)
 {
-    const auto &load = loadQueue[load_idx].instruction();
-    if (fastForwarding.count(load->seqNum))
-        return true;
-    if (partialForwarding.count(load->seqNum) ||
-        request->isAnyOutstandingRequest())
-        return false;
     refreshForwardingContext();
-    const auto req = request->mainReq();
-    if (!hasFastForwardingPrediction(load) || request->isSplit() ||
-        req->isMasked() || req->isLLSC() || req->isReadModifyWrite() ||
-        req->isAcquire() || req->isLocalAccess() || req->isUncacheable() ||
-        req->isStrictlyOrdered() || req->isCacheMaintenance() ||
-        req->isMemMgmt() || (req->getFlags() & Request::NO_ACCESS))
+    if (!size || cpu->checker || !hasFastForwardingPrediction(load) ||
+        fastForwarding.count(load->seqNum))
         return false;
-
     const Addr store_pc = forwardingHistory.at(
-        {forwardingContext(), load->pcState().instAddr()});
+        {forwardingContext(), load->pcState().instAddr() & 0xffff}).storePC;
     auto candidate = storeQueue.end();
     for (auto it = storeQueue.begin(); it != storeQueue.end(); ++it) {
         if (it->instruction()->seqNum >= load->seqNum)
             break;
         if (it->instruction()->isStoreAddress() &&
-            it->instruction()->pcState().instAddr() == store_pc)
+            (it->instruction()->pcState().instAddr() & 0xffff) == store_pc)
             candidate = it;
     }
-    if (candidate == storeQueue.end() || candidate->addressReady())
-        return false; // A resolved address uses ordinary, verified forwarding.
-    if (!candidate->dataReady()) {
-        selectiveBlockedLoads.insert_or_assign(load->seqNum,
-            SelectiveBlockedLoad{candidate->instruction()->seqNum, load,
-                                 true, true});
-        iewStage->rescheduleMemInst(load);
-        load->clearIssued();
-        load->effAddrValid(false);
-        ++stats.splitStoreDataWaits;
-        ++stats.rescheduledLoads;
-        request->discard();
-        loadQueue[load_idx].setRequest(nullptr);
-        return true;
-    }
-    if (candidate->dataBytes() < req->getSize())
+    if (candidate == storeQueue.end() || !candidate->dataReady() ||
+        candidate->dataBytes() < size ||
+        (candidate->addressReady() && load->effAddrValid()))
         return false;
     FastForwarding prediction{load, candidate->instruction(), {},
                               forwardingContext()};
+    prediction.size = size;
+    prediction.value.assign(candidate->data(), candidate->data() + size);
     for (auto it = candidate; it != storeQueue.end(); ++it) {
         if (it->instruction()->seqNum >= load->seqNum)
             break;
@@ -2392,19 +2473,19 @@ LSQUnit::tryFastForwarding(LSQRequest *request, ssize_t load_idx)
     fastForwarding.emplace(load->seqNum, std::move(prediction));
     // Preserve resolved physical ranges before an older store can leave SQ.
     validateFastForwarding();
-    if (!load->memData)
-        load->memData = new uint8_t[req->getSize()];
-    std::memcpy(load->memData, candidate->data(), req->getSize());
-    request->noteNativeTerminal(TaoTraceNativeTerminalReason::StoreForward);
-    request->writebackScheduled();
-    auto *event = new EventFunctionWrapper([this, load, request] {
-        auto complete = [this, load, request] {
+    auto *event = new EventFunctionWrapper([this, load] {
+        auto complete = [this, load] {
             auto found = fastForwarding.find(load->seqNum);
             if (found != fastForwarding.end() && !load->isSquashed() &&
-                load->savedRequest == request &&
-                !found->second.failed) {
-                Packet pkt(request->mainReq(), MemCmd::ReadReq);
-                pkt.dataStatic(load->memData);
+                !found->second.failed && load->fault == NoFault &&
+                !load->isExecuted()) {
+                auto &prediction = found->second;
+                // This packet only invokes the functional value operation.
+                // It is never translated, sent, or attributed to a cache.
+                auto value_req = std::make_shared<Request>(
+                    0, prediction.size, 0, Request::funcRequestorId);
+                Packet pkt(value_req, MemCmd::ReadReq);
+                pkt.dataStatic(prediction.value.data());
                 load->completeAcc(&pkt);
                 found->second.valueReady = true;
                 if (load->fault == NoFault)
@@ -2412,13 +2493,14 @@ LSQUnit::tryFastForwarding(LSQRequest *request, ssize_t load_idx)
                 validateFastForwarding();
                 iewStage->activityThisCycle();
             }
-            request->writebackDone();
         };
-        if (load->isSquashed() || load->savedRequest != request) {
+        if (load->isSquashed()) {
             complete();
             return;
         }
-        if (lsq->usesLoadCompletion(load, request->mainReq()))
+        if (lsq->usesLoadCompletion(load, std::make_shared<Request>(
+                0, load->staticInst->earlyForwardingSize(), 0,
+                Request::funcRequestorId)))
             lsq->enqueueLoadCompletion(load, std::move(complete));
         else
             complete();
@@ -2426,6 +2508,44 @@ LSQUnit::tryFastForwarding(LSQRequest *request, ssize_t load_idx)
     cpu->schedule(event, cpu->clockEdge(Cycles(1)));
     ++stats.fastForwardPredictions;
     return true;
+}
+
+void
+LSQUnit::predictUnreadyLoadAddresses()
+{
+    if (!fastForwardingAllowed() || cpu->checker) return;
+    for (const auto &entry : loadQueue) {
+        const auto &load = entry.instruction();
+        bool operands_unready = false;
+        for (int source = 0; source < load->numSrcRegs(); ++source)
+            operands_unready |= !load->readySrcIdx(source);
+        if (!load->isSquashed() && load->isInIQ() && !load->isIssued() &&
+            operands_unready && !load->translationStarted() &&
+            load->fault == NoFault &&
+            startFastForwarding(load, load->staticInst->earlyForwardingSize()))
+            ++stats.fastForwardLoadAddressPredictions;
+    }
+}
+
+bool
+LSQUnit::tryFastForwarding(LSQRequest *request, ssize_t load_idx)
+{
+    const auto &load = loadQueue[load_idx].instruction();
+    const auto req = request->mainReq();
+    const bool ordinary = !request->isSplit() && !req->isMasked() &&
+        !req->isLLSC() && !req->isReadModifyWrite() && !req->isAcquire() &&
+        !req->isLocalAccess() && !req->isUncacheable() &&
+        !req->isStrictlyOrdered() && !req->isCacheMaintenance() &&
+        !req->isMemMgmt() && !(req->getFlags() & Request::NO_ACCESS);
+    if (fastForwarding.count(load->seqNum)) {
+        validateFastForwarding();
+        return true;
+    }
+    if (!ordinary || partialForwarding.count(load->seqNum) ||
+        request->isAnyOutstandingRequest() ||
+        !load->staticInst->earlyForwardingSize())
+        return false;
+    return startFastForwarding(load, req->getSize());
 }
 
 void
@@ -2442,57 +2562,69 @@ LSQUnit::validateFastForwarding()
                 !it->hasRequest() ||
                 prediction.physicalStores.count(store->seqNum))
                 continue;
-            auto &ranges = prediction.physicalStores[store->seqNum];
-            for (const auto &fragment : it->request()->_reqs)
-                if (fragment->hasPaddr())
-                    ranges.emplace_back(fragment->getPaddr(), fragment->getSize());
+            FastForwarding::StoreBytes bytes;
+            if (!it->request()->physicalBytes(bytes.bytes)) continue;
+            bytes.secure = it->request()->mainReq()->isSecure();
+            bytes.ordinary = isOrdinaryStore(it);
+            prediction.physicalStores.emplace(store->seqNum, std::move(bytes));
         }
-        if (!prediction.sourceVerified && prediction.store->effAddrValid()) {
-            for (auto it = storeQueue.begin(); it != storeQueue.end(); ++it)
-                if (it->instruction() == prediction.store) {
-                    prediction.sourceVerified = isOrdinaryStore(it) &&
-                        it->request()->mainReq()->getPaddr() ==
-                            load->savedRequest->mainReq()->getPaddr() &&
-                        it->request()->mainReq()->isSecure() ==
-                            load->savedRequest->mainReq()->isSecure();
-                    break;
-                }
-        }
-        if (!prediction.valueReady || std::any_of(
+        if (!prediction.valueReady || !load->savedRequest ||
+            !load->effAddrValid() || std::any_of(
             prediction.interveningStores.begin(),
             prediction.interveningStores.end(), [](const auto &store) {
                 return !store->effAddrValid() && !store->isSquashed();
             }))
             continue;
         const auto &source = prediction.store;
+        const auto req = load->savedRequest->mainReq();
+        std::vector<Addr> load_bytes;
+        const bool ordinary = !load->savedRequest->isSplit() &&
+            !req->isMasked() && !req->isLLSC() && !req->isReadModifyWrite() &&
+            !req->isAcquire() && !req->isLocalAccess() &&
+            !req->isUncacheable() && !req->isStrictlyOrdered() &&
+            !req->isCacheMaintenance() && !req->isMemMgmt() &&
+            !(req->getFlags() & Request::NO_ACCESS);
+        const auto producer = prediction.physicalStores.find(source->seqNum);
         bool correct = prediction.context == forwardingContext() &&
-            prediction.sourceVerified && fastForwardingAllowed() &&
+            fastForwardingAllowed() && ordinary &&
             !source->isSquashed() &&
             source->fault == NoFault && load->fault == NoFault &&
-            source->effAddr == load->effAddr &&
-            source->effSize >= load->effSize;
+            load->effSize == prediction.size &&
+            load->savedRequest->physicalBytes(load_bytes) &&
+            producer != prediction.physicalStores.end() &&
+            producer->second.ordinary && !producer->second.bytes.empty() &&
+            producer->second.secure == req->isSecure() &&
+            producer->second.bytes.front() == req->getPaddr();
+        if (correct)
+            for (const auto address : load_bytes)
+                correct &= std::find(producer->second.bytes.begin(),
+                    producer->second.bytes.end(), address) !=
+                        producer->second.bytes.end();
         for (const auto &store : prediction.interveningStores) {
             if (store == source || store->isSquashed())
                 continue;
-            auto ranges = prediction.physicalStores.find(store->seqNum);
-            if (ranges == prediction.physicalStores.end()) {
+            auto bytes = prediction.physicalStores.find(store->seqNum);
+            if (bytes == prediction.physicalStores.end()) {
                 correct = false;
                 continue;
             }
-            const Addr address = load->savedRequest->mainReq()->getPaddr();
-            for (const auto &[begin, size] : ranges->second)
-                if (begin < address + load->effSize && address < begin + size)
+            if (bytes->second.secure != req->isSecure()) continue;
+            for (const Addr address : load_bytes)
+                if (std::find(bytes->second.bytes.begin(),
+                        bytes->second.bytes.end(), address) !=
+                        bytes->second.bytes.end())
                     correct = false;
         }
         if (!correct) {
             prediction.failed = true;
-            forwardingHistory.erase(
-                {prediction.context, load->pcState().instAddr()});
+            trainForwarding(load, true);
             ++stats.fastForwardFailures;
             iewStage->squashFastForwarding(load);
             continue;
         }
         prediction.validated = true;
+        load->savedRequest->noteNativeTerminal(
+            TaoTraceNativeTerminalReason::StoreForward);
         ++stats.fastForwardValidated;
         ++stats.forwLoads;
         rememberForwarding(load, source);
@@ -2576,6 +2708,7 @@ LSQUnit::collectSameStartForwarding(LSQRequest *request, ssize_t load_idx)
                 return false;
             bytes.mask[byte] = true;
             bytes.data[byte] = entry->data[offset];
+            bytes.sourceSequence[byte] = entry->sourceSequence[offset];
         }
     }
     const unsigned supplied = std::count(bytes.mask.begin(), bytes.mask.end(), true);
@@ -2605,6 +2738,9 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
 
     std::vector<uint8_t> data(size, 0);
     std::vector<bool> covered(size, false);
+    std::vector<InstSeqNum> producers(size, 0);
+    std::vector<Addr> producerPC(size, 0);
+    std::vector<Addr> producerStart(size, 0);
     bool overlap = false;
     auto oldest_pending = std::find_if(
         committedStoreBuffer.begin(), committedStoreBuffer.end(),
@@ -2688,6 +2824,9 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
                     overlap = true;
                     covered[byte] = true;
                     data[byte] = entry->data[offset];
+                    producers[byte] = entry->sourceSequence[offset];
+                    producerPC[byte] = entry->sourcePC[offset];
+                    producerStart[byte] = entry->sourceStart[offset];
                 }
             }
             if (entry->invalidated && overlap &&
@@ -2696,7 +2835,48 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
         }
         if (!overlap)
             return false;
+        // A buffered value is older than every store still in the SQ. Do
+        // not forward it while a younger older-than-load store could still
+        // resolve to the same bytes; retry once its address is known.
+        if (sprMemoryDependence) {
+            auto store = load->sqIt;
+            while (store != storeWBIt) {
+                --store;
+                if (store->instruction()->effAddrValid())
+                    continue;
+                const bool retain = canRetainLoadRequest(request);
+                iewStage->instQueue.memoryDependence(lsqID).noteAddressWait(load);
+                selectiveBlockedLoads.insert_or_assign(load->seqNum,
+                    SelectiveBlockedLoad{store->instruction()->seqNum,
+                                         load, false, true, retain});
+                if (!retain) {
+                    iewStage->rescheduleMemInst(load);
+                    load->clearIssued();
+                    load->effAddrValid(false);
+                    ++stats.rescheduledLoads;
+                    request->discard();
+                    load_entry.setRequest(nullptr);
+                }
+                return true;
+            }
+        }
         if (std::all_of(covered.begin(), covered.end(), [](bool v) { return v; })) {
+            // The value is already selected even if its writeback event has
+            // not run.  Include it in violation checks against unresolved
+            // younger stores.  The oldest byte producer is a conservative
+            // bound when several committed stores supply the load.
+            fullForwardingSource.insert_or_assign(
+                load->seqNum, *std::min_element(producers.begin(), producers.end()));
+            DPRINTF(LSQUnit, "Store buffer forwards load [sn:%llu] "
+                    "vaddr %#x paddr %#x oldest producer [sn:%llu]\n",
+                    load->seqNum, req->getVaddr(), address,
+                    fullForwardingSource.at(load->seqNum));
+            if (size && fastForwardingAllowed() &&
+                producerStart.front() == address &&
+                std::all_of(producers.begin(), producers.end(),
+                    [&](auto sequence) { return sequence == producers.front(); }))
+                forwardingTraining.insert_or_assign(
+                    load->seqNum, producerPC.front() & 0xffff);
             request->noteNativeTerminal(TaoTraceNativeTerminalReason::StoreForward);
             if (!load->memData)
                 load->memData = new uint8_t[size];

@@ -184,6 +184,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     State CacheState,        desc="cache state";
     DataBlock DataBlk,       desc="data for the block";
     bool Dirty, default="false",   desc="data is dirty";
+    bool CapacityVictim, default="false", desc="Selected for an actual data-capacity replacement";
     bool isPrefetched, default="false", desc="Set if this block was prefetched";
   }
 
@@ -420,18 +421,28 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   in_port(optionalQueue_in, RubyRequest, prefetchQueue, desc="...", rank = 2) {
     if (optionalQueue_in.isReady(clockEdge())) {
       peek(optionalQueue_in, RubyRequest) {
-        if (in_msg.Type != RubyRequestType:Store_Prepare &&
+        // A translated store hint must not overtake an already queued
+        // demand access. Keep the hint for a later cycle instead of dropping
+        // its completion obligation.
+        if (in_msg.Type == RubyRequestType:Store_Prepare &&
+            mandatoryQueue.isReady(clockEdge())) {
+          optionalQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
+        } else if (in_msg.Type != RubyRequestType:Store_Prepare &&
             (mandatoryQueue.isReady(clockEdge()) ||
              TBEs.isPresent(in_msg.LineAddress) ||
              !TBEs.areNSlotsAvailable(1, clockEdge()) ||
              (in_msg.Type != RubyRequestType:IFETCH &&
-              !Dcache.canAllocateDataFill()))) {
+              !Dcache.canAllocateDataFill(in_msg.Type == RubyRequestType:ST ||
+                  in_msg.Type == RubyRequestType:Load_Linked)))) {
           prefetcher.prefetchDropped(in_msg.LineAddress);
           optionalQueue_in.dequeue(clockEdge());
         } else if (in_msg.Type != RubyRequestType:IFETCH &&
             getState(TBEs[in_msg.LineAddress],
                      getDCacheEntry(in_msg.LineAddress), in_msg.LineAddress) == State:I &&
-            !Dcache.canAllocateDataFill()) {
+            !Dcache.canAllocateDataFill(
+                in_msg.Type == RubyRequestType:Store_Prepare ||
+                in_msg.Type == RubyRequestType:ST ||
+                in_msg.Type == RubyRequestType:Load_Linked)) {
           Dcache.recordFillBlocked();
           optionalQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
         } else {
@@ -531,6 +542,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
               }
             } else {
               check_on_cache_probe(optionalQueue_in, addr);
+              getDCacheEntry(addr).CapacityVictim := true;
               trigger(Event:PF_L0_Replacement, addr,
                       getDCacheEntry(addr),
                       TBEs[addr]);
@@ -601,7 +613,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                    getState(TBEs[in_msg.LineAddress],
                             getDCacheEntry(in_msg.LineAddress),
                             in_msg.LineAddress) == State:I &&
-                   !Dcache.canAllocateDataFill()) {
+                   !Dcache.canAllocateDataFill(in_msg.Type == RubyRequestType:ST ||
+                       in_msg.Type == RubyRequestType:ATOMIC)) {
           Dcache.recordDemandFillBlocked();
           mandatoryQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
         } else if (in_msg.Type == RubyRequestType:IFETCH) {
@@ -682,6 +695,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
                 // Check if the line we want to evict is not locked
                 Addr addr := Dcache.cacheProbe(in_msg.LineAddress);
                 check_on_cache_probe(mandatoryQueue_in, addr);
+                getDCacheEntry(addr).CapacityVictim := true;
                 trigger(Event:L0_Replacement, addr,
                         getDCacheEntry(addr),
                         TBEs[addr]);
@@ -977,6 +991,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
       Dcache.profileDemandMiss();
       Dcache.observeDataFillDemandRead(address);
       peek(mandatoryQueue_in, RubyRequest) {
+        if (in_msg.fillAuditRole() == 1 || in_msg.fillAuditRole() == 2) {
+          Dcache.observeSoftwarePrefetchHit(address);
+        }
         sequencer.registerReadFill(in_msg.getRequestPtr(), true, true);
         nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
             in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 3);
@@ -1035,12 +1052,23 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   action(fd_allocateDataFill, "fd", desc="Account for an L1 data line fill") {
     assert(is_valid(tbe));
-    Dcache.allocateDataFill(address, sequencer.hasPendingDemandRead(address));
+    peek(mandatoryQueue_in, RubyRequest) {
+      Dcache.allocateDataFill(address, sequencer.hasPendingDemandRead(address),
+          in_msg.Type == RubyRequestType:ST || in_msg.Type == RubyRequestType:ATOMIC);
+      if (in_msg.fillAuditRole() == 5 || in_msg.fillAuditRole() == 8) {
+        Dcache.markSoftwarePrefetchFill(address);
+      }
+    }
   }
 
   action(fp_allocatePrefetchFill, "fp", desc="Account for a non-demand data fill") {
     assert(is_valid(tbe));
-    Dcache.allocateDataFill(address, false);
+    peek(optionalQueue_in, RubyRequest) {
+      Dcache.allocateDataFill(address, false,
+          in_msg.Type == RubyRequestType:Store_Prepare ||
+          in_msg.Type == RubyRequestType:ST ||
+          in_msg.Type == RubyRequestType:Load_Linked);
+    }
   }
 
   action(k_popMandatoryQueue, "k", desc="Pop mandatory queue") {
@@ -1112,6 +1140,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   action(ff_deallocateCacheBlock, "\f",
          desc="Deallocate L1 cache block.") {
     if (Dcache.isTagPresent(address)) {
+      if (cache_entry.CapacityVictim) {
+        Dcache.profileDataReplacement(address);
+      }
       Dcache.deallocate(address);
     } else {
       Icache.deallocate(address);
@@ -1152,10 +1183,18 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   action(uu_profileInstMiss, "\ui", desc="Profile the demand miss") {
     Icache.profileDemandMiss();
+    peek(mandatoryQueue_in, RubyRequest) {
+      nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
+          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 1);
+    }
   }
 
   action(uu_profileInstHit, "\uih", desc="Profile the demand hit") {
     Icache.profileDemandHit();
+    peek(mandatoryQueue_in, RubyRequest) {
+      nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
+          in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 0);
+    }
   }
 
   action(uu_profileDataMiss, "\ud", desc="Profile the demand miss") {
@@ -1179,6 +1218,9 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     Dcache.profileDemandMiss();
     Dcache.observeDataFillDemandRead(address);
     peek(mandatoryQueue_in, RubyRequest) {
+      if (in_msg.fillAuditRole() == 1 || in_msg.fillAuditRole() == 2) {
+        Dcache.observeSoftwarePrefetchHit(address);
+      }
       sequencer.registerReadFill(in_msg.getRequestPtr(), true, true);
       nativeCacheOutcome(in_msg.getRequestPtr(), in_msg.traceIdentityValid(),
           in_msg.traceContextId(), in_msg.traceInstSeqNum(), 0, 3);
@@ -1995,6 +2037,12 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   // Flush transitions
+  transition({IS, Inst_IS, IM, SM, PF_IS, PF_Inst_IS, PF_IE, SP_IE}, Flush) {
+    // Permission or data acquisition must finish before this flush can
+    // reuse the line's TBE and publish its invalidation.
+    z_stallAndWaitMandatoryQueue;
+  }
+
   transition(I, Flush, I_F) {
     i_allocateTBE_flush;
     f_sendFlushNPToL1;

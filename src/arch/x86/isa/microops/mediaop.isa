@@ -609,6 +609,25 @@ let {{
             FpDestHiReg_uqw = 0;
         '''
 
+    # Partial memory loads execute a load and a register merge. The merge
+    # connects the loaded half to the preserved half without delaying the
+    # independent address/load operation behind the old XMM value.
+    class Mxmmmergehi(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'SimdInsertOp'
+        code = '''
+            FpDestReg_uqw = FpSrcReg1_uqw;
+            FpDestHiReg_uqw = FpSrcReg2_uqw;
+        '''
+
+    class Mxmmmergelo(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'SimdMiscOp'
+        code = '''
+            FpDestReg_uqw = FpSrcReg2_uqw;
+            FpDestHiReg_uqw = FpSrcReg1_uqw;
+        '''
+
     class Mxmmfromint(MediaOp):
         operand_types = (FloatDestOp, FloatDestHiOp, IntSrc1Op)
         op_class = 'SimdInsertOp'

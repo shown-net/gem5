@@ -75,8 +75,8 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         self.Dcache = RubyCache(
             size=l1d_size,
             assoc=l1d_assoc,
-            # Issue-to-issue dependent load interval: one AGU handoff + four
-            # Ruby service cycles. Completion-to-ROB delay is not added here.
+            # Generic Ruby service component. The SPR hierarchy calibrates
+            # this separately from the AGU/LSU issue-to-issue handoffs.
             dataAccessLatency=4,
             fill_capacity=16,
             fill_stats_clock=clk_domain,
