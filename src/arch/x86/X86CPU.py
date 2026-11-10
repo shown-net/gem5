@@ -149,7 +149,7 @@ def spr_fu_pool():
             indices = (1, 5)
         elif name == "IntDiv":
             indices = (1,)
-        elif name in {"FloatMult", "SimdFloatMult", "FloatMultAcc",
+        elif name in {"FloatMult", "SimdFloatMult", "SimdMult", "FloatMultAcc",
                       "SimdFloatMultAcc", "SimdMultAcc", "SimdCmp", "SimdShift"}:
             indices = (0, 1)
         elif name in {"SimdPack", "SimdInsert"}:

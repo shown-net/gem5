@@ -84,20 +84,31 @@
                         // TODO(SPR-MSR): MONITOR/MWAIT here do not establish
                         // UMONITOR/UMWAIT or IGN_UMONITOR behavior; check use.
                         0x0: MonitorInst::monitor({{
-                           xc->armMonitor(Rax);
+                           if (Rcx != 0)
+                               return std::make_shared<GeneralProtection>(0);
+                           const Addr address = monitorAddress(xc, Rax);
+                           const auto flags = monitorFlags();
+                           uint64_t mem = 0;
+                           fault = readMemAtomic(xc, traceData, address,
+                                                 mem, 1, flags);
+                           if (fault != NoFault)
+                               return fault;
+                           auto *tc = xc->tcBase();
+                           auto req = std::make_shared<Request>(
+                               address, 1, flags,
+                               tc->getCpuPtr()->dataRequestorId(),
+                               tc->pcState().instAddr(), tc->contextId());
+                           fault = tc->getMMUPtr()->translateAtomic(
+                               req, tc, BaseMMU::Read);
+                           if (fault == NoFault)
+                               xc->armMonitor(address, req->getPaddr());
                         }});
                         0x1: MwaitInst::mwait({{
-                           if (!xc->getAddrMonitor()->armed)
-                               return NoFault;
-                           uint64_t m = 0;          //mem
-                           unsigned s = 0x8;        //size
-                           unsigned f = 0;          //flags
-                           readMemAtomic(xc, traceData,
-                                         xc->getAddrMonitor()->vAddr,
-                                         m, s, f);
-                           xc->mwaitAtomic(xc->tcBase());
+                           if (Rcx & ~uint64_t(1))
+                               return std::make_shared<GeneralProtection>(0);
                            MicroHalt hltObj(machInst, mnemonic, 0x0);
-                           hltObj.execute(xc, traceData);
+                           if (xc->mwait(Rcx & 1))
+                               hltObj.execute(xc, traceData);
                         }});
                         default: Inst::UD2();
                     }

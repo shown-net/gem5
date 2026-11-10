@@ -164,6 +164,7 @@ structure (Sequencer, external = "yes") {
   void llscClearLocalMonitor();
 
   void evictionCallback(Addr);
+  void evictionCallback(Addr, bool);
   void storePrepareComplete();
 
   void invL1Callback();
@@ -242,6 +243,7 @@ structure (CacheMemory, external = "yes") {
   void setMRU(AbstractCacheEntry);
   void recordRequestType(CacheRequestType, Addr);
   void profileNativeRequest(int, bool, bool);
+  void profileNativeReadAccess(int);
     void beginOffcoreOwnership(Addr, int);
     void endOffcoreOwnership(Addr);
     void profileDataReplacement(Addr);

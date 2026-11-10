@@ -1022,6 +1022,11 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(k_popL0RequestQueue, "k", desc="Pop mandatory queue.") {
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      if (in_msg.Class == CoherenceClass:GETS) {
+        cache.profileNativeReadAccess(in_msg.FillAuditRole);
+      }
+    }
     messageBufferFromL0_in.dequeue(clockEdge());
   }
 

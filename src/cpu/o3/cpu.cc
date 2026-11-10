@@ -51,6 +51,7 @@
 #include "cpu/o3/stack_engine.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/mmu.hh"
+#include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
@@ -1477,6 +1478,48 @@ CPU::removeAllInsts()
     instList.clear();
 }
 */
+void
+CPU::dumpProgressState()
+{
+    cprintf("%llu: %s no-progress state status:%d tick_scheduled:%d "
+            "active_threads:%u\n", curTick(), name(), _status,
+            tickEvent.scheduled(), activeThreads.size());
+    fetch.dumpProgressState();
+    if (auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu)) {
+        x86_mmu->getInstructionWalker()->dumpProgressState();
+        x86_mmu->getDataWalker()->dumpProgressState();
+    }
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        const auto *context = tcBase(tid);
+        cprintf("Thread:%u status:%d committed_PC:%s ROB_empty:%d\n",
+                tid, context->status(), context->pcState(), rob.isEmpty(tid));
+        const auto &monitor = *getCpuAddrMonitor(tid);
+        cprintf("Thread:%u monitor_armed:%d monitor_waiting:%d "
+                "monitor_got_wakeup:%d monitor_vaddr:%#x "
+                "monitor_paddr:%#x interrupt_deliverable:%d\n",
+                tid, monitor.armed, monitor.waiting, monitor.gotWakeup,
+                monitor.armed ? monitor.vAddr : 0,
+                monitor.waiting ? monitor.pAddr : 0, checkInterrupts(tid));
+        if (rob.isEmpty(tid))
+            continue;
+        const auto &head = rob.readHeadInst(tid);
+        cprintf("ROB head PC:%s [sn:%llu] op:%s issued:%d executed:%d "
+                "can_commit:%d mem_done:%d in_IQ:%d in_LSQ:%d "
+                "translation_started:%d translation_complete:%d "
+                "effective_address_valid:%d fault:%s\n",
+                head->pcState(), head->seqNum, head->staticInst->getName(),
+                head->isIssued(), head->isExecuted(), head->readyToCommit(),
+                head->memOpDone(), head->isInIQ(), head->isInLSQ(),
+                head->translationStarted(), head->translationCompleted(),
+                head->effAddrValid(), head->getFault() == NoFault ?
+                    "none" : head->getFault()->name());
+        for (unsigned source = 0; source < head->numSrcRegs(); ++source)
+            cprintf("ROB head source:%u ready:%d\n",
+                    source, head->readySrcIdx(source));
+        iew.ldstQueue.dumpInsts(tid);
+    }
+}
+
 void
 CPU::dumpInsts()
 {

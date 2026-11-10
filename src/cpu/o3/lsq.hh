@@ -524,6 +524,11 @@ class LSQ
             return flags.isSet(Flag::Complete);
         }
 
+        virtual bool hasReturnedData() const
+        {
+            return flags.isSet(Flag::Complete);
+        }
+
         bool
         isInTranslation()
         {
@@ -716,6 +721,10 @@ class LSQ
                 gem5::ThreadContext* tc, BaseMMU::Mode mode);
         virtual bool recvTimingResp(PacketPtr pkt);
         virtual void initiateTranslation();
+        bool hasReturnedData() const override
+        {
+            return numReceivedPackets != 0;
+        }
         virtual void sendPacketToCache();
         virtual void buildPackets();
 
@@ -935,7 +944,8 @@ class LSQ
     bool usesLoadCompletion(const DynInstPtr &inst,
                             const RequestPtr &request) const;
     void enqueueLoadCompletion(const DynInstPtr &inst,
-                               std::function<void()> complete);
+                               std::function<void()> complete,
+                               bool same_cycle = false);
     /**
      * Handles writing back and completing the load or store that has
      * returned from memory.
@@ -1000,6 +1010,9 @@ class LSQ
     const bool sprL1LoadBankConflicts;
     std::array<unsigned, 16> loadBankUses{};
     const unsigned loadCompletionWidth;
+    unsigned usedLoadCompletions = 0;
+    Cycles loadCompletionCycle = Cycles(0);
+    void updateLoadCompletionBudget();
     struct LoadCompletion {
         Tick ready;
         InstSeqNum sequence;

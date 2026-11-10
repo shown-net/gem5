@@ -73,6 +73,7 @@ def template MediaOpDeclare {{
         Fault execute(ExecContext *, trace::InstRecord *) const override;
         %(move_elimination)s;
         %(float_dest_pair)s;
+        %(vector_cost)s;
     };
 }};
 
@@ -132,9 +133,35 @@ let {{
                 'bool isFullXmmMove() const override '
                 '{ return !machInst.vex.present; }'
                 if Name == 'Mxmmmov' else '')
+            # Golden Cove server instruction package: whole-instruction
+            # latency for single-action SSE operations. PMULLD result timing
+            # uses the native dependent-chain prior documented at Mmulld.
+            vector_cost = ''
+            costs = {
+                'Mxmmmuli': ('0x03', 5),
+                'Mmulld': ('0x03', 10),
+                'Mxmmavg': ('0x03', 1),
+                'Mxmmmini': ('0x03', 1),
+                'Mxmmmaxi': ('0x03', 1),
+                'Mxmmsad': ('0x20', 3),
+                'Mxmmpack': ('0x20', 3),
+                'Mxmmshiftcount': ('0x22', 1),
+            }
+            if Name in ('Mxmmaddi', 'Mxmmsubi'):
+                vector_cost = (
+                    'uint16_t vectorExecutionPorts() const override '
+                    '{ return ext & 0x2 ? 0x03 : 0; }')
+            elif Name in costs:
+                ports, latency = costs[Name]
+                vector_cost = (
+                    'uint16_t vectorExecutionPorts() const override '
+                    '{ return %s; }\n'
+                    'unsigned vectorExecutionLatency() const override '
+                    '{ return %d; }' % (ports, latency))
             iop = InstObjParams(name, Name + suffix, base,
                                 {"code": code, "zero_idiom": zero_idiom,
                                  "move_elimination": move_elimination,
+                                 "vector_cost": vector_cost,
                                  "float_dest_pair":
                                      'bool isFullXmmWrite() const override '
                                      '{ return true; }'
@@ -600,6 +627,12 @@ let {{
             FpDestReg_uqw = FpSrcReg1_uqw;
             FpDestHiReg_uqw = FpSrcReg2_uqw;
         '''
+
+    class Mxmmshiftcount(MediaOp):
+        # The register-count shift's p15 action feeds its p01 action.
+        operand_types = (FloatDestOp, FloatSrc1Op)
+        op_class = 'SimdMiscOp'
+        code = 'FpDestReg_uqw = FpSrcReg1_uqw;'
 
     class Mxmmmovq(MediaOp):
         operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op)
@@ -1423,6 +1456,14 @@ let {{
             }
             FpDestReg_uqw = result;
         '''
+
+    class Mmulld(Mmuli):
+        # Two parallel lane records reserve the two p01 PMULLD actions.
+        # Result publication uses the measured 10-cycle dependency latency,
+        # not Intel's two 4-cycle duop entries as an inferred stage graph.
+        # Xeon 8457C evidence: cpu_microarchitecture/output/
+        # spr-pmulld-prior-native-20261110 (long-minus-short: 10.00625 c/op).
+        op_class = 'SimdMultOp'
 
     class Mavg(Media3Op):
         op_class = 'SimdAddOp'
@@ -2275,7 +2316,8 @@ let {{
     # Integer lane arithmetic is evaluated as one XMM operation. FP arithmetic
     # uses the SSEMath classes above, including one instruction's MXCSR/fault
     # boundary; it must not be regenerated from the old host-FP lane helpers.
-    for lane_class in (Maddi, Mmuli, Mcmpi2r, Msrl, Msra, Msll):
+    for lane_class in (Maddi, Msubi, Mmuli, Mmini, Mmaxi, Mavg, Msad,
+                       Mcmpi2r, Msrl, Msra, Msll):
         is_shift = lane_class in (Msrl, Msra, Msll)
         lane_code = lane_class.code.replace('FpDestReg_uqw', 'result_lane')
         lane_code = lane_code.replace('FpSrcReg1_uqw', 'left_lane')

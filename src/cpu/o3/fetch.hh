@@ -114,11 +114,14 @@ class Fetch
     {
       protected:
         Fetch *fetch;
+        RequestPtr request;
 
       public:
-        FetchTranslation(Fetch *_fetch) : fetch(_fetch) {}
+        FetchTranslation(Fetch *_fetch, const RequestPtr &_request)
+            : fetch(_fetch), request(_request) {}
 
         void markDelayed() {}
+        bool squashed() const override;
 
         void
         finish(const Fault &fault, const RequestPtr &req,
@@ -282,6 +285,9 @@ class Fetch
 
     /** Tells fetch to wake up from a quiesce instruction. */
     void wakeFromQuiesce();
+
+    /** Read-only state for the explicitly enabled CPU progress diagnostic. */
+    void dumpProgressState() const;
 
     /** For priority-based fetch policies, need to keep update priorityList */
     void deactivateThread(ThreadID tid);

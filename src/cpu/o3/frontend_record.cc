@@ -2,6 +2,7 @@
 #include "cpu/o3/frontend_record.hh"
 #include <cstring>
 #include "arch/x86/insts/macroop.hh"
+#include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -19,11 +20,66 @@ repStringKind(const StaticInst *macro)
     return RepStringKind::None;
 }
 
+NearStackControl
+nearStackControl(const StaticInst *macro)
+{
+    const auto *x86_macro = dynamic_cast<const X86ISA::MacroopBase *>(macro);
+    if (!x86_macro) return NearStackControl::None;
+    const auto env =
+        const_cast<X86ISA::MacroopBase *>(x86_macro)->getEmulEnv();
+    if (env.stackSize != 8 || env.dataSize != 8)
+        return NearStackControl::None;
+    const char *block = x86_macro->getMicrocodeBlock();
+    if (std::strcmp(block, "CALL_NEAR_I") == 0)
+        return NearStackControl::DirectCall;
+    if (std::strcmp(block, "CALL_NEAR_R") == 0)
+        return NearStackControl::RegisterCall;
+    if (std::strcmp(block, "CALL_NEAR_M") == 0 ||
+        std::strcmp(block, "CALL_NEAR_P") == 0)
+        return NearStackControl::MemoryCall;
+    if (std::strcmp(block, "RET_NEAR") == 0)
+        return NearStackControl::Return;
+    if (std::strcmp(block, "RET_NEAR_I") == 0)
+        return NearStackControl::ReturnImmediate;
+    return NearStackControl::None;
+}
+
 StageDemand
 initialDemand(const StaticInst &instruction, const StaticInst *macro)
 {
     StageDemand demand;
     const auto name = instruction.getName();
+    const auto stack_control = nearStackControl(macro);
+    if (stack_control != NearStackControl::None) {
+        const bool ip_companion = name == "rdip";
+        const bool immediate_companion =
+            stack_control == NearStackControl::ReturnImmediate && name == "limm";
+        const bool direct_call = stack_control == NearStackControl::DirectCall;
+        const bool direct_control = direct_call && instruction.isCall();
+        const bool stack_update = instruction.numDestRegs() == 1 &&
+            instruction.destRegIdx(0) == X86ISA::int_reg::Rsp &&
+            (name == "subi" || name == "addi");
+        if (ip_companion || direct_control || immediate_companion || stack_update) {
+            // Keep the functional PC/value and implicit RSP records. They
+            // are not additional frontend or retirement units. Rename
+            // evaluates ready constants; Stack Engine owns absorbed updates.
+            demand.frontendUnits = demand.idqUnits = 0;
+            demand.allocationUnits = demand.retirementUnits = 0;
+            demand.retirementUops = 0;
+        }
+        if (ip_companion || direct_control || immediate_companion) {
+            demand.robUnits = demand.schedulerUnits = 0;
+            demand.schedulerActions = 0;
+        }
+        if (direct_call && instruction.isStore()) {
+            // The relative CALL has two store actions and no separate
+            // operand-dependent branch action.
+            demand.frontendUnits = demand.idqUnits = 2;
+            demand.allocationUnits = demand.robUnits = 2;
+            demand.retirementUnits = demand.retirementUops = 2;
+            demand.schedulerUnits = 2;
+        }
+    }
     const bool rep_parent = repStringKind(macro) != RepStringKind::None;
     const bool rep_helper = rep_parent && !instruction.isMemRef() &&
         !instruction.isFirstMicroop() && !instruction.isLastMicroop();

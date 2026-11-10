@@ -346,13 +346,14 @@ class CheckerCPU : public BaseCPU, public ExecContext
     }
 
     // monitor/mwait funtions
-    void armMonitor(Addr address) override { BaseCPU::armMonitor(0, address); }
-    bool mwait(PacketPtr pkt) override { return BaseCPU::mwait(0, pkt); }
-
     void
-    mwaitAtomic(ThreadContext *tc) override
+    armMonitor(Addr address, Addr paddr) override
     {
-        return BaseCPU::mwaitAtomic(0, tc, thread->mmu);
+        BaseCPU::armMonitor(0, address, paddr);
+    }
+    bool mwait(bool break_on_interrupt) override
+    {
+        return BaseCPU::mwait(0, break_on_interrupt);
     }
 
     AddressMonitor *

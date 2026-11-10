@@ -1066,6 +1066,8 @@ IEW::dispatchInsts(ThreadID tid)
             inst->setCanCommit();
             if (inst->getFault() == NoFault)
                 instQueue.recordCompletedProducer(inst);
+            if (inst->isControl())
+                checkMisprediction(inst);
             add_to_iq = false;
         } else if (inst->eliminatedMove || inst->stackAbsorbed) {
             // The destination names the source producer's physical register.

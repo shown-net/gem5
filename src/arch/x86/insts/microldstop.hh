@@ -86,11 +86,19 @@ class MemOp : public X86MicroopBase
 class LdStOp : public InstOperands<MemOp, FoldedDataOp, AddrOp>
 {
   public:
+    bool hasFastForwardingAddress() const override
+    {
+        // T0 represents the absent SIB index; a real zero-valued register
+        // remains indexed. Non-SIB base/displacement forms have scale zero.
+        return getName() == "ld" &&
+            (scale == 0 || index == int_reg::T0.index());
+    }
+
     unsigned earlyForwardingSize() const override
     {
-        return isLoad() && !isNonSpeculative() &&
+        return isLoad() && !isNonSpeculative() && hasFastForwardingAddress() &&
             (dataSize == 4 || dataSize == 8) &&
-            (getName() == "ld" || getName() == "ldrip") &&
+            getName() == "ld" &&
             !(memFlags & ~Request::FlagsType(SegmentFlagMask |
                 CPL0FlagBit | (AddrSizeFlagMask << AddrSizeFlagShift))) ?
                     dataSize : 0;
@@ -175,6 +183,13 @@ class StFpPairOp :
  */
 class MemNoDataOp : public InstOperands<MemOp, AddrOp>
 {
+  public:
+    bool hasFastForwardingAddress() const override
+    {
+        return isStoreAddress() && getName() == "sta" &&
+            (scale == 0 || index == int_reg::T0.index());
+    }
+
   protected:
     MemNoDataOp(ExtMachInst mach_inst, const char *mnem, const char *inst_mnem,
             uint64_t set_flags, uint8_t _scale, GpRegIndex _index,

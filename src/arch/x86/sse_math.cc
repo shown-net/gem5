@@ -5,6 +5,7 @@ extern "C" {
 #include "softfloat.h"
 }
 #include "arch/x86/faults.hh"
+#include "arch/x86/insts/static_inst.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/exec_context.hh"
 
@@ -160,5 +161,54 @@ SSEMath::finish(ExecContext *xc) const
     }
     xc->orMiscReg(misc_reg::Mxcsr, reported);
     return NoFault;
+}
+
+bool
+X86StaticInst::maskedSSEDivideAssist64(ExecContext *xc) const
+{
+    const unsigned kind = sseArithmeticKind();
+    if (opClass() != FloatDivOp ||
+        ((kind != 1 || numSrcRegs() != 3) &&
+         (kind != 3 || numSrcRegs() != 4)))
+        return false;
+    const uint32_t control = xc->readMiscReg(misc_reg::Mxcsr);
+    if ((control & 0x1f80) != 0x1f80)
+        return false;
+    const auto finite_nonzero = [](uint64_t value) {
+        return ((value >> 52) & 0x7ff) != 0x7ff &&
+            (value & 0x7fffffffffffffffULL);
+    };
+    const auto denormal = [](uint64_t value) {
+        return !(value & 0x7ff0000000000000ULL) &&
+            (value & 0x000fffffffffffffULL);
+    };
+    bool assist = false;
+    for (unsigned lane = 0; lane < (kind == 1 ? 1 : 2); ++lane) {
+        const uint64_t numerator = xc->getRegOperand(this, lane);
+        const uint64_t divisor = xc->getRegOperand(this, lane + 2);
+        // Only measured finite, nonzero input classes are admitted. Special
+        // values and unmasked exceptions retain the functional fault path.
+        if (!finite_nonzero(numerator) || !finite_nonzero(divisor))
+            return false;
+        if (!(control & (1u << 6)) &&
+            (denormal(numerator) || denormal(divisor)))
+            assist = true;
+        const unsigned numerator_exp = (numerator >> 52) & 0x7ff;
+        const unsigned divisor_exp = (divisor >> 52) & 0x7ff;
+        if (!(control & (1u << 15)) && numerator_exp && divisor_exp) {
+            constexpr uint64_t fraction = 0x000fffffffffffffULL;
+            // Normal significands have the same implicit leading bit. Their
+            // ratio is below one exactly when the numerator fraction is less.
+            const int result_exp = int(numerator_exp) - int(divisor_exp) +
+                1023 - int((numerator & fraction) < (divisor & fraction));
+            // The measured assist range uses the unrounded quotient exponent,
+            // including values that round to zero. Below it, upward rounding
+            // can still produce the smallest subnormal without an assist.
+            if (result_exp >= -64 && result_exp <= 0)
+                assist = true;
+        }
+    }
+    // This is a transient timing query. Do not publish sticky bits or faults.
+    return assist;
 }
 }

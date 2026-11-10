@@ -535,6 +535,19 @@ FrontendTemplate::encodedSlots() const
     // one encoded slot while allocating separate backend entries.
     if (macroop && (macroop->isMicroFusedMemory() || macroop->isStackRegAllocation()))
         return 1;
+    switch (nearStackControl(macroop.get())) {
+      case NearStackControl::DirectCall:
+      case NearStackControl::RegisterCall:
+        return 2;
+      case NearStackControl::MemoryCall:
+        return 3;
+      case NearStackControl::Return:
+        return 1;
+      case NearStackControl::ReturnImmediate:
+        return 3;
+      case NearStackControl::None:
+        break;
+    }
     unsigned slots = 0;
     for (const auto &op : operations) {
         const auto divide = op->intDivide();
@@ -648,7 +661,6 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
 void
 DsbTemplates::invalidate(Addr physical_block)
 {
-    ++codeEpoch;
     for (auto it = entries.begin(); it != entries.end();) {
         auto entry = it++;
         const bool overlaps = std::any_of(entry->members.begin(), entry->members.end(),
@@ -923,6 +935,7 @@ void FrontendCoordinator::cancelAfter(InstSeqNum through)
 }
 void FrontendCoordinator::reset()
 {
+    ++translationEpochValue;
     cancelAfter(0);
     dsb->invalidateAll();
     instructionBytes->invalidate();
@@ -1003,6 +1016,20 @@ void FrontendCoordinator::invalidateCode(Addr block)
     fusionTail = nullptr;
     clearLoop();
     dsb->invalidate(block);
+    // Physical invalidation revokes only templates using this line. A
+    // global epoch change here would reject unrelated pending code fills
+    // whenever the snooping instruction port observes a data eviction.
+    for (auto it = pendingFills.begin(); it != pendingFills.end();) {
+        auto &templates = it->templates;
+        templates.erase(std::remove_if(templates.begin(), templates.end(),
+            [block](const FrontendTemplate &value) {
+                return std::find(value.physicalBlocks.begin(),
+                    value.physicalBlocks.end(), block) !=
+                    value.physicalBlocks.end();
+            }), templates.end());
+        if (templates.empty()) it = pendingFills.erase(it);
+        else ++it;
+    }
     leases.erase(std::remove_if(leases.begin(), leases.end(),
         [&](const CodeLease &lease) { return lease.physicalBlock == block; }), leases.end());
     if (instructionBytes->matchesPhysicalBlock(block, lineSize))
@@ -1040,6 +1067,7 @@ FrontendCoordinator::markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
 }
 void FrontendCoordinator::invalidateTranslations()
 {
+    ++translationEpochValue;
     fusionTail = nullptr;
     clearLoop();
     leases.clear();

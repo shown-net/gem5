@@ -197,6 +197,7 @@ class Sequencer : public RubyPort
     void markRemoved();
     void storePrepareComplete();
     void evictionCallback(Addr address);
+    void evictionCallback(Addr address, bool local_capacity);
     int coreId() const { return m_coreId; }
 
     virtual int functionalWrite(Packet *func_pkt) override;

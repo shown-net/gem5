@@ -315,6 +315,7 @@ class CacheMemory : public SimObject
           statistics::Scalar dataFillInstallServiceCycles;
           statistics::Scalar demandDataReadHits, demandDataReadTrueMisses;
           statistics::Scalar codeReadHits, codeReadTrueMisses;
+          statistics::Scalar demandDataReadAccesses, codeReadAccesses;
           statistics::Scalar rfoHits, rfoTrueMisses;
           statistics::Scalar softwarePrefetchHits, softwarePrefetchTrueMisses;
           statistics::Scalar hardwarePrefetchHits, hardwarePrefetchTrueMisses;
@@ -348,6 +349,7 @@ class CacheMemory : public SimObject
       void profileDemandHit();
       void profileDemandMiss();
       void profileNativeRequest(int role, bool miss, bool ownership);
+      void profileNativeReadAccess(int role);
     void beginOffcoreOwnership(Addr address, int role);
     void endOffcoreOwnership(Addr address);
     void profileDataReplacement(Addr address);

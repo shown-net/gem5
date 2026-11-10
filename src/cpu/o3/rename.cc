@@ -53,6 +53,7 @@
 #include "params/BaseO3CPU.hh"
 #include "cpu/o3/zero_idiom.hh"
 #include "cpu/o3/stack_engine.hh"
+#include "cpu/o3/frontend_record.hh"
 #include "arch/x86/insts/macroop.hh"
 #include "arch/x86/regs/int.hh"
 #include "debug/StackEngine.hh"
@@ -65,6 +66,19 @@ namespace o3
 
 namespace
 {
+bool
+isNearControlConstant(const DynInstPtr &inst)
+{
+    const auto kind = nearStackControl(inst->macroop.get());
+    const bool call = kind == NearStackControl::DirectCall ||
+        kind == NearStackControl::RegisterCall ||
+        kind == NearStackControl::MemoryCall;
+    return (call && (inst->staticInst->getName() == "rdip" ||
+        (kind == NearStackControl::DirectCall && inst->isCall()))) ||
+        (kind == NearStackControl::ReturnImmediate &&
+         inst->staticInst->getName() == "limm");
+}
+
 // Only the flag-free, implicit 64-bit PUSH register update is eligible.
 // Keep the functional micro-op for other CPU models and the unready case.
 bool
@@ -786,6 +800,20 @@ Rename::renameInsts(ThreadID tid)
                 inst->stageDemand.schedulerUnits = 0;
             }
         }
+        if (!inst->isSquashed() && isNearControlConstant(inst) &&
+            inst->getFault() == NoFault) {
+            // PC and CS are actual functional operands, not predicted values.
+            // Preserve ordinary execution if any source is still unready.
+            auto *isa = inst->tcBase()->getIsaPtr();
+            bool ready = true;
+            for (unsigned i = 0; i < inst->numSrcRegs(); ++i)
+                ready &= scoreboard->getReg(renameMap[tid]->lookup(
+                    inst->srcRegIdx(i).flatten(*isa)));
+            inst->renameComputed = ready;
+            inst->stageDemand.robUnits = ready ? 0 : 1;
+            inst->stageDemand.schedulerUnits = ready ? 0 : 1;
+            inst->stageDemand.schedulerActions = ready ? 0 : 1;
+        }
         if (!inst->isSquashed() &&
             !inst->allocationGroup && inst->staticInst->isFullGprMove() &&
             inst->numSrcRegs() == 3 && inst->numDestRegs() == 1 &&
@@ -796,7 +824,7 @@ Rename::renameInsts(ThreadID tid)
             const auto source_reg = inst->srcRegIdx(1).flatten(*isa);
             const auto dest_reg = inst->destRegIdx(0).flatten(*isa);
             inst->eliminatedMove = source_reg.is(IntRegClass) &&
-                dest_reg.is(IntRegClass) &&
+                dest_reg.is(IntRegClass) && source_reg != dest_reg &&
                 !(stack_decision.sourceMask && cpu->stackEngine &&
                   cpu->stackEngine->offset(tid) != 0) &&
                 !renameMap[tid]->lookup(source_reg)->isPinned() &&
@@ -1051,21 +1079,29 @@ Rename::renameInsts(ThreadID tid)
             ++cpu->moveEliminationStats.accepted;
         if (inst->renameComputed) {
             const bool move = inst->staticInst->isZeroExtendingGprMove();
+            const bool control_constant = isNearControlConstant(inst);
             // The source was ready before the allocation was reserved.
             // Execute the actual zero-extension/update into the new PRF.
-            panic_if(!scoreboard->getReg(inst->renamedSrcIdx(move ? 1 : 0)),
-                     "Rename-computed source became unready after admission");
+            if (control_constant) {
+                for (unsigned i = 0; i < inst->numSrcRegs(); ++i)
+                    panic_if(!scoreboard->getReg(inst->renamedSrcIdx(i)),
+                        "Control constant source became unready after admission");
+            } else {
+                panic_if(!scoreboard->getReg(inst->renamedSrcIdx(move ? 1 : 0)),
+                         "Rename-computed source became unready after admission");
+            }
             inst->execute();
             panic_if(inst->getFault() != NoFault,
                      "Rename-computed operation faulted");
             if (cpu->resultForwarding)
                 cpu->resultForwarding->track(inst, false);
-            scoreboard->setReg(inst->renamedDestIdx(0));
+            for (unsigned i = 0; i < inst->numDestRegs(); ++i)
+                scoreboard->setReg(inst->renamedDestIdx(i));
             inst->setExecuted();
             inst->setResultsWoken();
             if (move)
                 ++cpu->moveEliminationStats.accepted;
-            else
+            else if (!control_constant)
                 ++stats.pushUpdatesComputed;
         } else if ((!cpu->stackEngine || !cpu->stackEngine->enabled()) &&
                    isImplicitPushUpdate(inst)) {

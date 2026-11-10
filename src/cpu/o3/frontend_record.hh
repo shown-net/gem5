@@ -73,6 +73,10 @@ struct FrontendRecord
 using FrontendRecordPtr = std::unique_ptr<FrontendRecord>;
 enum class RepStringKind { None, Copy, Store };
 RepStringKind repStringKind(const StaticInst *macro);
+enum class NearStackControl {
+    None, DirectCall, RegisterCall, MemoryCall, Return, ReturnImmediate
+};
+NearStackControl nearStackControl(const StaticInst *macro);
 StageDemand initialDemand(const StaticInst &instruction,
                           const StaticInst *macro = nullptr);
 }

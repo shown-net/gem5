@@ -192,7 +192,7 @@ class RubyPort : public ClockedObject
     void ruby_unaddressed_callback(PacketPtr pkt);
     void ruby_stale_translation_callback(Addr txnId);
     void testDrainComplete();
-    void ruby_eviction_callback(Addr address);
+    void ruby_eviction_callback(Addr address, bool local_capacity = false);
 
     /**
      * Called by the PIO port when receiving a timing response.

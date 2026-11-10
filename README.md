@@ -27,27 +27,14 @@ FMA, wide-vector, and mask instruction extensions are outside this round.
 Use the companion repository's `compile_gem5.sh` for serial builds and its public
 build/collect CLI with explicit frozen inputs. The canonical local build remains
 `build/X86`; completed evidence remains under the CPU repository's `output`.
-The public fast binary was rebuilt on 2026-11-09 with validated NOP execution
-membership, REP guards, dependent 32-bit move projection, overlapping instruction
-fetch, request recovery, Ruby store-prepare event membership, architectural
-MFENCE service, integer-divider activity accounting, and partial XMM load
-merges with preserved-half dependencies. SPR's Ruby L1D data service is now
-3 component cycles, with the existing AGU/LSU handoffs contributing to the
-complete load path. The generic hierarchy
-retains its original service. The SPR board now defaults to eight outstanding
-instruction requests and sixteen resident byte blocks. Request overlap and
-resident-byte capacity remain separate resources. These are
-bounded model settings, not a measurement of the physical SPR queue size. L1I hit/miss
-actions also annotate the original request so frontend miss waiting is observed.
-Data/tag stall counters remain a shared candidate proxy, with their hardware
-gating differences unresolved. Public fast SHA-256 is
-`ed665da831012308f73bb9a21000f96132b2ee80b865360677e4ce45f0e8ea30`.
-The companion [final calibration report](../../calibration/cpu_microarchitecture/docs/calibration/spr-long-calibration-20261109.md)
-owns the final r10 data: 21 complete model windows, their native measurements,
-705 event comparisons, current parameters, and acceptance limits. Stockfish has
-a user-path population anomaly, and SQLite has one complete model window.
-Remaining calibration gaps include DSB admission, ownership traffic,
-memory service, and several execution and recovery counters.
+The companion [component model](../../calibration/cpu_microarchitecture/docs/calibration/spr-long-calibration-20261109.md)
+owns current parameters and mechanism limits. The
+[workload reports](../../calibration/cpu_microarchitecture/docs/calibration/real-workloads/README.md)
+and [guest wakeup analysis](../../calibration/cpu_microarchitecture/docs/calibration/multicore/experiments/futex-wakeup/analysis.md)
+own measured binary identities, complete windows, residuals, and unresolved
+guest failures. Data/tag stall counters remain a shared candidate proxy.
+Remaining gaps include DSB supply, forwarding readiness, translation overlap,
+memory service, and execution and recovery populations.
 
 ## Testing status
 

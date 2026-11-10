@@ -244,6 +244,8 @@ class FrontendCoordinator : public SimObject
     unsigned loopCaptureUnits = 0;
     FrontendRecord *fusionTail = nullptr;
     std::shared_ptr<bool> decodingMiss;
+    // Physical code invalidations revoke matching requests separately.
+    uint64_t translationEpochValue = 0;
     std::function<void(const FrontendRecord &, uint64_t)> deliveryObserver;
     void observeLoop(const FrontendRecord &record);
     void clearLoop();
@@ -318,6 +320,7 @@ class FrontendCoordinator : public SimObject
     void invalidateCode(Addr physical_block);
     bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block);
     void invalidateTranslations();
+    uint64_t translationEpoch() const { return translationEpochValue; }
     DrainState drain() override;
 };
 }

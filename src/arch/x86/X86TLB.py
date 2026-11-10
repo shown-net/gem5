@@ -60,6 +60,9 @@ class X86PagetableWalker(ClockedObject):
     max_active_walks = Param.Unsigned(1, "Concurrent timing page walks")
     paging_structure_cache = Param.X86PagingStructureCache(NULL, "Optional shared virtual-prefix cache")
     prefix_hit_latency = Param.Cycles(1, "Upper-prefix hit service latency")
+    pte_response_latency = Param.Cycles(
+        0, "PTE read response processing before the next walk step"
+    )
 
 
 class X86TLB(BaseTLB):
@@ -71,6 +74,9 @@ class X86TLB(BaseTLB):
     itlb_4k_ways = Param.Unsigned(0, "4K instruction TLB ways; zero uses fully associative replacement")
     dtlb_4k_ways = Param.Unsigned(0, "4K data TLB ways; zero uses fully associative replacement")
     spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
+    spr_shared_index_shift = Param.Unsigned(
+        0, "4K VPN high-bit XOR fold; zero keeps the linear index proxy"
+    )
     spr_split_l1 = Param.Bool(False, "SPR first-level page-size and data-access replacement domains")
     next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
     system = Param.System(Parent.any, "system object")

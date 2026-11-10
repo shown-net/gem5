@@ -1181,19 +1181,14 @@ class DynInst : public ExecContext, public RefCounted
   public:
     // monitor/mwait funtions
     void
-    armMonitor(Addr address) override
+    armMonitor(Addr address, Addr paddr) override
     {
-        cpu->armMonitor(threadNumber, address);
+        cpu->armMonitor(threadNumber, address, paddr);
     }
     bool
-    mwait(PacketPtr pkt) override
+    mwait(bool break_on_interrupt) override
     {
-        return cpu->mwait(threadNumber, pkt);
-    }
-    void
-    mwaitAtomic(gem5::ThreadContext *tc) override
-    {
-        return cpu->mwaitAtomic(threadNumber, tc, cpu->mmu);
+        return cpu->mwait(threadNumber, break_on_interrupt);
     }
     AddressMonitor *
     getAddrMonitor() override

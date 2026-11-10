@@ -107,9 +107,16 @@ class StaticInst : public RefCounted, public StaticInstFlags
     // 0=none, 1=scalar double, 2=scalar single, 3=packed double,
     // 4=packed single. Only supported original SSE arithmetic qualifies.
     virtual unsigned sseArithmeticKind() const { return 0; }
+    // Timing-only query on ready functional operands; does not publish state.
+    virtual bool maskedSSEDivideAssist64(ExecContext *) const { return false; }
     // Nonzero only when completeAcc can produce the entire load result
     // without reading an unresolved address or a merge destination.
     virtual unsigned earlyForwardingSize() const { return 0; }
+    // Address eligibility applies independently to the load and its producer.
+    virtual bool hasFastForwardingAddress() const { return false; }
+    // Nonzero only for an ordinary integer store-data operation whose
+    // complete payload is the low bytes of its sole register source.
+    virtual unsigned earlyStoreDataSize() const { return 0; }
     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
     ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
     bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
@@ -241,6 +248,10 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual bool isFullXmmMove() const { return false; }
     /// Two FP data fragments produced as one XMM value, including temporaries.
     virtual bool isFullXmmWrite() const { return false; }
+    /// Instruction-specific costs in the shared SPR execution-port pool.
+    /// Zero keeps the configured OpClass ports or latency.
+    virtual uint16_t vectorExecutionPorts() const { return 0; }
+    virtual unsigned vectorExecutionLatency() const { return 0; }
     unsigned
     numFloatDestEntries() const
     {

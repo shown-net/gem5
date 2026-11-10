@@ -116,6 +116,7 @@ namespace X86ISA
         uint32_t baseSize;
         uint32_t smallPageWays;
         bool sprSharedDomains;
+        unsigned sprSharedIndexShift;
         bool sprSplitL1;
         std::array<unsigned, 8> largePageTree{};
         Cycles nextLevelHitLatency;

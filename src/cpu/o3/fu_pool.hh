@@ -100,6 +100,23 @@ class FUPool : public SimObject
     // Scalar/double and packed/single op classes reach the same FP divider
     // on a port. Their per-class intervals cannot create two dividers.
     std::vector<Cycles> fpDividerNextIssue;
+    std::vector<OpClass> fpDividerLastClass;
+    const Cycles fpDividerSwitchCycles;
+    const Cycles fpDiv64ActiveCycles;
+    const Cycles fpDiv32ActiveCycles;
+    const Cycles fpDiv64PowerOfTwoLatency;
+    const Cycles fpDiv64PowerOfTwoActiveCycles;
+    bool normalPowerOfTwoDivide64(const DynInstPtr &inst) const;
+    const Cycles fpDiv64AssistLatency;
+    const Cycles fpDiv64AssistInterval;
+    const Cycles fpDiv64AssistActiveCycles;
+    Cycles fpDividerReadyAt(int unit, OpClass capability) const
+    {
+        return fpDividerNextIssue[unit] +
+            (fpDividerLastClass[unit] != No_OpClass &&
+             fpDividerLastClass[unit] != capability ?
+                fpDividerSwitchCycles : Cycles(0));
+    }
     std::array<uint16_t, Num_OpClasses> capablePorts{};
     std::array<unsigned, 12> pendingPortLoads{};
     std::array<unsigned, 12> allocationLoadSnapshot{};
@@ -159,6 +176,9 @@ class FUPool : public SimObject
         explicit PoolStats(FUPool *pool);
         statistics::Vector issuedByUnit;
         statistics::Scalar fpDividerCrossClassBlocked;
+        statistics::Scalar fpDividerClassSwitches;
+        statistics::Scalar fpDiv64PowerOfTwoIssued;
+        statistics::Scalar fpDiv64AssistIssued;
     } stats;
 
   public:
@@ -226,6 +246,7 @@ class FUPool : public SimObject
      * otherwise.
      */
     int getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
+                Cycles &op_latency,
                 bool store = false, bool branch = false, int bound_port = -1);
 
     /** Frees a FU at the end of this cycle. */
@@ -244,6 +265,7 @@ class FUPool : public SimObject
     Cycles getOpLatency(OpClass capability) {
         return maxOpLatencies[capability];
     }
+    Cycles getOpLatency(const DynInstPtr &inst);
 
     /** Returns the issue latency of the given capability. */
     bool isPipelined(OpClass capability) {

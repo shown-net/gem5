@@ -406,9 +406,13 @@ Fetch::processCacheCompletion(PacketPtr pkt)
         return;
     }
 
-    // A response can race a store that was translated after the I-fetch was
-    // issued. Do not decode the old bytes while the same-line write is pending.
-    if (pendingCodeWrite(tid, pkt->req->getPaddr())) {
+    // Reuse permission does not control byte validity: complete() makes its
+    // bytes available to MITE even when template reuse is disabled. Discard
+    // replies whose code or translation context was revoked before arrival.
+    const auto validity = pkt->req->getExtension<InstructionCodeValidity>();
+    if ((frontend && requestEpoch[tid] != frontend->translationEpoch()) ||
+        (validity && validity->stale) ||
+        pendingCodeWrite(tid, pkt->req->getPaddr())) {
         TaoTraceFrontendRegistry::noteTerminal(
             pkt->req, TaoTraceFrontendRegistry::Terminal::SquashedResponse,
             uint64_t(curTick()));
@@ -421,12 +425,9 @@ Fetch::processCacheCompletion(PacketPtr pkt)
     }
 
     if (frontend) {
-        const auto validity = pkt->req->getExtension<InstructionCodeValidity>();
         frontend->instructionBytes->complete(pkt->req->getVaddr(),
             pkt->req->getPaddr(), pkt->getConstPtr<uint8_t>(), fetchBufferSize,
-            uint64_t(cpu->curCycle()), !pkt->req->isUncacheable() &&
-            !(validity && validity->stale) &&
-            requestEpoch[tid] == frontend->dsb->epoch());
+            uint64_t(cpu->curCycle()), !pkt->req->isUncacheable());
     } else {
         memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
     }
@@ -543,6 +544,49 @@ Fetch::wakeFromQuiesce()
 }
 
 void
+Fetch::dumpProgressState() const
+{
+    cprintf("Fetch status:%d interrupt_pending:%d cache_blocked:%d "
+            "byte_requests:%u pending_memory_expansion:%u batch_pending:%d "
+            "code_epoch:%llu translation_epoch:%llu\n",
+            _status, interruptPending, cacheBlocked, byteRequests.size(),
+            pendingMemoryExpansion.size(), frontendBatchPending,
+            frontend ? frontend->dsb->epoch() : 0,
+            frontend ? frontend->translationEpoch() : 0);
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        const auto head = ftq ? ftq->readHead(tid) : nullptr;
+        cprintf("Fetch thread:%u status:%s PC:%s offset:%#x "
+                "decode_stall:%d drain_stall:%d delayed_commit:%d "
+                "microcode_control:%llu macro:%s memory_request:%d "
+                "retry:%d BTB_ready_cycle:%llu FTQ_head:%s\n",
+                tid, FetchStatGroup::statusStrings[fetchStatus[tid]],
+                *pc[tid], fetchOffset[tid], stalls[tid].decode,
+                stalls[tid].drain, delayedCommit[tid], microcodeControl[tid],
+                macroop[tid] ? macroop[tid]->getName() : "none",
+                bool(memReq[tid]), retryPkt && retryTid == tid,
+                btbReadyCycle[tid], head ? head->toString() : "none");
+    }
+    if (frontend) {
+        cprintf("Frontend can_accept:%d IDQ_occupied:%u IDQ_capacity:%u\n",
+                frontend->canAccept(), frontend->idq->occupied(),
+                frontend->idq->capacityValue());
+        for (const auto source : {FrontendSource::Mite, FrontendSource::Dsb,
+                                  FrontendSource::Microcode}) {
+            const auto *service = frontend->sourceService(source);
+            cprintf("Frontend source:%u idle:%d free_batch_ops:%u "
+                    "head_sequence:%llu\n", unsigned(source), service->idle(),
+                    service->freeBatchOps(), service->headSequence());
+        }
+    }
+    for (const auto &[request, state] : byteRequests) {
+        cprintf("Fetch byte request context:%u vaddr:%#x "
+                "epoch:%llu response:%d retry:%d\n",
+                request->contextId(), request->getVaddr(), state.epoch,
+                state.response, retryPkt && retryPkt->req == request);
+    }
+}
+
+void
 Fetch::switchToActive()
 {
     if (_status == Inactive) {
@@ -598,8 +642,6 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
     Fault fault = NoFault;
 
     assert(!cpu->switchedOut());
-    if (frontend && byteRequestPending(vaddr, tid))
-        return false;
     if (frontend && memReq[tid])
         return false;
 
@@ -625,6 +667,32 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
     DPRINTF(Fetch, "[tid:%i] Fetching cache line %#x for addr %#x\n",
             tid, fetchBufferBlockPC, vaddr);
 
+    if (frontend) {
+        for (auto it = byteRequests.begin(); it != byteRequests.end(); ++it) {
+            const auto &request = it->first;
+            if (cpu->contextToThread(request->contextId()) != tid ||
+                request->getVaddr() != fetchBufferBlockPC)
+                continue;
+            if (lookahead)
+                return false;
+            // Once decode needs these bytes, the existing predicted request
+            // owns demand completion, including its architectural fault.
+            // Otherwise repeated predicted faults can prevent demand from
+            // ever issuing and leave an active CPU with no retirement.
+            memReq[tid] = request;
+            byteLookahead[tid] = false;
+            requestEpoch[tid] = it->second.epoch;
+            fetchBufferPC[tid] = fetchBufferBlockPC;
+            fetchBufferValid[tid] = false;
+            fetchStatus[tid] = it->second.response ?
+                IcacheWaitResponse : ItlbWait;
+            if (it->second.response)
+                lastIcacheStall[tid] = curTick();
+            byteRequests.erase(it);
+            return true;
+        }
+    }
+
     // Setup the memReq to do a read of the first instruction's address.
     // Set the appropriate read size and flags as well.
     // Build request here.
@@ -642,14 +710,29 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
 
     memReq[tid] = mem_req;
     byteLookahead[tid] = lookahead;
-    if (frontend) requestEpoch[tid] = frontend->dsb->epoch();
+    if (frontend) requestEpoch[tid] = frontend->translationEpoch();
 
     // Initiate translation of the icache block
     fetchStatus[tid] = ItlbWait;
-    FetchTranslation *trans = new FetchTranslation(this);
+    FetchTranslation *trans = new FetchTranslation(this, mem_req);
     cpu->mmu->translateTiming(mem_req, cpu->thread[tid]->getTC(),
                               trans, BaseMMU::Execute);
     return true;
+}
+
+bool
+Fetch::FetchTranslation::squashed() const
+{
+    const ThreadID tid = fetch->cpu->contextToThread(request->contextId());
+    const auto lookahead = fetch->byteRequests.find(request);
+    if (lookahead != fetch->byteRequests.end())
+        return lookahead->second.epoch != fetch->frontend->translationEpoch();
+    // Redirects revoke demand and predicted-byte request identities. Let the
+    // walker discard their queued translations rather than repeatedly walking
+    // abandoned paths under later CR3 contexts ahead of the live demand.
+    return request != fetch->memReq[tid] ||
+        (fetch->frontend &&
+         fetch->requestEpoch[tid] != fetch->frontend->translationEpoch());
 }
 
 void
@@ -682,7 +765,7 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
     }
 
 
-    if (frontend && requestEpoch[tid] != frontend->dsb->epoch()) {
+    if (frontend && requestEpoch[tid] != frontend->translationEpoch()) {
         memReq[tid] = nullptr;
         fetchStatus[tid] = Running;
         TaoTraceFrontendRegistry::noteTerminal(mem_req,

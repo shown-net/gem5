@@ -258,11 +258,32 @@ class BaseO3CPU(BaseCPU):
         False, "Enable load receive response throttling in the LSQ"
     )
     loadCompletionWidth = Param.Unsigned(
-        0, "Ordinary load result deliveries per cycle; zero disables the limit"
+        0, "Shared load result deliveries per cycle; zero disables the limit"
     )
 
     sprMemoryDependence = Param.Bool(False, "Use the SPR local/global dependence predictor")
     sprFastStoreForwarding = Param.Bool(False, "Use the tagged load/store-PC forwarding proxy")
+    sprPredictReadyLoadValues = Param.Bool(
+        False, "Allow trained value forwarding before ready load addresses issue"
+    )
+    sprEarlyStoreDataForwarding = Param.Bool(
+        False, "Supply trained loads from ready integer store-data operands"
+    )
+    sprFastForwardingLatency = Param.Cycles(
+        1, "Predicted store data to load value service delay"
+    )
+    sprStoreForwardingLatency = Param.Cycles(
+        0, "Service delay for complete ordinary store-to-load forwarding"
+    )
+    sprSameStartPartialForwarding = Param.Bool(
+        True, "Allow a same-start partial store value to merge with a cache load"
+    )
+    sprMultiStoreBufferForwarding = Param.Bool(
+        True, "Allow several committed stores to supply one complete load"
+    )
+    sprContainedForwardingExtraLatency = Param.Cycles(
+        0, "Additional service delay for a contained load at a different offset"
+    )
     sprL1WidthService = Param.Bool(False, "Use width-dependent L1 load/store service budgets")
     recvRespMaxCachelines = Param.Unsigned(
         1,

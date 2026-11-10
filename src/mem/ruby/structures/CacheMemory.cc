@@ -831,6 +831,8 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
       ADD_STAT(demandDataReadTrueMisses, "Candidate cacheable demand data read requests observed missing the private L2, excluding merges and upgrades"),
       ADD_STAT(codeReadHits, "Private L2 instruction read hits"),
       ADD_STAT(codeReadTrueMisses, "Private L2 instruction read true misses"),
+      ADD_STAT(demandDataReadAccesses, "Private L2 consumed demand data and page-table read requests, including pending prefetch merges"),
+      ADD_STAT(codeReadAccesses, "Private L2 consumed instruction read requests, including pending prefetch merges"),
       ADD_STAT(rfoHits, "Private L2 demand and prefetch ownership hits, including permission upgrades"),
       ADD_STAT(rfoTrueMisses, "Private L2 demand and prefetch ownership true misses, excluding pending merges"),
       ADD_STAT(softwarePrefetchHits, "Private L2 software-prefetch hits"),
@@ -1110,6 +1112,15 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+void
+CacheMemory::profileNativeReadAccess(int role)
+{
+    if (role == 1 || role == 4)
+        ++cacheMemoryStats.demandDataReadAccesses;
+    else if (role == 3)
+        ++cacheMemoryStats.codeReadAccesses;
 }
 
 void

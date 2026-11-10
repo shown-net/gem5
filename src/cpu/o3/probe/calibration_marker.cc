@@ -84,6 +84,9 @@ CalibrationMarker::traceMarkerHandoff(gem5::ThreadContext *tc)
     }
     // Capture the target identity before leaving KVM.
     traceSourceRoiCheckpoint(tc);
+    inform("CalibrationMarker: HANDOFF context=%u SPEC_CTRL=%#lx",
+           tc->contextId(), (unsigned long)tc->readMiscRegNoEffect(
+               X86ISA::misc_reg::SpecCtrl));
     marker_address_root_ = tc->getSystemPtr()->getSourceRoiAddressSpaceId();
     if (simQuantum) {
         // Parallel KVM hypercalls exit at the next safe global boundary.
@@ -153,6 +156,8 @@ CalibrationMarker::snapshot(const char *kind, Addr pc, uint64_t completed)
         << kind << "\",\"worker_id\":" << worker_
         << ",\"cpu_id\":" << marker_cpu_->cpuId()
         << ",\"cr3\":" << marker_address_space_ << ",\"pc\":" << pc
+        << ",\"spec_ctrl\":" << marker_cpu_->getContext(0)->readMiscRegNoEffect(
+            X86ISA::misc_reg::SpecCtrl)
         << ",\"tick\":" << curTick()
         << ",\"clock_period_ticks\":" << marker_cpu_->clockPeriod()
         << ",\"core_path\":\"" << marker_cpu_->name() << "\""

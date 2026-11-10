@@ -426,21 +426,15 @@ class SimpleExecContext : public ExecContext
     }
 
     void
-    armMonitor(Addr address) override
+    armMonitor(Addr address, Addr paddr) override
     {
-        cpu->armMonitor(thread->threadId(), address);
+        cpu->armMonitor(thread->threadId(), address, paddr);
     }
 
     bool
-    mwait(PacketPtr pkt) override
+    mwait(bool break_on_interrupt) override
     {
-        return cpu->mwait(thread->threadId(), pkt);
-    }
-
-    void
-    mwaitAtomic(ThreadContext *tc) override
-    {
-        cpu->mwaitAtomic(thread->threadId(), tc, thread->mmu);
+        return cpu->mwait(thread->threadId(), break_on_interrupt);
     }
 
     AddressMonitor *

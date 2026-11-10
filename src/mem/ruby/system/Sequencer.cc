@@ -63,6 +63,7 @@
 #include "mem/ruby/slicc_interface/RubyRequest.hh"
 #include "mem/ruby/slicc_interface/RubySlicc_Util.hh"
 #include "mem/ruby/system/RubySystem.hh"
+#include "sim/system.hh"
 
 namespace gem5
 {
@@ -1247,6 +1248,7 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                          printAddress(request_address));
 
     // update the data unless it is a non-data-carrying flush
+    bool published_write = false;
     if (m_ruby_system->getWarmupEnabled()) {
         data.setData(pkt);
     } else if (!pkt->isFlush() && !pkt->isCleanInvalidateRequest()) {
@@ -1286,6 +1288,7 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
                 data.getData(getOffset(request_address), pkt->getSize()));
             data.setData(&overwrite_val[0],
                          getOffset(request_address), pkt->getSize());
+            published_write = true;
             DPRINTF(RubySequencer, "swap data %s\n", data);
         } else if (pkt->isAtomicOp()) {
             // Set the data in the packet to the old value in the cache
@@ -1295,14 +1298,19 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
             // execute AMO operation
             (*(pkt->getAtomicOp()))(
                 data.getDataMod(getOffset(request_address)));
+            published_write = true;
             DPRINTF(RubySequencer, "AMO new data %s\n", data);
         } else if (type != RubyRequestType_Store_Conditional || llscSuccess) {
             // Types of stores set the actual data here, apart from
             // failed Store Conditional requests
             data.setData(pkt);
+            published_write = true;
             DPRINTF(RubySequencer, "set data %s\n", data);
         }
     }
+    if (published_write)
+        system->capacityReadObservations.notifyWrite(
+            makeLineAddress(request_address), pkt->req);
 
     // If using the RubyTester, update the RubyTester sender state's
     // subBlock with the recieved data.  The tester will later access
@@ -1892,8 +1900,14 @@ Sequencer::recordRequestType(SequencerRequestType requestType) {
 void
 Sequencer::evictionCallback(Addr address)
 {
+    evictionCallback(address, false);
+}
+
+void
+Sequencer::evictionCallback(Addr address, bool local_capacity)
+{
     llscClearMonitor(address);
-    ruby_eviction_callback(address);
+    ruby_eviction_callback(address, local_capacity);
 }
 
 void

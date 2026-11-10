@@ -202,6 +202,7 @@ class IntegerDivider : public SimObject
     };
     CPU *cpu = nullptr;
     Tick nextLaunch = 0;
+    std::array<std::array<unsigned, 3>, 2> latency32, latency64;
     std::list<std::shared_ptr<Operation>> operations;
     EventFunctionWrapper serviceEvent;
     struct Stats : statistics::Group

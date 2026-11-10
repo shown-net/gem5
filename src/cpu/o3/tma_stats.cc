@@ -826,7 +826,7 @@ CPU::DividerStats::DividerStats(CPU *cpu)
       ADD_STAT(IDIV_ACTIVE, statistics::units::Cycle::get(),
                "Integer arithmetic-active cycles, excluding output publication and ending early on cancellation"),
       ADD_STAT(FPDIV_ACTIVE, statistics::units::Cycle::get(),
-               "Cycles of admitted fixed-latency floating divide or square-root execution"),
+               "Union of admitted floating divide or square-root arithmetic-active intervals"),
       ADD_STAT(DIV_ACTIVE, statistics::units::Cycle::get(),
                "Union of integer and floating divide busy intervals; concurrent units count once")
 {}

@@ -279,6 +279,7 @@ class Interrupts : public BaseInterrupts
      * @return true if there are interrupts pending.
      */
     bool checkInterruptsRaw() const;
+    bool isWakeUp() const override { return checkInterruptsRaw(); }
     /**
      * Check if there are pending unmaskable interrupts.
      *

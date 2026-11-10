@@ -70,7 +70,9 @@ TLB::TLB(const Params &p)
       size(p.size + (p.spr_split_l1 ?
            (p.dtlb_4k_ways ? 56 : 32) : 0)), baseSize(p.size),
       smallPageWays(p.dtlb_4k_ways ? p.dtlb_4k_ways : p.itlb_4k_ways),
-      sprSharedDomains(p.spr_shared_domains), sprSplitL1(p.spr_split_l1),
+      sprSharedDomains(p.spr_shared_domains),
+      sprSharedIndexShift(p.spr_shared_index_shift),
+      sprSplitL1(p.spr_split_l1),
       nextLevelHitLatency(p.next_level_hit_latency),
       tlb(size), lruSeq(0), m5opRange(p.system->m5opRange()), stats(this)
 {
@@ -84,6 +86,8 @@ TLB::TLB(const Params &p)
              "TLB size must be divisible by its number of 4K ways");
     fatal_if(sprSharedDomains && size != 2048,
              "SPR shared TLB proxy requires 2048 entries");
+    fatal_if(sprSharedIndexShift >= 64,
+             "Shared TLB index fold must be less than 64 bits");
     if (nextLevel() && type() == TypeTLB::instruction)
         itlbMissStats = std::make_unique<ItlbMissStats>(this);
     if (type() == TypeTLB::data) {
@@ -238,10 +242,12 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
         // TODO(SPR-MSR): If STLB QoS is used, distinguish CLOS fill masks
         // from this fixed geometry; first verify native/guest effective masks.
         // Two support domains. A: 4K/2M/4M, B: 4K/1G.
-        // 4K placement uses VPN[7] for the domain and VPN[6:0] for
-        // the set; large-page indexing is an uncalibrated proxy.
-        auto location = [](Addr addr, unsigned log_bytes) {
-            const Addr page = addr >> log_bytes;
+        // The optional 4K fold controls false conflicts at sparse strides.
+        // Neither this fold nor large-page indexing is a recovered SPR hash.
+        auto location = [this](Addr addr, unsigned log_bytes) {
+            Addr page = addr >> log_bytes;
+            if (log_bytes == 12 && sprSharedIndexShift)
+                page ^= page >> sprSharedIndexShift;
             const unsigned domain = log_bytes == 12 ? ((page >> 7) & 1) :
                                     log_bytes == 30 ? 1 : 0;
             return std::make_pair(domain, unsigned(page & 127));

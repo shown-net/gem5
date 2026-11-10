@@ -54,7 +54,23 @@ _families = {
        for suffix, size in (("B", 1), ("W", 2), ("D", 4))},
     **{f"PCMPGT{suffix}": ("mxmmcmpi2r", size, 2)
        for suffix, size in (("B", 1), ("W", 2), ("D", 4), ("Q", 8))},
+    **{f"{family}{suffix}": (op, size, '"2 |" + Signed')
+       for family, op in (("PADDS", "mxmmaddi"), ("PSUBS", "mxmmsubi"))
+       for suffix, size in (("B", 1), ("W", 2))},
+    **{f"{family}{suffix}": (op, size, 2)
+       for family, op in (("PADDUS", "mxmmaddi"), ("PSUBUS", "mxmmsubi"))
+       for suffix, size in (("B", 1), ("W", 2))},
+    **{f"{family}S{suffix}": (op, size, "Signed")
+       for family, op in (("PMIN", "mxmmmini"), ("PMAX", "mxmmmaxi"))
+       for suffix, size in (("B", 1), ("W", 2), ("D", 4))},
+    **{f"{family}U{suffix}": (op, size, 0)
+       for family, op in (("PMIN", "mxmmmini"), ("PMAX", "mxmmmaxi"))
+       for suffix, size in (("B", 1), ("W", 2), ("D", 4))},
+    "PAVGB": ("mxmmavg", 1, 0),
+    "PAVGW": ("mxmmavg", 2, 0),
+    "PSADBW": ("mxmmsad", 1, 0),
     "PMULLW": ("mxmmmuli", 2, 0),
+    "PMULHW": ("mxmmmuli", 2, 'Signed + "|" + MultHi'),
     "PMULHUW": ("mxmmmuli", 2, "MultHi"),
     "PMULUDQ": ("mxmmmuli", 4, "Scalar"),
 }
@@ -67,7 +83,8 @@ def _full_width(match):
     if family not in _families:
         return match.group(0)
     op, size, ext = _families[family]
-    sizes = "srcSize=4, destSize=8" if family == "PMULUDQ" else f"size={size}"
+    sizes = ({"PMULUDQ": "srcSize=4, destSize=8",
+              "PSADBW": "srcSize=1, destSize=2"}.get(family, f"size={size}"))
     if form == "XMM":
         body = f"{op} xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, {sizes}, ext={ext}"
     else:
@@ -79,6 +96,26 @@ def _full_width(match):
 
 
 microcode = re.sub(r"def macroop (\w+) \{(.*?)\};", _full_width,
+                   microcode, flags=re.S)
+
+
+def _multiply_dword(match):
+    name = match.group(1)
+    if name.split("_")[0] != "PMULLD":
+        return match.group(0)
+    form = name.split("_")[-1]
+    body, low, high = "", "xmmlm", "xmmhm"
+    if form in ("M", "P"):
+        load = "ldfpxmmrip" if form == "P" else "ldfpxmm"
+        address = "riprel" if form == "P" else "sib"
+        body = f".microfused_load\n    {load} (ufp1, ufp2), seg, {address}, disp\n    "
+        low, high = "ufp1", "ufp2"
+    body += (f"mmulld xmml, xmml, {low}, size=4, ext=Signed\n"
+             f"    mmulld xmmh, xmmh, {high}, size=4, ext=Signed")
+    return f"def macroop {name} {{\n    {body}\n}};"
+
+
+microcode = re.sub(r"def macroop (\w+) \{(.*?)\};", _multiply_dword,
                    microcode, flags=re.S)
 
 
@@ -96,11 +133,12 @@ def _full_shift(match):
         op += "i"
         count = "imm"
     elif form == "XMM":
-        count = "xmmlm"
+        body = "mxmmshiftcount ufp1, xmmlm, size=8\n    "
+        count = "ufp1"
     else:
-        load = "ldfprip" if form == "P" else "ldfp"
+        load = "ldfpxmmrip" if form == "P" else "ldfpxmm"
         address = "riprel" if form == "P" else "sib"
-        body = f".microfused_load\n    {load} ufp1, seg, {address}, disp, dataSize=8\n    "
+        body = f".microfused_load\n    {load} (ufp1, ufp2), seg, {address}, disp\n    "
         count = "ufp1"
     body += f"{op} xmml, xmmh, xmml, xmmh, {count}, size={size}, ext=0"
     return f"def macroop {name} {{\n    {body}\n}};"

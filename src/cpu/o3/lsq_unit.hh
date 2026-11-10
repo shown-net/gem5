@@ -61,6 +61,7 @@
 #include "cpu/timebuf.hh"
 #include "debug/HtmCpu.hh"
 #include "debug/LSQUnit.hh"
+#include "mem/cache_eviction.hh"
 #include "mem/packet.hh"
 #include "mem/port.hh"
 
@@ -86,14 +87,22 @@ class IEW;
  * the LSQ until the store writes back. At that point the load is
  * replayed.
  */
-class LSQUnit
+class LSQUnit : public CapacityReadObserver
 {
   public:
     static constexpr auto MaxDataBytes = MaxVecRegLenInBytes;
 
     using LSQRequest = LSQ::LSQRequest;
     void noteSplitTranslation(const std::vector<RequestPtr> &fragments);
+    void notifyCapacityReadWrite(Addr line,
+                                const RequestPtr &writer) override;
   private:
+    // Each registration belongs to a live LQ entry, including split reads.
+    std::map<InstSeqNum, std::unordered_set<Addr>> capacityReadLines;
+    std::unordered_map<Addr, unsigned> capacityReadLineCounts;
+    void rememberCapacityRead(InstSeqNum sequence, Addr line);
+    void releaseCapacityRead(InstSeqNum sequence);
+
     struct CommittedStoreEntry
     {
         uint64_t id;
@@ -110,6 +119,7 @@ class LSQUnit
         std::vector<Addr> sourceStart;
         std::vector<InstSeqNum> sourceSequence;
         std::vector<Addr> sourcePC;
+        std::vector<bool> sourceFastForwardingAddress;
         unsigned logicalStores = 1;
         bool issued = false;
         bool completed = false;
@@ -458,7 +468,7 @@ class LSQUnit
     bool collectSameStartForwarding(LSQRequest *request, ssize_t load_idx);
     bool tryFastForwarding(LSQRequest *request, ssize_t load_idx);
     bool startFastForwarding(const DynInstPtr &load, unsigned size);
-    void predictUnreadyLoadAddresses();
+    void predictLoadValues();
     void validateFastForwarding();
     void refreshForwardingContext();
     void rememberForwarding(const DynInstPtr &load, const DynInstPtr &store);
@@ -582,6 +592,13 @@ class LSQUnit
     Cycles sprClflushMinCycles = Cycles(0);
     bool sprMemoryDependence = false;
     bool sprFastStoreForwarding = false;
+    bool sprPredictReadyLoadValues = false;
+    bool sprEarlyStoreDataForwarding = false;
+    Cycles sprFastForwardingLatency = Cycles(1);
+    Cycles sprStoreForwardingLatency = Cycles(0);
+    bool sprSameStartPartialForwarding = true;
+    bool sprMultiStoreBufferForwarding = true;
+    Cycles sprContainedForwardingExtraLatency = Cycles(0);
     uint64_t nextStoreBufferId = 1;
     std::deque<CommittedStoreEntry> committedStoreBuffer;
     std::map<Addr, unsigned> storeBufferLinesInFlight;
@@ -702,6 +719,8 @@ class LSQUnit
         statistics::Scalar sameStartPartialLoads;
         statistics::Scalar fastForwardPredictions;
         statistics::Scalar fastForwardLoadAddressPredictions;
+        statistics::Scalar fastForwardEarlyStoreDataPredictions;
+        statistics::Scalar fastForwardRetainedDataPredictions;
         statistics::Scalar fastForwardValidated;
         statistics::Scalar fastForwardFailures;
         statistics::Scalar noncontiguousTranslations;
@@ -714,9 +733,14 @@ class LSQUnit
         /** Total number of responses from the memory system that are
          * ignored due to the instruction already being squashed. */
         statistics::Scalar ignoredResponses;
+        statistics::Scalar localCapacityEvictions;
+        statistics::Scalar coherenceInvalidations;
+        statistics::Scalar capacityReadRegistrations;
+        statistics::Scalar capacityReadWrites;
 
         /** Tota number of memory ordering violations. */
         statistics::Scalar memOrderViolation;
+        statistics::Scalar returnedLoadOrderViolations;
 
         /** Total number of squashed stores. */
         statistics::Scalar squashedStores;

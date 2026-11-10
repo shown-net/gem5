@@ -92,7 +92,13 @@ FUPool::PoolStats::PoolStats(FUPool *pool)
       ADD_STAT(issuedByUnit, statistics::units::Count::get(),
                "Model FU reservations, including paired store-data slots"),
       ADD_STAT(fpDividerCrossClassBlocked, statistics::units::Count::get(),
-               "FP divide grants blocked by the shared divider after their own op-class interval")
+               "FP divide grants blocked by the shared divider after their own op-class interval"),
+      ADD_STAT(fpDividerClassSwitches, statistics::units::Count::get(),
+               "Admitted shared FP divider operations changing the previous op class"),
+      ADD_STAT(fpDiv64PowerOfTwoIssued, statistics::units::Count::get(),
+               "Admitted normal SSE double divides using the power-of-two timing candidate"),
+      ADD_STAT(fpDiv64AssistIssued, statistics::units::Count::get(),
+               "Admitted masked SSE double divide assist candidates; includes speculative work, not retired ASSISTS.FP")
 {}
 void
 FUPool::bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
@@ -152,6 +158,8 @@ FUPool::portMask(const DynInstPtr &inst) const
         return inst->fusedLeader() ? mask & 0x41 : mask;
     }
     uint16_t mask = capablePorts[inst->opClass()];
+    if (const auto ports = inst->staticInst->vectorExecutionPorts())
+        mask &= ports;
     if (inst->fusedLeader() ||
         (inst->isControl() && inst->opClass() == IntAluOp))
         mask &= 0x41;
@@ -270,12 +278,21 @@ FUPool::takeOverFrom()
     allocationLoadSnapshot.fill(0);
     batchMaskUses.clear();
     haveBindingCycle = false;
+    std::fill(fpDividerLastClass.begin(), fpDividerLastClass.end(), No_OpClass);
     if (forwarding)
         forwarding->reset();
 }
 
 FUPool::FUPool(const Params &p)
-    : SimObject(p), storeDataPorts(p.storeDataPorts), branchPorts(p.branchPorts),
+    : SimObject(p), fpDividerSwitchCycles(p.fpDividerSwitchCycles),
+      fpDiv64ActiveCycles(p.fpDiv64ActiveCycles),
+      fpDiv32ActiveCycles(p.fpDiv32ActiveCycles),
+      fpDiv64PowerOfTwoLatency(p.fpDiv64PowerOfTwoLatency),
+      fpDiv64PowerOfTwoActiveCycles(p.fpDiv64PowerOfTwoActiveCycles),
+      fpDiv64AssistLatency(p.fpDiv64AssistLatency),
+      fpDiv64AssistInterval(p.fpDiv64AssistInterval),
+      fpDiv64AssistActiveCycles(p.fpDiv64AssistActiveCycles),
+      storeDataPorts(p.storeDataPorts), branchPorts(p.branchPorts),
       stats(this)
 {
     numFU = 0;
@@ -352,6 +369,7 @@ FUPool::FUPool(const Params &p)
     unitBusy.resize(numFU);
     nextIssue.resize(numFU);
     fpDividerNextIssue.resize(numFU, Cycles(0));
+    fpDividerLastClass.resize(numFU, No_OpClass);
     for (auto &ready : nextIssue)
         ready.fill(Cycles(0));
     pairedUnit.resize(numFU, -1);
@@ -389,7 +407,7 @@ FUPool::fpDividerReady(OpClass capability, Cycles cycle)
             cycle < nextIssue[unit][capability] ||
             (executionPorts && !executionPorts->get(unit)->available(curTick())))
             continue;
-        if (cycle >= fpDividerNextIssue[unit]) return true;
+        if (cycle >= fpDividerReadyAt(unit, capability)) return true;
         shared_blocked = true;
     }
     // One class-head admission probe replaces identical probes of all younger
@@ -398,8 +416,45 @@ FUPool::fpDividerReady(OpClass capability, Cycles cycle)
     return false;
 }
 
+bool
+FUPool::normalPowerOfTwoDivide64(const DynInstPtr &inst) const
+{
+    const auto *si = inst->staticInst.get();
+    const unsigned kind = si->sseArithmeticKind();
+    if ((kind != 1 || si->numSrcRegs() != 3) &&
+        (kind != 3 || si->numSrcRegs() != 4))
+        return false;
+
+    // Legacy scalar/packed SSE divide operands are old-low, old-high,
+    // divisor-low[, divisor-high]. Read ready functional values through
+    // DynInst so unpublished producer results retain their forwarding owner.
+    const auto normal_lane = [](uint64_t numerator, uint64_t divisor) {
+        const unsigned n_exp = (numerator >> 52) & 0x7ff;
+        const unsigned d_exp = (divisor >> 52) & 0x7ff;
+        if (!n_exp || n_exp == 0x7ff || !d_exp || d_exp == 0x7ff ||
+            (divisor & ((uint64_t(1) << 52) - 1)))
+            return false;
+        const int result_exp = int(n_exp) - int(d_exp) + 1023;
+        return result_exp > 0 && result_exp < 0x7ff;
+    };
+    if (!normal_lane(inst->getRegOperand(si, 0),
+                     inst->getRegOperand(si, 2)))
+        return false;
+    return kind == 1 || normal_lane(inst->getRegOperand(si, 1),
+                                   inst->getRegOperand(si, 3));
+}
+
+Cycles
+FUPool::getOpLatency(const DynInstPtr &inst)
+{
+    const unsigned latency = inst->staticInst->vectorExecutionLatency();
+    return executionPorts && latency ? Cycles(latency) :
+        getOpLatency(inst->opClass());
+}
+
 int
 FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
+               Cycles &op_latency,
                bool store, bool branch,
                int bound_port)
 {
@@ -426,14 +481,17 @@ FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cyc
         capability == SimdFloatDivOp || capability == X86FloatSqrt32Op ||
         capability == X86FloatSqrt64Op;
     const auto dividerAvailable = [&](int unit) {
-        if (!fp_divide || cycle >= fpDividerNextIssue[unit]) return true;
+        if (!fp_divide || cycle >= fpDividerReadyAt(unit, capability)) return true;
         ++stats.fpDividerCrossClassBlocked;
         return false;
     };
+    const uint16_t vector_ports = executionPorts ?
+        inst->staticInst->vectorExecutionPorts() : 0;
 
     // Iterate through the circular queue if needed, stopping if we've reached
     // the first element again.
-    while (unitBusy[fu_idx] || cycle < nextIssue[fu_idx][capability] ||
+    while ((vector_ports && !(vector_ports & (1u << fu_idx))) ||
+           unitBusy[fu_idx] || cycle < nextIssue[fu_idx][capability] ||
            !dividerAvailable(fu_idx) ||
            fu_idx == data_idx ||
            (executionPorts && !executionPorts->get(fu_idx)->available(curTick())) ||
@@ -452,17 +510,47 @@ FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cyc
     assert(fu_idx < numFU);
 
     unitBusy[fu_idx] = true;
+    op_latency = getOpLatency(inst);
+    const bool power_of_two = capability == FloatDivOp &&
+        fpDiv64PowerOfTwoLatency && normalPowerOfTwoDivide64(inst);
+    if (power_of_two) {
+        op_latency = fpDiv64PowerOfTwoLatency;
+        ++stats.fpDiv64PowerOfTwoIssued;
+    }
+    const bool assist = capability == FloatDivOp &&
+        fpDiv64AssistLatency &&
+        inst->staticInst->maskedSSEDivideAssist64(inst.get());
+    if (assist) {
+        op_latency = fpDiv64AssistLatency;
+        ++stats.fpDiv64AssistIssued;
+    }
     nextIssue[fu_idx][capability] = cycle + issueIntervals[fu_idx][capability];
-    if (fp_divide)
-        fpDividerNextIssue[fu_idx] = nextIssue[fu_idx][capability];
     if (fp_divide) {
+        if (fpDividerLastClass[fu_idx] != No_OpClass &&
+            fpDividerLastClass[fu_idx] != capability)
+            ++stats.fpDividerClassSwitches;
+        fpDividerLastClass[fu_idx] = capability;
+        fpDividerNextIssue[fu_idx] = nextIssue[fu_idx][capability];
+        if (assist)
+            fpDividerNextIssue[fu_idx] = cycle + fpDiv64AssistInterval;
+    }
+    if (fp_divide) {
+        const Cycles configured_active =
+            assist && fpDiv64AssistActiveCycles ?
+            fpDiv64AssistActiveCycles :
+            power_of_two && fpDiv64PowerOfTwoActiveCycles ?
+            fpDiv64PowerOfTwoActiveCycles : capability == FloatDivOp ?
+            fpDiv64ActiveCycles : capability == SimdFloatDivOp ?
+                fpDiv32ActiveCycles : Cycles(0);
+        const Cycles active = configured_active ?
+            configured_active : op_latency;
         cpu->dividerStats.start(true);
-        // The admitted fixed-latency FU operation remains in execution until
-        // its completion/free boundary, including speculative instructions.
+        // Arithmetic activity can end before result publication. This event
+        // only accounts admitted work; it does not release the FU or wake IQ.
         cpu->schedule(new EventFunctionWrapper([cpu] {
             cpu->dividerStats.finish(true);
-        }, name() + ".dividerComplete", true),
-            cpu->clockEdge(getOpLatency(capability)));
+        }, name() + ".dividerArithmeticComplete", true),
+            cpu->clockEdge(active));
     }
     if (executionPorts)
         executionPorts->commit(IntExecutionFamily::None, 1 << fu_idx,

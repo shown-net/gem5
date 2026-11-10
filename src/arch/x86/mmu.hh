@@ -83,6 +83,12 @@ class MMU : public BaseMMU
     }
 
     Walker*
+    getInstructionWalker()
+    {
+        return static_cast<TLB*>(itb)->getWalker();
+    }
+
+    Walker*
     getDataWalker()
     {
         return static_cast<TLB*>(dtb)->getWalker();

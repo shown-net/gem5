@@ -1407,6 +1407,7 @@ InstructionQueue::scheduleReadyInsts()
         if (op_class != No_OpClass && !managed && !path_blocked &&
             !issuing_inst->repFunctional()) {
             idx = fu_pool->getUnit(cpu, issuing_inst, op_class, cpu->curCycle(),
+                                   op_latency,
                                    issuing_inst->isStore() &&
                                    !issuing_inst->isStoreAddress(),
                                    issuing_inst->isControl() && op_class == IntAluOp,
@@ -1417,9 +1418,6 @@ InstructionQueue::scheduleReadyInsts()
                 iqIOStats.vecAluAccesses++;
             } else {
                 iqIOStats.intAluAccesses++;
-            }
-            if (idx > FUPool::NoFreeFU) {
-                op_latency = fu_pool->getOpLatency(op_class);
             }
         }
 

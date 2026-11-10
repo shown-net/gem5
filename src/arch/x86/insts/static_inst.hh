@@ -158,6 +158,7 @@ class X86StaticInst : public StaticInst
         if (machInst.legacy.rep) return 2;
         return machInst.legacy.op ? 3 : 4;
     }
+    bool maskedSSEDivideAssist64(ExecContext *) const override;
     bool hasLengthChangingPrefix() const override
     {
         // VEX's normalized mandatory prefixes do not change encoded length.

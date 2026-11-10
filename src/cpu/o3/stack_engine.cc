@@ -150,7 +150,11 @@ StackEngine::classify(const DynInstPtr &inst) const
             }
             if (writes_rsp) {
                 d.trackedWrite = true;
-                d.absorbedUpdate = true;
+                // RET imm has a separate adjustment action even when its
+                // logical RSP is tracked. The implicit return-address pop
+                // remains absorbed; the immediate operand is functional.
+                d.absorbedUpdate = !(ret_imm &&
+                    inst->staticInst->getName() == "add");
                 d.increment = step;
             }
             return d;

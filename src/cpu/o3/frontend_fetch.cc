@@ -231,7 +231,8 @@ Fetch::fetchFrontend(bool &status_change)
     AllocationGroupPtr &memoryGroup = memoryExpansionGroup;
     auto sharesAllocation = [](const StaticInstPtr &macro) {
         return macro && (macro->isMicroFusedMemory() ||
-                         macro->isStackRegAllocation());
+                         macro->isStackRegAllocation() ||
+                         nearStackControl(macro.get()) == NearStackControl::Return);
     };
 
     while (records.size() < limit && !stop) {
@@ -251,6 +252,16 @@ Fetch::fetchFrontend(bool &status_change)
         StaticInstPtr op;
         if (!current_macro && !in_rom) {
             if (accepted_instructions >= instruction_limit) break;
+            if (source == FrontendSource::Mite && accepted_instructions &&
+                !lcpDecoded[tid] && !codeDecodeInProgress[tid]) {
+                // A preparation batch is not a decoded-cache miss region.
+                // Hand a resident successor back to DSB rather than decode
+                // and refill it, which would evict its packed neighbours.
+                cached = lookupValidated();
+                if (cached || (fetchStatus[tid] != Running &&
+                               !fetching_successor))
+                    break;
+            }
             StaticInstPtr root;
             if (source == FrontendSource::Dsb || source == FrontendSource::Lsd) {
                 if (!cached) cached = source == FrontendSource::Lsd ?
@@ -458,6 +469,10 @@ Fetch::fetchFrontend(bool &status_change)
                                     *record->predictedPC);
         const bool target_exit = curFT && curFT->isExitInst(at.instAddr()) &&
             (!op->isMicroop() || op->isLastMicroop());
+        const bool chain_dsb_target = decoupledFrontEnd &&
+            source == FrontendSource::Dsb && maxTakenPredPerCycle > 1 &&
+            target_exit && supplied_target && record->prediction.taken &&
+            !op->isMicrocodeControl();
         if (target_exit && curFT->isExitBranch(at.instAddr()) && !op->isControl())
             bac->discardNonBranchTarget(tid, at.instAddr());
         stop = at.branching() || record->prediction.taken;
@@ -484,6 +499,11 @@ Fetch::fetchFrontend(bool &status_change)
                 reportTargetBoundary("history");
                 bacResteer(at, tid);
                 stop = true;
+            } else if (chain_dsb_target) {
+                // Continue only through a validated DSB template and an
+                // already supplied target. The next loop iteration checks
+                // FTQ readiness, target budget, identity, and source capacity.
+                stop = false;
             }
             curFT = nullptr;
         }
@@ -606,12 +626,13 @@ Fetch::startByteLookahead(Addr address, ThreadID tid)
         block, fetchBufferSize, Request::INST_FETCH, cpu->instRequestorId(),
         address, cpu->thread[tid]->contextId());
     request->taskId(cpu->taskId());
-    byteRequests.emplace(request, ByteRequest{frontend->dsb->epoch()});
+    byteRequests.emplace(request, ByteRequest{frontend->translationEpoch()});
     lastByteIssue = cycle;
     TaoTraceFrontendRegistry::noteRequestStart(
         request, cpu->inUserMode(tid), false, false, uint64_t(curTick()));
     cpu->mmu->translateTiming(request, cpu->thread[tid]->getTC(),
-                             new FetchTranslation(this), BaseMMU::Execute);
+                             new FetchTranslation(this, request),
+                             BaseMMU::Execute);
     return true;
 }
 
@@ -642,7 +663,7 @@ Fetch::finishByteTranslation(const Fault &fault, const RequestPtr &request)
     const ThreadID tid = cpu->contextToThread(request->contextId());
     TaoTraceFrontendRegistry::noteTranslationComplete(request);
     const auto state = byteRequests.at(request);
-    if (fault != NoFault || state.epoch != frontend->dsb->epoch() ||
+    if (fault != NoFault || state.epoch != frontend->translationEpoch() ||
         !cpu->system->isMemAddr(request->getPaddr()) ||
         pendingCodeWrite(tid, request->getPaddr()) || cacheBlocked) {
         // Speculative translation faults are reproduced by the demand path.
@@ -677,7 +698,7 @@ Fetch::completeByteLookahead(PacketPtr packet)
     if (it == byteRequests.end()) return false;
     const ThreadID tid = cpu->contextToThread(packet->req->contextId());
     const auto validity = packet->req->getExtension<InstructionCodeValidity>();
-    const bool valid = it->second.epoch == frontend->dsb->epoch() &&
+    const bool valid = it->second.epoch == frontend->translationEpoch() &&
         !(validity && validity->stale) &&
         !pendingCodeWrite(tid, packet->req->getPaddr());
     if (valid) {
@@ -703,14 +724,44 @@ void
 Fetch::invalidateCode(Addr physical_block)
 {
     if (!frontend) return;
+    physical_block &= ~(cacheBlkSize - 1);
+    // Ruby reports data evictions on the snooping instruction port too.
+    // Revoke only same-line bytes, including replies already in transit.
+    const auto revoke = [&](const RequestPtr &request) {
+        if (!request || !request->hasPaddr() ||
+            (request->getPaddr() & ~(cacheBlkSize - 1)) != physical_block)
+            return;
+        auto validity = request->getExtension<InstructionCodeValidity>();
+        if (!validity) {
+            validity = std::make_shared<InstructionCodeValidity>();
+            request->setExtension(validity);
+        }
+        validity->stale = true;
+    };
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        revoke(memReq[tid]);
+    for (const auto &[request, state] : byteRequests)
+        revoke(request);
     if (frontend->instructionBytes->matchesPhysicalBlock(
             physical_block, cacheBlkSize)) {
         for (ThreadID tid = 0; tid < numThreads; ++tid)
             fetchBufferValid[tid] = false;
     }
     frontend->invalidateCode(physical_block);
-    expansionTemplate.reset();
-    decodeCanReuse = false;
+    bool decoded_overlap = expansionTemplate &&
+        std::find(expansionTemplate->physicalBlocks.begin(),
+            expansionTemplate->physicalBlocks.end(), physical_block) !=
+            expansionTemplate->physicalBlocks.end();
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        const auto begin = decodedCodeBlocks[tid].begin();
+        decoded_overlap |= std::find(begin,
+            begin + decodedCodeBlockCount[tid], physical_block) !=
+            begin + decodedCodeBlockCount[tid];
+    }
+    if (decoded_overlap) {
+        expansionTemplate.reset();
+        decodeCanReuse = false;
+    }
 }
 
 bool

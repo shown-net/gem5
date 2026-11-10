@@ -134,7 +134,7 @@ namespace X86ISA
             WalkerState(Walker * _walker, BaseMMU::Translation *_translation,
                         const RequestPtr &_req, bool _isFunctional = false) :
                 walker(_walker), req(_req), state(Ready),
-                nextState(Ready), inflight(0),
+                nextState(Ready), inflight(0), read(nullptr),
                 translation(_translation),
                 functional(_isFunctional), timing(false),
                 retrying(false), started(false), squashed(false)
@@ -181,6 +181,7 @@ namespace X86ISA
 
         PagingStructureCache *pagingStructureCache;
         const Cycles prefixHitLatency;
+        const Cycles pteResponseLatency;
         // Kick off the state machine.
         Fault start(ThreadContext * _tc, BaseMMU::Translation *translation,
                 const RequestPtr &req, BaseMMU::Mode mode);
@@ -188,6 +189,7 @@ namespace X86ISA
                 unsigned &logBytes, BaseMMU::Mode mode);
         Port &getPort(const std::string &if_name,
                       PortID idx=InvalidPortID) override;
+        void dumpProgressState() const;
 
       protected:
         // The TLB we're supposed to load.
@@ -223,6 +225,7 @@ namespace X86ISA
             statistics::Scalar unclassifiedCompleted;
             statistics::Scalar WALK_ACTIVE, WALK_PENDING;
             statistics::Scalar COALESCED_REQUESTS;
+            statistics::Scalar pteReadResponses;
         } dtlbLoadStats, dtlbStoreStats;
         unsigned activeInstructionWalks = 0;
         uint64_t lastInstructionWalkCycle = 0;
@@ -241,6 +244,7 @@ namespace X86ISA
 
         // Functions for dealing with packets.
         bool recvTimingResp(PacketPtr pkt);
+        void completeTimingResp(PacketPtr pkt);
         void recvReqRetry();
         bool sendTiming(WalkerState * sendingState, PacketPtr pkt);
 
@@ -257,7 +261,8 @@ namespace X86ISA
             ClockedObject(params), port(name() + ".port", this),
             funcState(this, NULL, NULL, true),
             pagingStructureCache(params.paging_structure_cache),
-            prefixHitLatency(params.prefix_hit_latency), tlb(NULL), sys(params.system),
+            prefixHitLatency(params.prefix_hit_latency),
+            pteResponseLatency(params.pte_response_latency), tlb(NULL), sys(params.system),
             requestorId(sys->getRequestorId(this)),
             numSquashable(params.num_squash_per_cycle),
             maxActiveWalks(params.max_active_walks), itlbStats(this),

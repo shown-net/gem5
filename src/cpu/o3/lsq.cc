@@ -96,9 +96,9 @@ LSQ::DcachePort::DcachePortStats::DcachePortStats(CPU* _cpu)
       ADD_STAT(numSendRetryResp, statistics::units::Count::get(),
                "Number of retry responses sent"),
       ADD_STAT(loadCompletionQueued, statistics::units::Count::get(),
-               "Ordinary load values admitted to the completion queue"),
+               "Load values admitted to the shared completion resource"),
       ADD_STAT(loadCompletionDelivered, statistics::units::Count::get(),
-               "Ordinary load values delivered from the completion queue"),
+               "Load values delivered by the shared completion resource"),
       ADD_STAT(loadCompletionBlockedCycles, statistics::units::Cycle::get(),
                "Cycles with ready load values remaining after delivery")
 {
@@ -236,16 +236,18 @@ LSQ::takeOverFrom()
 void
 LSQ::tick()
 {
-    unsigned delivered = 0;
-    while (!loadCompletions.empty() && delivered < loadCompletionWidth) {
+    updateLoadCompletionBudget();
+    while (!loadCompletions.empty() &&
+           usedLoadCompletions < loadCompletionWidth) {
         auto completion = std::move(loadCompletions.front());
         loadCompletions.pop_front();
         const bool live = !completion.inst->isSquashed();
-        completion.complete();
         if (live) {
-            ++delivered;
+            // Charge before callbacks can deliver another predicted value.
+            ++usedLoadCompletions;
             ++dcachePort.dcachePortStats.loadCompletionDelivered;
         }
+        completion.complete();
     }
     if (!loadCompletions.empty())
         ++dcachePort.dcachePortStats.loadCompletionBlockedCycles;
@@ -555,10 +557,33 @@ LSQ::usesLoadCompletion(const DynInstPtr &inst, const RequestPtr &req) const
 }
 
 void
+LSQ::updateLoadCompletionBudget()
+{
+    const auto cycle = cpu->curCycle();
+    if (cycle != loadCompletionCycle) {
+        loadCompletionCycle = cycle;
+        usedLoadCompletions = 0;
+    }
+}
+
+void
 LSQ::enqueueLoadCompletion(const DynInstPtr &inst,
-                           std::function<void()> complete)
+                           std::function<void()> complete, bool same_cycle)
 {
     assert(loadCompletionWidth && inst);
+    updateLoadCompletionBudget();
+    ++dcachePort.dcachePortStats.loadCompletionQueued;
+    // A predicted register value has no cache-response handoff. It may use
+    // remaining result slots now, but cannot pass older queued responses.
+    if (same_cycle && loadCompletions.empty() &&
+        usedLoadCompletions < loadCompletionWidth) {
+        if (!inst->isSquashed()) {
+            ++usedLoadCompletions;
+            ++dcachePort.dcachePortStats.loadCompletionDelivered;
+        }
+        complete();
+        return;
+    }
     LoadCompletion item{curTick(), inst->seqNum, inst, std::move(complete)};
     auto position = std::upper_bound(loadCompletions.begin(),
         loadCompletions.end(), item,
@@ -567,7 +592,6 @@ LSQ::enqueueLoadCompletion(const DynInstPtr &inst,
                 (a.ready == b.ready && a.sequence < b.sequence);
         });
     loadCompletions.insert(position, std::move(item));
-    ++dcachePort.dcachePortStats.loadCompletionQueued;
     cpu->wakeCPU();
     iewStage->activityThisCycle();
 }
@@ -1715,6 +1739,13 @@ LSQ::DcachePort::throttleReadResp(PacketPtr pkt)
 bool
 LSQ::DcachePort::recvTimingResp(PacketPtr pkt)
 {
+    // A local write need not invalidate our already-owned cache line. Its
+    // completed visibility must still trigger an armed address monitor.
+    if (pkt->isWrite()) {
+        for (ThreadID tid = 0; tid < cpu->numThreads; ++tid)
+            if (cpu->getCpuAddrMonitor(tid)->doMonitor(pkt))
+                cpu->wakeup(tid);
+    }
     if (lsq->recvRespThrottling && pkt->cmd == MemCmd::ReadResp) {
         if (throttleReadResp(pkt)) {
             return false;

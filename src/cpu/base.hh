@@ -77,6 +77,7 @@ struct AddressMonitor
     bool armed;
     Addr vAddr;
     Addr pAddr;
+    Addr blockMask;
     uint64_t val;
     bool waiting;   // 0=normal, 1=mwaiting
     bool gotWakeup;
@@ -89,6 +90,7 @@ class CPUProgressEvent : public Event
     Counter lastNumInst;
     BaseCPU *cpu;
     bool _repeatEvent;
+    bool noProgressReported = false;
 
   public:
     CPUProgressEvent(BaseCPU *_cpu, Tick ival = 0);
@@ -464,6 +466,9 @@ class BaseCPU : public ClockedObject
 
     virtual Counter totalOps() const = 0;
 
+    /** Diagnostic state for an explicitly enabled, stalled progress event. */
+    virtual void dumpProgressState() {}
+
     /**
      * Schedule an event that exits the simulation loops after a
      * predefined number of instructions.
@@ -708,9 +713,8 @@ class BaseCPU : public ClockedObject
     std::vector<AddressMonitor> addressMonitor;
 
   public:
-    void armMonitor(ThreadID tid, Addr address);
-    bool mwait(ThreadID tid, PacketPtr pkt);
-    void mwaitAtomic(ThreadID tid, ThreadContext *tc, BaseMMU *mmu);
+    void armMonitor(ThreadID tid, Addr address, Addr paddr);
+    bool mwait(ThreadID tid, bool break_on_interrupt);
     AddressMonitor *
     getCpuAddrMonitor(ThreadID tid)
     {

@@ -886,6 +886,22 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
     }
   }
 
+  action(forward_capacity_eviction_to_cpu, "ce", desc="Notify a local L1 capacity replacement") {
+    if (send_evictions) {
+      DPRINTF(RubySlicc, "Sending local L1 capacity eviction for %#x to the CPU\n", address);
+      sequencer.evictionCallback(address, true);
+    }
+  }
+
+  action(forward_invalidation_to_cpu, "ci", desc="Preserve the origin of a private-L2 or external invalidation") {
+    if (send_evictions) {
+      peek(messgeBuffer_in, CoherenceMsg) {
+        DPRINTF(RubySlicc, "Sending invalidation class %s for %#x to the CPU\n", in_msg.Class, address);
+        sequencer.evictionCallback(address, in_msg.Class == CoherenceClass:INV_OWN);
+      }
+    }
+  }
+
   action(g_issuePUTX, "g", desc="Relinquish line to the L1 cache") {
     enqueue(requestNetwork_out, CoherenceMsg, response_latency) {
       assert(is_valid(cache_entry));
@@ -1469,7 +1485,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(FB_S, {L0_Replacement, PF_L0_Replacement}, I) {
-    forward_eviction_to_cpu;
+    forward_capacity_eviction_to_cpu;
     rc_cancelDataFillInstall;
     s_deallocateTBE;
     ff_deallocateCacheBlock;
@@ -1477,7 +1493,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition({FB_E, FB_M}, {L0_Replacement, PF_L0_Replacement}, I) {
-    forward_eviction_to_cpu;
+    forward_capacity_eviction_to_cpu;
     g_issuePUTX;
     rc_cancelDataFillInstall;
     s_deallocateTBE;
@@ -1486,7 +1502,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(FB_S, {InvOwn, InvElse}, I) {
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fi_sendInvAck;
     rc_cancelDataFillInstall;
     s_deallocateTBE;
@@ -1496,7 +1512,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(FB_E, {InvOwn, InvElse, Fwd_GETX}, I) {
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fi_sendInvAck;
     rc_cancelDataFillInstall;
     s_deallocateTBE;
@@ -1506,7 +1522,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(FB_M, {InvOwn, InvElse, Fwd_GETX}, I) {
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     f_sendDataToL1;
     rc_cancelDataFillInstall;
     s_deallocateTBE;
@@ -1575,7 +1591,7 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   // service our flush. I_F has no local data-cache copy, but an I-cache
   // entry can still be present and must be invalidated if so.
   transition(I_F, InvOwn) {
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fvi_ackOwnInvalidateDuringFlush;
     fin_dropLineDuringAbsentFlush;
     l_popRequestQueue;
@@ -1640,14 +1656,14 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   transition({I, IS, IM, Inst_IS}, {InvOwn, InvElse}) {
     su_markSourceUnreliable;
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fi_sendInvAck;
     l_popRequestQueue;
   }
 
   transition(SM, {InvOwn, InvElse}, IM) {
     su_markSourceUnreliable;
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fi_sendInvAck;
     l_popRequestQueue;
   }
@@ -1692,12 +1708,12 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(S, {L0_Replacement,PF_L0_Replacement}, I) {
-    forward_eviction_to_cpu;
+    forward_capacity_eviction_to_cpu;
     ff_deallocateCacheBlock;
   }
 
   transition(S, {InvOwn, InvElse}, I) {
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fi_sendInvAck;
     ff_deallocateCacheBlock;
     l_popRequestQueue;
@@ -1712,14 +1728,14 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
   }
 
   transition(E, {L0_Replacement,PF_L0_Replacement}, I) {
-    forward_eviction_to_cpu;
+    forward_capacity_eviction_to_cpu;
     g_issuePUTX;
     ff_deallocateCacheBlock;
   }
 
   transition(E, {InvOwn, InvElse, Fwd_GETX}, I) {
     // don't send data
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     fi_sendInvAck;
     ff_deallocateCacheBlock;
     l_popRequestQueue;
@@ -1732,13 +1748,13 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
 
   // Transitions from Modified
   transition(M, {L0_Replacement,PF_L0_Replacement}, I) {
-    forward_eviction_to_cpu;
+    forward_capacity_eviction_to_cpu;
     g_issuePUTX;
     ff_deallocateCacheBlock;
   }
 
   transition(M, {InvOwn, InvElse, Fwd_GETX}, I) {
-    forward_eviction_to_cpu;
+    forward_invalidation_to_cpu;
     f_sendDataToL1;
     ff_deallocateCacheBlock;
     l_popRequestQueue;

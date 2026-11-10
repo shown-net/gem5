@@ -235,6 +235,7 @@ class CPU : public BaseCPU
 
     /** Count the Total Ops (including micro ops) committed in the CPU. */
     Counter totalOps() const override;
+    void dumpProgressState() override;
 
     /** Add Thread to Active Threads List. */
     void activateContext(ThreadID tid) override;

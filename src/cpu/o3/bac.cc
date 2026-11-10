@@ -814,9 +814,18 @@ BAC::generateFetchTargets(ThreadID tid, bool &status_change)
         const uint64_t lookup_ready = branch_found ? cycle +
             uint64_t(target_latency) : cycle;
         const uint64_t ready = branch_found ? lookup_ready + 1 : cycle;
-        curFT->setReadyCycle(ready);
+        // A known later-level branch belongs to this target's lookup.
+        // Keep predecode behind its completion and handoff; otherwise a
+        // wider Fetch batch can replace that pending result with a static
+        // not-taken placeholder before completeLateTargets() runs.
+        curFT->setReadyCycle(late_inst ?
+            std::max(ready, cycle + uint64_t(late_latency) + 1) : ready);
         if (predict_taken) {
-            targetReadyCycle[tid] = std::max(cycle + 1, lookup_ready);
+            // A configured multi-target predictor may use another zero-
+            // latency target in this cycle. Later supplying levels still
+            // wait for their real lookup completion; Fetch retains handoff.
+            targetReadyCycle[tid] = maxTakenPredPerCycle > 1 ?
+                lookup_ready : std::max(cycle + 1, lookup_ready);
         }
 
         ftq->insert(tid, curFT);

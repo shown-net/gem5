@@ -323,7 +323,7 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
             if (!ref.vectorResult->ready || ref.vectorResult->cancelled)
                 return std::numeric_limits<Tick>::max();
             const Cycles latency = inst->iq ?
-                inst->iq->fuPool()->getOpLatency(inst->opClass()) : Cycles(0);
+                inst->iq->fuPool()->getOpLatency(inst) : Cycles(0);
             const auto consumer = vectorDomain(inst, consumer_port, latency);
             int adjustment = vectorBypass(ref.vectorResult->domain, consumer);
             // These legacy SSE forms use the instruction package's complete
@@ -638,7 +638,17 @@ IntegerDivider::Stats::Stats(statistics::Group *parent)
 IntegerDivider::IntegerDivider(const IntegerDividerParams &p)
     : SimObject(p), serviceEvent([this] { service(); }, name() + ".service", false,
                                Event::Priority(0)), stats(this)
-{}
+{
+    const auto assign = [](auto &matrix, const auto &quotient,
+                           const auto &remainder) {
+        fatal_if(quotient.size() != 3 || remainder.size() != 3,
+                 "Integer divide latency rows require three input paths");
+        std::copy(quotient.begin(), quotient.end(), matrix[0].begin());
+        std::copy(remainder.begin(), remainder.end(), matrix[1].begin());
+    };
+    assign(latency32, p.quotientLatency32, p.remainderLatency32);
+    assign(latency64, p.quotientLatency64, p.remainderLatency64);
+}
 
 void
 IntegerDivider::releaseAction(const DynInstPtr &inst)
@@ -752,9 +762,7 @@ IntegerDivider::service()
             // EMR input -> output matrices, ordered low dividend, high
             // dividend, divisor. They are parameter priors, not an SPR
             // value-dependent duration function or a sum of duop latencies.
-            const std::array<std::array<unsigned, 3>, 2> matrix = info.bytes == 4 ?
-                std::array<std::array<unsigned, 3>, 2>{{{11,15,10}, {15,15,14}}} :
-                std::array<std::array<unsigned, 3>, 2>{{{14,18,14}, {18,18,18}}};
+            const auto &matrix = info.bytes == 4 ? latency32 : latency64;
             const Tick wait = now - (op->admitted + period);
             for (unsigned result = 0; result < 2; ++result) {
                 const auto &row = matrix[result];
