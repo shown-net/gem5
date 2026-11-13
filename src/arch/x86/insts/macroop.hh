@@ -57,6 +57,37 @@ class MacroopBase : public X86StaticInst
     const uint32_t numMicroops;
     X86ISA::EmulEnv env;
 
+    void
+    setMicrocodeBlock(const char *block, MacroopKind kind)
+    {
+        macrocodeBlock = block;
+        // Block identity is immutable after the generated constructor adjusts
+        // env. Dynamic REP and Stack Engine eligibility remains with consumers.
+        macroopInfo = kind;
+        if (env.stackSize != 8 || env.dataSize != 8)
+            return;
+        switch (macroopInfo) {
+          case MacroopKind::CallImmediate:
+            nearStackInfo = NearStackControl::DirectCall;
+            break;
+          case MacroopKind::CallRegister:
+            nearStackInfo = NearStackControl::RegisterCall;
+            break;
+          case MacroopKind::CallMemory:
+          case MacroopKind::CallPcRelative:
+            nearStackInfo = NearStackControl::MemoryCall;
+            break;
+          case MacroopKind::Return:
+            nearStackInfo = NearStackControl::Return;
+            break;
+          case MacroopKind::ReturnImmediate:
+            nearStackInfo = NearStackControl::ReturnImmediate;
+            break;
+          default:
+            break;
+        }
+    }
+
     //Constructor.
     MacroopBase(const char *mnem, ExtMachInst _machInst,
             uint32_t _numMicroops, X86ISA::EmulEnv _env) :
@@ -93,13 +124,13 @@ class MacroopBase : public X86StaticInst
 
   public:
     ExtMachInst
-    getExtMachInst()
+    getExtMachInst() const
     {
         return machInst;
     }
 
     X86ISA::EmulEnv
-    getEmulEnv()
+    getEmulEnv() const
     {
         return env;
     }

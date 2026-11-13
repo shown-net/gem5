@@ -42,7 +42,6 @@
 #include "cpu/o3/rename.hh"
 
 #include <list>
-#include <map>
 
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
@@ -89,7 +88,7 @@ isImplicitPushUpdate(const DynInstPtr &inst)
         inst->numSrcRegs() != 1 || inst->numDestRegs() != 1)
         return false;
     auto *macro = dynamic_cast<X86ISA::MacroopBase *>(inst->macroop.get());
-    if (!macro || std::string(macro->getMicrocodeBlock()) != "PUSH_R")
+    if (!macro || macro->macroopKind() != MacroopKind::PushRegister)
         return false;
     const auto env = macro->getEmulEnv();
     if (env.stackSize != 8 || env.dataSize != 8)
@@ -1064,6 +1063,10 @@ Rename::renameInsts(ThreadID tid)
             serializeAfter(insts_to_rename, tid);
         }
 
+        if (cpu->coreFunctionalObservation && !inst->coreFunctionalFacts) {
+            inst->coreFunctionalFacts = std::make_unique<CoreFunctionalSnapshot>(
+                inst->numSrcRegs(), inst->numDestRegs());
+        }
         // Nothing above this point has acquired downstream capacity. Once
         // admitted, these reservations survive pipeline delay and cannot be
         // stolen by a younger allocation or a memory replay.
@@ -1075,6 +1078,8 @@ Rename::renameInsts(ThreadID tid)
         renameSrcRegs(inst, inst->threadNumber);
 
         renameDestRegs(inst, inst->threadNumber);
+        if (inst->coreFunctionalFacts)
+            inst->coreFunctionalFacts->completeNormalization();
         if (inst->moveProjection)
             ++cpu->moveEliminationStats.accepted;
         if (inst->renameComputed) {
@@ -1472,6 +1477,8 @@ Rename::renameSrcRegs(const DynInstPtr &inst, ThreadID tid)
     for (int src_idx = 0; src_idx < num_src_regs; src_idx++) {
         const RegId& src_reg = inst->srcRegIdx(src_idx);
         const RegId flat_reg = src_reg.flatten(*isa);
+        if (inst->coreFunctionalFacts)
+            inst->coreFunctionalFacts->observeSource(src_idx, src_reg, flat_reg);
         PhysRegIdPtr renamed_reg;
 
         renamed_reg = map->lookup(flat_reg);
@@ -1539,7 +1546,6 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
     UnifiedRenameMap *map = renameMap[tid];
     unsigned num_dest_regs = inst->numDestRegs();
     auto *isa = tc->getIsaPtr();
-    std::map<std::pair<RegClassType, RegIndex>, PhysRegIdPtr> entry_peers;
 
     // Rename the destination registers.
     for (int dest_idx = 0; dest_idx < num_dest_regs; dest_idx++) {
@@ -1548,6 +1554,9 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
 
         RegId flat_dest_regid = dest_reg.flatten(*isa);
         flat_dest_regid.setNumPinnedWrites(dest_reg.getNumPinnedWrites());
+        if (inst->coreFunctionalFacts)
+            inst->coreFunctionalFacts->observeDestination(
+                dest_idx, dest_reg, flat_dest_regid);
 
         if (inst->stackTrackedWrite && flat_dest_regid ==
             X86ISA::int_reg::Rsp.flatten(*isa)) {
@@ -1572,11 +1581,27 @@ Rename::renameDestRegs(const DynInstPtr &inst, ThreadID tid)
             const auto group = flat_dest_regid.is(FloatRegClass) &&
                 inst->stageDemand.floatWideEntries == 1 ? 0 :
                 flat_dest_regid.regClass().regAllocationGroup(flat_dest_regid);
-            const auto key = std::make_pair(flat_dest_regid.classValue(), group);
-            rename_result = map->rename(flat_dest_regid,
-                                       entry ? entry_peers[key] : nullptr);
-            if (entry && rename_result.first != rename_result.second)
-                entry_peers[key] = rename_result.first;
+            PhysRegIdPtr peer = nullptr;
+            if (entry) {
+                // Prior destinations already retain the latest successful
+                // rename for each allocation group; no transient map is needed.
+                for (int prior_idx = dest_idx - 1; prior_idx >= 0; --prior_idx) {
+                    const auto &prior = inst->flattenedDestIdx(prior_idx);
+                    if (prior.classValue() != flat_dest_regid.classValue() ||
+                        prior.regClass().isFunctional(prior) ||
+                        inst->renamedDestIdx(prior_idx) ==
+                            inst->prevDestIdx(prior_idx))
+                        continue;
+                    const auto prior_group = prior.is(FloatRegClass) &&
+                        inst->stageDemand.floatWideEntries == 1 ? 0 :
+                        prior.regClass().regAllocationGroup(prior);
+                    if (prior_group == group) {
+                        peer = inst->renamedDestIdx(prior_idx);
+                        break;
+                    }
+                }
+            }
+            rename_result = map->rename(flat_dest_regid, peer);
             if (entry && inst->stageDemand.floatWideEntries &&
                 flat_dest_regid.is(FloatRegClass) &&
                 rename_result.first != rename_result.second)

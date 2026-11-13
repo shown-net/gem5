@@ -40,6 +40,7 @@
 
 #include "cpu/o3/rob.hh"
 
+#include <algorithm>
 #include <list>
 
 #include "base/logging.hh"
@@ -329,11 +330,16 @@ ROB::canReserve(const std::vector<DynInstPtr> &insts) const
 {
     unsigned need = 0;
     std::array<unsigned, MaxThreads> per_thread{};
-    std::map<InstSeqNum, bool> seen;
+    assert(insts.size() <= MaxWidth);
+    std::array<InstSeqNum, MaxWidth> seen;
+    unsigned seen_count = 0;
     for (const auto &inst : insts) {
+        const auto key = inst->robKey();
         if (hasReservation(inst) || trackingEntries.count(inst->robKey()) ||
-            !seen.emplace(inst->robKey(), true).second)
+            std::find(seen.begin(), seen.begin() + seen_count, key) !=
+                seen.begin() + seen_count)
             continue;
+        seen[seen_count++] = key;
         need += inst->backendSlots();
         per_thread[inst->threadNumber] += inst->backendSlots();
     }
@@ -651,6 +657,33 @@ ROB::findInst(ThreadID tid, InstSeqNum squash_inst)
         }
     }
     return NULL;
+}
+
+bool
+ROB::retirementGroupReady(const DynInstPtr &head_inst, bool &fault_ready) const
+{
+    const auto &insts = instList[head_inst->threadNumber];
+    auto member = insts.begin();
+    assert(member != insts.end() && *member == head_inst);
+
+    bool group_ready = true;
+    fault_ready = false;
+    const bool stack_sync_gaps = cpu->instSeqStride() == 2;
+    // ROB insertion preserves sequence order. Walk only this group's records;
+    // absent odd sequences reserve space for optional StackSync instructions.
+    for (InstSeqNum sn = head_inst->seqNum;
+         sn <= head_inst->retirementEnd(); ++sn) {
+        if (member == insts.end() || (*member)->seqNum != sn) {
+            if (!stack_sync_gaps || !(sn & 1))
+                group_ready = false;
+            continue;
+        }
+        const bool ready = (*member)->readyToCommit();
+        group_ready &= ready;
+        fault_ready |= ready && (*member)->getFault() != NoFault;
+        ++member;
+    }
+    return group_ready;
 }
 
 } // namespace o3

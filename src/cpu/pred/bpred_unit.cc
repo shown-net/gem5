@@ -41,6 +41,7 @@
  */
 
 #include "cpu/pred/bpred_unit.hh"
+#include "cpu/o3/dyn_inst.hh"
 
 #include <algorithm>
 
@@ -55,12 +56,29 @@ namespace gem5
 namespace branch_prediction
 {
 
+BPredUnit::PredictorHistory::PredictorHistory(ThreadID _tid, InstSeqNum sn,
+        Addr _pc, const StaticInstPtr &inst)
+    : seqNum(sn), tid(_tid), pc(_pc), inst(inst), type(getBranchType(inst)),
+      call(inst->isCall()), uncond(!inst->isCondCtrl()), predTaken(false),
+      actuallyTaken(false), condPred(false), btbHit(false),
+      targetProvider(TargetProvider::NoTarget), resteered(false),
+      mispredict(false), target(nullptr)
+{}
+
+BPredUnit::PredictorHistory::~PredictorHistory()
+{
+    assert(bpHistory == nullptr);
+    assert(indirectHistory == nullptr);
+    assert(rasHistory == nullptr);
+}
+
 BPredUnit::BPredUnit(const Params &params)
     : SimObject(params), numThreads(params.numThreads),
       requiresBTBHit(params.requiresBTBHit),
       useReturnFallback(params.useReturnFallback),
       updateBTBAtSquash(params.updateBTBAtSquash),
-      instShiftAmt(params.instShiftAmt), predHist(numThreads), btb(params.btb),
+      instShiftAmt(params.instShiftAmt), predHist(numThreads),
+      replayPredictions(numThreads), btb(params.btb),
       ras(params.ras), cPred(params.conditionalBranchPred),
       iPred(params.indirectBranchPred), stats(this)
 {
@@ -90,6 +108,87 @@ BPredUnit::drainSanityCheck() const
     // a drained system.
     for ([[maybe_unused]] const auto& ph : predHist)
         assert(ph.empty());
+    assert(transactions.empty());
+}
+
+BPredUnit::PredictorHistory *
+BPredUnit::makeHistory(ThreadID tid, InstSeqNum seq, Addr pc,
+                       const StaticInstPtr &inst)
+{
+    auto history = std::make_shared<PredictorHistory>(tid, seq, pc, inst);
+    auto *identity = history.get();
+    transactions.emplace(identity, std::move(history));
+    return identity;
+}
+
+BPredUnit::HistoryHandle
+BPredUnit::historyHandle(PredictorHistory *history) const
+{
+    auto found = transactions.find(history);
+    return found == transactions.end() ? HistoryHandle{} : found->second;
+}
+
+BPredUnit::HistoryHandle
+BPredUnit::newestHistory(ThreadID tid) const
+{
+    return predHist[tid].empty() ? HistoryHandle{} :
+        historyHandle(predHist[tid].front());
+}
+
+BPredUnit::PathSnapshot
+BPredUnit::pathSnapshot(ThreadID tid) const
+{
+    return {cPred->pathSnapshot(tid), iPred ? iPred->pathSnapshot(tid) : nullptr};
+}
+
+bool
+BPredUnit::predictNotTakenAtSnapshot(const StaticInstPtr &inst, InstSeqNum sequence,
+        ThreadID tid, const PathSnapshot &snapshot, PCStateBase &pc,
+        PredictorHistory *&history)
+{
+    if (!inst->isCondCtrl() || !snapshot.conditional ||
+        (iPred && !snapshot.indirect) || hasReplay(tid, pc.instAddr()))
+        return false;
+    void *conditional_history = nullptr;
+    if (!cPred->lookupNotTakenSnapshot(snapshot.conditional, pc.instAddr(),
+                                       conditional_history))
+        return false;
+    history = makeHistory(tid, sequence, pc.instAddr(), inst);
+    history->sequenceBound = true;
+    history->preservedPath = true;
+    history->directionKnown = true;
+    history->bpHistory = conditional_history;
+    history->condPred = false;
+    if (iPred) {
+        const bool captured = iPred->notTakenSnapshot(tid, pc.instAddr(),
+            snapshot.indirect, history->indirectHistory);
+        assert(captured);
+    }
+    ++stats.condPredicted;
+    ++stats.BTBLookups;
+    ++stats.lookups[tid][history->type];
+    ++stats.targetProvider[tid][TargetProvider::NoTarget];
+    ppBranches->notify(1);
+    history->btbAwaitingSnapshot = btb->valid(tid, pc.instAddr());
+    if (!history->btbAwaitingSnapshot)
+        btb->lookup(tid, pc.instAddr(), history->type);
+    set(history->target, pc);
+    inst->advancePC(*history->target);
+    set(pc, *history->target);
+    return true;
+}
+
+void
+BPredUnit::setReplay(ThreadID tid, Addr pc, bool taken, const PCStateBase &target)
+{
+    replayPredictions[tid] = ReplayPrediction{
+        pc, taken, std::unique_ptr<PCStateBase>(target.clone())};
+}
+
+void BPredUnit::clearReplay(ThreadID tid) { replayPredictions[tid].reset(); }
+bool BPredUnit::hasReplay(ThreadID tid, Addr pc) const
+{
+    return replayPredictions[tid] && replayPredictions[tid]->pc == pc;
 }
 
 
@@ -121,7 +220,8 @@ BPredUnit::insertPredictorHistory(ThreadID tid, PredictorHistory *&bpu_history)
 bool
 BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
                    PCStateBase &pc, ThreadID tid, PredictorHistory* &hist,
-                   bool staged_targets)
+                   bool staged_targets, const BranchTargetBuffer::Snapshot *snapshot,
+                   bool predecoded)
 {
     assert(hist == nullptr);
 
@@ -132,7 +232,8 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
     // if prediction was wrong.
 
     BranchType brType = getBranchType(inst);
-    hist = new PredictorHistory(tid, seqNum, pc.instAddr(), inst);
+    hist = makeHistory(tid, seqNum, pc.instAddr(), inst);
+    hist->sequenceBound = !staged_targets;
 
     stats.lookups[tid][brType]++;
     ppBranches->notify(1);
@@ -159,6 +260,7 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
         }
     }
     hist->predTaken = hist->condPred;
+    hist->directionKnown = true;
 
     DPRINTF(Branch,
             "[tid:%i, sn:%llu] Branch predictor predicted %i for PC:%#x %s\n",
@@ -179,7 +281,11 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
      * chance to detect a branch without a BTB hit.
      */
     stats.BTBLookups++;
-    const PCStateBase * btb_target = btb->lookup(tid, pc.instAddr(), brType);
+    const bool delayed_predecoded = predecoded && !snapshot &&
+        !btb->earlyValid(tid, pc.instAddr()) && btb->valid(tid, pc.instAddr());
+    hist->btbAwaitingSnapshot = delayed_predecoded;
+    const PCStateBase *btb_target = delayed_predecoded ? nullptr : snapshot ?
+        btb->consumeSnapshot(*snapshot, brType) : btb->lookup(tid, pc.instAddr(), brType);
     if (btb_target) {
         stats.BTBHits++;
         hist->btbHit = true;
@@ -198,7 +304,7 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
     // to know about a branch instruction. In that case consolidate
     // indirect and RAS predictor only if there was a BTB it.
     // For low end CPUs predecoding might be used to identify branches.
-    const bool branch_detected = (hist->btbHit || !requiresBTBHit);
+    const bool branch_detected = (hist->btbHit || !requiresBTBHit || predecoded);
 
 
     /* -----------------------------------------------
@@ -230,6 +336,7 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
             // If it's a return from a function call, then look up the
             // RETURN address in the RAS.
             const PCStateBase *return_addr = ras->pop(tid, hist->rasHistory);
+            hist->rasUnderflow = !return_addr;
             if (return_addr) {
 
                 // Set the target to the return address
@@ -266,12 +373,16 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
         std::unique_ptr<const PCStateBase> itarget(
             iPred->lookup(tid, seqNum, pc.instAddr(),
                           hist->indirectHistory));
+        if (hist->rasUnderflow)
+            iPred->setReturnFallback(hist->indirectHistory);
 
         if (itarget) {
             // Indirect predictor hit
             ++stats.indirectHits;
-            if (staged_targets && hist->targetProvider != TargetProvider::NoTarget) {
+            if (staged_targets &&
+                (hist->targetProvider != TargetProvider::NoTarget || predecoded)) {
                 hist->pendingTarget.reset(itarget->clone());
+                hist->needsResolution = true;
             } else {
                 hist->targetProvider = TargetProvider::Indirect;
                 set(hist->target, *itarget);
@@ -297,7 +408,18 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
      * If there is no target its either not taken or
      * a BTB miss. In that case we just fallthrough.
      * */
-    if (hist->targetProvider == TargetProvider::NoTarget) {
+    const bool replay = hasReplay(tid, hist->pc);
+    hist->targetAvailable = replay || hist->targetProvider != TargetProvider::NoTarget;
+    if (replay) {
+        auto &saved = *replayPredictions[tid];
+        hist->predTaken = saved.taken;
+        set(hist->target, *saved.target);
+        hist->pendingTarget.reset();
+        hist->needsResolution = false;
+        replayPredictions[tid].reset();
+    } else if (hist->targetProvider == TargetProvider::NoTarget) {
+        hist->noTargetTaken = hist->condPred;
+        hist->needsResolution |= hist->noTargetTaken;
         set(hist->target, pc);
         inst->advancePC(*hist->target);
         hist->predTaken = false;
@@ -344,13 +466,42 @@ BPredUnit::predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
 
 
 bool
+BPredUnit::prepareStagedBtb(ThreadID tid, PredictorHistory *hist,
+                            const BranchTargetBuffer::Snapshot &snapshot)
+{
+    if (!hist || !hist->valid || !hist->btbAwaitingSnapshot || hist->pc != snapshot.pc ||
+        !btb->snapshotValid(snapshot)) return false;
+    hist->btbAwaitingSnapshot = false;
+    const auto *target = btb->consumeSnapshot(snapshot, hist->type);
+    if (!target) return false;
+    ++stats.BTBHits;
+    hist->btbHit = true;
+    // A simultaneously available indirect target already owns the later
+    // prediction; do not overwrite it with the slower BTB snapshot.
+    if (!hist->noTargetTaken || hist->resolved || hist->pendingTarget) return false;
+    set(hist->pendingTarget, *target);
+    hist->pendingBtbTarget = true;
+    hist->needsResolution = true;
+    return true;
+}
+
+bool
 BPredUnit::completeStagedTarget(ThreadID tid, PredictorHistory *hist)
 {
     if (!hist || !hist->pendingTarget) return false;
-    const bool changed = *hist->target != *hist->pendingTarget;
+    const bool changed = hist->noTargetTaken || *hist->target != *hist->pendingTarget;
     hist->target = std::move(hist->pendingTarget);
-    hist->targetProvider = TargetProvider::Indirect;
+    hist->targetAvailable = true;
+    hist->targetProvider = hist->pendingBtbTarget ? TargetProvider::BTB :
+        TargetProvider::Indirect;
+    if (hist->noTargetTaken) {
+        hist->predTaken = true;
+        hist->actuallyTaken = true;
+        hist->noTargetTaken = false;
+    }
+    hist->pendingBtbTarget = false;
     if (changed) {
+        ++hist->predictionVersion;
         // Younger speculative histories have already been removed by BAC.
         // Retarget this transaction without a second lookup, RAS action or
         // prediction-table training operation.
@@ -376,7 +527,8 @@ BPredUnit::update(const InstSeqNum &done_sn, ThreadID tid)
         // sequence number until the most recent done number
         commitBranch(tid, *predHist[tid].rbegin());
 
-        delete predHist[tid].back();
+        predHist[tid].back()->valid = false;
+        transactions.erase(predHist[tid].back());
         predHist[tid].pop_back();
         DPRINTF(Branch, "[tid:%i] [commit sn:%llu] pred_hist.size(): %i\n",
                 tid, done_sn, predHist[tid].size());
@@ -386,6 +538,10 @@ BPredUnit::update(const InstSeqNum &done_sn, ThreadID tid)
 void
 BPredUnit::commitBranch(ThreadID tid, PredictorHistory* &hist)
 {
+    if (hist->resolved && hist->resolvedTarget) {
+        hist->actuallyTaken = hist->resolvedTaken;
+        set(hist->target, *hist->resolvedTarget);
+    }
     // A direct unconditional branch is taken even when its target equals
     // the sequential PC. In that case a missing BTB entry can predict the
     // correct next PC without a squash, leaving the placeholder marked not
@@ -498,7 +654,8 @@ BPredUnit::squashHistory(ThreadID tid, PredictorHistory* &history)
     // This call will  delete the bpHistory.
     cPred->squash(tid, history->bpHistory);
 
-    delete history;
+    history->valid = false;
+    transactions.erase(history);
     history = nullptr;
 }
 
@@ -506,7 +663,8 @@ BPredUnit::squashHistory(ThreadID tid, PredictorHistory* &history)
 void
 BPredUnit::squash(const InstSeqNum &squashed_sn,
                   const PCStateBase &corr_target,
-                  bool actually_taken, ThreadID tid, bool from_commit)
+                  bool actually_taken, ThreadID tid, bool from_commit,
+                  std::optional<bool> original_mispredict)
 {
     // Now that we know that a branch was mispredicted, we need to undo
     // all the branches that have been seen up until this branch and
@@ -532,7 +690,7 @@ BPredUnit::squash(const InstSeqNum &squashed_sn,
     // If there's a squash due to a syscall, there may not be an entry
     // corresponding to the squash.  In that case, don't bother trying to
     // fix up the entry.
-    if (!predHist[tid].empty()) {
+    if (!predHist[tid].empty() && predHist[tid].front()->seqNum == squashed_sn) {
 
         PredictorHistory *hist = predHist[tid].front();
 
@@ -564,8 +722,10 @@ BPredUnit::squash(const InstSeqNum &squashed_sn,
         // the branch actually commits.
 
         // Remember the correct direction and target for the update at commit.
-        hist->mispredict = true;
+        hist->mispredict |= original_mispredict.value_or(true);
         hist->actuallyTaken = actually_taken;
+        hist->noTargetTaken = false;
+        hist->targetAvailable = true;
         set(hist->target,  corr_target);
 
         // Correct Direction predictor ------------------

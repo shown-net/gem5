@@ -8,7 +8,9 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/allocation_group.hh"
+#include "cpu/o3/core_functional_facts.hh"
 #include "cpu/o3/stage_demand.hh"
+#include "cpu/pred/bpred_unit.hh"
 #include "cpu/static_inst.hh"
 #include "sim/faults.hh"
 #include "sim/insttracer.hh"
@@ -22,8 +24,13 @@ struct FrontendPrediction
     bool taken = false;
     bool directionValid = false;
     bool originalDirection = false;
+    bool targetValid = false;
+    bool noTargetTaken = false;
+    bool requiresResteer = false;
     bool btbHit = false;
     bool untrackedBranch = false;
+    branch_prediction::BPredUnit::HistoryHandle transaction;
+    uint64_t version = 0;
 };
 
 enum class FrontendSource { Mite, Dsb, Microcode, Lsd };
@@ -42,6 +49,7 @@ struct FrontendRecord
     Tick fetchedAt;
     bool fromUser = false;
     uint64_t addressSpace = 0;
+    std::unique_ptr<CoreFunctionalContext> coreFunctionalContext;
     std::array<Addr, 2> codeBlocks{};
     unsigned codeBlockCount = 0;
     bool staleCode = false;
@@ -73,9 +81,6 @@ struct FrontendRecord
 using FrontendRecordPtr = std::unique_ptr<FrontendRecord>;
 enum class RepStringKind { None, Copy, Store };
 RepStringKind repStringKind(const StaticInst *macro);
-enum class NearStackControl {
-    None, DirectCall, RegisterCall, MemoryCall, Return, ReturnImmediate
-};
 NearStackControl nearStackControl(const StaticInst *macro);
 StageDemand initialDemand(const StaticInst &instruction,
                           const StaticInst *macro = nullptr);

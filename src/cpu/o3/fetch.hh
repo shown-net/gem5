@@ -44,6 +44,7 @@
 
 #include <array>
 #include <optional>
+#include <set>
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"
 #include "base/random.hh"
@@ -229,6 +230,8 @@ class Fetch
 
     /** Sets the main backwards communication time buffer pointer. */
     void setTimeBuffer(TimeBuffer<TimeStruct> *time_buffer);
+    void refreshWake();
+    void cancelWake();
 
     /** Sets pointer to list of active threads. */
     void setActiveThreads(std::list<ThreadID> *at_ptr);
@@ -321,10 +324,12 @@ class Fetch
     void finishTranslation(const Fault &fault, const RequestPtr &mem_req);
     bool startByteLookahead(Addr address, ThreadID tid);
     void finishByteTranslation(const Fault &fault, const RequestPtr &request);
+    void sendReadyByteRequests();
     bool completeByteLookahead(PacketPtr packet);
     void fetchPredictedBytes(ThreadID tid, FetchTargetPtr target);
     bool byteRequestPending(Addr address, ThreadID tid) const;
     void discardByteLookahead(ThreadID tid);
+    void revokeDemandRequest(ThreadID tid);
 
 
     /** Check if an interrupt is pending and that we need to handle
@@ -397,6 +402,7 @@ class Fetch
     bool emitFrontendRecord(FrontendRecordPtr record);
     FrontendSource expansionSource = FrontendSource::Mite;
     std::optional<FrontendTemplate> expansionTemplate;
+    InstSeqNum expansionFirstSequence = 0;
     AllocationGroupPtr memoryExpansionGroup;
     std::vector<FrontendRecordPtr> pendingMemoryExpansion;
     bool decodeCanReuse = true;
@@ -431,6 +437,7 @@ class Fetch
   private:
     /** Pointer to the O3CPU. */
     CPU *cpu;
+    EventFunctionWrapper wakeEvent;
     FrontendCoordinator *frontend;
 
     /** Time buffer interface. */
@@ -450,6 +457,7 @@ class Fetch
 
     /** Wire used to write any information backward to BAC. */
     TimeBuffer<TimeStruct>::wire toBAC;
+    TimeBuffer<TimeStruct>::wire fromBAC;
 
     //Might be annoying how this name is different than the queue.
     /** Wire used to write any information heading to decode. */
@@ -501,7 +509,7 @@ class Fetch
     };
 
     /** Tracks which stages are telling fetch to stall. */
-    Stalls stalls[MaxThreads];
+    Stalls stalls[MaxThreads]{};
 
     /** Enables the decoupled front-end */
     const bool decoupledFrontEnd;
@@ -525,7 +533,7 @@ class Fetch
     const unsigned decodeWidth;
 
     /** Is the cache blocked?  If so no threads can access it. */
-    bool cacheBlocked;
+    bool cacheBlocked = false;
 
     /** The packet that is waiting to be retried. */
     PacketPtr retryPkt;
@@ -559,17 +567,25 @@ class Fetch
     /** Whether or not the fetch buffer data is valid. */
     bool fetchBufferValid[MaxThreads];
     bool byteLookahead[MaxThreads]{};
+    bool demandAccepted[MaxThreads]{};
     struct ByteRequest
     {
         uint64_t epoch;
+        uint64_t order;
         bool response = false;
+        bool cancelled = false;
+        bool translated = false;
+        bool demand = false;
     };
     std::map<RequestPtr, ByteRequest> byteRequests;
+    uint64_t nextByteRequestOrder = 0;
     uint64_t lastByteIssue = ~uint64_t(0);
 
     /** Earliest cycle for the next fetch after a coupled BTB prediction. */
     uint64_t btbReadyCycle[MaxThreads]{};
     InstSeqNum microcodeControl[MaxThreads]{};
+    InstSeqNum noTargetBranch[MaxThreads]{};
+    std::set<InstSeqNum> lateHoldSequences[MaxThreads];
     StaticInstPtr lcpDecoded[MaxThreads];
     uint64_t lcpReadyCycle[MaxThreads]{};
     std::shared_ptr<bool> dsbMissExposed[MaxThreads];
@@ -610,6 +626,7 @@ class Fetch
     /*Max number of FT added to the FTQ per Cycle*/
     const unsigned maxFTPerCycle;
     const unsigned maxTakenPredPerCycle;
+    const unsigned maxDsbTakenPerCycle;
 
   protected:
     struct FetchStatGroup : public statistics::Group

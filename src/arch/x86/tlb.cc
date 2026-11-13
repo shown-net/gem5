@@ -35,6 +35,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/x86/tlb.hh"
 
 #include <cstring>
@@ -123,6 +124,50 @@ TLB::DtlbStoreMissStats::DtlbStoreMissStats(statistics::Group *parent)
 {}
 
 void
+TLB::indexSharedEntry(TlbEntry *entry)
+{
+    if (!sprSharedDomains || sprSplitL1)
+        return;
+    auto &members = sharedSets[sharedSet(entry->vaddr, entry->logBytes)];
+    members.insert(std::lower_bound(members.begin(), members.end(), entry), entry);
+}
+
+unsigned
+TLB::sharedSet(Addr vpn, unsigned log_bytes) const
+{
+    Addr page = vpn >> log_bytes;
+    if (log_bytes == 12 && sprSharedIndexShift == 8) {
+        // Fold every byte of the unsigned virtual page number.  The final
+        // low eight bits select the two modeled domains and their sets.
+        page ^= page >> 32;
+        page ^= page >> 16;
+        page ^= page >> 8;
+    } else if (log_bytes == 12 && sprSharedIndexShift) {
+        page ^= page >> sprSharedIndexShift;
+    }
+    const unsigned domain = log_bytes == 12 ? ((page >> 7) & 1) :
+                            log_bytes == 30 ? 1 : 0;
+    return domain * 128 + unsigned(page & 127);
+}
+
+void
+TLB::removeEntry(TlbEntry *entry)
+{
+    assert(entry->trieHandle);
+    if (sprSharedDomains && !sprSplitL1) {
+        auto &members = sharedSets[sharedSet(entry->vaddr, entry->logBytes)];
+        const auto found = std::lower_bound(members.begin(), members.end(), entry);
+        assert(found != members.end() && *found == entry);
+        members.erase(found);
+    }
+    TlbEntryTrie &owner = sprSplitL1 && type() == TypeTLB::data &&
+        unsigned(entry - tlb.data()) >= baseSize + 40 ? storeTrie : trie;
+    owner.remove(entry->trieHandle);
+    entry->trieHandle = nullptr;
+    freeList.push_back(entry);
+}
+
+void
 TLB::evictLRU()
 {
     // Find the entry with the lowest (and hence least recently updated)
@@ -134,10 +179,7 @@ TLB::evictLRU()
             lru = i;
     }
 
-    assert(tlb[lru].trieHandle);
-    trie.remove(tlb[lru].trieHandle);
-    tlb[lru].trieHandle = NULL;
-    freeList.push_back(&tlb[lru]);
+    removeEntry(&tlb[lru]);
 }
 
 TlbEntry *
@@ -169,13 +211,6 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
             first = baseSize + 32;
             last = first + 8;
         }
-        auto removeEntry = [&](TlbEntry *victim) {
-            TlbEntryTrie &owner = data &&
-                unsigned(victim - tlb.data()) >= baseSize + 40 ? storeTrie : trie;
-            owner.remove(victim->trieHandle);
-            victim->trieHandle = nullptr;
-            freeList.push_back(victim);
-        };
         if (first == 0 && entry.logBytes == 12) {
             const unsigned target = (vpn >> 12) % (baseSize / smallPageWays);
             unsigned used = 0;
@@ -244,29 +279,13 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
         // Two support domains. A: 4K/2M/4M, B: 4K/1G.
         // The optional 4K fold controls false conflicts at sparse strides.
         // Neither this fold nor large-page indexing is a recovered SPR hash.
-        auto location = [this](Addr addr, unsigned log_bytes) {
-            Addr page = addr >> log_bytes;
-            if (log_bytes == 12 && sprSharedIndexShift)
-                page ^= page >> sprSharedIndexShift;
-            const unsigned domain = log_bytes == 12 ? ((page >> 7) & 1) :
-                                    log_bytes == 30 ? 1 : 0;
-            return std::make_pair(domain, unsigned(page & 127));
-        };
-        auto target = location(vpn, entry.logBytes);
-        unsigned used = 0;
-        TlbEntry *victim = nullptr;
-        for (auto &candidate : tlb) {
-            if (candidate.trieHandle &&
-                location(candidate.vaddr, candidate.logBytes) == target) {
-                ++used;
-                if (!victim || candidate.lruSeq < victim->lruSeq)
-                    victim = &candidate;
-            }
-        }
-        if (used >= 8) {
-            trie.remove(victim->trieHandle);
-            victim->trieHandle = nullptr;
-            freeList.push_back(victim);
+        const auto &members = sharedSets[sharedSet(vpn, entry.logBytes)];
+        if (members.size() >= 8) {
+            auto *victim = *std::min_element(members.begin(), members.end(),
+                [](const TlbEntry *a, const TlbEntry *b) {
+                    return a->lruSeq < b->lruSeq;
+                });
+            removeEntry(victim);
         }
     } else if (smallPageWays && entry.logBytes == 12) {
         const auto set = (vpn >> 12) % (size / smallPageWays);
@@ -281,9 +300,7 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
             }
         }
         if (used >= smallPageWays) {
-            trie.remove(victim->trieHandle);
-            victim->trieHandle = nullptr;
-            freeList.push_back(victim);
+            removeEntry(victim);
         }
     }
     if (freeList.empty())
@@ -304,6 +321,7 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
         newEntry->trieHandle =
         trie.insert(key, TlbEntryTrie::MaxBits, newEntry);
     }
+    indexSharedEntry(newEntry);
     if (fillNextLevel && nextLevel())
         static_cast<TLB *>(nextLevel())->insert(entry.vaddr, entry, pcid);
     return newEntry;
@@ -335,18 +353,19 @@ TLB::lookup(Addr va, bool update_lru, BaseMMU::Mode mode)
 void
 TLB::flushAll()
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushAll, 0, 0, true);
     ++invalidationGeneration;
     if (walker->pagingStructureCache)
         walker->pagingStructureCache->invalidate();
     if (codeInvalidation) codeInvalidation();
-    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushAll();
+    if (nextLevel()) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
+        static_cast<TLB *>(nextLevel())->flushAll();
+    }
     DPRINTF(TLB, "Invalidating all entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle) {
-            (sprSplitL1 && type() == TypeTLB::data && i >= baseSize + 40 ?
-                storeTrie : trie).remove(tlb[i].trieHandle);
-            tlb[i].trieHandle = NULL;
-            freeList.push_back(&tlb[i]);
+            removeEntry(&tlb[i]);
         }
     }
 }
@@ -360,19 +379,20 @@ TLB::setConfigAddress(uint32_t addr)
 void
 TLB::flushNonGlobal(int pcid)
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal, 0, 0, true);
     ++invalidationGeneration;
     if (walker->pagingStructureCache)
         walker->pagingStructureCache->invalidate(pcid);
     if (codeInvalidation) codeInvalidation();
-    if (nextLevel()) static_cast<TLB *>(nextLevel())->flushNonGlobal(pcid);
+    if (nextLevel()) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
+        static_cast<TLB *>(nextLevel())->flushNonGlobal(pcid);
+    }
     DPRINTF(TLB, "Invalidating all non global entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle && !tlb[i].global &&
             (pcid < 0 || tlb[i].pcid == pcid)) {
-            (sprSplitL1 && type() == TypeTLB::data && i >= baseSize + 40 ?
-                storeTrie : trie).remove(tlb[i].trieHandle);
-            tlb[i].trieHandle = NULL;
-            freeList.push_back(&tlb[i]);
+            removeEntry(&tlb[i]);
         }
     }
 }
@@ -394,14 +414,17 @@ TLB::contextChanged()
 void
 TLB::invalidatePage(Addr va, uint16_t pcid, bool include_global)
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, va, pcid, true);
     ++invalidationGeneration;
     // INVLPG clears all upper-prefix entries for the PCID, independently of
     // VA. Architectural page faults may conservatively use this same scope.
     if (walker->pagingStructureCache)
         walker->pagingStructureCache->invalidate(pcid);
     if (codeInvalidation) codeInvalidation();
-    if (nextLevel())
+    if (nextLevel()) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
         static_cast<TLB *>(nextLevel())->invalidatePage(va, pcid, include_global);
+    }
     // Scan both load and store banks, including overlapping large pages.
     for (unsigned i = 0; i < size; ++i) {
         auto &entry = tlb[i];
@@ -409,10 +432,7 @@ TLB::invalidatePage(Addr va, uint16_t pcid, bool include_global)
             ((entry.global && include_global) ||
              (!entry.global && entry.pcid == pcid)) &&
             (va & ~mask(entry.logBytes)) == entry.vaddr) {
-            (sprSplitL1 && type() == TypeTLB::data && i >= baseSize + 40 ?
-                storeTrie : trie).remove(entry.trieHandle);
-            entry.trieHandle = nullptr;
-            freeList.push_back(&entry);
+            removeEntry(&entry);
         }
     }
 }
@@ -991,6 +1011,7 @@ TLB::serialize(CheckpointOut &cp) const
 void
 TLB::unserialize(CheckpointIn &cp)
 {
+    functional_mmu::lifecycle(this);
     // Do not allow to restore with a smaller tlb.
     uint32_t _size;
     UNSERIALIZE_SCALAR(_size);
@@ -1015,6 +1036,7 @@ TLB::unserialize(CheckpointIn &cp)
         newEntry->trieHandle = index.insert(key, FullSystem ?
             TlbEntryTrie::MaxBits - newEntry->logBytes :
             TlbEntryTrie::MaxBits, newEntry);
+        indexSharedEntry(newEntry);
     }
     if (sprSplitL1)
         for (unsigned i = 0; i < largePageTree.size(); ++i)

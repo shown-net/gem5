@@ -54,8 +54,21 @@ if env['CONF']['BUILD_ISA']:
     DebugFlag('SimpleTrace')
 
     SimObject('TaoTrace.py', sim_objects=['TaoTrace'])
+    # Source-scoped static semantics identity. This project builds independently
+    # of the parent FastSim checkout and uses only child-local source files.
+    import runpy
+    from SCons.Scanner import Scanner
+    static_policy_module = runpy.run_path(File('generate_static_uop_policy.py').srcnode().abspath)
+    static_policy_root = Dir('#').abspath
+    def generate_static_policy(target, source, env):
+        static_policy_module['write_header'](static_policy_root, str(target[0]))
+    env.Command('static_uop_policy.hh',
+                [File('#' + path) for path in static_policy_module['policy_files'](static_policy_root)],
+                Action(generate_static_policy, 'GENERATE static UOP source policy'),
+                source_scanner=Scanner(function=lambda node, env, path: []))
     Source('tao_trace.cc')
     Source('calibration_marker.cc')
+    Source('fixed_work_marker.cc')
     DebugFlag('TaoTrace')
 
     if env['CONF']['HAVE_PROTOBUF']:

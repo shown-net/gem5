@@ -286,6 +286,11 @@ IEW::clearStates(ThreadID tid)
          i <= cpu->iewQueue.getFuture(); ++i) {
         IEWStruct& iew_struct = cpu->iewQueue[i];
         removeCommThreadInsts(tid, iew_struct);
+        auto &resolutions = iew_struct.branchResolutions;
+        resolutions.erase(std::remove_if(resolutions.begin(), resolutions.end(),
+            [tid](const auto &entry) {
+                return entry.instruction && entry.instruction->threadNumber == tid;
+            }), resolutions.end());
         iew_struct.mispredictInst[tid] = nullptr;
         iew_struct.mispredPC[tid] = 0;
         iew_struct.squashedSeqNum[tid] = 0;
@@ -1122,6 +1127,11 @@ IEW::dispatchInsts(ThreadID tid)
             instQueue.insert(inst);
         }
 
+        if (inst->bypassesIQ())
+            ++cpu->uopsIssuedStats.iqBypasses;
+        else
+            ++cpu->uopsIssuedStats.iqAdmissions;
+
         insts_to_dispatch.pop();
 
         toRename->iewInfo[tid].dispatched += inst->backendSlots();
@@ -1324,6 +1334,7 @@ IEW::executeInsts()
         ThreadID tid = inst->threadNumber;
 
         inst->recordExecutionBranch();
+        notifyBranchResolution(inst);
         if (!fetchRedirect[tid] ||
             !toCommit->squash[tid] ||
             toCommit->squashedSeqNum[tid] > inst->seqNum) {
@@ -1639,6 +1650,7 @@ IEW::checkMisprediction(const DynInstPtr& inst)
 {
     ThreadID tid = inst->threadNumber;
     inst->recordExecutionBranch();
+    notifyBranchResolution(inst);
     if (!fetchRedirect[tid] ||
         !toCommit->squash[tid] ||
         toCommit->squashedSeqNum[tid] > inst->seqNum) {
@@ -1667,6 +1679,23 @@ IEW::checkMisprediction(const DynInstPtr& inst)
             }
         }
     }
+}
+
+void
+IEW::notifyBranchResolution(const DynInstPtr &inst)
+{
+    if (!inst->isControl() || !inst->isExecuted() || inst->isSquashed() ||
+        inst->getFault() != NoFault || inst->predictionResolutionSent)
+        return;
+    auto history = inst->predictionTransaction.lock();
+    if (!history || !history->valid || !history->needsResolution) return;
+    auto target = std::unique_ptr<PCStateBase>(inst->pcState().clone());
+    inst->staticInst->advancePC(*target);
+    toCommit->branchResolutions.push_back({inst, std::move(target),
+        inst->predictionVersion,
+        inst->isUncondCtrl() || inst->pcState().branching()});
+    inst->predictionResolutionSent = true;
+    wroteToTimeBuffer = true;
 }
 
 } // namespace o3

@@ -38,6 +38,7 @@
 #ifndef __ARCH_GENERIC_MMU_HH__
 #define __ARCH_GENERIC_MMU_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <set>
 
 #include "mem/request.hh"
@@ -101,6 +102,8 @@ class BaseMMU : public SimObject
     }
 
   public:
+    ~BaseMMU() override { functional_mmu::unregisterEndpoint(this); }
+    void registerFunctionalMmuControls(functional_mmu::Observer &observer);
     /**
      * Called at init time, this method is traversing the TLB hierarchy
      * and pupulating the instruction/data/unified containers accordingly
@@ -120,6 +123,9 @@ class BaseMMU : public SimObject
     virtual void
     translateTiming(const RequestPtr &req, ThreadContext *tc,
                     Translation *translation, Mode mode);
+
+    /** Notify timing translators after this thread's requests are squashed. */
+    virtual void squashTiming(ThreadContext *tc) {}
 
     virtual Fault
     translateFunctional(const RequestPtr &req, ThreadContext *tc,

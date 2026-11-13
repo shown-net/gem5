@@ -79,6 +79,7 @@ class StackEngine : public SimObject
     void noteSyncCreated(SyncReason reason);
     void noteSyncExecuted() { ++stats.syncExecuted; }
     void noteSyncRetired() { ++stats.syncRetired; }
+    uint64_t retiredSynchronizations() const { return stats.syncRetired.value(); }
     void noteSyncSquashed() { ++stats.syncSquashed; }
 };
 

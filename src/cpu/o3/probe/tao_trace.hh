@@ -17,11 +17,14 @@
 #ifndef __CPU_O3_PROBE_TAO_TRACE_HH__
 #define __CPU_O3_PROBE_TAO_TRACE_HH__
 
+#include "mem/functional_mmu_controls.hh"
+#include "mem/functional_architectural_boundaries.hh"
 #include <array>
 #include <cstdint>
 #include <cstdio>
 #include <list>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -31,8 +34,14 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/kernel_event.hh"
 #include "cpu/o3/probe/perf_retirement.hh"
+#include "cpu/o3/probe/functional_store_pair.hh"
+#include "cpu/o3/probe/fst_static_uops.hh"
+#include "cpu/o3/probe/fst_core_functional_facts.hh"
+#include "cpu/o3/probe/native_task_clock.hh"
 #include "lru_banked.hh"
 #include "fst_dynamic_translation_writer.hh"
+#include "retired_frontend_facts.hh"
+#include "fst_instruction_translations.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
 #include "params/TaoTrace.hh"
@@ -45,6 +54,7 @@
 namespace gem5
 {
 class ThreadContext;
+class StaticInst;
 
 namespace o3
 {
@@ -52,6 +62,7 @@ namespace o3
 class CPU;
 
 class CalibrationMarker;
+class FixedWorkMarker;
 class TaoTrace : public ProbeListenerObject
 {
   public:
@@ -67,6 +78,10 @@ class TaoTrace : public ProbeListenerObject
 
   private:
     std::unique_ptr<CalibrationMarker> calibration_marker_;
+    friend class FixedWorkMarker;
+    std::unique_ptr<FixedWorkMarker> fixed_work_marker_;
+    int32_t explicit_source_core_ = -1;
+    int32_t sourceCoreId() const;
     enum class InstrType : uint8_t {
         INT = 0, FP, LD, ST, ATOMIC, FENCE, BR, SYS, OTHER
     };
@@ -208,6 +223,8 @@ class TaoTrace : public ProbeListenerObject
     void onRename(const DynInstPtr &dynInst);
     void onDispatch(const DynInstPtr &dynInst);
     void onCommit(const DynInstPtr &dynInst);
+    void onCommitMiscRegsApplied(const DynInstPtr &dynInst);
+    void onCommitPCAdvanced(const DynInstPtr &dynInst);
     void onPreCommit(const DynInstPtr &dynInst);
     void onCommitStall(const DynInstPtr &dynInst);
     void onSquash(const DynInstPtr &dynInst);
@@ -334,9 +351,18 @@ public:
     void startMarkerCapture(const std::string &directory);
     void selectMarkerWindow(uint64_t begin, uint64_t end);
     void resumeMarkerHandoff();
+    void startFixedWorkCapture();
+    void finishFixedWorkCapture();
+    void exportFixedWorkResult();
+    void resumeFixedWorkHandoff();
     static void traceMarkerHandoff(gem5::ThreadContext *tc);
     static void traceMeasurementBegin();
+    void armArchitecturalBoundaryEpoch();
     void startFunctionalMeasurement() { traceMeasurementBegin(); }
+    bool functionalMeasurementStarted() const
+    {
+        return functional_measurement_started_;
+    }
     static void traceMeasurementEnd();
     // Offline-only exact squash boundary. Commit calls this when it accepts
     // an IEW redirect, before ROB::squash mutates the younger instructions.
@@ -371,6 +397,7 @@ private:
 
     void openOutput();
     void accountCplCommit(const DynInstPtr &inst, bool is_syscall);
+    bool fixedWorkNativeOnly() const;
     bool cplMeasurementActive() const;
     uint64_t cplMeasurementBeginTick() const;
     uint64_t cplMeasurementEndTick() const;
@@ -505,21 +532,39 @@ private:
     uint64_t fst_extra_distances_ = 0;
     void writeFstDependencyHeader();
     std::FILE *out_fst_memory_requests_ = nullptr;
+    std::FILE *out_fst_store_requests_ = nullptr;
+    std::unique_ptr<fastsim::fst::StaticUopWriter> fst_static_uops_;
+    std::unique_ptr<fastsim::fst::CoreFunctionalWriter> fst_core_functional_;
+    functional_fst::StorePairer fst_store_pairer_;
+    uint64_t fst_store_request_rows_ = 0;
     std::unique_ptr<fastsim::fst::DynamicTranslationWriter> fst_translations_;
     uint64_t fst_memory_request_rows_ = 0;
     uint64_t fst_memory_request_hash_ = 14695981039346656037ull;
     void writeFstMemoryRequestHeader(bool finalized);
     std::FILE *out_fst_retirement_ = nullptr;
     uint64_t fst_retirement_rows_ = 0;
-    void noteFstMemoryRequest(const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
+    void noteFstMemoryRequest(const DynInstPtr &inst, const void *record, bool no_access, uint32_t micro_pc, bool software_prefetch = false, bool hardware_entry = false, bool precise_fault_abandonment = false);
+    void validateFunctionalRetirement(const TaoTraceParams &params) const;
+    void accountFstRetirementCommit(const DynInstPtr &inst);
+    retirement::Ledger functional_retirement_ledger_;
 
+    std::unique_ptr<fastsim::fst::RetiredFrontendWriter> fst_frontend_;
+    std::unique_ptr<fastsim::fst::InstructionTranslationWriter> fst_instruction_translations_;
+    std::shared_ptr<const fastsim::fst::InstructionFetchFacts> fst_instruction_pending_;
+    fastsim::fst::RetiredFrontendMacro fst_frontend_pending_{};
+    const StaticInst* fst_frontend_root_ = nullptr;
+    uint32_t fst_frontend_thread_ = 0;
+    bool fst_frontend_open_ = false, fst_frontend_started_ = false;
+    void observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_t asid);
+    void flushFstFrontend(bool complete);
     std::string fst_path_;
     int32_t     fst_core_id_ = -1;      // header.core_id；首条 emit 时锁定
     uint64_t    fst_record_count_ = 0;  // header.record_count
     uint64_t    fst_feature_flags_ = 0; // header.feature_flags（累积）
     bool        fst_finalized_ = false;
     // virtual-page token interning: the CR3 root is part of the identity, so
-    // identical virtual/physical pages in two processes never alias.
+    // identical virtual/physical pages in two processes never alias. This is
+    // retirement-observed ASID, independent of each frozen translation origin.
     std::map<std::tuple<uint64_t, uint64_t, uint64_t>, uint32_t>
         fst_page_tokens_;
     uint32_t    fst_next_page_token_ = 1;
@@ -551,12 +596,14 @@ private:
         std::array<uint64_t, 2> read_register_mask{};
         std::array<uint64_t, 2> write_register_mask{};
     };
+    using FstStaticInstructionKey = std::pair<uint64_t, uint64_t>;
     struct FstStaticInstructionPending : FstStaticInstruction {
+        uint64_t address_space_id = 0;
         std::array<uint64_t, 2> written_register_mask{};
         bool valid = false;
     };
-    std::map<uint64_t, FstStaticInstruction> fst_static_instructions_;
-    std::unordered_set<uint64_t> fst_static_unsupported_pcs_;
+    std::map<FstStaticInstructionKey, FstStaticInstruction> fst_static_instructions_;
+    std::set<FstStaticInstructionKey> fst_static_unsupported_pcs_;
     std::unordered_map<uint32_t, FstStaticInstructionPending>
         fst_static_pending_;
     // 把当前 records.micro 头部（record_count / feature_flags）刷回文件起始。
@@ -616,6 +663,16 @@ private:
     bool functional_user_only_ = false;
     bool functional_include_kernel_ = false;
     bool functional_syscall_microops_ = false;
+    bool functional_frontend_ = false;
+    bool functional_core_facts_ = false;
+    bool functional_mmu_controls_ = false;
+    bool functional_architectural_boundaries_ = false;
+    std::unique_ptr<functional_arch::Observer> fst_architectural_boundaries_;
+    std::unique_ptr<functional_mmu::Observer> fst_mmu_controls_;
+    bool functional_instruction_translations_ = false;
+    bool functional_translation_origins_ = false;
+    bool functional_retirement_ = false;
+    bool functional_asid_static_map_ = false;
     bool functional_warmup_ = false;
     uint64_t functional_user_target_ = 0;
     uint64_t functional_sync_marker_pc_ = 0;
@@ -628,6 +685,21 @@ private:
     void emitFunctionalSync(const DynInstPtr &inst, uint64_t ordinal,
                             bool measurement);
     void finalizeFunctionalSync();
+    bool functional_task_clock_ = false;
+    uint64_t scheduler_account_out_pc_ = 0, scheduler_account_in_pc_ = 0;
+    CPU *task_clock_cpu_ = nullptr;
+    void ensureTaskClockCounter();
+    bool taskClockContinuousCapture() const;
+    std::string taskClockInitialResolution() const;
+    task_clock::Ledger native_task_clock_;
+    bool emitTaskClockCut(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
+    void onTaskClockActive(const uint64_t &delta);
+    void onTaskClockSleeping(const bool &sleeping);
+    void onTaskClockCycles(const uint64_t &delta);
+    void closeTaskClock();
+    void observeTaskClockRetirement(uint64_t record_ordinal);
+    void finalizeTaskClock();
+    std::string taskClockMetadata() const;
     uint64_t thread_state_marker_pc_ = 0;
     uint64_t scheduler_switch_pc_ = 0;
     uint64_t scheduler_wakeup_pc_ = 0;
@@ -671,7 +743,7 @@ private:
     static std::unordered_map<uint64_t, uint64_t> thread_state_runtime_tasks_;
     static std::unordered_map<int32_t, StateRequest> thread_state_waits_;
     static std::unordered_map<int32_t, StateRequest> thread_state_wakes_;
-    bool isThreadStateHook(uint64_t pc) const;
+    bool isThreadStateHook(uint64_t pc, uint64_t micro_pc) const;
     void openThreadState();
     void emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
     void ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
@@ -688,6 +760,8 @@ private:
     bool perf_retirement_finalized_ = false;
     std::map<uint32_t, retirement::NativeMemberDiagnostic> perf_retirement_previous_;
     std::vector<std::string> perf_retirement_boundary_samples_;
+    std::vector<std::string> perf_retirement_unsupported_samples_;
+    uint64_t perf_retirement_unsupported_samples_omitted_ = 0;
     uint64_t perf_retirement_boundary_samples_omitted_ = 0;
     uint64_t perf_retirement_known_rom_samples_ = 0;
     uint64_t perf_retirement_missing_first_samples_ = 0;
@@ -791,6 +865,11 @@ private:
         uint64_t ruby_aliased_admission_fragments = 0;
         uint64_t ruby_hierarchy_request_fragments = 0;
         uint64_t ruby_response_fragments = 0;
+        uint64_t bypass_accepted_fragments = 0;
+        uint64_t bypass_response_fragments = 0;
+        uint64_t bypass_protocol_errors = 0;
+        uint64_t device_bypass_uops = 0;
+        uint64_t mixed_bypass_uops = 0;
         uint64_t sequencer_coalesced_fragments = 0;
         uint64_t no_ruby_uops = 0;
         uint64_t native_outcome_uops = 0;
@@ -975,7 +1054,7 @@ private:
         native_diag_by_scope_{};
     std::array<std::array<uint64_t, 2>, 5>
         native_diag_proxy_confusion_{};
-    std::array<uint64_t, 9> native_diag_terminal_reason_counts_{};
+    std::array<uint64_t, 10> native_diag_terminal_reason_counts_{};
     std::vector<NativeAnomalySample> native_diag_anomaly_samples_;
     uint64_t native_diag_anomaly_samples_dropped_ = 0;
     bool native_diag_finalized_ = false;

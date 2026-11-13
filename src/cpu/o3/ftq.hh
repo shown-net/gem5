@@ -40,6 +40,7 @@
 #define __CPU_O3_FTQ_HH__
 
 #include <list>
+#include <map>
 #include <string>
 
 #include "arch/generic/pcstate.hh"
@@ -65,6 +66,19 @@ struct DerivO3CPUParams;
 // Fetch target sequence type. Basically the same as the instruction sequence
 // number but since the fetch target is generated before instructions.
 typedef InstSeqNum FTSeqNum;
+
+struct FetchTargetState
+{
+    FetchTargetState(FTSeqNum number, Addr start) : sequence(number), startAddress(start) {}
+    const FTSeqNum sequence;
+    const Addr startAddress;
+    branch_prediction::BPredUnit::PathSnapshot paths;
+    branch_prediction::BPredUnit::HistoryHandle predictionTransaction;
+    std::map<Addr, branch_prediction::BPredUnit::HistoryHandle> decodedTransactions;
+    Addr consumedThrough = 0;
+    bool hasConsumed = false;
+    bool decodedBranch = false;
+};
 
 /** The fetch target class.
  * A fetch target is used to cary branch prediction information from the
@@ -110,15 +124,20 @@ class FetchTarget
 
     /** Earliest O3 cycle at which this path can be consumed. */
     uint64_t readyCycle = 0;
+    uint64_t exitReadyCycle = 0;
 
   public:
     void setReadyCycle(uint64_t cycle) { readyCycle = cycle; }
     bool ready(uint64_t cycle) const { return cycle >= readyCycle; }
+    void setExitReadyCycle(uint64_t cycle) { exitReadyCycle = cycle; }
+    bool exitReady(uint64_t cycle) const { return cycle >= exitReadyCycle; }
+    uint64_t exitReadyAt() const { return exitReadyCycle; }
 
     /** Anchor point to attach a branch predictor history.
      * Will carry information while FT is waiting in th FTQ. */
     branch_prediction::BPredUnit::PredictorHistory *bpuHistory;
-    bool decodedBranch = false;
+    std::shared_ptr<FetchTargetState> state;
+    void consumed(Addr last) { state->consumedThrough = last; state->hasConsumed = true; }
 
     /* Start address of the basic block */
     Addr

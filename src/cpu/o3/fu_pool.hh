@@ -44,8 +44,8 @@
 #include <array>
 #include <bitset>
 #include <list>
-#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "base/statistics.hh"
@@ -120,7 +120,7 @@ class FUPool : public SimObject
     std::array<uint16_t, Num_OpClasses> capablePorts{};
     std::array<unsigned, 12> pendingPortLoads{};
     std::array<unsigned, 12> allocationLoadSnapshot{};
-    std::map<uint16_t, unsigned> batchMaskUses;
+    std::vector<std::pair<uint16_t, unsigned>> batchMaskUses;
     Cycles bindingCycle = Cycles(0);
     bool haveBindingCycle = false;
     const std::vector<unsigned> storeDataPorts;

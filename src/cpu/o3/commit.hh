@@ -41,6 +41,7 @@
 #ifndef __CPU_O3_COMMIT_HH__
 #define __CPU_O3_COMMIT_HH__
 
+#include <deque>
 #include <queue>
 
 #include "base/statistics.hh"
@@ -126,6 +127,8 @@ class Commit
     /** Probe Points. */
     ProbePointArg<DynInstPtr> *ppPreCommit;
     ProbePointArg<DynInstPtr> *ppCommit;
+    ProbePointArg<DynInstPtr> *ppCommitMiscRegsApplied;
+    ProbePointArg<DynInstPtr> *ppCommitPCAdvanced;
     ProbePointArg<DynInstPtr> *ppCommitStall;
     /** To probe when an instruction is squashed */
     ProbePointArg<DynInstPtr> *ppSquash;
@@ -327,6 +330,14 @@ class Commit
 
     /** Wire to read information from IEW (for ROB). */
     TimeBuffer<TimeStruct>::wire robInfoFromIEW;
+    TimeBuffer<TimeStruct>::wire fromBAC;
+
+    struct LateCorrection {
+        DynInstPtr inst;
+        std::unique_ptr<PCStateBase> target;
+        uint64_t version;
+    };
+    std::deque<LateCorrection> lateCorrections[MaxThreads];
 
     TimeBuffer<FetchStruct> *fetchQueue;
 
@@ -337,6 +348,7 @@ class Commit
 
     /** Wire to read information from IEW queue. */
     TimeBuffer<IEWStruct>::wire fromIEW;
+    TimeBuffer<IEWStruct>::wire fromIEWResolution;
 
     /** Rename instruction queue interface, for ROB. */
     TimeBuffer<RenameStruct> *renameQueue;

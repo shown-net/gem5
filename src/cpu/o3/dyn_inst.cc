@@ -88,16 +88,28 @@ DynInst::hardwareDestEntries(RegClassType type) const
     if (eliminatedMove)
         return 0;
     auto *isa = tcBase()->getIsaPtr();
-    std::set<RegIndex> groups;
+    unsigned groups = 0;
     for (unsigned i = 0; i < numDestRegs(); ++i) {
         const auto reg = destRegIdx(i).flatten(*isa);
         if (!reg.is(type) || reg.regClass().isFunctional(reg) ||
             (stackTrackedWrite && reg == X86ISA::int_reg::Rsp.flatten(*isa)))
             continue;
-        groups.insert(reg.regClass().regAllocationGroup(reg));
+        const auto group = reg.regClass().regAllocationGroup(reg);
+        bool seen = false;
+        for (unsigned j = 0; j < i; ++j) {
+            const auto prior = destRegIdx(j).flatten(*isa);
+            if (prior.is(type) && !prior.regClass().isFunctional(prior) &&
+                !(stackTrackedWrite &&
+                  prior == X86ISA::int_reg::Rsp.flatten(*isa)) &&
+                prior.regClass().regAllocationGroup(prior) == group) {
+                seen = true;
+                break;
+            }
+        }
+        groups += !seen;
     }
-    return type == FloatRegClass && !groups.empty() && stageDemand.floatWideEntries ?
-        stageDemand.floatWideEntries : groups.size();
+    return type == FloatRegClass && groups && stageDemand.floatWideEntries ?
+        stageDemand.floatWideEntries : groups;
 }
 
 DynInst::DynInst(const Arrays &arrays, const StaticInstPtr &static_inst,
@@ -240,6 +252,7 @@ DynInst::operator delete(void *ptr)
 
 DynInst::~DynInst()
 {
+    if (thread) functional_mmu::destroy(tcBase(), seqNum, mmuControlGeneration);
     if (stackSync && isSquashed() && cpu && cpu->stackEngine)
         cpu->stackEngine->noteSyncSquashed();
     /*

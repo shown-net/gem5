@@ -76,7 +76,7 @@ namespace X86ISA
         typedef X86TLBParams Params;
         TLB(const Params &p);
 
-        void takeOverFrom(BaseTLB *otlb) override {}
+        void takeOverFrom(BaseTLB *otlb) override { functional_mmu::lifecycle(this); }
 
         TlbEntry *lookup(Addr va, bool update_lru = true,
                          BaseMMU::Mode mode = BaseMMU::Read);
@@ -122,6 +122,11 @@ namespace X86ISA
         Cycles nextLevelHitLatency;
 
         std::vector<TlbEntry> tlb;
+        // Members retain physical-slot order, including after restoration.
+        std::array<std::vector<TlbEntry *>, 256> sharedSets;
+        unsigned sharedSet(Addr vpn, unsigned log_bytes) const;
+        void indexSharedEntry(TlbEntry *entry);
+        void removeEntry(TlbEntry *entry);
 
         EntryList freeList;
 

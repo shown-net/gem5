@@ -178,6 +178,12 @@ CPU::MemoryInstRetiredStats::MemoryInstRetiredStats(CPU *cpu)
       ADD_STAT(LOCK_LOADS, statistics::units::Count::get(), "Retired locked load instructions including implicit memory XCHG"),
       ADD_STAT(STLB_MISS_LOADS, statistics::units::Count::get(), "Retired load instructions with a request-local L1 and second-level TLB miss"),
       ADD_STAT(STLB_MISS_STORES, statistics::units::Count::get(), "Retired store instructions with a request-local L1 and second-level TLB miss"),
+      ADD_STAT(stlbWalkLeaderLoads, statistics::units::Count::get(), "Retired load instructions with at least one walker leader fragment; model diagnostic"),
+      ADD_STAT(stlbWalkFollowerLoads, statistics::units::Count::get(), "Retired load instructions with at least one coalesced walker follower fragment; overlaps leader"),
+      ADD_STAT(stlbWalkBothLoads, statistics::units::Count::get(), "Retired load instructions with both walker leader and follower observations"),
+      ADD_STAT(stlbWalkLeaderStores, statistics::units::Count::get(), "Retired store instructions with at least one walker leader fragment; model diagnostic"),
+      ADD_STAT(stlbWalkFollowerStores, statistics::units::Count::get(), "Retired store instructions with at least one coalesced walker follower fragment; overlaps leader"),
+      ADD_STAT(stlbWalkBothStores, statistics::units::Count::get(), "Retired store instructions with both walker leader and follower observations"),
       ADD_STAT(ALL_STORES_USER, statistics::units::Count::get(), "Model retired store instructions whose store members retired at CPL 3"),
       ADD_STAT(ALL_STORES_NONUSER, statistics::units::Count::get(), "Model retired store instructions whose store members retired outside CPL 3"),
       ADD_STAT(ALL_STORES_MIXED, statistics::units::Count::get(), "Model retired store instructions with store members spanning CPL classes")
@@ -278,6 +284,12 @@ void CPU::endMemoryObservation()
 void CPU::releaseMemoryRetirement(const DynInstPtr &inst, bool squashed)
 {
     if (!memoryObservationActive) return;
+    // A normally retired non-memory instruction with no request cannot own
+    // a native memory lifecycle. Squash and exceptional/prefetch forms keep
+    // the conservative registry path, as do any instructions with a request.
+    if (!squashed && !inst->isMemRef() && !inst->isDataPrefetch() &&
+        !inst->isInstPrefetch() && !inst->hasRequest() && !inst->memReqFlags)
+        return;
     const auto context = uint32_t(tcBase(inst->threadNumber)->contextId());
     if (squashed)
         TaoTraceNativeAccessRegistry::noteSquashed(context, inst->seqNum);
@@ -302,13 +314,19 @@ void CPU::recordMemoryRetirement(const DynInstPtr &inst)
     pending.store |= store;
     pending.lockedLoad |= load && locked;
     if ((load || store) && inst->savedRequest) {
-        bool stlb_miss = false;
+        bool stlb_miss = false, walk_leader = false, walk_follower = false;
         for (const auto &fragment : inst->savedRequest->_reqs) {
             const auto facts = fragment->getExtension<TranslationMissExtension>();
             stlb_miss |= facts && facts->stlbMiss;
+            walk_leader |= facts && facts->stlbMiss && facts->stlbWalkLeader;
+            walk_follower |= facts && facts->stlbMiss && facts->stlbWalkFollower;
         }
         pending.stlbMissLoad |= load && stlb_miss;
         pending.stlbMissStore |= store && stlb_miss;
+        pending.stlbWalkLeaderLoad |= load && walk_leader;
+        pending.stlbWalkFollowerLoad |= load && walk_follower;
+        pending.stlbWalkLeaderStore |= store && walk_leader;
+        pending.stlbWalkFollowerStore |= store && walk_follower;
         if (inst->effAddrValid() && inst->effSize &&
             inst->readMemAccPredicate()) {
             const auto line = cacheLineSize();
@@ -468,6 +486,14 @@ void CPU::recordMemoryRetirement(const DynInstPtr &inst)
         if (pending.lockedLoad) ++memoryInstRetiredStats.LOCK_LOADS;
         if (pending.stlbMissLoad) ++memoryInstRetiredStats.STLB_MISS_LOADS;
         if (pending.stlbMissStore) ++memoryInstRetiredStats.STLB_MISS_STORES;
+        if (pending.stlbWalkLeaderLoad) ++memoryInstRetiredStats.stlbWalkLeaderLoads;
+        if (pending.stlbWalkFollowerLoad) ++memoryInstRetiredStats.stlbWalkFollowerLoads;
+        if (pending.stlbWalkLeaderLoad && pending.stlbWalkFollowerLoad)
+            ++memoryInstRetiredStats.stlbWalkBothLoads;
+        if (pending.stlbWalkLeaderStore) ++memoryInstRetiredStats.stlbWalkLeaderStores;
+        if (pending.stlbWalkFollowerStore) ++memoryInstRetiredStats.stlbWalkFollowerStores;
+        if (pending.stlbWalkLeaderStore && pending.stlbWalkFollowerStore)
+            ++memoryInstRetiredStats.stlbWalkBothStores;
         if (pending.load) {
             ++memoryInstRetiredStats.ALL_LOADS;
             if (pending.sources & 1) ++memoryLoadRetiredStats.L1_HIT;
@@ -655,8 +681,9 @@ CPU::IdqStats::IdqStats(CPU *cpu)
       ADD_STAT(MITE_CYCLES_OK, statistics::units::Cycle::get(), "Cycles with at least six MITE delivery units"),
       ADD_STAT(DSB_CYCLES_ANY, statistics::units::Cycle::get(), "Cycles with positive DSB delivery"),
       ADD_STAT(DSB_CYCLES_OK, statistics::units::Cycle::get(), "Cycles with at least six DSB delivery units"),
-      ADD_STAT(MS_CYCLES_ANY, statistics::units::Cycle::get(), "Cycles with positive microcode delivery"),
-      ADD_STAT(MS_SWITCHES, statistics::units::Count::get(), "Actual positive IDQ deliveries entering the MS source"),
+      ADD_STAT(MS_CYCLES_ANY, statistics::units::Cycle::get(), "Candidate cycles with an active microcode body and positive IDQ input from any source"),
+      ADD_STAT(MS_SOURCE_CYCLES_ANY, statistics::units::Cycle::get(), "Cycles with positive microcode-source IDQ delivery; model diagnostic"),
+      ADD_STAT(MS_SWITCHES, statistics::units::Count::get(), "Positive IDQ deliveries entering MS from MITE or DSB"),
       ADD_STAT(knownMicrocodeUnits, statistics::units::Count::get(), "Delivered units with evidence-backed instruction microcode identity"),
       ADD_STAT(inferredMicrocodeUnits, statistics::units::Count::get(), "Delivered units classified by internal functional control alone")
 {}
@@ -671,7 +698,9 @@ CPU::LsdStats::LsdStats(CPU *cpu)
 CPU::UopsIssuedStats::UopsIssuedStats(CPU *cpu)
     : statistics::Group(cpu, "UOPS_ISSUED"),
       ADD_STAT(ANY, statistics::units::Count::get(), "Allocation-domain units admitted by Rename after resource reservation; includes later squashed work"),
-      ADD_STAT(CYCLES, statistics::units::Cycle::get(), "Thread cycles with positive Rename admission")
+      ADD_STAT(CYCLES, statistics::units::Cycle::get(), "Thread cycles with positive Rename admission"),
+      ADD_STAT(iqAdmissions, statistics::units::Count::get(), "Dispatch records admitted to an IQ, including later squashed records; not Rename allocation units"),
+      ADD_STAT(iqBypasses, statistics::units::Count::get(), "Dispatch records bypassing IQ resources; not Rename allocation units")
 {}
 
 CPU::UopsExecutedStats::UopsExecutedStats(CPU *cpu)
@@ -736,7 +765,7 @@ CPU::ExecutionActivityStats::ExecutionActivityStats(CPU *cpu)
       ADD_STAT(rsNonemptyNoActionCycles, statistics::units::Cycle::get(),
                "Active cycles with resident RS records but no port action"),
       ADD_STAT(BOUND_ON_LOADS, statistics::units::Cycle::get(),
-               "No-port-action candidate cycles with an actual demand load request in flight"),
+               "No-port-action candidate cycles with a demand load in translation, admission, response or completion"),
       ADD_STAT(BOUND_ON_STORES, statistics::units::Cycle::get(),
                "No-port-action candidate cycles with full store resources and no demand load in flight"),
       ADD_STAT(loadTranslationCycles, statistics::units::Cycle::get(),
@@ -746,7 +775,15 @@ CPU::ExecutionActivityStats::ExecutionActivityStats(CPU *cpu)
       ADD_STAT(loadResponseCycles, statistics::units::Cycle::get(),
                "Observed cycles with an accepted demand-load packet awaiting response"),
       ADD_STAT(loadCompletionCycles, statistics::units::Cycle::get(),
-               "Observed cycles with returned load data awaiting functional completion")
+               "Observed cycles with returned load data awaiting functional completion"),
+      ADD_STAT(noActionLoadTranslationCycles, statistics::units::Cycle::get(),
+               "No-port-action cycles overlapping load translation; stages may overlap"),
+      ADD_STAT(noActionLoadAdmissionCycles, statistics::units::Cycle::get(),
+               "No-port-action cycles overlapping load admission wait; stages may overlap"),
+      ADD_STAT(noActionLoadResponseCycles, statistics::units::Cycle::get(),
+               "No-port-action cycles overlapping load response wait; stages may overlap"),
+      ADD_STAT(noActionLoadCompletionCycles, statistics::units::Cycle::get(),
+               "No-port-action cycles overlapping load completion wait; stages may overlap")
 {}
 
 void
@@ -761,6 +798,10 @@ CPU::ExecutionActivityStats::account()
                 const uint64_t stalled = elapsed - (sample.actions ? 1 : 0);
                 if (sample.loadStages) BOUND_ON_LOADS += stalled;
                 else if (sample.storesFull) BOUND_ON_STORES += stalled;
+                if (sample.loadStages & 1) noActionLoadTranslationCycles += stalled;
+                if (sample.loadStages & 2) noActionLoadAdmissionCycles += stalled;
+                if (sample.loadStages & 4) noActionLoadResponseCycles += stalled;
+                if (sample.loadStages & 8) noActionLoadCompletionCycles += stalled;
                 if (sample.loadStages & 1) loadTranslationCycles += elapsed;
                 if (sample.loadStages & 2) loadAdmissionCycles += elapsed;
                 if (sample.loadStages & 4) loadResponseCycles += elapsed;
@@ -876,8 +917,9 @@ void
 CPU::recordFrontendDelivery(FrontendSource source, unsigned units, uint64_t cycle)
 {
     if (units) {
-        if (source == FrontendSource::Microcode &&
-            (!idqStats.haveSource || idqStats.previousSource != source))
+        if (source == FrontendSource::Microcode && idqStats.haveSource &&
+            (idqStats.previousSource == FrontendSource::Mite ||
+             idqStats.previousSource == FrontendSource::Dsb))
             ++idqStats.MS_SWITCHES;
         idqStats.previousSource = source;
         idqStats.haveSource = true;
@@ -902,7 +944,7 @@ CPU::recordFrontendDelivery(FrontendSource source, unsigned units, uint64_t cycl
         activity = &idqStats.activity[1];
     } else {
         total = &idqStats.MS_UOPS;
-        any = &idqStats.MS_CYCLES_ANY;
+        any = &idqStats.MS_SOURCE_CYCLES_ANY;
         activity = &idqStats.activity[2];
     }
     const unsigned before = activity->add(cycle, units);

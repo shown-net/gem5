@@ -11,6 +11,10 @@ namespace gem5
 class TSOOrderedStore : public Extension<Request, TSOOrderedStore>
 {
   public:
+    // Number of retired stores represented by this request. This is metadata,
+    // not an additional queue entry or a store-service budget.
+    unsigned logicalStores = 1;
+
     // Set synchronously only by a Sequencer using the supporting protocol.
     bool acceptedBySequencer = false;
 

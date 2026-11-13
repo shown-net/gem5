@@ -133,6 +133,7 @@ structure (Sequencer, external = "yes") {
   void readRequestCallback(Addr, DataBlock, RequestPtr);
   void registerReadFill(RequestPtr, bool, bool);
   void readFillCallback(Addr, DataBlock, int, int, int);
+  void readFillCallbackStale(Addr, DataBlock);
   void readCallback(Addr, DataBlock);
   void readCallback(Addr, DataBlock, bool);
   void readCallback(Addr, DataBlock, bool, MachineType);
@@ -140,6 +141,7 @@ structure (Sequencer, external = "yes") {
                     Cycles, Cycles, Cycles);
 
   bool writeCallback(Addr, DataBlock);
+  bool writeCallbackData(Addr, DataBlock);
   bool writeCallback(Addr, DataBlock, bool);
   bool writeCallback(Addr, DataBlock, bool, MachineType);
   bool writeCallback(Addr, DataBlock, bool, MachineType,
@@ -261,6 +263,8 @@ structure (CacheMemory, external = "yes") {
   void releaseDataFill(Addr);
   void finishDataFill(Addr);
   void recordDemandFillBlocked();
+  void beginDemandFillWait(PacketPtr, bool);
+  void endDemandFillWait(PacketPtr);
   void observeDataFillDemandRead(Addr);
   bool dataFillPresent(Addr);
   bool dataFillReady(Addr);

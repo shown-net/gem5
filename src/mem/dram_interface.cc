@@ -680,7 +680,7 @@ DRAMInterface::DRAMInterface(const DRAMInterfaceParams &_p)
     uint64_t deviceCapacity = deviceSize / (1024 * 1024) * devicesPerRank *
                               ranksPerChannel;
 
-    uint64_t capacity = 1ULL << ceilLog2(AbstractMemory::size());
+    uint64_t capacity = 1ULL << ceilLog2(timingCapacity());
 
     DPRINTF(DRAM, "Memory capacity %lld (%lld) bytes\n", capacity,
             AbstractMemory::size());

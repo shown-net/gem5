@@ -57,6 +57,7 @@
 #include "debug/LSQ.hh"
 #include "debug/Writeback.hh"
 #include "mem/functional_translation.hh"
+#include "mem/l1_data_access.hh"
 #include "mem/taotrace_response.hh"
 #include "params/BaseO3CPU.hh"
 
@@ -121,7 +122,6 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       cacheStorePorts(params.cacheStorePorts), usedStorePorts(0),
       cacheLoadPorts(params.cacheLoadPorts), usedLoadPorts(0),
       sprL1WidthService(params.sprL1WidthService),
-      sprL1LoadBankConflicts(params.sprL1LoadBankConflicts),
       loadCompletionWidth(params.loadCompletionWidth),
       waitingForStaleTranslation(false),
       staleTranslationWaitTxnId(0),
@@ -224,8 +224,9 @@ LSQ::takeOverFrom()
     assert(loadCompletions.empty());
     usedStorePorts = 0;
     usedLoadPorts = 0;
-    usedLoadService = usedStoreService = 0;
-    usedStorePreparePorts = 0;
+    cachedL1DataResource = nullptr;
+    if (sprL1WidthService)
+        ++widthServiceEpoch;
     _cacheBlocked = false;
 
     for (ThreadID tid = 0; tid < numThreads; tid++) {
@@ -251,18 +252,22 @@ LSQ::tick()
     }
     if (!loadCompletions.empty())
         ++dcachePort.dcachePortStats.loadCompletionBlockedCycles;
-    for (ThreadID tid : *activeThreads)
+    for (ThreadID tid : *activeThreads) {
+        if (thread[tid].hasFastForwardingModel())
+            thread[tid].advanceForwarding();
         thread[tid].sampleStoreOccupancy();
+    }
     // Re-issue loads which got blocked on the per-cycle load ports limit.
-    if ((usedLoadPorts == cacheLoadPorts || usedLoadService >= 4) &&
+    if ((usedLoadPorts == cacheLoadPorts ||
+         (sprL1WidthService &&
+          l1DataResource()->loadWidthExhausted(widthServiceEpoch))) &&
         !_cacheBlocked)
         iewStage->cacheUnblocked();
 
     usedLoadPorts = 0;
     usedStorePorts = 0;
-    loadBankUses.fill(0);
-    usedLoadService = usedStoreService = 0;
-    usedStorePreparePorts = 0;
+    if (sprL1WidthService)
+        ++widthServiceEpoch;
 }
 
 unsigned
@@ -284,7 +289,7 @@ LSQ::cacheBlocked(bool v)
 }
 
 bool
-LSQ::cachePortAvailable(bool is_load, unsigned bytes) const
+LSQ::cachePortAvailable(bool is_load, unsigned bytes)
 {
     bool ret;
     if (is_load) {
@@ -294,9 +299,8 @@ LSQ::cachePortAvailable(bool is_load, unsigned bytes) const
     }
     if (sprL1WidthService && bytes) {
         // Mixed-width proxy, not a claim about SRAM bank geometry.
-        const unsigned units = (bytes + 31) / 32;
-        ret &= is_load ? usedLoadService + units <= 4 :
-                         usedStoreService + units <= 2;
+        ret &= l1DataResource()->widthAvailable(is_load, bytes,
+                                                widthServiceEpoch);
     }
     return ret;
 }
@@ -307,13 +311,11 @@ LSQ::cachePortBusy(bool is_load, unsigned bytes)
     assert(cachePortAvailable(is_load, bytes));
     if (is_load) {
         usedLoadPorts++;
-        if (sprL1WidthService)
-            usedLoadService += (bytes + 31) / 32;
     } else {
         usedStorePorts++;
-        if (sprL1WidthService)
-            usedStoreService += (bytes + 31) / 32;
     }
+    if (sprL1WidthService && bytes)
+        l1DataResource()->noteWidthAccess(is_load, bytes, widthServiceEpoch);
 }
 
 std::vector<DynInstPtr>
@@ -337,26 +339,49 @@ LSQ::memorySpeculationAllowed(const DynInstPtr &load) const
 bool
 LSQ::hasFastForwardingPrediction(const DynInstPtr &load) const
 {
-    return thread[load->threadNumber].hasFastForwardingPrediction(load);
+    const auto &unit = thread[load->threadNumber];
+    return unit.hasFastForwardingModel() &&
+        unit.hasFastForwardingPrediction(load);
 }
 
 void
 LSQ::clearFastForwarding(ThreadID tid)
 {
-    thread[tid].clearFastForwarding();
+    if (thread[tid].hasFastForwardingModel())
+        thread[tid].clearFastForwarding();
+}
+
+L1DataAccessResource *
+LSQ::l1DataResource()
+{
+    if (cachedL1DataResource)
+        return cachedL1DataResource;
+    fatal_if(!dcachePort.isConnected(),
+             "L1 data service limits require a connected cache port");
+    auto *peer = dynamic_cast<L1DataAccessPort *>(&dcachePort.getPeer());
+    cachedL1DataResource = peer ? peer->l1DataAccess() : nullptr;
+    if (!cachedL1DataResource) {
+        // X86O3CPU enables width service by default and can connect through
+        // non-Ruby ports. Preserve its existing local budget in that case.
+        if (!localL1DataResource)
+            localL1DataResource = std::make_unique<L1DataAccessBudget>();
+        cachedL1DataResource = localL1DataResource.get();
+    }
+    return cachedL1DataResource;
 }
 
 bool
-LSQ::loadBankAvailable(Addr addr) const
+LSQ::loadBankAvailable(Addr addr)
 {
-    return !sprL1LoadBankConflicts || loadBankUses[(addr >> 2) & 15] < 2;
+    return !sprL1WidthService ||
+        l1DataResource()->bankAvailable(addr, widthServiceEpoch);
 }
 
 void
 LSQ::noteLoadBank(Addr addr)
 {
-    if (sprL1LoadBankConflicts)
-        ++loadBankUses[(addr >> 2) & 15];
+    if (sprL1WidthService)
+        l1DataResource()->noteBankAccess(addr, widthServiceEpoch);
 }
 
 void
@@ -990,7 +1015,23 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
         // The effective virtual address exists before translation starts.
         // Ordinary LSU retries reuse this request and do not query MDP again.
         iewStage->instQueue.memoryDependence(tid).addressGenerated(inst);
+        const bool prepare_l1_index = sprL1WidthService && isLoad &&
+            inst->isLoad() && !inst->isDataPrefetch() && !inst->isAtomic() &&
+            !inst->isReadBarrier() && !inst->isWriteBarrier() &&
+            !inst->inHtmTransactionalState();
+        const Tick index_ready = cpu->clockEdge(Cycles(1));
         request->initiateTranslation();
+        if (prepare_l1_index) {
+            // Every split fragment has its own virtual address and request.
+            // Starting this preparation never issues a cache transaction.
+            for (const auto &fragment : request->_reqs) {
+                if (fragment->hasVaddr()) {
+                    const Addr index = (fragment->getVaddr() >> 6) & 0x3f;
+                    fragment->setExtension(std::make_shared<L1IndexPreparation>(
+                        index_ready, index));
+                }
+            }
+        }
     }
 
     /* This is the place were instructions get the effAddr. */
@@ -1422,8 +1463,8 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
         // response facts from every physical fragment onto its Request so the
         // O3 completion observer sees the complete line population.
         auto aggregate = std::make_shared<TaoTraceRubyResponseExtension>();
-        // sendPacketToCache() closes issuance on _mainReq before any fragment
-        // can respond.  Preserve that identity-wide state when replacing the
+        // sendPacketToCache() closes issuance only after all fragments have
+        // been accepted. Preserve that identity-wide state when replacing the
         // main extension with the fragment aggregate; otherwise a completed
         // split access has admissions == responses but appears permanently
         // open when it is imported at a measurement/target boundary.
@@ -1436,7 +1477,8 @@ LSQ::SplitDataRequest::recvTimingResp(PacketPtr pkt)
                 request->getExtension<TaoTraceRubyResponseExtension>();
             if (fragment) aggregate->merge(*fragment);
         }
-        if (aggregate->responses != 0 || aggregate->terminalNoRuby ||
+        if (aggregate->responses != 0 || aggregate->bypassAccepted != 0 ||
+            aggregate->terminalNoRuby ||
             aggregate->issuanceClosed) {
             _mainReq->setExtension(aggregate);
         }

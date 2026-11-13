@@ -42,6 +42,7 @@
 #ifndef __CPU_O3_DYN_INST_HH__
 #define __CPU_O3_DYN_INST_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <algorithm>
 #include <array>
 #include <deque>
@@ -58,11 +59,13 @@
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/allocation_group.hh"
+#include "cpu/o3/core_functional_facts.hh"
 #include "cpu/o3/stage_demand.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/int_execution.hh"
 #include "cpu/o3/lsq_unit.hh"
 #include "cpu/op_class.hh"
+#include "cpu/pred/bpred_unit.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst.hh"
 #include "cpu/translation.hh"
@@ -179,6 +182,11 @@ class DynInst : public ExecContext, public RefCounted
     /** The StaticInst used by this BaseDynInst. */
     const StaticInstPtr staticInst;
 
+    // Optional observer facts owned by this instruction, discarded on squash.
+    std::unique_ptr<CoreFunctionalSnapshot> coreFunctionalFacts;
+    functional_arch::BoundaryToken functionalBoundary;
+    functional_arch::MacroOrigin functionalMacroOrigin;
+
     /** Pointer to the Impl's CPU object. */
     CPU *cpu = nullptr;
 
@@ -186,6 +194,7 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Pointer to the thread state. */
     ThreadState *thread = nullptr;
+    std::uint32_t mmuControlGeneration = 0;
 
     /** The kind of fault this instruction has generated. */
     Fault fault = NoFault;
@@ -400,15 +409,18 @@ class DynInst : public ExecContext, public RefCounted
     InstSeqNum allocationKey() const
     { return stageDemand.allocationGroup ? stageDemand.allocationGroup : seqNum; }
     InstSeqNum allocationEnd() const
-    { return stageDemand.allocationLast ? stageDemand.allocationLast : seqNum; }
+    { return allocationGroup && stageDemand.allocationGroup ? allocationGroup->end :
+        stageDemand.allocationLast ? stageDemand.allocationLast : seqNum; }
     InstSeqNum robKey() const
     { return stageDemand.robGroup ? stageDemand.robGroup : seqNum; }
     InstSeqNum robEnd() const
-    { return stageDemand.robLast ? stageDemand.robLast : seqNum; }
+    { return allocationGroup && stageDemand.robGroup ? allocationGroup->end :
+        stageDemand.robLast ? stageDemand.robLast : seqNum; }
     InstSeqNum retirementKey() const
     { return stageDemand.retirementGroup ? stageDemand.retirementGroup : seqNum; }
     InstSeqNum retirementEnd() const
-    { return stageDemand.retirementLast ? stageDemand.retirementLast : seqNum; }
+    { return allocationGroup && stageDemand.retirementGroup ? allocationGroup->end :
+        stageDemand.retirementLast ? stageDemand.retirementLast : seqNum; }
     unsigned retirementGroupSlots() const
     { return stageDemand.retirementUnits; }
     unsigned retirementSlots() const
@@ -532,6 +544,7 @@ class DynInst : public ExecContext, public RefCounted
     void
     demapPage(Addr vaddr, uint64_t asn) override
     {
+        functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Immediate, mmuControlGeneration);
         cpu->demapPage(vaddr, asn);
     }
 
@@ -724,6 +737,13 @@ class DynInst : public ExecContext, public RefCounted
     bool isNop()          const { return staticInst->isNop(); }
     bool eliminatedMove = false;
     bool untrackedFrontendBranch = false;
+    branch_prediction::BPredUnit::HistoryHandle predictionTransaction;
+    uint64_t predictionVersion = 0;
+    bool predictionResolutionSent = false;
+    bool commitResolutionObserved = false;
+    bool commitResolutionTaken = false;
+    uint64_t commitResolutionVersion = 0;
+    std::unique_ptr<PCStateBase> commitResolutionTarget;
     bool frontendDsbMiss = false;
     std::shared_ptr<bool> frontendDsbMissExposed;
     // A ready implicit PUSH update was evaluated using the normal PRF at rename.
@@ -1142,7 +1162,10 @@ class DynInst : public ExecContext, public RefCounted
     void setTid(ThreadID tid) { threadNumber = tid; }
 
     /** Sets the pointer to the thread state. */
-    void setThreadState(ThreadState *state) { thread = state; }
+    void setThreadState(ThreadState *state) {
+        thread = state;
+        mmuControlGeneration = thread ? functional_mmu::generation(thread->getTC()) : 0;
+    }
 
     /** Returns the thread context. */
     gem5::ThreadContext *tcBase() const override { return thread->getTC(); }
@@ -1293,6 +1316,7 @@ class DynInst : public ExecContext, public RefCounted
             thread->noSquashFromTC = true;
 
             /** Update the architectural state with the new value */
+            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Immediate, mmuControlGeneration);
             cpu->setMiscReg(reg.index(), val, threadNumber);
 
             thread->noSquashFromTC = no_squash_from_TC;
@@ -1310,13 +1334,17 @@ class DynInst : public ExecContext, public RefCounted
         bool no_squash_from_TC = thread->noSquashFromTC;
         thread->noSquashFromTC = true;
 
-        for (int i = 0; i < _destMiscRegIdx.size(); i++)
+        for (int i = 0; i < _destMiscRegIdx.size(); i++) {
+            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Deferred, mmuControlGeneration);
             cpu->setMiscReg(
                 _destMiscRegIdx[i], _destMiscRegVal[i], threadNumber);
-        for (const auto &entry : _orMiscRegs)
+        }
+        for (const auto &entry : _orMiscRegs) {
+            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Deferred, mmuControlGeneration);
             cpu->setMiscReg(entry.first,
                 cpu->readMiscRegNoEffect(entry.first, threadNumber) | entry.second,
                 threadNumber);
+        }
 
         thread->noSquashFromTC = no_squash_from_TC;
     }

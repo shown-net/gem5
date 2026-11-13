@@ -537,6 +537,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(c_exclusiveReplacement, "c", desc="Send data to memory") {
+    perfCacheNativeWritebackGlobal(2, true);
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       assert(is_valid(cache_entry));
       out_msg.addr := address;
@@ -550,6 +551,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(c_exclusiveCleanReplacement, "cc", desc="Send ack to memory for clean replacement") {
+    perfCacheNativeWritebackGlobal(2, false);
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:ACK;
@@ -560,6 +562,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(ct_exclusiveReplacementFromTBE, "ct", desc="Send data to memory") {
+    perfCacheNativeWritebackGlobal(2, true);
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       assert(is_valid(tbe) && tbe.DataValid);
       out_msg.addr := address;
@@ -985,6 +988,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   action(c_exclusiveFlushReplacement, "cef", desc="Send flushed data to memory") {
     peek(L1RequestL2Network_in, RequestMsg) {
+      perfCacheNativeWritebackGlobal(2, cache_entry.Dirty);
       enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
         assert(is_valid(tbe) && tbe.DataValid);
         out_msg.addr := address;
@@ -1018,8 +1022,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     peek(L1RequestL2Network_in, RequestMsg) {
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 1);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 1);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 1);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 1);
     }
   }
 
@@ -1028,8 +1037,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     peek(L1RequestL2Network_in, RequestMsg) {
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 0);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 0);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 0);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 0);
     }
   }
 
@@ -1038,8 +1052,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     peek(L1RequestL2Network_in, RequestMsg) {
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 2);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 2);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 2);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 2);
     }
   }
 
@@ -1048,8 +1067,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     peek(L1RequestL2Network_in, RequestMsg) {
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 3);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 3);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 3);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 3);
     }
   }
 
@@ -1058,8 +1082,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     peek(L1RequestL2Network_in, RequestMsg) {
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 4);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 4);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 4);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 4);
     }
   }
 

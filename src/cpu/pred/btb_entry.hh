@@ -134,6 +134,8 @@ class BTBSetAssociative : public BTBIndexingPolicy
         return 0;
     }
 
+    bool exactAddressTags() const { return fullAddressTag && tagMask == MaxAddr; }
+
   private:
     const uint64_t tagMask;
     const bool fullAddressTag;
@@ -223,6 +225,7 @@ class BTBEntry : public ReplaceableEntry
      */
     KeyType getTag() const { return tag; }
     Addr getBranchPC() const { return branchPC; }
+    void setBranchPC(Addr pc) { branchPC = pc; }
 
     /** Invalidate the block. Its contents are no longer valid. */
     void

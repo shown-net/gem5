@@ -104,6 +104,10 @@ class CPU : public BaseCPU
 {
   public:
     bool markerObservation = false;
+    // Enabled by the observer constructor before the first Execute request.
+    bool instructionTranslationObservation = false;
+    // Pure architectural snapshots; never enables marker/fusion behavior.
+    bool coreFunctionalObservation = false;
     const bool tmaEnabled;
     FrontendCoordinator *frontend = nullptr;
     ResultForwarding *resultForwarding = nullptr;
@@ -544,6 +548,8 @@ class CPU : public BaseCPU
 
     /** Wakes the CPU, rescheduling the CPU if it's not already active. */
     void wakeCPU();
+    void wakeFrontend();
+    void clockPeriodUpdated() override;
 
     virtual void wakeup(ThreadID tid) override;
 
@@ -594,6 +600,9 @@ class CPU : public BaseCPU
 
     /** The cycle that the CPU was last running, used for statistics. */
     Cycles lastRunningCycle;
+
+    /** The tick event is being serviced and must not be scheduled again now. */
+    bool tickInProgress = false;
 
     /** The cycle that the CPU was last activated by a new thread*/
     Tick lastActivatedCycle;
@@ -822,6 +831,7 @@ class CPU : public BaseCPU
         statistics::Scalar MITE_UOPS, DSB_UOPS, MS_UOPS;
         statistics::Scalar MITE_CYCLES_ANY, MITE_CYCLES_OK;
         statistics::Scalar DSB_CYCLES_ANY, DSB_CYCLES_OK, MS_CYCLES_ANY;
+        statistics::Scalar MS_SOURCE_CYCLES_ANY;
         statistics::Scalar MS_SWITCHES, knownMicrocodeUnits;
         statistics::Scalar inferredMicrocodeUnits;
         FrontendSource previousSource = FrontendSource::Mite;
@@ -830,7 +840,6 @@ class CPU : public BaseCPU
         void resetStats() override {
             statistics::Group::resetStats();
             activity = {};
-            haveSource = false;
         }
     } idqStats;
     struct LsdStats : public statistics::Group {
@@ -844,7 +853,7 @@ class CPU : public BaseCPU
     } lsdStats;
     struct UopsIssuedStats : public statistics::Group {
         explicit UopsIssuedStats(CPU *cpu);
-        statistics::Scalar ANY, CYCLES;
+        statistics::Scalar ANY, CYCLES, iqAdmissions, iqBypasses;
         std::array<ActionCycle, MaxThreads> activity{};
         void resetStats() override {
             statistics::Group::resetStats();
@@ -884,6 +893,8 @@ class CPU : public BaseCPU
         statistics::Scalar BOUND_ON_LOADS, BOUND_ON_STORES;
         statistics::Scalar loadTranslationCycles, loadAdmissionCycles;
         statistics::Scalar loadResponseCycles, loadCompletionCycles;
+        statistics::Scalar noActionLoadTranslationCycles, noActionLoadAdmissionCycles;
+        statistics::Scalar noActionLoadResponseCycles, noActionLoadCompletionCycles;
         struct Sample {
             bool nonempty = false;
             unsigned actions = 0;
@@ -914,6 +925,7 @@ class CPU : public BaseCPU
 
     void recordFrontendDelivery(FrontendSource source, unsigned units,
                                 uint64_t cycle);
+    void recordMsActiveDelivery() { ++idqStats.MS_CYCLES_ANY; }
     void recordAllocatedUops(unsigned count, const DynInstPtr &inst);
     void recordExecutionAction(const DynInstPtr &inst, int port);
     struct PendingRetirement {
@@ -939,6 +951,8 @@ class CPU : public BaseCPU
         statistics::Scalar ALL_LOADS, ALL_STORES;
         statistics::Scalar ANY, SPLIT_LOADS, SPLIT_STORES, LOCK_LOADS;
         statistics::Scalar STLB_MISS_LOADS, STLB_MISS_STORES;
+        statistics::Scalar stlbWalkLeaderLoads, stlbWalkFollowerLoads, stlbWalkBothLoads;
+        statistics::Scalar stlbWalkLeaderStores, stlbWalkFollowerStores, stlbWalkBothStores;
         statistics::Scalar ALL_STORES_USER, ALL_STORES_NONUSER, ALL_STORES_MIXED;
     } memoryInstRetiredStats;
     struct MemoryLoadRetiredStats : public statistics::Group
@@ -970,6 +984,8 @@ class CPU : public BaseCPU
         bool load = false, store = false;
         bool splitLoad = false, splitStore = false, lockedLoad = false;
         bool stlbMissLoad = false, stlbMissStore = false;
+        bool stlbWalkLeaderLoad = false, stlbWalkFollowerLoad = false;
+        bool stlbWalkLeaderStore = false, stlbWalkFollowerStore = false;
         bool storeUserSeen = false, storeNonuserSeen = false;
         bool physicalL1Hit = false, l1HitWithoutForward = false;
         uint8_t sources = 0, sourceGaps = 0;

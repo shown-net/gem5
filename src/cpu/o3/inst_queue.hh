@@ -481,6 +481,7 @@ class InstructionQueue
     std::list<DynInstPtr> admissionWaitMemInsts;
     // Each pending projection belongs to an already reserved ROB entry.
     std::deque<DynInstPtr> readyMoveProjections;
+    std::vector<DynInstPtr> resourceDeferred;
     bool processingMoveProjections = false;
     void completeMoveProjections();
 

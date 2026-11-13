@@ -119,6 +119,10 @@ namespace X86ISA
             bool retrying;
             bool started;
             bool squashed;
+            bool abandoned = false;
+            bool cancelled = false;
+            bool faultPresent = false;
+            bool faultReserved = false;
             bool prefixHit = false;
             bool cacheablePrefix = true;
             unsigned physicalAddressBits = 48;
@@ -151,6 +155,8 @@ namespace X86ISA
             bool isTiming();
             void retry();
             void squash();
+            bool hasLiveUsers() const;
+            void stopPendingRead();
             std::string name() const {return walker->name();}
 
           private:
@@ -159,7 +165,7 @@ namespace X86ISA
             void sendPackets();
             void sendPrefixResponse();
             void endWalk();
-            void releaseFollowers(bool completed);
+            void releaseFollowers(bool completed, bool shared_fault = false);
             Fault pageFault(bool present, bool reserved = false);
         };
 
@@ -182,6 +188,8 @@ namespace X86ISA
         PagingStructureCache *pagingStructureCache;
         const Cycles prefixHitLatency;
         const Cycles pteResponseLatency;
+        const bool coalesceFaultResults;
+        const bool cancelSquashedWalks;
         // Kick off the state machine.
         Fault start(ThreadContext * _tc, BaseMMU::Translation *translation,
                 const RequestPtr &req, BaseMMU::Mode mode);
@@ -190,6 +198,7 @@ namespace X86ISA
         Port &getPort(const std::string &if_name,
                       PortID idx=InvalidPortID) override;
         void dumpProgressState() const;
+        void squashTiming(ThreadContext *tc);
 
       protected:
         // The TLB we're supposed to load.
@@ -226,7 +235,16 @@ namespace X86ISA
             statistics::Scalar WALK_ACTIVE, WALK_PENDING;
             statistics::Scalar COALESCED_REQUESTS;
             statistics::Scalar pteReadResponses;
+            statistics::Scalar pteReadRequests;
+            statistics::Scalar cancelledQueued, cancelledStarted;
+            statistics::Scalar sharedFaultRequests;
         } dtlbLoadStats, dtlbStoreStats;
+        struct DtlbLoadWalkOutcomeStats : statistics::Group
+        {
+            explicit DtlbLoadWalkOutcomeStats(Walker *owner);
+            statistics::Scalar faultSquashed, faultNotSquashed;
+            statistics::Scalar noFaultSquashed, noFaultNotSquashed;
+        } dtlbLoadWalkOutcomeStats;
         unsigned activeInstructionWalks = 0;
         uint64_t lastInstructionWalkCycle = 0;
         void accountInstructionWalks();
@@ -236,6 +254,7 @@ namespace X86ISA
 
         // Wrapper for checking for squashes before starting a translation.
         void startWalkWrapper();
+        void retireWalk(WalkerState *walk);
 
         /**
          * Event used to call startWalkWrapper.
@@ -262,12 +281,15 @@ namespace X86ISA
             funcState(this, NULL, NULL, true),
             pagingStructureCache(params.paging_structure_cache),
             prefixHitLatency(params.prefix_hit_latency),
-            pteResponseLatency(params.pte_response_latency), tlb(NULL), sys(params.system),
+            pteResponseLatency(params.pte_response_latency),
+            coalesceFaultResults(params.coalesce_fault_results),
+            cancelSquashedWalks(params.cancel_squashed_walks), tlb(NULL), sys(params.system),
             requestorId(sys->getRequestorId(this)),
             numSquashable(params.num_squash_per_cycle),
             maxActiveWalks(params.max_active_walks), itlbStats(this),
             dtlbLoadStats(this, "DTLB_LOAD_MISSES"),
             dtlbStoreStats(this, "DTLB_STORE_MISSES"),
+            dtlbLoadWalkOutcomeStats(this),
             startWalkWrapperEvent([this]{ startWalkWrapper(); }, name())
         {
             fatal_if(!maxActiveWalks, "Page walker needs an active walk slot");

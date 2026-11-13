@@ -107,6 +107,8 @@ MemCmd::commandInfo[] =
     /* SoftPFExReq */
     { {IsRead, NeedsWritable, IsInvalidate, IsRequest,
            IsSWPrefetch, NeedsResponse}, SoftPFResp, "SoftPFExReq" },
+    /* StoreOwnershipReq: no architectural data or response packet. */
+    { {NeedsWritable, IsRequest}, InvalidCmd, "StoreOwnershipReq" },
     /* HardPFReq */
     { {IsRead, IsRequest, IsHWPrefetch, NeedsResponse, FromCache},
             HardPFResp, "HardPFReq" },

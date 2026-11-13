@@ -43,10 +43,13 @@
 #define __CPU_PRED_BPRED_UNIT_HH__
 
 #include <deque>
+#include <map>
+#include <memory>
 
 #include "base/statistics.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
+#include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/pred/branch_type.hh"
 #include "cpu/pred/btb.hh"
 #include "cpu/pred/conditional.hh"
@@ -125,7 +128,8 @@ class BPredUnit : public SimObject
      *              or from decode. Its optional and used for statistics.
      */
     void squash(const InstSeqNum &squashed_sn, const PCStateBase &corr_target,
-                bool actually_taken, ThreadID tid, bool from_commit=true);
+                bool actually_taken, ThreadID tid, bool from_commit=true,
+                std::optional<bool> original_mispredict = std::nullopt);
 
     /**
      * Looks up a given PC in the BTB to see if a matching entry exists.
@@ -292,23 +296,9 @@ class BPredUnit : public SimObject
          * information needed to update the predictor, BTB, and RAS.
          */
         PredictorHistory(ThreadID _tid, InstSeqNum sn, Addr _pc,
-                         const StaticInstPtr & inst)
-            : seqNum(sn), tid(_tid), pc(_pc),
-              inst(inst), type(getBranchType(inst)),
-              call(inst->isCall()), uncond(!inst->isCondCtrl()),
-              predTaken(false), actuallyTaken(false), condPred(false),
-              btbHit(false), targetProvider(TargetProvider::NoTarget),
-              resteered(false), mispredict(false), target(nullptr),
-              bpHistory(nullptr),
-              indirectHistory(nullptr), rasHistory(nullptr)
-        { }
+                         const StaticInstPtr &inst);
 
-        ~PredictorHistory()
-        {
-            assert(bpHistory == nullptr);
-            assert(indirectHistory == nullptr);
-            assert(rasHistory == nullptr);
-        }
+        ~PredictorHistory();
 
         PredictorHistory (const PredictorHistory&) = delete;
         PredictorHistory& operator= (const PredictorHistory&) = delete;
@@ -348,6 +338,14 @@ class BPredUnit : public SimObject
 
         /** The prediction of the conditional predictor */
         bool condPred;
+        bool directionKnown = false;
+        bool sequenceBound = false;
+        bool preservedPath = false;
+        bool rasUnderflow = false;
+        bool noTargetTaken = false;
+        bool pendingBtbTarget = false;
+        bool btbAwaitingSnapshot = false;
+        bool targetAvailable = false;
 
         /** Was BTB hit at prediction time */
         bool btbHit;
@@ -364,6 +362,15 @@ class BPredUnit : public SimObject
         /** The predicted target */
         std::unique_ptr<PCStateBase> target;
         std::unique_ptr<PCStateBase> pendingTarget;
+        // Identity persists while the transaction is owned by BPredUnit.
+        uint64_t predictionVersion = 0;
+        bool resolved = false;
+        bool valid = true;
+        bool needsResolution = false;
+        bool resolvedTaken = false;
+        uint64_t resolvedVersion = 0;
+        std::unique_ptr<PCStateBase> resolvedTarget;
+        o3::DynInstPtr lateInstruction;
 
         /**
          * Pointer to the history objects passed back from the branch
@@ -379,6 +386,31 @@ class BPredUnit : public SimObject
 
     };
 
+    using HistoryHandle = std::weak_ptr<PredictorHistory>;
+    struct PathSnapshot {
+        std::shared_ptr<const void> conditional;
+        std::shared_ptr<const void> indirect;
+    };
+    PathSnapshot pathSnapshot(ThreadID tid) const;
+    bool predictNotTakenAtSnapshot(const StaticInstPtr &inst, InstSeqNum sequence,
+        ThreadID tid, const PathSnapshot &snapshot, PCStateBase &pc,
+        PredictorHistory *&history);
+    PredictorHistory *makeHistory(ThreadID tid, InstSeqNum seq, Addr pc,
+                                  const StaticInstPtr &inst);
+    HistoryHandle historyHandle(PredictorHistory *history) const;
+    HistoryHandle newestHistory(ThreadID tid) const;
+    void setReplay(ThreadID tid, Addr pc, bool taken, const PCStateBase &target);
+    void clearReplay(ThreadID tid);
+    bool hasReplay(ThreadID tid, Addr pc) const;
+    std::optional<BranchTargetBuffer::Snapshot> BTBProbe(ThreadID tid, Addr pc) const
+    { return btb->probe(tid, pc); }
+    bool BTBSnapshotValid(const BranchTargetBuffer::Snapshot &snapshot) const
+    { return btb->snapshotValid(snapshot); }
+    bool BTBRangeCandidates(ThreadID tid, Addr start, unsigned width,
+                            unsigned stride, std::optional<Addr> &early,
+                            std::optional<Addr> &late) const
+    { return btb->rangeCandidates(tid, start, width, stride, early, late); }
+
     /**
      * Pushes a `PredictorHistory` object into the branch predictor history
      * queue. This is used by the decoupled front-end to move predictions
@@ -393,8 +425,12 @@ class BPredUnit : public SimObject
      */
     bool predict(const StaticInstPtr &inst, const InstSeqNum &seqNum,
                PCStateBase &pc, ThreadID tid, PredictorHistory* &bpu_history,
-               bool staged_targets = false);
+               bool staged_targets = false,
+               const BranchTargetBuffer::Snapshot *snapshot = nullptr,
+               bool predecoded = false);
     bool completeStagedTarget(ThreadID tid, PredictorHistory *history);
+    bool prepareStagedBtb(ThreadID tid, PredictorHistory *history,
+                          const BranchTargetBuffer::Snapshot &snapshot);
 
     /**
      * Squashes a particular branch instance. Reverts
@@ -447,6 +483,13 @@ class BPredUnit : public SimObject
      * a squash.
      */
     std::vector<std::deque<PredictorHistory *>> predHist;
+    std::map<PredictorHistory *, std::shared_ptr<PredictorHistory>> transactions;
+    struct ReplayPrediction {
+        Addr pc;
+        bool taken;
+        std::unique_ptr<PCStateBase> target;
+    };
+    std::vector<std::optional<ReplayPrediction>> replayPredictions;
 
     /** The BTB. */
     BranchTargetBuffer * btb;

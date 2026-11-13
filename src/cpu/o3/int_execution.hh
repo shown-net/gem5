@@ -106,12 +106,14 @@ class ResultForwarding : public SimObject
     };
 
   private:
-    std::unordered_map<PhysRegIndex, Reference> producers;
+    std::vector<Reference> producers;
     struct Waiter { DynInstPtr inst; Tick when; };
     std::unordered_map<uint64_t, Waiter> waiters;
     const std::vector<ResultPathRule *> paths;
     CPU *cpu = nullptr;
     EventFunctionWrapper wakeEvent;
+    bool inIssuePass = false;
+    bool issueWaitersClean = false;
     struct Stats : statistics::Group
     {
         statistics::Scalar deferred, wakeups, cancelled, unissuedCancelled;
@@ -120,18 +122,21 @@ class ResultForwarding : public SimObject
     };
     mutable Stats stats;
     void armWake();
+    void updateWake(Tick old_when, Tick new_when);
     void wakeConsumers();
     void checkDrain();
 
   public:
     ResultForwarding(const ResultForwardingParams &p);
-    void bindCPU(CPU *owner);
+    void bindCPU(CPU *owner, unsigned num_registers);
     void track(const DynInstPtr &inst, bool managed);
     void dispatched(const DynInstPtr &inst, unsigned port, Cycles latency);
     Reference source(PhysRegIdPtr reg) const;
     bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
     Tick availableAt(const DynInstPtr &inst, unsigned consumer_port) const;
     int earliestAdjustment(const DynInstPtr &inst, unsigned producer_port) const;
+    void beginIssuePass();
+    void endIssuePass();
     void defer(const DynInstPtr &inst, Tick when);
     void clearWait(const DynInstPtr &inst);
     void release(const DynInstPtr &inst);
@@ -151,6 +156,7 @@ class IntExecutionResource : public SimObject
     struct Operation
     {
         DynInstPtr inst;
+        std::list<std::shared_ptr<Operation>>::iterator position;
         bool completed = false;
         bool written = false;
         bool sent = false;

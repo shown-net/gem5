@@ -44,6 +44,7 @@
 #include "base/intmath.hh"
 #include "base/logging.hh"
 #include "mem/ruby/slicc_interface/AbstractController.hh"
+#include "mem/ruby/common/SPRBankHash.hh"
 #include "debug/HtmMem.hh"
 #include "debug/RubyCache.hh"
 #include "debug/RubyCacheTrace.hh"
@@ -73,7 +74,7 @@ CacheMemory::CacheMemory(const Params &p)
     dataArray(p.dataArrayBanks, p.dataAccessLatency, p.start_index_bit),
     tagArray(p.tagArrayBanks, p.tagAccessLatency, p.start_index_bit),
     atomicALUArray(p.atomicALUs, p.atomicLatency),
-    dataFillInstallBytesPerCycle(p.fill_install_bytes_per_cycle),
+    l1DataService(p.fill_install_bytes_per_cycle),
     cacheMemoryStats(this)
 {
     m_cache_size = p.size;
@@ -85,10 +86,10 @@ CacheMemory::CacheMemory(const Params &p)
     m_is_instruction_only_cache = p.is_icache;
     m_resource_stalls = p.resourceStalls;
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
-    m_fill_capacity = p.fill_capacity;
-    dataFillBuffer.setCapacity(p.fill_capacity);
-    dataFillBuffer.setWriteCapacity(p.write_fill_capacity);
-    fatal_if(dataFillInstallBytesPerCycle == 0,
+    l2CacheService.setFillCapacity(p.fill_capacity);
+    l1DataService.setCapacity(p.fill_capacity);
+    l1DataService.setWriteCapacity(p.write_fill_capacity);
+    fatal_if(p.fill_install_bytes_per_cycle == 0,
              "L1 refill bandwidth must be positive");
     if (p.fill_stats_clock)
         dataFillClock = std::make_unique<DataFillClock>(*p.fill_stats_clock);
@@ -99,31 +100,75 @@ CacheMemory::CacheMemory(const Params &p)
 bool
 CacheMemory::canAllocateFill() const
 {
-    return m_fill_capacity == 0 || m_fill_in_flight < m_fill_capacity;
+    return l2CacheService.canAllocateFill();
 }
 
 void
 CacheMemory::allocateFill()
 {
-    assert(canAllocateFill());
-    ++m_fill_in_flight;
+    const auto occupancy = l2CacheService.allocateFill();
     ++cacheMemoryStats.fillAllocations;
-    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+    cacheMemoryStats.fillOccupancy = occupancy;
 }
 
 void
 CacheMemory::releaseFill()
 {
-    assert(m_fill_in_flight > 0);
-    --m_fill_in_flight;
+    const auto occupancy = l2CacheService.releaseFill();
     ++cacheMemoryStats.fillCompletions;
-    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+    cacheMemoryStats.fillOccupancy = occupancy;
 }
 
 void
 CacheMemory::recordFillBlocked()
 {
     ++cacheMemoryStats.fillBlockedRequests;
+}
+
+void
+CacheMemory::recordL1DataHitRead()
+{
+    ++cacheMemoryStats.l1DataHitReadRequests;
+}
+
+void
+CacheMemory::recordL1DataFillRead()
+{
+    ++cacheMemoryStats.l1DataFillReadResponses;
+}
+
+void
+CacheMemory::recordL1OrderedStore(unsigned logical_stores, unsigned enabled_bytes)
+{
+    ++cacheMemoryStats.l1OrderedStorePackets;
+    cacheMemoryStats.l1OrderedStoreLogicalStores += logical_stores;
+    cacheMemoryStats.l1OrderedStoreEnabledBytes += enabled_bytes;
+}
+
+void
+CacheMemory::registerDataFillRead(PacketPtr packet, bool follower,
+                                  bool has_service_source)
+{
+    if (l1DataService.registerFillRead(packet, follower, has_service_source)) {
+        ++cacheMemoryStats.l1FillReadRegistrations;
+        if (follower)
+            ++cacheMemoryStats.l1FillFollowerRegistrations;
+    }
+}
+
+void
+CacheMemory::cancelDataFillRead(PacketPtr packet)
+{
+    if (l1DataService.cancelFillRead(packet))
+        ++cacheMemoryStats.l1FillReadCancellations;
+}
+
+std::vector<L1DataService::FillParticipant>
+CacheMemory::selectDataFillReads(Addr line)
+{
+    auto selected = l1DataService.selectFillReads(line);
+    cacheMemoryStats.l1FillReadSelections += selected.size();
+    return selected;
 }
 
 uint64_t
@@ -140,11 +185,14 @@ CacheMemory::accountDataFillCycles()
     const uint64_t now = currentDataFillCycle();
     const uint64_t elapsed = now - lastDataFillCycle;
     cacheMemoryStats.dataFillDemandReadPending +=
-        elapsed * dataFillBuffer.demandReadCount();
+        elapsed * l1DataService.demandReadCount();
     cacheMemoryStats.dataFillReadyEntryCycles +=
-        elapsed * dataFillBuffer.readyCount();
-    if (dataFillBuffer.demandReadCount())
+        elapsed * l1DataService.readyCount();
+    if (l1DataService.demandReadCount())
         cacheMemoryStats.dataFillDemandReadPendingCycles += elapsed;
+    if ((demandFillReadWaiters && !l1DataService.canAllocate(false)) ||
+        (demandFillWriteWaiters && !l1DataService.canAllocate(true)))
+        cacheMemoryStats.dataFillDemandWaitFullCycles += elapsed;
     if (offcoreDemandRfos) cacheMemoryStats.offcoreDemandRfoCycles += elapsed;
     lastDataFillCycle = now;
 }
@@ -152,7 +200,7 @@ CacheMemory::accountDataFillCycles()
 bool
 CacheMemory::canAllocateDataFill(bool write_initiated) const
 {
-    return dataFillBuffer.canAllocate(write_initiated);
+    return l1DataService.canAllocate(write_initiated);
 }
 
 void
@@ -160,28 +208,28 @@ CacheMemory::allocateDataFill(Addr address, bool demand_read, bool write_initiat
 {
     assert(canAllocateDataFill(write_initiated));
     accountDataFillCycles();
-    dataFillBuffer.allocate(makeLineAddress(address), demand_read, write_initiated);
+    l1DataService.allocate(makeLineAddress(address), demand_read, write_initiated);
     ++cacheMemoryStats.fillAllocations;
-    cacheMemoryStats.fillOccupancy = dataFillBuffer.size();
+    cacheMemoryStats.fillOccupancy = l1DataService.size();
 }
 
 void
 CacheMemory::markDataFillReady(Addr address)
 {
     accountDataFillCycles();
-    dataFillBuffer.markReady(makeLineAddress(address));
+    l1DataService.markReady(makeLineAddress(address));
 }
 
 void
 CacheMemory::markSoftwarePrefetchFill(Addr address)
 {
-    dataFillBuffer.markSoftwarePrefetch(makeLineAddress(address));
+    l1DataService.markSoftwarePrefetch(makeLineAddress(address));
 }
 
 void
 CacheMemory::observeSoftwarePrefetchHit(Addr address)
 {
-    if (dataFillBuffer.fromSoftwarePrefetch(makeLineAddress(address)))
+    if (l1DataService.fromSoftwarePrefetch(makeLineAddress(address)))
         ++cacheMemoryStats.softwarePrefetchFillHits;
 }
 
@@ -189,9 +237,9 @@ void
 CacheMemory::releaseDataFill(Addr address)
 {
     accountDataFillCycles();
-    dataFillBuffer.release(makeLineAddress(address));
+    l1DataService.release(makeLineAddress(address));
     ++cacheMemoryStats.fillCompletions;
-    cacheMemoryStats.fillOccupancy = dataFillBuffer.size();
+    cacheMemoryStats.fillOccupancy = l1DataService.size();
 }
 
 void
@@ -200,7 +248,7 @@ CacheMemory::finishDataFill(Addr address)
     // Permission-only transactions do not own a data fill. The protocol
     // calls this after its data action and local callbacks, independently of
     // deallocating the coherence transaction.
-    if (dataFillBuffer.contains(makeLineAddress(address))) {
+    if (l1DataService.contains(makeLineAddress(address))) {
         ++cacheMemoryStats.dataFillCancellations;
         releaseDataFill(address);
     }
@@ -209,13 +257,13 @@ CacheMemory::finishDataFill(Addr address)
 bool
 CacheMemory::dataFillPresent(Addr address) const
 {
-    return dataFillBuffer.contains(makeLineAddress(address));
+    return l1DataService.contains(makeLineAddress(address));
 }
 
 bool
 CacheMemory::dataFillReady(Addr address) const
 {
-    return dataFillBuffer.ready(makeLineAddress(address));
+    return l1DataService.ready(makeLineAddress(address));
 }
 
 bool
@@ -224,29 +272,24 @@ CacheMemory::advanceDataFillInstall(Addr address)
     // Permission-only responses consume no refill service. Reserve actual
     // transfer beats, independently of the load issue pipeline latency.
     const Addr line = makeLineAddress(address);
-    if (!dataFillBuffer.contains(line)) return true;
-    const uint64_t now = currentDataFillCycle();
-    if (!dataFillBuffer.installStarted(line)) {
-        if (now < nextDataFillInstallCycle) {
-            ++cacheMemoryStats.dataFillInstallBlocked;
-            return false;
-        }
-        const unsigned bytes = m_ruby_system->getBlockSizeBytes();
-        const unsigned beats = (bytes + dataFillInstallBytesPerCycle - 1) /
-                               dataFillInstallBytesPerCycle;
-        dataFillBuffer.startInstall(line, now + beats - 1);
-        nextDataFillInstallCycle = now + beats;
+    const auto result = l1DataService.advanceInstall(
+        line, currentDataFillCycle(), m_ruby_system->getBlockSizeBytes());
+    if (result == L1DataService::InstallResult::Blocked) {
+        ++cacheMemoryStats.dataFillInstallBlocked;
+        return false;
     }
-    const bool complete = dataFillBuffer.installComplete(line, now);
-    if (!complete) ++cacheMemoryStats.dataFillInstallServiceCycles;
-    return complete;
+    if (result == L1DataService::InstallResult::InProgress) {
+        ++cacheMemoryStats.dataFillInstallServiceCycles;
+        return false;
+    }
+    return true;
 }
 
 void
 CacheMemory::installDataFill(Addr address)
 {
     if (!dataFillPresent(address)) return;
-    assert(dataFillReady(address) && dataFillBuffer.installComplete(
+    assert(dataFillReady(address) && l1DataService.installComplete(
         makeLineAddress(address), currentDataFillCycle()));
     ++cacheMemoryStats.dataFillInstalls;
     releaseDataFill(address);
@@ -263,19 +306,48 @@ CacheMemory::recordDemandFillBlocked()
     }
 }
 
+void
+CacheMemory::beginDemandFillWait(PacketPtr packet, bool write_initiated)
+{
+    if (!packet) return;
+    accountDataFillCycles();
+    const auto [it, inserted] = demandFillWaiters.emplace(packet, write_initiated);
+    assert(inserted || it->second == write_initiated);
+    if (inserted) {
+        if (write_initiated) ++demandFillWriteWaiters;
+        else ++demandFillReadWaiters;
+    }
+}
+
+void
+CacheMemory::endDemandFillWait(PacketPtr packet)
+{
+    const auto it = demandFillWaiters.find(packet);
+    if (it == demandFillWaiters.end()) return;
+    accountDataFillCycles();
+    if (it->second) {
+        assert(demandFillWriteWaiters);
+        --demandFillWriteWaiters;
+    } else {
+        assert(demandFillReadWaiters);
+        --demandFillReadWaiters;
+    }
+    demandFillWaiters.erase(it);
+}
+
 bool
 CacheMemory::dataFillPending(Addr address) const
 {
-    return dataFillBuffer.pending(makeLineAddress(address));
+    return l1DataService.pending(makeLineAddress(address));
 }
 
 void
 CacheMemory::observeDataFillDemandRead(Addr address)
 {
     const Addr line = makeLineAddress(address);
-    if (!dataFillBuffer.needsDemandRead(line)) return;
+    if (!l1DataService.needsDemandRead(line)) return;
     accountDataFillCycles();
-    dataFillBuffer.observeDemandRead(line);
+    l1DataService.observeDemandRead(line);
 }
 
 bool
@@ -340,7 +412,9 @@ CacheMemory::addressToCacheSet(Addr address) const
 {
     assert(address == makeLineAddress(address));
     if (m_index_divisor != 1) {
-        return ((address >> m_start_index_bit) / m_index_divisor) %
+        const Addr line = sprL3IndexLine(address >> m_start_index_bit,
+                                       m_index_divisor);
+        return (line / m_index_divisor) %
                m_cache_num_sets;
     }
     if (isPowerOf2(m_cache_num_sets)) {
@@ -820,6 +894,7 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
       ADD_STAT(fillBlockedRequests, "Fill admissions retried because the budget was full"),
       ADD_STAT(fillOccupancy, "Average number of live tracked line fills"),
       ADD_STAT(dataFillDemandBlockedCycles, "Candidate cycles a demand request waits for data fill-buffer capacity"),
+      ADD_STAT(dataFillDemandWaitFullCycles, "Cycles with a previously FB-rejected demand request still waiting while its FB credit is unavailable; model candidate"),
       ADD_STAT(dataFillDemandReadPending, "Integral of L0 data fill entries containing a demand read"),
       ADD_STAT(dataFillDemandReadPendingCycles, "Cycles with at least one L0 demand-read data fill"),
       ADD_STAT(dataFillReadyEntryCycles, "Integral of data-ready fill entries awaiting L1 installation"),
@@ -827,6 +902,15 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
       ADD_STAT(dataFillCancellations, "Data fill entries released without L1 installation"),
       ADD_STAT(dataFillInstallBlocked, "L1 installation attempts waiting for refill bandwidth"),
       ADD_STAT(dataFillInstallServiceCycles, "Data-ready FB line cycles spent transferring into L1"),
+      ADD_STAT(l1DataHitReadRequests, "L1 data-hit read requests completed by the controller"),
+      ADD_STAT(l1DataFillReadResponses, "Read responses supplied by L1 data fill, including prefetch hints"),
+      ADD_STAT(l1OrderedStorePackets, "Committed ordinary store packets published in L1"),
+      ADD_STAT(l1OrderedStoreLogicalStores, "Logical stores represented by published committed store packets"),
+      ADD_STAT(l1OrderedStoreEnabledBytes, "Enabled bytes in published committed store packets"),
+      ADD_STAT(l1FillReadRegistrations, "Read requests newly registered with an L1 data fill"),
+      ADD_STAT(l1FillFollowerRegistrations, "New L1 data fill registrations classified as followers"),
+      ADD_STAT(l1FillReadSelections, "Registered reads selected for L1 data-fill supply"),
+      ADD_STAT(l1FillReadCancellations, "Registered reads completed on a non-fill path"),
       ADD_STAT(demandDataReadHits, "Candidate cacheable demand data read requests observed hitting the private L2"),
       ADD_STAT(demandDataReadTrueMisses, "Candidate cacheable demand data read requests observed missing the private L2, excluding merges and upgrades"),
       ADD_STAT(codeReadHits, "Private L2 instruction read hits"),

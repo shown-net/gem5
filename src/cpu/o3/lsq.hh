@@ -43,7 +43,6 @@
 #define __CPU_O3_LSQ_HH__
 
 #include <cassert>
-#include <array>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -62,6 +61,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/utils.hh"
 #include "enums/SMTQueuePolicy.hh"
+#include "mem/l1_data_access.hh"
 #include "mem/port.hh"
 #include "mem/taotrace_response.hh"
 #include "sim/sim_object.hh"
@@ -418,6 +418,7 @@ class LSQ
         virtual void initiateTranslation() = 0;
 
         PacketPtr packet(int idx = 0) { return _packets.at(idx); }
+        bool hasBuiltPackets() const { return !_packets.empty(); }
 
         virtual PacketPtr
         mainPacket()
@@ -445,6 +446,10 @@ class LSQ
         noteNativeTerminal(TaoTraceNativeTerminalReason reason)
         {
             if (!_reqs.empty()) {
+                // This explicit LSQ terminal proves no further main-request
+                // fragments will be issued. Earlier accepted service still
+                // drains through the independent lifecycle counters.
+                TaoTraceNativeAccessRegistry::noteIssuanceClosed(mainReq());
                 TaoTraceNativeAccessRegistry::noteTerminal(mainReq(), reason);
             }
         }
@@ -972,14 +977,10 @@ class LSQ
     /** Set D-cache blocked status */
     void cacheBlocked(bool v);
     /** Is any store port available to use? */
-    bool cachePortAvailable(bool is_load, unsigned bytes = 0) const;
+    bool cachePortAvailable(bool is_load, unsigned bytes = 0);
     /** Another store port is in use */
     void cachePortBusy(bool is_load, unsigned bytes = 0);
-    bool storePreparePortAvailable() const
-    { return usedStorePreparePorts < cacheStorePorts; }
-    void noteStorePreparePort()
-    { assert(storePreparePortAvailable()); ++usedStorePreparePorts; }
-    bool loadBankAvailable(Addr addr) const;
+    bool loadBankAvailable(Addr addr);
     void noteLoadBank(Addr addr);
     std::vector<DynInstPtr> olderStores(const DynInstPtr &load) const;
     bool memorySpeculationAllowed(const DynInstPtr &load) const;
@@ -1002,13 +1003,12 @@ class LSQ
     /** The number of used cache ports in this cycle by loads. */
     int usedLoadPorts;
     const bool sprL1WidthService;
-    unsigned usedLoadService = 0;
-    unsigned usedStoreService = 0;
+    uint64_t widthServiceEpoch = 0;
     // Engineering request limiter for zero-byte ownership hints. These are
     // not STD/data actions and never consume the L1 store data budget.
-    int usedStorePreparePorts = 0;
-    const bool sprL1LoadBankConflicts;
-    std::array<unsigned, 16> loadBankUses{};
+    L1DataAccessResource *cachedL1DataResource = nullptr;
+    std::unique_ptr<L1DataAccessBudget> localL1DataResource;
+    L1DataAccessResource *l1DataResource();
     const unsigned loadCompletionWidth;
     unsigned usedLoadCompletions = 0;
     Cycles loadCompletionCycle = Cycles(0);

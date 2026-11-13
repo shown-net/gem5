@@ -438,9 +438,8 @@ class LSQUnit : public CapacityReadObserver
                         storeWBIt->valid() &&
                         storeWBIt->canWB() &&
                         !storeWBIt->completed();
-        const bool buffer_ready = std::any_of(
-            committedStoreBuffer.begin(), committedStoreBuffer.end(),
-            [](const auto &entry) { return !entry.issued; });
+        const bool buffer_ready =
+            issuedStoreBufferEntries < committedStoreBuffer.size();
         return (sq_ready || buffer_ready) && !isStoreBlocked;
     }
 
@@ -448,6 +447,8 @@ class LSQUnit : public CapacityReadObserver
     void recvRetry();
 
     void completeStoreBufferWrite(uint64_t entry_id);
+    void advanceForwarding();
+    bool hasFastForwardingModel() const { return bool(fsfp); }
     void sampleStoreOccupancy();
     unsigned demandLoadStages() const;
 
@@ -472,6 +473,7 @@ class LSQUnit : public CapacityReadObserver
     void validateFastForwarding();
     void refreshForwardingContext();
     void rememberForwarding(const DynInstPtr &load, const DynInstPtr &store);
+    void recordForwardingTraining(const DynInstPtr &load, const DynInstPtr &store);
     bool fastForwardingAllowed() const;
     uint64_t forwardingContext() const;
 
@@ -505,7 +507,7 @@ class LSQUnit : public CapacityReadObserver
     bool trySendPacket(bool isLoad, PacketPtr data_pkt);
     bool memorySpeculationAllowed() const;
     bool hasFastForwardingPrediction(const DynInstPtr &load) const;
-    void clearFastForwarding() { forwardingHistory.clear(); }
+    void clearFastForwarding() { if (fsfp) fsfp->forwardingHistory.clear(); }
 
 
     /** Debugging function to dump instructions in the LSQ. */
@@ -586,21 +588,19 @@ class LSQUnit : public CapacityReadObserver
     /** The number of store instructions in the SQ waiting to writeback. */
     int storesToWB;
     bool sprStoreBuffer = false;
+    unsigned sprStoreDrainLineCredits = 4;
     bool sprEarlyStorePrepare = false;
     bool sprRetiredStorePrepare = true;
-    bool sprStorePrepareDemandPriority = true;
     Cycles sprClflushMinCycles = Cycles(0);
     bool sprMemoryDependence = false;
-    bool sprFastStoreForwarding = false;
-    bool sprPredictReadyLoadValues = false;
-    bool sprEarlyStoreDataForwarding = false;
-    Cycles sprFastForwardingLatency = Cycles(1);
     Cycles sprStoreForwardingLatency = Cycles(0);
-    bool sprSameStartPartialForwarding = true;
-    bool sprMultiStoreBufferForwarding = true;
+    bool sprMultiStoreForwarding = true;
     Cycles sprContainedForwardingExtraLatency = Cycles(0);
     uint64_t nextStoreBufferId = 1;
     std::deque<CommittedStoreEntry> committedStoreBuffer;
+    unsigned committedStores = 0;
+    // Retained issued prefix, including completed entries awaiting front pop.
+    unsigned issuedStoreBufferEntries = 0;
     std::map<Addr, unsigned> storeBufferLinesInFlight;
 
     // hardware transactional memory
@@ -658,11 +658,7 @@ class LSQUnit : public CapacityReadObserver
         Addr storePC;
         uint8_t confidence = 0;
     };
-    std::map<std::pair<uint64_t, Addr>, ForwardingHistory> forwardingHistory;
-    std::map<InstSeqNum, Addr> forwardingTraining;
     void trainForwarding(const DynInstPtr &load, bool failed = false);
-    uint64_t lastForwardingContext = 0;
-    bool forwardingContextValid = false;
     struct FastForwarding {
         DynInstPtr load;
         DynInstPtr store;
@@ -680,7 +676,16 @@ class LSQUnit : public CapacityReadObserver
         };
         std::map<InstSeqNum, StoreBytes> physicalStores{};
     };
-    std::map<InstSeqNum, FastForwarding> fastForwarding;
+    struct FastForwardingState {
+        std::map<std::pair<uint64_t, Addr>, ForwardingHistory> forwardingHistory;
+        std::map<InstSeqNum, Addr> forwardingTraining;
+        uint64_t lastForwardingContext = 0;
+        bool forwardingContextValid = false;
+        std::map<InstSeqNum, FastForwarding> fastForwarding;
+    };
+    // Absent for the fixed SPR profile; generic experimental configurations
+    // can still instantiate the predictor with the existing parameter.
+    std::unique_ptr<FastForwardingState> fsfp;
 
     /** The packet that needs to be retried. */
     PacketPtr retryPkt;
@@ -717,10 +722,12 @@ class LSQUnit : public CapacityReadObserver
         /** Total number of loads forwaded from LSQ stores. */
         statistics::Scalar forwLoads;
         statistics::Scalar sameStartPartialLoads;
+        statistics::Scalar sameStartMixedStoreProducers;
+        statistics::Scalar sameStartMixedStoreRejected;
+        statistics::Scalar samePageSplitCandidates;
+        statistics::Scalar samePageSplitForwarded;
         statistics::Scalar fastForwardPredictions;
         statistics::Scalar fastForwardLoadAddressPredictions;
-        statistics::Scalar fastForwardEarlyStoreDataPredictions;
-        statistics::Scalar fastForwardRetainedDataPredictions;
         statistics::Scalar fastForwardValidated;
         statistics::Scalar fastForwardFailures;
         statistics::Scalar noncontiguousTranslations;
@@ -741,6 +748,10 @@ class LSQUnit : public CapacityReadObserver
         /** Tota number of memory ordering violations. */
         statistics::Scalar memOrderViolation;
         statistics::Scalar returnedLoadOrderViolations;
+        statistics::Scalar storeOrderCandidateExecuted;
+        statistics::Scalar storeOrderCandidateForwarded;
+        statistics::Scalar storeOrderCandidateReturned;
+        statistics::Scalar storeOrderCandidateOutstanding;
 
         /** Total number of squashed stores. */
         statistics::Scalar squashedStores;
@@ -760,6 +771,9 @@ class LSQUnit : public CapacityReadObserver
         statistics::Scalar storeBufferMerged;
         statistics::Scalar storeBufferSent;
         statistics::Scalar storeBufferCompleted;
+        statistics::Scalar storeBufferLogicalSent;
+        statistics::Scalar storeBufferLogicalCompleted;
+        statistics::Value storeBufferLogicalLive;
         statistics::Scalar storeBufferForwardedLoads;
         statistics::Scalar storeBufferPartialWaits;
         statistics::Scalar storeBufferEntryCycles;
@@ -768,6 +782,7 @@ class LSQUnit : public CapacityReadObserver
         statistics::Scalar sharedStoreFullCycles;
         statistics::Scalar storeDrainCacheBlocked;
         statistics::Scalar storeDrainPortBlocked;
+        statistics::Scalar storeDrainLineCreditBlocked;
 
         /** Number of times the LSQ is blocked due to the cache. */
         statistics::Scalar blockedByCache;

@@ -54,6 +54,7 @@
 #include "mem/ruby/protocol/SequencerRequestType.hh"
 #include "mem/ruby/structures/CacheMemory.hh"
 #include "mem/ruby/system/RubyPort.hh"
+#include "mem/ruby/system/SequencerRequest.hh"
 #include "params/RubySequencer.hh"
 
 namespace gem5
@@ -61,39 +62,6 @@ namespace gem5
 
 namespace ruby
 {
-
-// A request and its local observation remain with the Sequencer until Ruby
-// completes it. Coalescing alone does not establish a fill-buffer hit.
-struct SequencerRequest
-{
-    PacketPtr pkt;
-    RubyRequestType m_type;
-    RubyRequestType m_second_type;
-    Cycles issue_time;
-    uint8_t admissionDataSource = 0; // 1: readable L1, 2: pending fill
-    // A request issued independently to the L1 controller owns its own
-    // response.  A read may join a line fill only after the controller has
-    // observed that request, never merely because it shares a line address.
-    bool issuedToL1 = false;
-    bool waitingForDataFill = false;
-    bool dataFillFollower = false;
-    bool dataFillHasServiceSource = false;
-    // The request whose callback supplied a coalesced follower. Observer only.
-    RequestPtr serviceParent;
-    bool serviceParentIsWrite = false;
-
-    SequencerRequest(PacketPtr pkt, RubyRequestType type,
-                     RubyRequestType second_type, Cycles issue_time)
-        : pkt(pkt), m_type(type), m_second_type(second_type),
-          issue_time(issue_time)
-    {}
-
-    bool functionalWrite(Packet *func_pkt) const
-    {
-        assert(func_pkt->isWrite());
-        return func_pkt->trySatisfyFunctional(pkt);
-    }
-};
 
 using SequencerRequestTable =
     std::unordered_map<Addr, std::list<SequencerRequest>>;
@@ -104,6 +72,7 @@ class Sequencer : public RubyPort
     typedef RubySequencerParams Params;
     Sequencer(const Params &);
     ~Sequencer();
+    L1DataAccessResource *l1DataAccessResource() override;
 
     /**
      * Proxy function to writeCallback that first
@@ -131,7 +100,16 @@ class Sequencer : public RubyPort
                        const Cycles initialRequestTime = Cycles(0),
                        const Cycles forwardRequestTime = Cycles(0),
                        const Cycles firstResponseTime = Cycles(0),
-                       const bool noCoales = false);
+                       const bool noCoales = false,
+                       const bool sprDataWitness = false);
+
+    // Used only by the controller action immediately following an actual
+    // data-block response, not by permission-only or final-hit inference.
+    bool writeCallbackData(Addr address, DataBlock& data)
+    {
+        return writeCallback(address, data, true, MachineType_NUM, Cycles(0),
+                             Cycles(0), Cycles(0), false, true);
+    }
 
     // Write callback that prevents coalescing
     void writeUniqueCallback(Addr address, DataBlock& data)
@@ -158,7 +136,9 @@ class Sequencer : public RubyPort
     void registerReadFill(const RequestPtr &request, bool follower,
                           bool has_service_source);
     void readFillCallback(Addr address, DataBlock &data, int service_source,
-                          int l2_outcome, int l3_outcome);
+                          int l2_outcome, int l3_outcome, bool stale = false);
+    void readFillCallbackStale(Addr address, DataBlock &data)
+    { readFillCallback(address, data, 0, 0, 0, true); }
 
     void atomicCallback(Addr address,
                         DataBlock& data,
@@ -287,24 +267,10 @@ class Sequencer : public RubyPort
   protected:
     // Retain packets and preserve same-line ordering independently of FBs.
     SequencerRequestTable m_RequestTable;
-    // Data was read at the cache callback. Hold the packet credit and its
-    // value until the finite fill-return path can deliver it to the core.
-    struct PendingDataFillRead
-    {
-        SequencerRequest request;
-        DataBlock data;
-    };
-    std::deque<PendingDataFillRead> m_pendingDataFillReads;
-    unsigned m_dataFillResponseWidth;
-    unsigned m_dataFillResponsesUsed = 0;
-    uint64_t m_dataFillResponseCycle = uint64_t(-1);
     std::deque<const Request *> m_orderedStores;
     std::unordered_set<Addr> m_parkedOrderedLines;
     void wakeParkedOrderedHead();
     bool tailCanFollow(Addr address) const;
-    bool m_orderedLineValid = false;
-    Cycles m_orderedLineCycle = Cycles(0);
-    Addr m_orderedLine = 0;
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other
     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;
@@ -336,7 +302,6 @@ class Sequencer : public RubyPort
     // Global outstanding request count, across all request tables
     int m_outstanding_count;
     int m_store_prepare_outstanding;
-    unsigned m_maxStorePrepareOutstanding;
     bool m_deadlock_check_scheduled;
 
     int m_coreId;

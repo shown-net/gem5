@@ -41,6 +41,7 @@
 #ifndef __ARCH_GENERIC_TLB_HH__
 #define __ARCH_GENERIC_TLB_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <type_traits>
 
 #include "arch/generic/mmu.hh"
@@ -67,6 +68,7 @@ class BaseTLB : public SimObject
     BaseTLB *_nextLevel;
 
   public:
+    ~BaseTLB() override { functional_mmu::unregisterEndpoint(this); }
     virtual void demapPage(Addr vaddr, uint64_t asn) = 0;
 
     virtual Fault translateAtomic(

@@ -68,12 +68,6 @@ class RegOpBase : public X86MicroopBase
   public:
     const uint8_t dataSize;
     const RegIndex foldOBit;
-    unsigned earlyStoreDataSize() const override
-    {
-        return isStoreData() && getName() == "storedata" &&
-            numSrcRegs() == 1 && (dataSize == 4 || dataSize == 8) ?
-                dataSize : 0;
-    }
 };
 
 template <typename ...Operands>

@@ -149,6 +149,10 @@ class ROB
      */
     DynInstPtr findInst(ThreadID tid, InstSeqNum squash_inst);
 
+    /** Check the head's retirement group, including ready interior faults. */
+    bool retirementGroupReady(const DynInstPtr &head_inst,
+                              bool &fault_ready) const;
+
     /** Returns pointer to the tail instruction within the ROB.  There is
      *  no guarantee as to the return value if the ROB is empty.
      *  @retval Pointer to the DynInst that is at the tail of the ROB.

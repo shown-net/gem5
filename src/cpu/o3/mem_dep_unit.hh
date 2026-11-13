@@ -83,8 +83,8 @@ class LSQ;
  * As memory operations are issued to the IQ, they are also issued to this
  * unit, which then looks up the prediction as to what they are dependent
  * upon. This unit must be checked prior to a memory operation being able
- * to issue. The SPR policy separates store-address resolution from memory
- * completion, learns local load independence and applies a global watchdog.
+ * to issue. The SPR policy preserves physical load ranges for ordering
+ * checks and conservatively waits for older store addresses in the LSQ.
  * Other configurations retain the generic StoreSet predictor.
  */
 class MemDepUnit
@@ -212,8 +212,6 @@ class MemDepUnit
 
         /** A vector of any dependent instructions. */
         std::vector<MemDepEntryPtr> dependInsts;
-        bool addressGenerated = false;
-        bool orderingChecked = false;
 
         /** If the registers are ready or not. */
         bool regsReady = false;
@@ -256,42 +254,17 @@ class MemDepUnit
      *  this unit what instruction the newly added instruction is dependent
      *  upon.
      */
-    StoreSet depPred;
+    std::unique_ptr<StoreSet> depPred;
 
-    // Golden Cove mechanism prior.  The five watchdog states model the
-    // documented four-violation disable behavior, not a physical bit encoding.
+    // Select the SPR ordering path; prediction is not enabled by this flag.
     bool sprPredictor = false;
     LSQ *lsq = nullptr;
-    std::array<uint8_t, 512> independence{};
-    int speculationCredit = 3;
-    unsigned safePredictions = 0;
-    enum class ObservationResult { Pending, Independent, Dependent, Covered,
-                                   Cancelled };
-    struct StoreObservation {
-        DynInstPtr store;
-        bool member = false;
-        bool physicalReady = false;
-        std::vector<Addr> bytes;
-        bool orderingChecked = false;
-    };
     struct LoadObservation {
-        DynInstPtr load;
-        std::vector<StoreObservation> olderStores;
         std::vector<Addr> bytes;
         bool physicalReady = false;
-        ObservationResult result = ObservationResult::Pending;
-        bool localPrediction = false;
-        bool hadUnresolvedStore = false;
-        bool bypassAdmitted = false;
         bool addressWaitObserved = false;
-        bool violationCharged = false;
-        bool orderingFailed = false;
-        bool watchdogObserved = false;
     };
     std::unordered_map<InstSeqNum, LoadObservation, SNHash> loadObservations;
-    void observeLoad(const DynInstPtr &inst);
-    void trainLoad(LoadObservation &observation);
-    void recoverWatchdog(LoadObservation &observation);
 
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;
@@ -326,17 +299,7 @@ class MemDepUnit
         /** Stat for number of conflicting stores that had to wait for a
          *  store. */
         statistics::Scalar conflictingStores;
-        statistics::Scalar independencePredictions;
-        statistics::Scalar localQueries;
         statistics::Scalar addressWaits;
-        statistics::Scalar resolvedIndependentLoads;
-        statistics::Scalar resolvedDependentLoads;
-        statistics::Scalar coveredLoads;
-        statistics::Scalar watchdogBlocks;
-        statistics::Scalar watchdogDisables;
-        statistics::Scalar watchdogRecoveries;
-        statistics::Scalar watchdogFailures;
-        statistics::Scalar watchdogSafeOpportunities;
     } stats;
 };
 

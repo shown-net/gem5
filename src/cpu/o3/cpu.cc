@@ -41,6 +41,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "cpu/o3/cpu.hh"
 
 #include "cpu/activity.hh"
@@ -157,18 +158,19 @@ CPU::CPU(const BaseO3CPUParams &params)
     stackEngine = params.stackEngine;
     if (stackEngine) stackEngine->configure(params.numThreads);
     frontend = params.frontend;
+    if (frontend) frontend->attachCPU(this);
     if (frontend) {
         frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
         frontend->setDeliveryObserver(
             [this](const FrontendRecord &record, uint64_t cycle) {
-                recordFrontendDelivery(record.source, record.demand.frontendUnits, cycle);
+                recordFrontendDelivery(record.source, record.demand.idqUnits, cycle);
                 const auto &architecture = record.macroop ?
                     record.macroop : record.instruction;
                 if (architecture->usesMicrocodeService()) {
                     if (architecture->hasKnownMicrocodeIdentity())
-                        idqStats.knownMicrocodeUnits += record.demand.frontendUnits;
+                        idqStats.knownMicrocodeUnits += record.demand.idqUnits;
                     else
-                        idqStats.inferredMicrocodeUnits += record.demand.frontendUnits;
+                        idqStats.inferredMicrocodeUnits += record.demand.idqUnits;
                 }
             });
         auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
@@ -233,6 +235,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     rename.setRenameQueue(&renameQueue);
     iew.setRenameQueue(&renameQueue);
     iew.setIEWQueue(&iewQueue);
+    bac.setIEWQueue(&iewQueue);
     commit.setIEWQueue(&iewQueue);
     commit.setRenameQueue(&renameQueue);
 
@@ -321,6 +324,9 @@ CPU::CPU(const BaseO3CPUParams &params)
                     type, peer, !id.regClass().isFunctional(id));
                 renameMap[tid].setEntry(id, phys_reg);
                 commitRenameMap[tid].setEntry(id, phys_reg);
+                // Initial architectural values are ready before execution,
+                // just like mappings installed by insertThread().
+                scoreboard.setReg(phys_reg);
                 previous = phys_reg;
                 previous_group = group;
             }
@@ -419,8 +425,14 @@ void
 CPU::noteCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block)
 {
     bool matched = fetch.markCodeWrite(tid, after, physical_block);
-    for (const auto &inst : instList)
+    // Fetch appends in sequence order; StackSync is inserted immediately
+    // before its following instruction. Older records cannot be marked.
+    for (auto it = instList.rbegin(); it != instList.rend(); ++it) {
+        const auto &inst = *it;
+        if (inst->seqNum <= after)
+            break;
         matched |= inst->markCodeWrite(tid, after, physical_block);
+    }
     if (matched) {
         DPRINTF(Fetch, "[tid:%i] Code write line %#x after [sn:%llu] "
                 "marked younger fetched instructions for replay\n",
@@ -457,9 +469,12 @@ CPU::CPUStats::CPUStats(CPU *cpu)
 void
 CPU::tick()
 {
+    for(auto* tc:threadContexts)if(auto* o=functional_arch::observer(tc))o->executed();
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
+    assert(!tickInProgress);
+    tickInProgress = true;
 
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         flushStackRsp(tid);
@@ -515,6 +530,7 @@ CPU::tick()
         updateThreadPriority();
 
     tryDrain();
+    tickInProgress = false;
 }
 
 void
@@ -539,6 +555,7 @@ void
 CPU::startup()
 {
     BaseCPU::startup();
+    for (auto *tc : threadContexts) functional_mmu::resume(tc);
 
     bac.startupStage();
     fetch.startupStage();
@@ -666,6 +683,9 @@ CPU::suspendContext(ThreadID tid)
     // If this was the last thread then unschedule the tick event.
     if (activeThreads.size() == 0) {
         unscheduleTickEvent();
+        bac.cancelWake();
+        fetch.cancelWake();
+        if (frontend) frontend->cancelWake();
         lastRunningCycle = curCycle();
         _status = Idle;
     }
@@ -687,6 +707,9 @@ CPU::haltContext(ThreadID tid)
 
     // If this was the last thread then unschedule the tick event.
     if (activeThreads.size() == 0) {
+        bac.cancelWake();
+        fetch.cancelWake();
+        if (frontend) frontend->cancelWake();
         if (tickEvent.scheduled())
         {
             unscheduleTickEvent();
@@ -878,6 +901,9 @@ CPU::drain()
         return DrainState::Draining;
     } else {
         DPRINTF(Drain, "CPU is already drained\n");
+        bac.cancelWake();
+        fetch.cancelWake();
+        if (frontend) frontend->cancelWake();
         if (tickEvent.scheduled())
             deschedule(tickEvent);
 
@@ -906,6 +932,10 @@ CPU::tryDrain()
 
     if (tickEvent.scheduled())
         deschedule(tickEvent);
+
+    bac.cancelWake();
+    fetch.cancelWake();
+    if (frontend) frontend->cancelWake();
 
     DPRINTF(Drain, "CPU done draining, processing drain event\n");
     signalDrainDone();
@@ -985,6 +1015,7 @@ CPU::drainResume()
     DPRINTF(Drain, "Resuming...\n");
     verifyMemoryMode();
 
+    for (auto *tc : threadContexts) functional_mmu::resume(tc);
     bac.drainResume();
     fetch.drainResume();
     commit.drainResume();
@@ -1013,6 +1044,9 @@ CPU::switchOut()
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         unhaltedClockStats.setActive(tid, false);
     tmaStats.setActive(false);
+    bac.cancelWake();
+    fetch.cancelWake();
+    if (frontend) frontend->cancelWake();
     BaseCPU::switchOut();
 
     activityRec.reset();
@@ -1026,6 +1060,7 @@ CPU::switchOut()
 void
 CPU::takeOverFrom(BaseCPU *oldCPU)
 {
+    for (auto *tc : threadContexts) {functional_mmu::lifecycle(tc);if(auto* o=functional_arch::observer(tc))o->lifecycle();}
     if (stackEngine)
         for (ThreadID tid = 0; tid < numThreads; ++tid)
             stackEngine->reset(tid);
@@ -1037,6 +1072,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
     rename.takeOverFrom();
     iew.takeOverFrom();
     commit.takeOverFrom();
+    for (auto *tc : threadContexts) functional_mmu::resume(tc);
 
     assert(!tickEvent.scheduled());
 
@@ -1047,6 +1083,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
 
     lastRunningCycle = curCycle();
     _status = Idle;
+    for(auto* tc:threadContexts)if(auto* o=functional_arch::observer(tc))o->completedTakeover();
 }
 
 void
@@ -1407,7 +1444,8 @@ CPU::removeInstsNotInROB(ThreadID tid)
 void
 CPU::removeInstsUntil(const InstSeqNum &seq_num, ThreadID tid)
 {
-    assert(!instList.empty());
+    // A frontend-only redirect can occur before any record materializes.
+    if (instList.empty()) return;
 
     removeInstsThisCycle = true;
 
@@ -1425,10 +1463,9 @@ CPU::removeInstsUntil(const InstSeqNum &seq_num, ThreadID tid)
 
         squashInstIt(inst_iter, tid);
 
-        inst_iter--;
-
         if (break_loop)
             break;
+        inst_iter--;
     }
 }
 
@@ -1550,6 +1587,10 @@ CPU::wakeDependents(const DynInstPtr &inst)
 void
 CPU::wakeCPU()
 {
+    if (tickInProgress) {
+        activityRec.activity();
+        return;
+    }
     if (activityRec.active() || tickEvent.scheduled()) {
         DPRINTF(Activity, "CPU already running.\n");
         return;
@@ -1566,6 +1607,33 @@ CPU::wakeCPU()
     }
 
     schedule(tickEvent, clockEdge());
+}
+
+void
+CPU::wakeFrontend()
+{
+    if (_status != Running || switchedOut() || activeThreads.empty() ||
+        drainState() == DrainState::Drained || tickEvent.scheduled())
+        return;
+    if (tickInProgress) {
+        activityRec.activity();
+        return;
+    }
+    Cycles cycles(curCycle() - lastRunningCycle);
+    if (cycles > 1) {
+        --cycles;
+        cpuStats.idleCycles += cycles;
+        baseStats.numCycles += cycles;
+    }
+    schedule(tickEvent, clockEdge());
+}
+
+void
+CPU::clockPeriodUpdated()
+{
+    bac.refreshWake();
+    fetch.refreshWake();
+    if (frontend) frontend->refreshWake();
 }
 
 void

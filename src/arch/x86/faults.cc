@@ -38,6 +38,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/x86/faults.hh"
 
 #include "arch/x86/generated/decoder.hh"
@@ -57,6 +58,29 @@ namespace gem5
 
 namespace X86ISA
 {
+
+functional_arch::AcceptedFacts
+X86FaultBase::functionalBoundaryFacts(ThreadContext* tc) const
+{
+    functional_arch::AcceptedFacts f;
+    using Cause=fastsim::fst::archb::Cause;
+    f.vector=vector;
+    const HandyM5Reg mode=tc->readMiscRegNoEffect(misc_reg::M5Reg);
+    f.mode=mode.mode==LongMode?1:2;
+    f.pc=tc->pcState().instAddr();f.micro_pc=tc->pcState().microPC();
+    f.exact_cause=true;f.pc_known=true;
+    if(typeid(*this)==typeid(PageFault)) {
+        const auto& pf=static_cast<const PageFault&>(*this);
+        f.cause=Cause::PageFault;f.fault_va=pf.getAddress();f.error_code=pf.getErrorCode();
+    } else if(typeid(*this)==typeid(ExternalInterrupt)) {f.cause=Cause::ExternalInterrupt;f.carrier=2;}
+    else if(typeid(*this)==typeid(NonMaskableInterrupt))f.cause=Cause::NMI;
+    else if(typeid(*this)==typeid(SystemManagementInterrupt))f.cause=Cause::SMI;
+    else if(typeid(*this)==typeid(InitInterrupt))f.cause=Cause::INIT;
+    else if(typeid(*this)==typeid(StartupInterrupt))f.cause=Cause::SIPI;
+    else if(dynamic_cast<const X86Trap*>(this))f.cause=Cause::Trap;
+    else f.cause=Cause::OtherFault;
+    return f;
+}
 
 void
 RepRestart::invoke(ThreadContext *tc, const StaticInstPtr &inst)
@@ -113,6 +137,10 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
     }
     pc.upc(romMicroPC(entry));
     pc.nupc(romMicroPC(entry) + 1);
+    if(auto* scope=functional_arch::AcceptedInvocationScope::active) {
+        const auto kind=m5reg.mode==LongMode?(errorCode!=(uint64_t)(-1)?2:1):3;
+        pc.functionalBoundary(scope->redirect(this,tc,pc.microPC(),kind,vector,pc.pc()-cs_base,errorCode!=(uint64_t)(-1)?errorCode:0));
+    }
     tc->pcState(pc);
 }
 
@@ -156,6 +184,7 @@ InvalidOpcode::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 void
 PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    functional_mmu::CauseScope mmu_cause(fastsim::fst::mmuctl::Reason::UnboundPageFault,this,tc);
     if (FullSystem) {
         // Invalidate any matching TLB entries before handling the page fault.
         const CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);

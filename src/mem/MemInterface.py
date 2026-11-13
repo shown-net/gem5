@@ -66,6 +66,9 @@ class MemInterface(AbstractMemory):
     write_buffer_size = Param.Unsigned(64, "Number of write queue entries")
     read_buffer_size = Param.Unsigned(32, "Number of read queue entries")
 
+    channel_ranges = VectorParam.AddrRange(
+        [], "Physical ranges sharing one channel address decoder and bank state")
+
     # scheduler, address map
     addr_mapping = Param.AddrMap("RoRaBaCoCh", "Address mapping policy")
 

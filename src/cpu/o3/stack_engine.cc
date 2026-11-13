@@ -117,17 +117,23 @@ StackEngine::classify(const DynInstPtr &inst) const
     const bool first = !inst->isMicroop() || inst->isFirstMicroop();
     const int64_t current = offset(inst->threadNumber);
     if (macro) {
-        const auto env = const_cast<X86ISA::MacroopBase *>(macro)->getEmulEnv();
-        const auto emi = const_cast<X86ISA::MacroopBase *>(macro)->getExtMachInst();
-        const std::string block(macro->getMicrocodeBlock());
+        const auto env = macro->getEmulEnv();
+        const auto emi = macro->getExtMachInst();
+        const auto kind = macro->macroopKind();
         const bool stack_size = env.stackSize == 8 &&
                                 (env.dataSize == 8 || env.dataSize == 2);
-        const bool push = stack_size && (block == "PUSH_R" || block == "PUSH_I" ||
-            block == "CALL_NEAR_I" || block == "CALL_NEAR_R" ||
-            block == "CALL_NEAR_M" || block == "CALL_NEAR_P");
-        const bool ret_imm = block == "RET_NEAR_I";
-        const bool pop = stack_size && ((block == "POP_R" &&
-            env.reg != X86ISA::int_reg::_RspIdx) || block == "RET_NEAR" || ret_imm);
+        const bool push = stack_size &&
+            (kind == MacroopKind::PushRegister ||
+             kind == MacroopKind::PushImmediate ||
+             kind == MacroopKind::CallImmediate ||
+             kind == MacroopKind::CallRegister ||
+             kind == MacroopKind::CallMemory ||
+             kind == MacroopKind::CallPcRelative);
+        const bool ret_imm = kind == MacroopKind::ReturnImmediate;
+        const bool pop = stack_size &&
+            ((kind == MacroopKind::PopRegister &&
+              env.reg != X86ISA::int_reg::_RspIdx) ||
+             kind == MacroopKind::Return || ret_imm);
         if (push || pop) {
             const int64_t immediate = ret_imm ? (emi.immediate & 0xffff) : 0;
             const int64_t total = push ? -env.dataSize : env.dataSize + immediate;
@@ -161,10 +167,11 @@ StackEngine::classify(const DynInstPtr &inst) const
         }
 
         const int64_t imm = int64_t(emi.immediate);
-        if ((block == "ADD_R_I" || block == "SUB_R_I") &&
+        if ((kind == MacroopKind::AddImmediate ||
+             kind == MacroopKind::SubImmediate) &&
             env.reg == X86ISA::int_reg::_RspIdx && env.dataSize == 8 &&
             tracksImmediate(imm)) {
-            const int64_t step = block == "ADD_R_I" ? imm : -imm;
+            const int64_t step = kind == MacroopKind::AddImmediate ? imm : -imm;
             if (!inRange(step)) {
                 d.fallback = first;
                 d.sync = first && (current != 0 || syncZero);
@@ -182,7 +189,7 @@ StackEngine::classify(const DynInstPtr &inst) const
             return d;
         }
 
-        if (block == "LEA_R_M" && env.reg == X86ISA::int_reg::_RspIdx &&
+        if (kind == MacroopKind::Lea && env.reg == X86ISA::int_reg::_RspIdx &&
             env.dataSize == 8 && env.addressSize == 8 && is_rsp(env.base) &&
             env.index == X86ISA::int_reg::T0 && emi.displacement == 0) {
             d.trackedWrite = writes_rsp;
@@ -191,8 +198,9 @@ StackEngine::classify(const DynInstPtr &inst) const
 
         // These operations can consume the logical RSP without making a new
         // physical base. RSP destinations instead take the conservative path.
-        if (!writes_rsp && (block == "MOV_R_R" || block == "LEA_R_M" ||
-                            block == "MOV_R_M"))
+        if (!writes_rsp &&
+            (kind == MacroopKind::RegisterMove || kind == MacroopKind::Lea ||
+             kind == MacroopKind::MemoryMove))
             return d;
 
         // Synchronize once at the beginning of an unsupported macro, before

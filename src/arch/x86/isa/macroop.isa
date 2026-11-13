@@ -122,7 +122,7 @@ def template MacroConstructor {{
             %(adjust_disp)s;
             %(init_env)s;
             %(constructor)s;
-            macrocodeBlock = "%(class_name)s";
+            setMicrocodeBlock("%(class_name)s", MacroopKind::%(macroop_kind)s);
             //alloc_microops is the code that sets up the microops
             //array in the parent class.
             %(alloc_microops)s;
@@ -403,6 +403,25 @@ let {{
             regSize = '''(%s || (env.base == int_reg::Rsp && %s) ?
                          env.stackSize :
                          env.dataSize)''' % (useStackSize, memoryInst)
+            # Exact immutable block identities used by timing consumers.
+            macroopKind = {
+                "MOVS_E_M_M": "RepCopy",
+                "STOS_E_M": "RepStore",
+                "CALL_NEAR_I": "CallImmediate",
+                "CALL_NEAR_R": "CallRegister",
+                "CALL_NEAR_M": "CallMemory",
+                "CALL_NEAR_P": "CallPcRelative",
+                "RET_NEAR": "Return",
+                "RET_NEAR_I": "ReturnImmediate",
+                "PUSH_R": "PushRegister",
+                "PUSH_I": "PushImmediate",
+                "POP_R": "PopRegister",
+                "ADD_R_I": "AddImmediate",
+                "SUB_R_I": "SubImmediate",
+                "LEA_R_M": "Lea",
+                "MOV_R_R": "RegisterMove",
+                "MOV_R_M": "MemoryMove",
+            }.get(self.name, "None")
             iop = InstObjParams(self.getMnemonic(), self.name, "Macroop",
                                 {"code" : "", "num_microops" : numMicroops,
                                  "alloc_microops" : allocMicroops,
@@ -411,7 +430,8 @@ let {{
                                  "adjust_disp" : self.adjust_disp,
                                  "disassembly" : env.disassembly,
                                  "regSize" : regSize,
-                                 "init_env" : self.initEnv})
+                                 "init_env" : self.initEnv,
+                                 "macroop_kind" : macroopKind})
             return MacroConstructor.subst(iop) + \
                    MacroDisassembly.subst(iop);
 }};

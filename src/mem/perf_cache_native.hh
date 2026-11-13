@@ -24,6 +24,10 @@ struct Counts {
     uint64_t unknown_context=0, unknown_kind=0, ignored_hooks=0;
     uint64_t unknown_identity=0;
     uint64_t duplicate_edges=0, overflow=0;
+    uint64_t inflight_begin=0, inflight_end=0, released=0, superseded=0;
+    int64_t inflight_balance_residual=0;
+    std::array<uint64_t,3> outgoing_writebacks{}, outgoing_dirty_writebacks{},
+                           invalidations{};
     uint64_t accesses(unsigned level) const {
         uint64_t n=0;
         for (unsigned k=0;k<Kinds;++k) {
@@ -70,10 +74,16 @@ class Observer {
     std::map<int,Window> cores_;
     std::unordered_map<uint64_t,Transaction> live_;
     std::unordered_map<uint64_t,uint64_t> packets_;
+    std::array<uint64_t,3> global_writebacks_{}, global_dirty_writebacks_{};
+    static constexpr std::size_t MaxLive=65536;
     Counts *at(int core,uint64_t tick) {
         auto it=cores_.find(core);
         if (it==cores_.end() || !it->second.open || tick<it->second.begin) return nullptr;
         return &it->second.counts;
+    }
+    Counts *openWindow(int core) {
+        auto it=cores_.find(core);
+        return it==cores_.end() || !it->second.open ? nullptr : &it->second.counts;
     }
     void sample(int core,uint64_t id,uint64_t packet,Kind kind,unsigned level,
                 Outcome outcome,uint64_t tick,bool writeback=false) {
@@ -88,22 +98,33 @@ class Observer {
         w.samples.push_back(s);
     }
   public:
-    // prepare permits bounded warmup transactions to cross the opening edge.
     void prepare(int core) { cores_.try_emplace(core); }
     void open(int core,uint64_t tick) {
         auto &w=cores_[core]; w.open=true; w.begin=tick; w.end=0; w.counts=Counts{};
         w.samples.clear(); w.omitted=0;
+        w.counts.inflight_begin=inflight(core);
     }
     void close(int core,uint64_t tick) {
-        auto &w=cores_[core]; w.open=false; w.end=tick;
+        auto &w=cores_[core];
+        if(w.open) w.counts=snapshot(core);
+        w.open=false; w.end=tick;
     }
     uint64_t issue(int core,uint64_t packet,Kind kind,uint64_t tick) {
         if (!cores_.count(core)) return 0;
-        // Only a genuine new hierarchy issuance calls issue; table-full retries
-        // and coalesced aliases use their own non-transaction diagnostics.
-        const uint64_t id=next_++;
         auto old=packets_.find(packet);
-        if (old!=packets_.end()) live_.erase(old->second);
+        if (old!=packets_.end()) {
+            const auto tx=live_.find(old->second);
+            if (tx!=live_.end())
+                if (auto *c=at(tx->second.core,tick)) ++c->superseded;
+            live_.erase(old->second);
+            packets_.erase(old);
+        }
+        if (live_.size()>=MaxLive || !next_) {
+            if (auto *c=at(core,tick)) ++c->overflow;
+            return 0;
+        }
+        if (unsigned(kind)>=Kinds) kind=Kind::Unknown;
+        const uint64_t id=next_++;
         live_[id]={core,kind,0,packet}; packets_[packet]=id;
         if (auto *c=at(core,tick)) {
             ++c->issued;
@@ -135,9 +156,19 @@ class Observer {
             sample(t.core,id,t.packet,t.kind,level,outcome,tick);
         }
     }
+    uint64_t attemptForPacket(uint64_t packet) const {
+        const auto it=packets_.find(packet);
+        if (it==packets_.end()) return 0;
+        const auto tx=live_.find(it->second);
+        return tx!=live_.end() && tx->second.packet==packet ? it->second : 0;
+    }
     void finish(uint64_t packet) {
         const auto it=packets_.find(packet);
         if (it==packets_.end()) return;
+        const auto tx=live_.find(it->second);
+        if (tx!=live_.end()) {
+            if (auto *c=openWindow(tx->second.core)) ++c->released;
+        }
         live_.erase(it->second); packets_.erase(it);
     }
     void merged(int core,uint64_t tick) { if(auto *c=at(core,tick)) ++c->merged; }
@@ -151,22 +182,58 @@ class Observer {
         if(auto *c=at(core,tick)) {
             ++c->unknown_identity; ++c->unknown_context;
             if(level>=3 || unsigned(outcome)>=Outcomes) { ++c->ignored_hooks; return; }
+            if(unsigned(kind)>=Kinds) kind=Kind::Unknown;
             ++c->levels[level][unsigned(kind)][unsigned(outcome)];
             if(kind==Kind::Unknown) ++c->unknown_kind;
             sample(core,0,0,kind,level,outcome,tick);
         }
     }
     void writeback(int core,bool dirty,uint64_t tick) {
+        writebackAt(core,1,dirty,tick);
+    }
+    void writebackAt(int core,unsigned level,bool dirty,uint64_t tick) {
         if(auto *c=at(core,tick)) {
-            ++c->writebacks; c->dirty_writebacks+=dirty; ++c->unknown_context;
-            sample(core,next_++,0,Kind::Writeback,1,Outcome::Hit,tick,true);
+            if(level>=3) { ++c->ignored_hooks; return; }
+            ++c->outgoing_writebacks[level];
+            c->outgoing_dirty_writebacks[level]+=dirty;
+            ++c->unknown_context;
+            // Legacy fields remain specifically private-L2 evictions.
+            if(level==1) { ++c->writebacks; c->dirty_writebacks+=dirty; }
+            sample(core,next_++,0,Kind::Writeback,level,Outcome::Hit,tick,true);
+        }
+    }
+    void globalWriteback(unsigned level,bool dirty) {
+        // Whole-run, unassigned LLC slice diagnostics; never core/ROI PMUs.
+        if(level<3) {
+            ++global_writebacks_[level];
+            global_dirty_writebacks_[level]+=dirty;
+        }
+    }
+    void invalidation(int core,unsigned level,uint64_t tick) {
+        if(auto *c=at(core,tick)) {
+            if(level<3) ++c->invalidations[level];
+            else ++c->ignored_hooks;
         }
     }
     Counts snapshot(int core) const {
-        const auto it=cores_.find(core); return it==cores_.end() ? Counts{} : it->second.counts;
+        const auto it=cores_.find(core);
+        if(it==cores_.end()) return Counts{};
+        auto c=it->second.counts;
+        if(it->second.open || !it->second.end) {
+            c.inflight_end=inflight(core);
+            c.inflight_balance_residual=int64_t(c.inflight_begin)+int64_t(c.issued)
+                -int64_t(c.released)-int64_t(c.superseded)-int64_t(c.inflight_end);
+        }
+        return c;
     }
     uint64_t inflight(int core) const {
         uint64_t n=0; for(const auto &entry:live_) n+=entry.second.core==core; return n;
+    }
+    uint64_t globalWritebacks(unsigned level) const {
+        return level<3 ? global_writebacks_[level] : 0;
+    }
+    uint64_t globalDirtyWritebacks(unsigned level) const {
+        return level<3 ? global_dirty_writebacks_[level] : 0;
     }
     const std::vector<Sample> &samples(int core) const { return cores_.at(core).samples; }
     void writeSamples(std::ostream &out,int core) const {
@@ -227,7 +294,20 @@ inline void writeCounts(std::ostream &out,const Counts &c) {
         << ",\"retries\":" << c.retries << ",\"unknown_context\":" << c.unknown_context
         << ",\"unknown_kind\":" << c.unknown_kind << ",\"ignored_hooks\":" << c.ignored_hooks
         << ",\"unknown_identity\":" << c.unknown_identity
-        << ",\"duplicate_edges\":" << c.duplicate_edges << ",\"overflow\":" << c.overflow << '}';
+        << ",\"duplicate_edges\":" << c.duplicate_edges << ",\"overflow\":" << c.overflow
+        << ",\"per_level_diagnostics\":{";
+    for(unsigned l=0;l<3;++l) {
+        if(l) out << ',';
+        out << '"' << levels[l] << "\":{\"outgoing_writebacks\":"
+            << c.outgoing_writebacks[l] << ",\"outgoing_dirty_writebacks\":"
+            << c.outgoing_dirty_writebacks[l] << ",\"invalidations\":"
+            << c.invalidations[l] << '}';
+    }
+    out << "},\"transaction_balance\":{\"inflight_begin\":" << c.inflight_begin
+        << ",\"inflight_end\":" << c.inflight_end
+        << ",\"released\":" << c.released
+        << ",\"superseded\":" << c.superseded
+        << ",\"balance_residual\":" << c.inflight_balance_residual << "}}";
 }
 }} // gem5::perf_cache_native
 #endif

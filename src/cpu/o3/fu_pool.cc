@@ -188,19 +188,27 @@ FUPool::bindPort(const DynInstPtr &inst, Cycles cycle)
     if (!mask)
         return;
     startAllocationCycle(cycle);
-    std::vector<unsigned> candidates;
+    std::array<unsigned, 12> candidates;
+    auto candidates_end = candidates.begin();
     for (unsigned port = 0; port < 12; ++port)
-        if (mask & (1u << port)) candidates.push_back(port);
-    std::sort(candidates.begin(), candidates.end(), [this](auto a, auto b) {
+        if (mask & (1u << port)) *candidates_end++ = port;
+    std::sort(candidates.begin(), candidates_end, [this](auto a, auto b) {
         return allocationLoadSnapshot[a] != allocationLoadSnapshot[b] ?
             allocationLoadSnapshot[a] < allocationLoadSnapshot[b] : a > b;
     });
     const unsigned minimum = allocationLoadSnapshot[candidates.front()];
-    candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+    candidates_end = std::remove_if(candidates.begin(), candidates_end,
         [this, minimum](auto p) {
             return allocationLoadSnapshot[p] >= minimum + 5;
-        }), candidates.end());
-    const unsigned port = candidates[batchMaskUses[mask]++ % candidates.size()];
+        });
+    auto uses = std::find_if(batchMaskUses.begin(), batchMaskUses.end(),
+        [mask](const auto &entry) { return entry.first == mask; });
+    if (uses == batchMaskUses.end()) {
+        batchMaskUses.emplace_back(mask, 0);
+        uses = batchMaskUses.end() - 1;
+    }
+    const unsigned port =
+        candidates[uses->second++ % (candidates_end - candidates.begin())];
     inst->boundExecutionPort = port;
     ++pendingPortLoads[port];
 }

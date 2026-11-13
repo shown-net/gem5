@@ -99,9 +99,6 @@ class RubySequencer(RubyPort):
     data_fill_response_width = Param.Unsigned(
         0, "Ordinary data-fill load responses per core cycle; zero is unlimited"
     )
-    max_store_prepare_outstanding = Param.Unsigned(
-        16, "Drop permission-prepare hints above this bound; zero is unlimited"
-    )
     deadlock_threshold = Param.Cycles(
         500000,
         "max outstanding cycles for a request "

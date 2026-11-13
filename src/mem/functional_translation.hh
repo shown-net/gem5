@@ -20,6 +20,9 @@ class TranslationMissExtension
 {
   public:
     bool stlbMiss = false;
+    // Request-local walker roles; a retried fragment can observe both.
+    bool stlbWalkLeader = false;
+    bool stlbWalkFollower = false;
     std::unique_ptr<ExtensionBase> clone() const override
     {
         return std::make_unique<TranslationMissExtension>(*this);

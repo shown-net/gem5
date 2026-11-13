@@ -123,6 +123,7 @@ class MemInterface : public AbstractMemory
      * Memory controller configuration initialized based on parameter
      * values.
      */
+    const std::vector<AddrRange> channelRanges;
     enums::AddrMap addrMapping;
 
     /**
@@ -235,7 +236,24 @@ class MemInterface : public AbstractMemory
      * @param addr The intput address which should be in the addrRange
      * @return An address in the continues range [0, max)
      */
-    Addr getCtrlAddr(Addr addr) { return range.getOffset(addr); }
+    Addr getCtrlAddr(Addr addr)
+    {
+        if (channelRanges.empty()) return range.getOffset(addr);
+        Addr offset = 0;
+        for (const auto &part : channelRanges) {
+            if (part.contains(addr)) return offset + part.getOffset(addr);
+            offset += part.size();
+        }
+        panic("Address outside shared channel ranges");
+    }
+
+    uint64_t timingCapacity() const
+    {
+        if (channelRanges.empty()) return AbstractMemory::size();
+        uint64_t total = 0;
+        for (const auto &part : channelRanges) total += part.size();
+        return total;
+    }
 
     /**
      * Setup the rank based on packet received

@@ -28,6 +28,9 @@ class GoldenCoveBP : public ConditionalPredictor
   public:
     explicit GoldenCoveBP(const GoldenCoveBPParams &p);
     bool lookup(ThreadID tid, Addr pc, void *&history) override;
+    std::shared_ptr<const void> pathSnapshot(ThreadID tid) const override;
+    bool lookupNotTakenSnapshot(const std::shared_ptr<const void> &snapshot,
+                                Addr pc, void *&history) override;
     void updateHistories(ThreadID tid, Addr pc, bool uncond, bool taken,
         Addr target, const StaticInstPtr &inst, void *&history) override;
     void update(ThreadID tid, Addr pc, bool taken, void *&history,
@@ -58,6 +61,8 @@ class GoldenCoveBP : public ConditionalPredictor
     unsigned index(const GoldenPath &h, Addr pc, unsigned bank) const;
     uint16_t tag(const GoldenPath &h, Addr pc, unsigned bank) const;
     History *capture(ThreadID tid, Addr pc);
+    History *capture(const GoldenPath &path, Addr pc);
+    bool lookupHistory(History *history, Addr pc);
 };
 
 /** Indirector Sec.3.2/Fig.8-9 geometry and hashes, used as a SPR proxy.
@@ -70,6 +75,10 @@ class GoldenCoveIndirectPredictor : public IndirectPredictor
     explicit GoldenCoveIndirectPredictor(const GoldenCoveIndirectPredictorParams &p);
     void reset() override;
     void setUserMode(ThreadID tid, bool user) override { userMode[tid] = user; }
+    void setReturnFallback(void *history) override;
+    std::shared_ptr<const void> pathSnapshot(ThreadID tid) const override;
+    bool notTakenSnapshot(ThreadID tid, Addr pc,
+        const std::shared_ptr<const void> &snapshot, void *&history) override;
     const PCStateBase *lookup(ThreadID tid, InstSeqNum sn, Addr pc,
         void *&history) override;
     void update(ThreadID tid, InstSeqNum sn, Addr pc, bool squash, bool taken,
@@ -89,7 +98,7 @@ class GoldenCoveIndirectPredictor : public IndirectPredictor
     struct History {
         GoldenPath before;
         Addr pc = 0;
-        bool indirect = false, taken = false, user = false;
+        bool indirect = false, taken = false, user = false, returnFallback = false;
         int provider = -1;
         std::unique_ptr<PCStateBase> predicted, target;
     };

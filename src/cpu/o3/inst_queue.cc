@@ -371,7 +371,7 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
 
     resetState();
     if (params.resultForwarding)
-        params.resultForwarding->bindCPU(cpu);
+        params.resultForwarding->bindCPU(cpu, numPhysRegs);
     for (auto iq : iqs)
         iq->fuPool()->bindIntegerResources(params.executionPorts, params.resultForwarding,
             params.intALU, params.intSHFT, params.intSlow, params.intBM,
@@ -781,15 +781,29 @@ InstructionQueue::hasReservation(const DynInstPtr &inst) const
 bool
 InstructionQueue::canReserve(const std::vector<DynInstPtr> &batch)
 {
-    std::map<IQUnit *, unsigned> used;
-    std::map<std::pair<IQUnit *, ThreadID>, unsigned> thread_used;
-    std::map<InstSeqNum, IQUnit *> groups;
+    assert(batch.size() <= MaxWidth);
+    struct Usage
+    {
+        unsigned total = 0;
+        std::array<unsigned, MaxThreads> thread{};
+    };
+    struct Group
+    {
+        InstSeqNum key;
+        IQUnit *owner;
+    };
+    std::vector<Usage> used(iqs.size());
+    std::array<Group, MaxWidth> groups;
+    unsigned group_count = 0;
     for (const auto &inst : batch) {
         if (inst->bypassesIQ() || hasReservation(inst))
             continue;
         bool found = false;
         const auto group = inst->schedulerKey();
-        IQUnit *owner = groups.count(group) ? groups.at(group) : nullptr;
+        const auto group_end = groups.begin() + group_count;
+        auto found_group = std::find_if(groups.begin(), group_end,
+            [group](const Group &entry) { return entry.key == group; });
+        IQUnit *owner = found_group != group_end ? found_group->owner : nullptr;
         for (auto iq : iqs)
             if (iq->hasGroup(group)) owner = iq;
         for (auto iq : iqs) {
@@ -797,14 +811,21 @@ InstructionQueue::canReserve(const std::vector<DynInstPtr> &batch)
             if (!iq->allows(inst) || (inst->opClass() != No_OpClass &&
                 !iq->fuPool()->isCapable(inst->opClass())))
                 continue;
-            const auto key = std::make_pair(iq, inst->threadNumber);
-            const unsigned slots = groups.count(group) ? 0 : iq->reservationDemand(inst);
-            if (iq->numFreeEntries() >= used[iq] + slots &&
+            // Credits belong to the IQ object even if its parameter list
+            // contains that object more than once.
+            auto &usage = used[std::distance(
+                iqs.begin(), std::find(iqs.begin(), iqs.end(), iq))];
+            const unsigned slots = found_group != group_end ?
+                0 : iq->reservationDemand(inst);
+            if (iq->numFreeEntries() >= usage.total + slots &&
                 iq->numFreeEntries(inst->threadNumber) >=
-                    thread_used[key] + slots) {
-                used[iq] += slots;
-                thread_used[key] += slots;
-                groups[group] = iq;
+                    usage.thread[inst->threadNumber] + slots) {
+                usage.total += slots;
+                usage.thread[inst->threadNumber] += slots;
+                if (found_group == group_end)
+                    groups[group_count++] = {group, iq};
+                else
+                    found_group->owner = iq;
                 found = true;
                 break;
             }
@@ -1226,6 +1247,8 @@ InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
 void
 InstructionQueue::scheduleReadyInsts()
 {
+    if (cpu->resultForwarding)
+        cpu->resultForwarding->beginIssuePass();
     DPRINTF(IQ, "Attempting to schedule ready instructions from "
             "the IQ.\n");
 
@@ -1282,7 +1305,7 @@ InstructionQueue::scheduleReadyInsts()
     // This will avoid trying to schedule a certain op class if there are no
     // FUs that handle it.
     int total_issued = 0;
-    std::vector<DynInstPtr> resource_deferred;
+    resourceDeferred.clear();
     ListOrderIt order_it = listOrder.begin();
     ListOrderIt order_end_it = listOrder.end();
 
@@ -1325,7 +1348,7 @@ InstructionQueue::scheduleReadyInsts()
         if (!issuing_inst->isInIQ()) {
             auto *replacement = findOrReclaimIQ(issuing_inst);
             if (!replacement) {
-                resource_deferred.push_back(issuing_inst);
+                resourceDeferred.push_back(issuing_inst);
                 readyInsts[op_class].pop();
                 if (!readyInsts[op_class].empty())
                     moveToYoungerInst(order_it);
@@ -1343,7 +1366,7 @@ InstructionQueue::scheduleReadyInsts()
         // acquire another execution port. They may finish even when all real
         // port grants for this cycle have been used.
         if (total_issued + issuing_inst->issueSlots() > totalWidth) {
-            resource_deferred.push_back(issuing_inst);
+            resourceDeferred.push_back(issuing_inst);
             readyInsts[op_class].pop();
             if (!readyInsts[op_class].empty())
                 moveToYoungerInst(order_it);
@@ -1530,7 +1553,7 @@ InstructionQueue::scheduleReadyInsts()
             iqStats.statFuBusy[op_class]++;
             iqStats.fuBusy[tid]++;
             if (managed || issuing_inst->boundExecutionPort >= 0) {
-                resource_deferred.push_back(issuing_inst);
+                resourceDeferred.push_back(issuing_inst);
                 readyInsts[op_class].pop();
                 if (!readyInsts[op_class].empty())
                     moveToYoungerInst(order_it);
@@ -1545,7 +1568,7 @@ InstructionQueue::scheduleReadyInsts()
         }
     }
 
-    for (const auto &inst : resource_deferred) {
+    for (const auto &inst : resourceDeferred) {
         // These operations were already selected from a ready queue. Memory
         // readiness is owned by MemDepUnit, which can leave CanIssue clear
         // after resolving its dependencies. Rechecking readyToIssue() would
@@ -1568,6 +1591,9 @@ InstructionQueue::scheduleReadyInsts()
     } else {
         DPRINTF(IQ, "Not able to schedule any instructions.\n");
     }
+    if (cpu->resultForwarding)
+        cpu->resultForwarding->endIssuePass();
+    resourceDeferred.clear();
 }
 
 void

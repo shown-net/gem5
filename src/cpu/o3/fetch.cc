@@ -41,6 +41,7 @@
  */
 
 #include "cpu/o3/fetch.hh"
+#include "arch/x86/pcstate.hh"
 #include "arch/x86/regs/misc.hh"
 
 #include <algorithm>
@@ -64,6 +65,7 @@
 #include "mem/packet.hh"
 #include "mem/inst_code.hh"
 #include "mem/taotrace_response.hh"
+#include "mem/functional_translation.hh"
 #include "params/BaseO3CPU.hh"
 #include "sim/byteswap.hh"
 #include "sim/core.hh"
@@ -118,6 +120,8 @@ Fetch::IcachePort::IcachePort(Fetch *_fetch, CPU *_cpu) :
 Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
     : fetchPolicy(params.smtFetchPolicy),
       cpu(_cpu),
+      wakeEvent([this] { cpu->wakeFrontend(); }, "Fetch ready", false,
+                Event::CPU_Tick_Pri - 1),
       frontend(params.frontend),
       bac(nullptr),
       ftq(nullptr),
@@ -140,6 +144,7 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
       finishTranslationEvent(this),
       maxFTPerCycle(params.maxFTPerCycle),
       maxTakenPredPerCycle(params.maxTakenPredPerCycle),
+      maxDsbTakenPerCycle(params.maxDsbTakenPerCycle),
       fetchStats(_cpu, this)
 {
     if (numThreads > MaxThreads)
@@ -186,6 +191,35 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
 
     // Get the size of an instruction.
     instSize = decoder[0]->moreBytesSize();
+}
+
+void
+Fetch::cancelWake()
+{
+    if (wakeEvent.scheduled()) cpu->deschedule(wakeEvent);
+}
+
+void
+Fetch::refreshWake()
+{
+    cancelWake();
+    if (!frontend || cpu->switchedOut() ||
+        cpu->drainState() == DrainState::Drained) return;
+    const uint64_t now = uint64_t(cpu->curCycle());
+    uint64_t due = frontend->instructionBytes->nextReady(now);
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        if (stalls[tid].drain) continue;
+        if (btbReadyCycle[tid] > now) due = std::min(due, btbReadyCycle[tid]);
+        if (lcpDecoded[tid] && lcpReadyCycle[tid] > now)
+            due = std::min(due, lcpReadyCycle[tid]);
+        if (decoupledFrontEnd && ftq) {
+            auto head = ftq->readHead(tid);
+            if (head && head->exitReadyAt() > now)
+                due = std::min(due, head->exitReadyAt());
+        }
+    }
+    if (due != ~uint64_t(0))
+        cpu->schedule(wakeEvent, cpu->clockEdge(Cycles(due - now)));
 }
 
 std::string Fetch::name() const { return cpu->name() + ".fetch"; }
@@ -267,6 +301,7 @@ Fetch::setTimeBuffer(TimeBuffer<TimeStruct> *time_buffer)
     // the BAC and fetch stage as the BAC stage does the PC updated
     // functionality and holds the branch predictor.
     toBAC = timeBuffer->getWire(0);
+    fromBAC = timeBuffer->getWire(0);
 }
 
 void
@@ -305,7 +340,11 @@ Fetch::startupStage()
 void
 Fetch::clearStates(ThreadID tid)
 {
+    cancelWake();
+    revokeDemandRequest(tid);
     discardByteLookahead(tid);
+    noTargetBranch[tid] = 0;
+    lateHoldSequences[tid].clear();
     btbReadyCycle[tid] = 0;
     if (frontend) {
         frontend->reset();
@@ -340,6 +379,7 @@ Fetch::clearStates(ThreadID tid)
 void
 Fetch::resetStage()
 {
+    cancelWake();
     if (frontend) {
         frontend->reset();
         expansionTemplate.reset();
@@ -348,15 +388,18 @@ Fetch::resetStage()
     }
     numInst = 0;
     interruptPending = false;
-    cacheBlocked = false;
+    panic_if(cacheBlocked, "Cannot reset Fetch while an I-cache retry is outstanding");
 
     priorityList.clear();
 
     // Setup PC and nextPC with initial state.
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        revokeDemandRequest(tid);
         discardByteLookahead(tid);
         btbReadyCycle[tid] = 0;
         microcodeControl[tid] = 0;
+        noTargetBranch[tid] = 0;
+        lateHoldSequences[tid].clear();
         fetchStatus[tid] = Running;
         set(pc[tid], cpu->pcState(tid));
         fetchOffset[tid] = 0;
@@ -401,6 +444,12 @@ Fetch::processCacheCompletion(PacketPtr pkt)
             pkt->req,
             TaoTraceFrontendRegistry::Terminal::SquashedResponse,
             uint64_t(curTick()));
+        // The response has arrived even if a trap or drain has changed the
+        // fetch status. Do not leave this request marked as still in flight.
+        if (pkt->req == memReq[tid]) {
+            memReq[tid] = nullptr;
+            demandAccepted[tid] = false;
+        }
         ++fetchStats.icacheSquashes;
         delete pkt;
         return;
@@ -418,6 +467,7 @@ Fetch::processCacheCompletion(PacketPtr pkt)
             uint64_t(curTick()));
         delete pkt;
         memReq[tid] = nullptr;
+        demandAccepted[tid] = false;
         fetchStatus[tid] = checkStall(tid) ? Blocked : Running;
         cpu->wakeCPU();
         switchToActive();
@@ -425,9 +475,15 @@ Fetch::processCacheCompletion(PacketPtr pkt)
     }
 
     if (frontend) {
+        std::optional<fastsim::fst::TranslationFragment> translation;
+        if (cpu->instructionTranslationObservation) {
+            const auto extension=pkt->req->getExtension<FunctionalTranslationExtension>();
+            if (extension) translation=extension->fragment;
+        }
         frontend->instructionBytes->complete(pkt->req->getVaddr(),
             pkt->req->getPaddr(), pkt->getConstPtr<uint8_t>(), fetchBufferSize,
-            uint64_t(cpu->curCycle()), !pkt->req->isUncacheable());
+            uint64_t(cpu->curCycle()), !pkt->req->isUncacheable(),
+            std::move(translation));
     } else {
         memcpy(fetchBuffer[tid], pkt->getConstPtr<uint8_t>(), fetchBufferSize);
     }
@@ -455,6 +511,7 @@ Fetch::processCacheCompletion(PacketPtr pkt)
         pkt->req, TaoTraceFrontendRegistry::Terminal::Response,
         uint64_t(curTick()));
     // Reset the mem req to NULL.
+    demandAccepted[tid] = false;
     delete pkt;
     memReq[tid] = NULL;
 }
@@ -487,6 +544,7 @@ Fetch::drainSanityCheck() const
 bool
 Fetch::isDrained() const
 {
+    if (cacheBlocked) return false;
     if (!byteRequests.empty()) return false;
     if (frontend && !frontend->empty()) return false;
     /* Make sure that threads are either idle of that the commit stage
@@ -647,11 +705,7 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
 
     // @todo: not sure if these should block translation.
     //AlphaDep
-    if (cacheBlocked) {
-        DPRINTF(Fetch, "[tid:%i] Can't fetch cache line, cache blocked\n",
-                tid);
-        return false;
-    } else if (checkInterrupt(pc) && !delayedCommit[tid]) {
+    if (checkInterrupt(pc) && !delayedCommit[tid]) {
         // Hold off fetch from getting new instructions when:
         // Cache is blocked, or
         // while an interrupt is pending and we're not in PAL mode, or
@@ -670,7 +724,8 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
     if (frontend) {
         for (auto it = byteRequests.begin(); it != byteRequests.end(); ++it) {
             const auto &request = it->first;
-            if (cpu->contextToThread(request->contextId()) != tid ||
+            if (it->second.cancelled ||
+                cpu->contextToThread(request->contextId()) != tid ||
                 request->getVaddr() != fetchBufferBlockPC)
                 continue;
             if (lookahead)
@@ -684,13 +739,24 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
             requestEpoch[tid] = it->second.epoch;
             fetchBufferPC[tid] = fetchBufferBlockPC;
             fetchBufferValid[tid] = false;
-            fetchStatus[tid] = it->second.response ?
-                IcacheWaitResponse : ItlbWait;
-            if (it->second.response)
+            if (it->second.response) {
+                fetchStatus[tid] = IcacheWaitResponse;
+                demandAccepted[tid] = true;
                 lastIcacheStall[tid] = curTick();
-            byteRequests.erase(it);
+                byteRequests.erase(it);
+            } else if (retryPkt && retryPkt->req == request) {
+                fetchStatus[tid] = IcacheWaitRetry;
+                byteRequests.erase(it);
+            } else {
+                it->second.demand = true;
+                fetchStatus[tid] = ItlbWait;
+            }
             return true;
         }
+    }
+    if (cacheBlocked && !frontend) {
+        DPRINTF(Fetch, "[tid:%i] Can't fetch cache line, cache blocked\n", tid);
+        return false;
     }
 
     // Setup the memReq to do a read of the first instruction's address.
@@ -709,6 +775,7 @@ Fetch::fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc, bool lookahead)
     mem_req->taskId(cpu->taskId());
 
     memReq[tid] = mem_req;
+    demandAccepted[tid] = false;
     byteLookahead[tid] = lookahead;
     if (frontend) requestEpoch[tid] = frontend->translationEpoch();
 
@@ -800,7 +867,12 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
             return;
         }
         if (frontend) {
-            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr());
+            std::optional<fastsim::fst::TranslationFragment> translation;
+            if (cpu->instructionTranslationObservation) {
+                const auto extension=mem_req->getExtension<FunctionalTranslationExtension>();
+                if (extension) translation=extension->fragment;
+            }
+            frontend->translated(mem_req->getVaddr(), mem_req->getPaddr(),std::move(translation));
             // A validated DSB hit consumes no native I-cache request.
             const auto identity = frontend->identity(byteLookahead[tid] ?
                 mem_req->getPC() : pc[tid]->instAddr());
@@ -842,6 +914,16 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
             return;
         }
 
+        if (frontend) {
+            fetchBufferPC[tid] = fetchBufferBlockPC;
+            fetchBufferValid[tid] = false;
+            ByteRequest state{requestEpoch[tid], nextByteRequestOrder++};
+            state.translated = true;
+            state.demand = true;
+            byteRequests.emplace(mem_req, state);
+            return;
+        }
+
         // Build packet here.
         PacketPtr data_pkt = new Packet(mem_req, MemCmd::ReadReq);
         data_pkt->dataDynamic(new uint8_t[fetchBufferSize]);
@@ -870,6 +952,7 @@ Fetch::finishTranslation(const Fault &fault, const RequestPtr &mem_req)
                     "response.\n", tid);
             lastIcacheStall[tid] = curTick();
             fetchStatus[tid] = IcacheWaitResponse;
+            demandAccepted[tid] = true;
             // Notify Fetch Request probe when a packet containing a fetch
             // request is successfully sent
             ppFetchRequestSent->notify(mem_req);
@@ -942,6 +1025,8 @@ Fetch::squashFromDecode(const PCStateBase &new_pc, const DynInstPtr squashInst,
     DPRINTF(Fetch, "[tid:%i] Squashing from decode.\n", tid);
 
     doSquash(new_pc, squashInst, tid);
+    lateHoldSequences[tid].erase(lateHoldSequences[tid].lower_bound(seq_num),
+                                 lateHoldSequences[tid].end());
     cpu->recoveryStats.restarted(tid);
 
     if (frontend) frontend->redirect(seq_num);
@@ -958,6 +1043,8 @@ Fetch::squashFromCommit(const PCStateBase &new_pc, const InstSeqNum seq_num,
     DPRINTF(Fetch, "[tid:%i] Squash from commit.\n", tid);
 
     doSquash(new_pc, squashInst, tid);
+    lateHoldSequences[tid].erase(lateHoldSequences[tid].lower_bound(seq_num),
+                                 lateHoldSequences[tid].end());
     cpu->recoveryStats.restarted(tid);
 
     if (squashInst && squashInst->isSquashAfter() &&
@@ -983,6 +1070,7 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
     pendingMemoryExpansion.clear();
     btbReadyCycle[tid] = 0;
     microcodeControl[tid] = 0;
+    noTargetBranch[tid] = 0;
     lcpDecoded[tid] = nullptr;
     lcpReadyCycle[tid] = 0;
     dsbMissExposed[tid].reset();
@@ -991,6 +1079,7 @@ Fetch::doSquash(const PCStateBase &new_pc, const DynInstPtr squashInst,
 
     TaoTraceFrontendRegistry::noteSquash(
         uint32_t(cpu->thread[tid]->contextId()), memReq[tid] != nullptr);
+    revokeDemandRequest(tid);
     discardByteLookahead(tid);
 
     set(pc[tid], new_pc);
@@ -1131,6 +1220,27 @@ Fetch::tick()
     }
 
     for (ThreadID tid : *activeThreads) {
+        const auto &bac = fromBAC->bacInfo[tid];
+        if (bac.frontendRedirect && bac.redirectTarget) {
+            doSquash(*bac.redirectTarget, nullptr, tid);
+            lateHoldSequences[tid].erase(
+                lateHoldSequences[tid].lower_bound(bac.redirectSequence),
+                lateHoldSequences[tid].end());
+            frontend->redirect(bac.redirectSequence);
+            cpu->removeInstsUntil(bac.redirectSequence, tid);
+        } else if (bac.correctionInst) {
+            lateHoldSequences[tid].insert(bac.correctionInst->seqNum);
+        }
+        if (noTargetBranch[tid] &&
+            fromBAC->bacInfo[tid].resolvedNoTarget == noTargetBranch[tid]) {
+            noTargetBranch[tid] = 0;
+            if (decoupledFrontEnd && ftq->isLocked(tid)) {
+                ftq->popHead(tid);
+                bacResteer(*pc[tid], tid);
+            }
+        }
+        for (InstSeqNum sequence : fromCommit->commitInfo[tid].releaseLateSequences)
+            lateHoldSequences[tid].erase(sequence);
         // Check the signals for each thread to determine the proper status
         // for each thread.
         bool updated_status = checkSignalsAndUpdate(tid);
@@ -1153,14 +1263,21 @@ Fetch::tick()
         bool translation = fetchStatus[0] == ItlbWait;
         bool response = fetchStatus[0] == IcacheWaitResponse;
         bool retry = fetchStatus[0] == IcacheWaitRetry;
+        const auto demand = byteRequests.find(memReq[0]);
+        if (demand != byteRequests.end() && demand->second.translated) {
+            translation = false;
+            retry |= cacheBlocked;
+        }
         const Addr address = pc[0]->instAddr() + fetchOffset[0];
         if (!frontend->instructionBytes->contains(address)) {
             for (const auto &[request, state] : byteRequests) {
-                if (request->getVaddr() != fetchBufferAlignPC(address)) continue;
+                if (state.cancelled ||
+                    request->getVaddr() != fetchBufferAlignPC(address)) continue;
                 const bool retrying = retryPkt && retryPkt->req == request;
-                retry |= retrying;
+                retry |= retrying ||
+                    (state.translated && !state.response && cacheBlocked);
                 response |= state.response;
-                translation |= !state.response && !retrying;
+                translation |= !state.translated && !state.response && !retrying;
                 break;
             }
         }
@@ -1169,15 +1286,21 @@ Fetch::tick()
             fromRename->renameInfo[0],
             [this](FrontendRecordPtr record) {
                 return emitFrontendRecord(std::move(record));
-            });
+            }, !lateHoldSequences[0].empty() || fromBAC->bacInfo[0].holdFetch);
     }
 
     for (threadFetched = 0; threadFetched < numFetchingThreads;
          threadFetched++) {
         // Fetch each of the actively fetching threads.
-        if (frontend) fetchFrontend(status_change);
-        else fetch(status_change);
+        if (frontend) {
+            if (lateHoldSequences[0].empty() && !fromBAC->bacInfo[0].holdFetch &&
+                !fromBAC->bacInfo[0].holdDecodeOnly)
+                fetchFrontend(status_change);
+        } else {
+            fetch(status_change);
+        }
     }
+    if (frontend) sendReadyByteRequests();
 
     // Record number of instructions fetched this cycle for distribution.
     fetchStats.nisnDist.sample(numInst);
@@ -1193,6 +1316,7 @@ Fetch::tick()
             pipelineIcacheAccesses(i);
         }
     }
+    refreshWake();
 
     // Send instructions enqueued into the fetch queue to decode.
     // Limit rate by fetchWidth.  Stall if decode is stalled.
@@ -1357,6 +1481,8 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     // Create a new DynInst from the instruction fetched.
     DynInstPtr instruction = new (arrays) DynInst(
             arrays, staticInst, curMacroop, this_pc, next_pc, seq, cpu);
+    instruction->functionalBoundary=this_pc.as<X86ISA::PCState>().functionalBoundary();
+    instruction->functionalMacroOrigin=this_pc.as<X86ISA::PCState>().functionalMacroOrigin();
     instruction->setTid(tid);
     if (cpu->markerObservation) {
         instruction->fetchedFromUser = cpu->inUserMode(tid);
@@ -1596,6 +1722,9 @@ Fetch::fetch(bool &status_change)
             if (!(curMacroop || inRom)) {
                 if (dec_ptr->instReady()) {
                     staticInst = dec_ptr->decode(this_pc);
+                    if(auto* observer=functional_arch::observer(cpu->tcBase(tid)))
+                        if(!this_pc.as<X86ISA::PCState>().functionalMacroOrigin().valid())
+                this_pc.as<X86ISA::PCState>().functionalMacroOrigin(observer->newMacroOrigin());
 
                     // Increment stat of fetched instructions.
                     cpu->fetchStats[tid]->numInsts++;
@@ -1763,6 +1892,7 @@ Fetch::recvReqRetry()
 {
     // If a trap is pending to execute, discard the retry
     if (retryPkt != NULL && fetchStatus[retryTid] == TrapPending) {
+        byteRequests.erase(retryPkt->req);
         TaoTraceFrontendRegistry::noteTerminal(
             retryPkt->req, TaoTraceFrontendRegistry::Terminal::RetryDiscard,
             uint64_t(curTick()));
@@ -1784,6 +1914,8 @@ Fetch::recvReqRetry()
                 byteRequests.at(retryPkt->req).response = true;
             else
                 fetchStatus[retryTid] = IcacheWaitResponse;
+            if (!predicted) demandAccepted[retryTid] = true;
+            if (!predicted) lastIcacheStall[retryTid] = curTick();
             // Notify Fetch Request probe when a retryPkt is successfully sent.
             // Note that notify must be called before retryPkt is set to NULL.
             ppFetchRequestSent->notify(retryPkt->req);
@@ -1796,6 +1928,10 @@ Fetch::recvReqRetry()
         // Access has been squashed since it was sent out.  Just clear
         // the cache being blocked.
         cacheBlocked = false;
+    }
+    if (!cacheBlocked) {
+        cpu->wakeCPU();
+        switchToActive();
     }
 }
 

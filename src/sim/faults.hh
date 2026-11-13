@@ -46,6 +46,7 @@
 #include "cpu/static_inst_fwd.hh"
 #include "mem/htm.hh"
 #include "sim/stats.hh"
+#include "mem/functional_architectural_boundaries.hh"
 
 namespace gem5
 {
@@ -59,6 +60,7 @@ class FaultBase
 {
   public:
     virtual FaultName name() const = 0;
+    virtual functional_arch::AcceptedFacts functionalBoundaryFacts(ThreadContext*) const { return {}; }
     virtual void invoke(ThreadContext * tc, const StaticInstPtr &inst=
                         nullStaticInstPtr);
     virtual ~FaultBase() {};

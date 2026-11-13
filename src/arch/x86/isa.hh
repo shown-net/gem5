@@ -29,6 +29,7 @@
 #ifndef __ARCH_X86_ISA_HH__
 #define __ARCH_X86_ISA_HH__
 
+#include "mem/functional_mmu_controls.hh"
 #include <iostream>
 #include <string>
 
@@ -73,6 +74,7 @@ class ISA : public BaseISA
     using Params = X86ISAParams;
 
     ISA(const Params &p);
+    ~ISA() override { functional_mmu::unregisterEndpoint(this); }
 
     uint64_t tscCycles(Tick tick) const;
     bool referenceClockCycles(Tick tick, uint64_t &cycles) const override

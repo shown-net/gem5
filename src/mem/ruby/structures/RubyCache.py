@@ -40,7 +40,7 @@ class RubyCache(SimObject):
     replacement_policy = Param.BaseReplacementPolicy(TreePLRURP(), "")
     start_index_bit = Param.Int(6, "index start, default 6 for 64-byte line")
     index_divisor = Param.Unsigned(
-        1, "Divide the shifted line address by the logical slice count before indexing"
+        1, "Divide the line address by the slice count; 52 banks use the SPR XOR proxy"
     )
     is_icache = Param.Bool(False, "is instruction only cache")
     block_size = Param.MemorySize(

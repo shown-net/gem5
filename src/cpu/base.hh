@@ -626,6 +626,18 @@ class BaseCPU : public ClockedObject
     static std::vector<BaseCPU *> cpuList;   //!< Static global cpu list
 
   public:
+    // Observation only: do not advance counters or notify any probe.
+    struct CycleCounterObservation {
+        uint64_t previous_cycle;
+        bool was_on;
+        bool was_sleeping;
+    };
+    CycleCounterObservation observeCycleCounter() const
+    {
+        return {uint64_t(previousCycle), previousState == CPU_STATE_ON,
+                previousState == CPU_STATE_SLEEP};
+    }
+
     void
     traceFunctions(Addr pc)
     {

@@ -14,9 +14,9 @@ The main website can be found at <http://www.gem5.org>.
 
 The current local changes implement the SPR component redesign in the companion
 [CPU calibration repository](../../calibration/cpu_microarchitecture/README.md).
-Its [component design](../../calibration/cpu_microarchitecture/docs/calibration/spr-component-redesign.md)
-owns the 29-item scope; workload evidence and remaining gaps are maintained in
-the companion calibration reports.
+Its [current component model](../../calibration/cpu_microarchitecture/docs/calibration/spr-model.md)
+owns parameters, behavior and coverage; workload evidence and remaining gaps
+are maintained in the companion calibration reports.
 
 Changes cover memory dependence and forwarding, logical store credits and early
 prepare, staged fill-buffer service, paging-prefix caching, frontend supply and
@@ -24,17 +24,19 @@ recovery, Stack Engine and code replay, grouped IQ and physical-value accounting
 SSE XMM arithmetic, integer division, bounded REP, and Ruby checkpoint handling.
 FMA, wide-vector, and mask instruction extensions are outside this round.
 
-Use the companion repository's `compile_gem5.sh` for serial builds and its public
+Use the companion repository's `compile_gem5.sh` for coordinated builds and its public
 build/collect CLI with explicit frozen inputs. The canonical local build remains
-`build/X86`; completed evidence remains under the CPU repository's `output`.
-The companion [component model](../../calibration/cpu_microarchitecture/docs/calibration/spr-long-calibration-20261109.md)
-owns current parameters and mechanism limits. The
+`build/X86`; raw evidence remains under the CPU repository's `output`. The
 [workload reports](../../calibration/cpu_microarchitecture/docs/calibration/real-workloads/README.md)
 and [guest wakeup analysis](../../calibration/cpu_microarchitecture/docs/calibration/multicore/experiments/futex-wakeup/analysis.md)
 own measured binary identities, complete windows, residuals, and unresolved
 guest failures. Data/tag stall counters remain a shared candidate proxy.
 Remaining gaps include DSB supply, forwarding readiness, translation overlap,
 memory service, and execution and recovery populations.
+Supported-address fast forwarding and STLB indexing still have measured
+hardware/model discrepancies. Per-set directories, bounded group scans and
+reused scheduler storage improve host-side implementation costs without
+establishing general simulator throughput or hardware timing accuracy.
 
 ## Testing status
 

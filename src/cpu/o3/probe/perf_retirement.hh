@@ -4,6 +4,7 @@
 #define TAOTRACE_RETIREMENT_ROM_BOUNDARIES 1
 #define TAOTRACE_RETIREMENT_INDEPENDENT_EVENTS 1
 
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <initializer_list>
@@ -15,6 +16,11 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#include "mem/prefetch_lineage_oracle.hh"
+#include "mem/retired_cache_membership.hh"
+#include "mem/spr_retired_load_miss.hh"
+#include "mem/spr_prepare_service.hh"
 
 namespace gem5 { namespace o3 { namespace retirement {
 
@@ -141,6 +147,14 @@ inline void writeNativeMemberDiagnostic(std::ostream &out,
 // Exact independent registry facts, never the functional path-class or MSHR
 // predictor. A terminal reason mask does not identify partial forwarding bytes.
 struct NativeFacts {
+    spr_retired::Aggregate sprMiss;
+    uint64_t spr_incomplete_completions=0, spr_failed_request=0, spr_failed_address=0;
+    unsigned spr_missing_levels=0;
+    unsigned spr_failed_alias_category=255;
+    unsigned spr_failed_prepare_status=255;
+    unsigned spr_failed_prepare_invalidation=0;
+    std::array<spr_retired::Level,3> spr_failed_levels{};
+    std::vector<retired_membership::FragmentEvidence> membership_fragments;
     bool resolved=false, store_forward=false, other_terminal=false;
     uint64_t admissions=0, responses=0, coalesced=0, hierarchy_requests=0;
     uint64_t sequencer_shared=0;
@@ -151,6 +165,22 @@ struct NativeFacts {
     uint64_t l3_accesses=0,l3_hits=0,l3_tag_misses=0,l3_other=0;
     uint64_t l3_merged_misses=0,l3_remote_supplies=0,terminal_reason_mask=0;
     uint64_t l2_permission_upgrades=0,l3_permission_upgrades=0;
+    uint64_t l1_late_prefetches=0,l2_late_prefetches=0;
+    std::array<uint64_t,5> l2_prefetch_parent_llc{};
+    std::array<uint64_t,3> l2_prefetch_parent_sender{},l2_prefetch_parent_response{};
+    int l2_prefetch_parent_sender_id=-1;
+    // Independent L1D-begun prefetch chain; populated only behind the same
+    // attempt-level lifecycle gate in tao_trace.cc.
+    std::array<uint64_t,5> l1_prefetch_parent_llc{};
+    std::array<uint64_t,3> l1_prefetch_parent_sender{},l1_prefetch_parent_response{};
+    int l1_prefetch_parent_sender_id=-1;
+    // Task 4 diagnosed lifecycle facts (observer diagnostics; the Task 5
+    // membership engine consumes them). Reject bit 1 = uniqueness failure
+    // (multi follower/lookup or repeated response), bit 2 = stale/invalidate.
+    bool stale_serviced=false, repeated_response=false;
+    uint64_t hierarchy_attempts=0, hierarchy_completions=0;
+    uint64_t hierarchy_attempt_id=0, hierarchy_completion_attempt_id=0;
+    uint8_t l1_parent_reject_mask=0, l2_parent_reject_mask=0;
     // Each mask is reduced from completed physical-fragment facts, not from
     // the shared fill supplier. Bits: unknown, hit, miss, not accessed.
     uint8_t own_l2_mask=0, own_l3_mask=0;
@@ -270,11 +300,49 @@ inline unsigned classifyRetiredCache(const NativeFacts &n) {
     X(independent_l3_hits_unknown) X(independent_l3_misses_unknown)
 
 struct Counts {
+    struct EventCounts {
+        uint64_t count=0, unknown=0, nonmember=0;
+        uint64_t exact_count=0, estimated_count=0;
+        uint64_t exact_nonmember=0, estimated_nonmember=0;
+        std::array<uint64_t,24> reasons{};
+        void add(const retired_membership::Label &l) {
+            using namespace retired_membership;
+            if (l.membership==Membership::Unknown) ++unknown;
+            else if (l.membership==Membership::Member) {
+                ++count;
+                (l.certainty==Certainty::Exact ? exact_count : estimated_count)++;
+            } else {
+                ++nonmember;
+                (l.certainty==Certainty::Exact ? exact_nonmember : estimated_nonmember)++;
+            }
+            for (unsigned i=0;i<24;++i)
+                if (l.reason && std::string(l.reason)==allReasons[i]) {
+                    ++reasons[i];return;
+                }
+            throw std::runtime_error("retired cache reason absent");
+        }
+        EventCounts &operator+=(const EventCounts &o) {
+            count+=o.count;unknown+=o.unknown;nonmember+=o.nonmember;
+            exact_count+=o.exact_count;estimated_count+=o.estimated_count;
+            exact_nonmember+=o.exact_nonmember;estimated_nonmember+=o.estimated_nonmember;
+            for(unsigned i=0;i<24;++i) reasons[i]+=o.reasons[i];
+            return *this;
+        }
+    };
+    std::array<EventCounts,retired_membership::Events> membership{};
+    std::array<EventCounts,3> spr_miss{};
+    std::array<uint64_t,15> spr_paths{};
+    std::array<uint64_t,6> membership_failures{};
 #define DECLARE(name) uint64_t name=0;
     TAOTRACE_RETIREMENT_COUNTS(DECLARE)
     TAOTRACE_RETIREMENT_COVERAGE(DECLARE)
 #undef DECLARE
     Counts &operator+=(const Counts &other) {
+        for(unsigned i=0;i<3;++i) spr_miss[i]+=other.spr_miss[i];
+        for(unsigned i=0;i<15;++i) spr_paths[i]+=other.spr_paths[i];
+        for(unsigned i=0;i<retired_membership::Events;++i)
+            membership[i]+=other.membership[i];
+        for(unsigned i=0;i<6;++i) membership_failures[i]+=other.membership_failures[i];
 #define ADD(name) name+=other.name;
         TAOTRACE_RETIREMENT_COUNTS(ADD)
         TAOTRACE_RETIREMENT_COVERAGE(ADD)
@@ -287,6 +355,32 @@ struct Scopes {
     Counts physical, user, kernel, workload_task, other_task;
 };
 
+inline void writeMembershipEvents(std::ostream &out,const Counts &counts)
+{
+    static const char *names[]={"retired_l1_load_hits","retired_l1_load_misses",
+        "retired_load_fb_hits","retired_l2_load_hits","retired_l2_load_misses",
+        "retired_l3_load_hits","retired_l3_load_misses"};
+    for(unsigned i=0;i<retired_membership::Events;++i) {
+        const auto &c=i==1 ? counts.spr_miss[0] :
+            (i==4 ? counts.spr_miss[1] : (i==6 ? counts.spr_miss[2] :
+             counts.membership[i]));
+        out << ",\"" << names[i] << "\":{\"count\":" << c.count
+            << ",\"unknown\":" << c.unknown << ",\"nonmember\":" << c.nonmember
+            << ",\"exact_count\":" << c.exact_count
+            << ",\"estimated_count\":" << c.estimated_count
+            << ",\"exact_nonmember\":" << c.exact_nonmember
+            << ",\"estimated_nonmember\":" << c.estimated_nonmember
+            << ",\"reasons\":{";
+        bool first=true;
+        for(unsigned j=0;j<24;++j) if(c.reasons[j]) {
+            if(!first) out << ',';
+            first=false;
+            out << '"' << retired_membership::allReasons[j] << "\":" << c.reasons[j];
+        }
+        out << "}}";
+    }
+}
+
 inline void writeCounts(std::ostream &out, const Counts &c, bool available)
 {
     out << "{\"available\":" << (available ? "true" : "false");
@@ -296,6 +390,14 @@ inline void writeCounts(std::ostream &out, const Counts &c, bool available)
     out << ",\"coverage\":{\"unit_contract\":\"native-ISA-membership-not-hardware-certification\"";
     TAOTRACE_RETIREMENT_COVERAGE(WRITE)
 #undef WRITE
+    out << ",\"spr_service_paths\":{\"unit\":\"retired-load-macro-containing-path\","
+        "\"policy\":\"" << spr_retired::Policy << "\",\"counts\":{";
+    for(unsigned i=0;i<15;++i) {
+        if(i) out << ',';
+        out << '"' << spr_retired::Aggregate::Paths[i] << "\":";
+        if(available) out << c.spr_paths[i]; else out << "null";
+    }
+    out << "}}";
     out << "}}";
 }
 
@@ -318,6 +420,10 @@ class Ledger {
         bool rom_entry=false, rom=false, measured=false, hardware_entry=false, precise_fault=false;
         unsigned source=0;
         unsigned independent_source=0;
+        retired_membership::MacroResult membership;
+        spr_retired::Aggregate sprMiss;
+        unsigned read_members=0;
+        bool membership_set=false;
         std::vector<std::pair<uint32_t,uint64_t>> identities;
     };
     using Identity=std::pair<uint32_t,uint64_t>;
@@ -332,13 +438,113 @@ class Ledger {
         unsigned membership=0; NativeFacts facts;
     };
     std::map<unsigned,uint64_t> native_unknown_masks_;
+    uint64_t native_unknown_l1_late_prefetch_=0,native_unknown_l2_late_prefetch_=0;
+    std::array<uint64_t,5> native_unknown_l2_prefetch_parent_llc_{};
+    std::array<uint64_t,3> native_unknown_l2_prefetch_parent_sender_{},
+                           native_unknown_l2_prefetch_parent_response_{};
+    std::array<uint64_t,5> native_unknown_l1_prefetch_parent_llc_{};
+    std::array<uint64_t,3> native_unknown_l1_prefetch_parent_sender_{},
+                           native_unknown_l1_prefetch_parent_response_{};
+    // Explicit fail-closed visibility (TR-4.2): uops kept unknown by each
+    // diagnosed failure class. Saturated uniqueness/stale reject bits match
+    // TaoTraceParentReject (1=uniqueness, 2=stale/invalidate).
+    uint64_t native_unknown_stale_serviced_=0;
+    uint64_t spr_incomplete_completions_=0;
+    uint64_t native_unknown_repeated_response_=0;
+    uint64_t native_unknown_lifecycle_incomplete_=0;
+    uint64_t native_unknown_l1_parent_reject_uniqueness_=0;
+    uint64_t native_unknown_l1_parent_reject_stale_=0;
+    uint64_t native_unknown_l2_parent_reject_uniqueness_=0;
+    uint64_t native_unknown_l2_parent_reject_stale_=0;
     std::vector<NativeSample> native_unknown_samples_;
     static void add(Scopes &s, const Counts &c, bool user) {
         s.physical+=c;
         (user ? s.user : s.kernel)+=c;
     }
+    static void mergeMembership(Macro &m,
+                                const retired_membership::MacroResult &next) {
+        using namespace retired_membership;
+        if (!m.membership_set) {
+            m.membership=next;m.membership_set=true;return;
+        }
+        auto &r=m.membership;
+        r.fail_incomplete+=next.fail_incomplete;r.fail_stale+=next.fail_stale;
+        r.fail_multi_follower+=next.fail_multi_follower;
+        r.fail_mixed_ownership+=next.fail_mixed_ownership;
+        for(unsigned e=0;e<Events;++e) {
+            auto &a=r.labels[e];const auto &b=next.labels[e];
+            if (a.membership==Membership::Member && a.certainty==Certainty::Exact)
+                continue;
+            if (b.membership==Membership::Member &&
+                (a.membership!=Membership::Member || b.certainty==Certainty::Exact)) {
+                a=b;continue;
+            }
+            if (a.membership==Membership::Member) continue;
+            if (a.membership==Membership::Unknown || b.membership==Membership::Unknown) {
+                const auto reason=detail::strongerFailure(
+                    a.membership==Membership::Unknown ? a.reason : nullptr,
+                    b.membership==Membership::Unknown ? b.reason : nullptr);
+                detail::setLabel(a,Membership::Unknown,Certainty::Unclassified,reason);
+            } else if (a.reason!=b.reason || b.certainty==Certainty::Estimated) {
+                detail::setLabel(a,Membership::Nonmember,Certainty::Estimated,
+                                 Reasons::kMixedFragment);
+            }
+        }
+        for(auto e : {retired_membership::L2Hit,retired_membership::L2Miss}) {
+            auto &label=r.labels[e];
+            if (label.membership==Membership::Member &&
+                label.certainty==Certainty::Exact) {
+                label.certainty=Certainty::Estimated;
+                label.reason=Reasons::kMixedFragment;
+            }
+        }
+    }
     static Counts sourceCounts(const Macro &m) {
         Counts c;
+        using namespace retired_membership;
+        auto result=m.membership;
+        if (m.unsupported || m.leading || m.crossing || m.warmup) {
+            CaseInput input;
+            input.unsupported=m.unsupported;
+            input.boundary=m.leading || m.crossing || m.warmup;
+            result=evaluate(input);
+        } else if (m.unresolved || !m.membership_set) {
+            const auto unknown=evaluate(CaseInput{});
+            if (!m.membership_set) result=unknown;
+            else {
+                for(unsigned e=0;e<Events;++e)
+                    if(result.labels[e].membership!=Membership::Member)
+                        result.labels[e]=unknown.labels[e];
+                ++result.fail_incomplete;
+            }
+        }
+        for(unsigned i=0;i<Events;++i) c.membership[i].add(result.labels[i]);
+        const bool invalid=m.unsupported || m.leading || m.crossing || m.warmup;
+        for(unsigned i=0;i<15;++i)
+            c.spr_paths[i]=bool(m.sprMiss.path_mask&(1u<<i));
+        const char *positive[]={Reasons::kDirectL1Miss,Reasons::kDirectL2Miss,
+                                Reasons::kDirectL3Miss};
+        const char *negative[]={Reasons::kDirectL1Hit,Reasons::kDirectL2Hit,
+                                Reasons::kDirectL3Hit};
+        for(unsigned l=0;l<3;++l) {
+            const unsigned bit=1u<<l;
+            const bool member=!invalid && (m.sprMiss.miss_mask&bit);
+            const bool unknown=invalid ||
+                (!member && (m.unresolved || (m.sprMiss.unknown()&bit)));
+            Label label;
+            label.membership=unknown ? Membership::Unknown :
+                (member ? Membership::Member : Membership::Nonmember);
+            label.certainty=unknown ? Certainty::Unclassified :
+                ((m.sprMiss.estimated_mask&bit) ? Certainty::Estimated : Certainty::Exact);
+            label.reason=unknown ? (m.unsupported ? Reasons::kUnsupportedIsa :
+                (invalid ? Reasons::kBoundary : Reasons::kIncompleteLifecycle)) :
+                ((m.sprMiss.estimated_mask&bit) ? Reasons::kMixedFragment :
+                 (member ? positive[l] : negative[l]));
+            c.spr_miss[l].add(label);
+        }
+        c.membership_failures={result.fail_incomplete,result.fail_stale,
+            result.fail_multi_follower,result.fail_mixed_ownership,
+            result.fail_boundary,result.fail_unsupported};
         const unsigned classes=m.source&(L1|Miss|FillBuffer);
         c.forwarded_loads=bool(m.source&Forwarded);
         c.mixed_source_loads=classes && (classes&(classes-1));
@@ -432,12 +638,20 @@ class Ledger {
         // independently of their asynchronous cache-fill request. They have
         // known negative membership in the three retired-load miss events.
         if (member.software_prefetch) {
+            spr_retired::Result hint;
+            hint.service=spr_retired::Service::SoftwarePrefetch;
+            m.sprMiss.add(spr_retired::convert(hint));
             m.source|=L1;
             m.independent_source|=L1;
+            retired_membership::CaseInput input;
+            input.fragments.emplace_back();
+            input.fragments.back().software_prefetch=true;
+            mergeMembership(m,retired_membership::evaluate(input));
         }
         m.unsupported|=!m.hardware_entry && (member.unsupported || member.rom);
         m.rom|=member.rom;
         if (member.read && !m.hardware_entry) {
+            if (++m.read_members>1) m.sprMiss.estimated_mask|=2;
             ++m.unresolved;
             const Identity identity{member.context,member.sequence};
             waiting_[identity]=pending;
@@ -485,26 +699,138 @@ class Ledger {
         const unsigned membership=classifyIndependent(facts)|classifyRetiredCache(facts);
         const unsigned unknown=membership&(Unknown|L2Unknown|L3Unknown);
         const auto waiting=waiting_.find({context,sequence});
+        if (waiting!=waiting_.end()) {
+            waiting->second->sprMiss.add(facts.sprMiss);
+            spr_incomplete_completions_+=facts.spr_incomplete_completions;
+            retired_membership::CaseInput input;
+            input.fragments=facts.membership_fragments;
+            input.physical_split=input.fragments.size()>1;
+            mergeMembership(*waiting->second,retired_membership::evaluate(input));
+        }
         // Diagnostic samples never become a reference fallback. Count every
         // measured unresolved-class observation; retain at most eight examples
         // per mask, so a noisy early class cannot hide another class.
-        if (unknown && waiting!=waiting_.end() && waiting->second->measured) {
+        if ((unknown || facts.sprMiss.unknown()) &&
+            waiting!=waiting_.end() && waiting->second->measured) {
             const auto &macro=*waiting->second;
-            const auto count=++native_unknown_masks_[unknown];
+            const auto diagnostic_mask=unknown | (unsigned(facts.sprMiss.unknown())<<16);
+            const auto count=++native_unknown_masks_[diagnostic_mask];
+            native_unknown_l1_late_prefetch_+=bool(facts.l1_late_prefetches);
+            native_unknown_l2_late_prefetch_+=bool(facts.l2_late_prefetches);
+            for (size_t i=0; i<native_unknown_l2_prefetch_parent_llc_.size(); ++i)
+                native_unknown_l2_prefetch_parent_llc_[i] += bool(facts.l2_prefetch_parent_llc[i]);
+            for (size_t i=0; i<native_unknown_l2_prefetch_parent_sender_.size(); ++i) {
+                native_unknown_l2_prefetch_parent_sender_[i] += bool(facts.l2_prefetch_parent_sender[i]);
+                native_unknown_l2_prefetch_parent_response_[i] += bool(facts.l2_prefetch_parent_response[i]);
+            }
+            for (size_t i=0; i<native_unknown_l1_prefetch_parent_llc_.size(); ++i)
+                native_unknown_l1_prefetch_parent_llc_[i] += bool(facts.l1_prefetch_parent_llc[i]);
+            for (size_t i=0; i<native_unknown_l1_prefetch_parent_sender_.size(); ++i) {
+                native_unknown_l1_prefetch_parent_sender_[i] += bool(facts.l1_prefetch_parent_sender[i]);
+                native_unknown_l1_prefetch_parent_response_[i] += bool(facts.l1_prefetch_parent_response[i]);
+            }
+            native_unknown_stale_serviced_ += facts.stale_serviced;
+            native_unknown_repeated_response_ += facts.repeated_response;
+            const bool lifecycle_incomplete = !facts.resolved || facts.other_terminal ||
+                !facts.responses || facts.responses!=facts.admissions ||
+                facts.repeated_response || facts.hierarchy_attempts!=1 ||
+                facts.hierarchy_completions!=1 ||
+                facts.hierarchy_completion_attempt_id!=facts.hierarchy_attempt_id;
+            native_unknown_lifecycle_incomplete_ += lifecycle_incomplete;
+            native_unknown_l1_parent_reject_uniqueness_ += bool(facts.l1_parent_reject_mask & 1u);
+            native_unknown_l1_parent_reject_stale_ += bool(facts.l1_parent_reject_mask & 2u);
+            native_unknown_l2_parent_reject_uniqueness_ += bool(facts.l2_parent_reject_mask & 1u);
+            native_unknown_l2_parent_reject_stale_ += bool(facts.l2_parent_reject_mask & 2u);
             if (count<=8) native_unknown_samples_.push_back(
                 {context,sequence,macro.owner,macro.pc,membership,facts});
         }
         resolve(context,sequence,classify(facts),membership);
     }
     void writeNativeDiagnostics(std::ostream &out) const {
-        out << "{\"diagnostic_only\":true,\"unit\":\"measured-read-uop-service-observation\",\"unknown_masks\":{";
+        out << "{\"diagnostic_only\":true,\"spr_policy\":\"" << spr_retired::Policy
+            << "\",\"spr_incomplete_completions\":" << spr_incomplete_completions_
+            << ",\"unit\":\"measured-read-uop-service-observation\",\"unknown_masks\":{";
         bool first=true;
         for (const auto &entry:native_unknown_masks_) {
             if (!first) out << ',';
             first=false;
             out << '\"' << entry.first << "\":" << entry.second;
         }
-        out << "},\"samples\":[";first=true;
+        out << "},\"l1_late_prefetch_unknown_uops\":" << native_unknown_l1_late_prefetch_
+            << ",\"l2_late_prefetch_unknown_uops\":" << native_unknown_l2_late_prefetch_
+            << ",\"l2_prefetch_parent_llc_unknown_uops\":[";
+        for (size_t i=0; i<native_unknown_l2_prefetch_parent_llc_.size(); ++i) {
+            if (i) out << ',';
+            out << native_unknown_l2_prefetch_parent_llc_[i];
+        }
+        out << "],\"l2_prefetch_parent_sender_unknown_uops\":[";
+        for (size_t i=0; i<native_unknown_l2_prefetch_parent_sender_.size(); ++i) {
+            if (i) out << ',';
+            out << native_unknown_l2_prefetch_parent_sender_[i];
+        }
+        out << "],\"l2_prefetch_parent_response_unknown_uops\":[";
+        for (size_t i=0; i<native_unknown_l2_prefetch_parent_response_.size(); ++i) {
+            if (i) out << ',';
+            out << native_unknown_l2_prefetch_parent_response_[i];
+        }
+        out << "],\"l1_prefetch_parent_llc_unknown_uops\":[";
+        for (size_t i=0; i<native_unknown_l1_prefetch_parent_llc_.size(); ++i) {
+            if (i) out << ',';
+            out << native_unknown_l1_prefetch_parent_llc_[i];
+        }
+        out << "],\"l1_prefetch_parent_sender_unknown_uops\":[";
+        for (size_t i=0; i<native_unknown_l1_prefetch_parent_sender_.size(); ++i) {
+            if (i) out << ',';
+            out << native_unknown_l1_prefetch_parent_sender_[i];
+        }
+        out << "],\"l1_prefetch_parent_response_unknown_uops\":[";
+        for (size_t i=0; i<native_unknown_l1_prefetch_parent_response_.size(); ++i) {
+            if (i) out << ',';
+            out << native_unknown_l1_prefetch_parent_response_[i];
+        }
+        out << "],\"stale_serviced_unknown_uops\":" << native_unknown_stale_serviced_
+            << ",\"repeated_response_unknown_uops\":" << native_unknown_repeated_response_
+            << ",\"lifecycle_incomplete_unknown_uops\":" << native_unknown_lifecycle_incomplete_
+            << ",\"l1_parent_reject_uniqueness_unknown_uops\":" << native_unknown_l1_parent_reject_uniqueness_
+            << ",\"l1_parent_reject_stale_unknown_uops\":" << native_unknown_l1_parent_reject_stale_
+            << ",\"l2_parent_reject_uniqueness_unknown_uops\":" << native_unknown_l2_parent_reject_uniqueness_
+            << ",\"l2_parent_reject_stale_unknown_uops\":" << native_unknown_l2_parent_reject_stale_
+            << ",\"prefetch_lineage_tracking\":{\"scope\":\"sim-global-cumulative-at-core-finalization\",\"capacity_overflows\":"
+            << prefetch_lineage::globalOracle().overflows()
+            << ",\"live\":" << prefetch_lineage::globalOracle().live()
+            << "},\"spr_lifecycle\":{\"scope\":\"sim-global-cumulative-at-core-finalization\"";
+        const auto &lifecycle=spr_retired::lifecycleDiagnostics();
+        out << ",\"created\":" << lifecycle.created
+            << ",\"completed\":" << lifecycle.completed
+            << ",\"replaced\":" << lifecycle.replaced
+            << ",\"canceled\":" << lifecycle.canceled
+            << ",\"retained\":" << lifecycle.retained
+            << ",\"released\":" << lifecycle.released
+            << ",\"live\":" << lifecycle.live
+            << ",\"peak\":" << lifecycle.peak
+            << ",\"lookup_without_live_identity\":" << lifecycle.late_lookup
+            << ",\"unclassified_alias_states\":{\"SP_IE\":" << lifecycle.unclassified_alias[0]
+            << ",\"Inst_IS\":" << lifecycle.unclassified_alias[1]
+            << ",\"PF_Inst_IS\":" << lifecycle.unclassified_alias[2]
+            << ",\"I_F\":" << lifecycle.unclassified_alias[3]
+            << ",\"V_F\":" << lifecycle.unclassified_alias[4]
+            << ",\"other\":" << lifecycle.unclassified_alias[5]
+            << ",\"SP_IE_fill_credit\":" << lifecycle.unclassified_alias[6]
+            << ",\"SP_IE_no_fill_credit\":" << lifecycle.unclassified_alias[7] << "}"
+            << ",\"prepare_service\":{";
+        const auto &prepare=spr_retired::prepareServices();
+        const auto &prepare_counts=prepare.counts();
+        out << "\"begun\":" << prepare_counts.begun
+            << ",\"linked\":" << prepare_counts.linked
+            << ",\"data_completed\":" << prepare_counts.data
+            << ",\"invalidated\":" << prepare_counts.invalidated
+            << ",\"replaced\":" << prepare_counts.replaced
+            << ",\"tbe_closed\":" << prepare_counts.closed
+            << ",\"destroyed\":" << prepare_counts.destroyed
+            << ",\"live\":" << prepare.live()
+            << ",\"live_tbes\":" << prepare.tbes()
+            << ",\"peak\":" << prepare_counts.peak << "}"
+            << "},\"samples\":[";first=true;
         for (const auto &sample:native_unknown_samples_) {
             if (!first) out << ',';
             first=false;
@@ -513,6 +839,24 @@ class Ledger {
                 << ",\"membership\":" << sample.membership << ",\"facts\":{";
             const auto &f=sample.facts;
             out << "\"resolved\":" << (f.resolved?"true":"false");
+            out << ",\"spr_miss_mask\":" << unsigned(f.sprMiss.miss_mask)
+                << ",\"spr_unknown_mask\":" << unsigned(f.sprMiss.unknown())
+                << ",\"spr_failure_callback\":\""
+                << (f.spr_incomplete_completions ? "noteHierarchyCompletion" : "not-observed")
+                << '"'
+                << ",\"spr_missing_levels\":" << f.spr_missing_levels
+                << ",\"spr_failed_alias_category\":" << f.spr_failed_alias_category
+                << ",\"spr_failed_prepare_status\":" << f.spr_failed_prepare_status
+                << ",\"spr_failed_prepare_invalidation\":" << f.spr_failed_prepare_invalidation
+                << ",\"spr_failed_request\":" << f.spr_failed_request
+                << ",\"spr_failed_address\":" << f.spr_failed_address
+                << ",\"spr_completion_callback\":\"Sequencer::hitCallback\""
+                << ",\"spr_failed_level_results\":[";
+            for(unsigned l=0;l<3;++l) {
+                if(l) out << ',';
+                out << unsigned(f.spr_failed_levels[l]);
+            }
+            out << "]";
 #define WRITE_FACT(name) out << ",\"" #name "\":" << f.name;
             WRITE_FACT(store_forward) WRITE_FACT(other_terminal) WRITE_FACT(terminal_reason_mask)
             WRITE_FACT(admissions) WRITE_FACT(responses) WRITE_FACT(coalesced) WRITE_FACT(hierarchy_requests)
@@ -522,7 +866,48 @@ class Ledger {
             WRITE_FACT(l3_accesses) WRITE_FACT(l3_hits) WRITE_FACT(l3_tag_misses) WRITE_FACT(l3_other)
             WRITE_FACT(l3_merged_misses) WRITE_FACT(l3_remote_supplies)
             WRITE_FACT(l2_permission_upgrades) WRITE_FACT(l3_permission_upgrades)
+            WRITE_FACT(l1_late_prefetches) WRITE_FACT(l2_late_prefetches)
 #undef WRITE_FACT
+            out << ",\"l2_prefetch_parent_llc\":[";
+            for (size_t i=0; i<f.l2_prefetch_parent_llc.size(); ++i) {
+                if (i) out << ',';
+                out << f.l2_prefetch_parent_llc[i];
+            }
+            out << "],\"l2_prefetch_parent_sender\":[";
+            for (size_t i=0; i<f.l2_prefetch_parent_sender.size(); ++i) {
+                if (i) out << ',';
+                out << f.l2_prefetch_parent_sender[i];
+            }
+            out << "],\"l2_prefetch_parent_response\":[";
+            for (size_t i=0; i<f.l2_prefetch_parent_response.size(); ++i) {
+                if (i) out << ',';
+                out << f.l2_prefetch_parent_response[i];
+            }
+            out << "],\"l2_prefetch_parent_sender_id\":" << f.l2_prefetch_parent_sender_id;
+            out << ",\"stale_serviced\":" << (f.stale_serviced?"true":"false")
+                << ",\"repeated_response\":" << (f.repeated_response?"true":"false")
+                << ",\"hierarchy_attempts\":" << f.hierarchy_attempts
+                << ",\"hierarchy_completions\":" << f.hierarchy_completions
+                << ",\"hierarchy_attempt_id\":" << f.hierarchy_attempt_id
+                << ",\"hierarchy_completion_attempt_id\":" << f.hierarchy_completion_attempt_id
+                << ",\"l1_parent_reject_mask\":" << unsigned(f.l1_parent_reject_mask)
+                << ",\"l2_parent_reject_mask\":" << unsigned(f.l2_parent_reject_mask);
+            out << ",\"l1_prefetch_parent_llc\":[";
+            for (size_t i=0; i<f.l1_prefetch_parent_llc.size(); ++i) {
+                if (i) out << ',';
+                out << f.l1_prefetch_parent_llc[i];
+            }
+            out << "],\"l1_prefetch_parent_sender\":[";
+            for (size_t i=0; i<f.l1_prefetch_parent_sender.size(); ++i) {
+                if (i) out << ',';
+                out << f.l1_prefetch_parent_sender[i];
+            }
+            out << "],\"l1_prefetch_parent_response\":[";
+            for (size_t i=0; i<f.l1_prefetch_parent_response.size(); ++i) {
+                if (i) out << ',';
+                out << f.l1_prefetch_parent_response[i];
+            }
+            out << "],\"l1_prefetch_parent_sender_id\":" << f.l1_prefetch_parent_sender_id;
             out << "}}";
         }
         out << "]}";

@@ -58,6 +58,12 @@ class X86PagetableWalker(ClockedObject):
         4, "Number of outstanding walks that can be squashed per cycle"
     )
     max_active_walks = Param.Unsigned(1, "Concurrent timing page walks")
+    coalesce_fault_results = Param.Bool(
+        False, "Complete joined translations from the same page-walk fault result"
+    )
+    cancel_squashed_walks = Param.Bool(
+        False, "Stop further PTE reads when all walk users have been squashed"
+    )
     paging_structure_cache = Param.X86PagingStructureCache(NULL, "Optional shared virtual-prefix cache")
     prefix_hit_latency = Param.Cycles(1, "Upper-prefix hit service latency")
     pte_response_latency = Param.Cycles(
@@ -75,7 +81,7 @@ class X86TLB(BaseTLB):
     dtlb_4k_ways = Param.Unsigned(0, "4K data TLB ways; zero uses fully associative replacement")
     spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
     spr_shared_index_shift = Param.Unsigned(
-        0, "4K VPN high-bit XOR fold; zero keeps the linear index proxy"
+        0, "4K VPN XOR fold: 8 folds every byte; other nonzero values fold once"
     )
     spr_split_l1 = Param.Bool(False, "SPR first-level page-size and data-access replacement domains")
     next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")

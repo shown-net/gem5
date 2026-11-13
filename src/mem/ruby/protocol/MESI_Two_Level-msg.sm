@@ -77,6 +77,7 @@ structure(RequestMsg, desc="...", interface="Message") {
   PrefetchBit Prefetch,         desc="Is this a prefetch request";
   int FillAuditRole, default="0", desc="Observer-only originating request role";
   Addr PerfTransactionId, default="0", desc="Independent native transaction ID, no retirement gate";
+  Addr PrefetchOracleGeneration, default="0", desc="Oracle-only private L2 prefetch generation";
   RequestPtr NativeRequest, desc="Originating request for cache-source accounting";
   bool TraceValid, default="false", desc="Oracle trace identity is valid";
   int TraceContextId, default="-1", desc="Oracle CPU context identity";

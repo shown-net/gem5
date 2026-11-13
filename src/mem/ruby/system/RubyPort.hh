@@ -45,6 +45,7 @@
 #include <cassert>
 #include <string>
 
+#include "mem/l1_data_access.hh"
 #include "mem/ruby/common/MachineID.hh"
 #include "mem/ruby/network/MessageBuffer.hh"
 #include "mem/ruby/protocol/RequestStatus.hh"
@@ -79,7 +80,7 @@ class RubyPort : public ClockedObject
         void recvRangeChange() {}
     };
 
-    class MemResponsePort : public QueuedResponsePort
+    class MemResponsePort : public QueuedResponsePort, public L1DataAccessPort
     {
       private:
         RubyPort& owner;
@@ -94,6 +95,8 @@ class RubyPort : public ClockedObject
                         PortID id, bool _no_retry_on_stall);
         void hitCallback(PacketPtr pkt);
         void evictionCallback(Addr address);
+        L1DataAccessResource *l1DataAccess() override
+        { return owner.l1DataAccessResource(); }
 
       protected:
         bool recvTimingReq(PacketPtr pkt);
@@ -165,6 +168,7 @@ class RubyPort : public ClockedObject
                   PortID idx=InvalidPortID) override;
 
     virtual RequestStatus makeRequest(PacketPtr pkt) = 0;
+    virtual L1DataAccessResource *l1DataAccessResource() { return nullptr; }
     virtual int outstandingCount() const = 0;
     virtual bool isDeadlockEventScheduled() const = 0;
     virtual void descheduleDeadlockEvent() = 0;

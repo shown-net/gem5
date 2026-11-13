@@ -97,6 +97,7 @@ structure(CoherenceMsg, desc="...", interface="Message") {
   bool TraceValid, default="false", desc="Oracle trace identity is valid";
   int TraceContextId, default="-1", desc="Oracle CPU context identity";
   Addr TraceInstSeqNum, default="0", desc="Oracle instruction sequence identity";
+  Addr PrefetchOracleGeneration, default="0", desc="Observer-only L1D prefetch generation token; never a protocol input";
 
   bool functionalRead(Packet *pkt) {
     // Valid data block is only present in message with following types

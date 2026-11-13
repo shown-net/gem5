@@ -18,6 +18,7 @@
 #include "sim/sim_exit.hh"
 #include "sim/system.hh"
 #include "sim/sim_object.hh"
+#include "sim/stats.hh"
 
 namespace gem5 { namespace o3 {
 uint64_t CalibrationMarker::marker_address_root_ = 0;
@@ -30,7 +31,8 @@ CalibrationMarker::CalibrationMarker(TaoTrace &owner, const TaoTraceParams &para
       marker_cpu_(dynamic_cast<CPU *>(params.manager)),
       worker_(params.marker_worker), begin_pcs_(params.marker_begin_pcs),
       end_pcs_(params.marker_end_pcs), workids_(params.marker_workids),
-      stat_objects_(params.marker_stat_objects)
+      stat_objects_(params.marker_stat_objects),
+      stat_names_(params.marker_stat_names.begin(), params.marker_stat_names.end())
 {
     fatal_if(!marker_pc_ || !marker_cpu_, "Marker requires O3 manager and boundary PC");
     fatal_if(marker_cpu_->numThreads != 1, "Marker core windows require one hardware thread");
@@ -125,6 +127,7 @@ CalibrationMarker::selectMarkerWindow(uint64_t begin, uint64_t end)
 void
 CalibrationMarker::snapshot(const char *kind, Addr pc, uint64_t completed)
 {
+    const double host_seconds = gem5::hostSeconds.result();
     // No global dump, reset or drain: settle only this core's owned objects.
     marker_cpu_->preDumpStats();
     for (auto *object : stat_objects_)
@@ -133,6 +136,8 @@ CalibrationMarker::snapshot(const char *kind, Addr pc, uint64_t completed)
     std::function<void(const statistics::Group *, const std::string &)> collect =
         [&](const statistics::Group *group, const std::string &prefix) {
             for (const auto *info : group->getStats()) {
+                if (!stat_names_.empty() && !stat_names_.count(prefix + info->name))
+                    continue;
                 if (const auto *scalar = dynamic_cast<const statistics::ScalarInfo *>(info)) {
                     const double value = scalar->value();
                     if (std::isfinite(value)) values[prefix + info->name] = value;
@@ -172,7 +177,8 @@ CalibrationMarker::snapshot(const char *kind, Addr pc, uint64_t completed)
         << ",\"completed_work\":";
     if (kind[0] == 'E' && !begin_pcs_.empty()) snapshots_ << completed;
     else snapshots_ << "null";
-    snapshots_ << ",\"stats\":{\"simTicks\":" << curTick();
+    snapshots_ << ",\"stats\":{\"simTicks\":" << curTick()
+        << ",\"hostSeconds\":" << std::setprecision(17) << host_seconds;
     for (const auto &[name, value] : values)
         snapshots_ << ",\"" << name << "\":" << std::setprecision(17) << value;
     snapshots_ << "}}\n";

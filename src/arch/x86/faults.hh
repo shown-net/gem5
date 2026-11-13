@@ -91,6 +91,7 @@ class X86FaultBase : public FaultBase
      *
      * @return interrupt vector number.
      */
+    functional_arch::AcceptedFacts functionalBoundaryFacts(ThreadContext*) const override;
     virtual uint8_t getVector() const { return vector; }
 };
 

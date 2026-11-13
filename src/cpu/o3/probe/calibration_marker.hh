@@ -44,6 +44,7 @@ class CalibrationMarker
     std::vector<Addr> begin_pcs_, end_pcs_;
     std::vector<uint64_t> workids_;
     std::vector<gem5::SimObject *> stat_objects_;
+    std::unordered_set<std::string> stat_names_;
     std::ofstream snapshots_;
     void snapshot(const char *kind, Addr pc, uint64_t completed);
     enum class MarkerMeasurementPhase { Warming, Measuring, Complete };

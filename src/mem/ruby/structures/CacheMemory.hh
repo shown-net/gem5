@@ -55,7 +55,8 @@
 #include "mem/ruby/slicc_interface/AbstractCacheEntry.hh"
 #include "mem/ruby/structures/ALUFreeListArray.hh"
 #include "mem/ruby/structures/BankedArray.hh"
-#include "mem/ruby/structures/DataFillBuffer.hh"
+#include "mem/ruby/structures/L1DataService.hh"
+#include "mem/ruby/structures/L2CacheService.hh"
 #include "mem/ruby/system/CacheRecorder.hh"
 #include "params/RubyCache.hh"
 #include "sim/clocked_object.hh"
@@ -179,12 +180,56 @@ class CacheMemory : public SimObject
     void releaseDataFill(Addr address);
     void finishDataFill(Addr address);
     void recordDemandFillBlocked();
+    void beginDemandFillWait(PacketPtr packet, bool write_initiated);
+    void endDemandFillWait(PacketPtr packet);
     bool dataFillPending(Addr address) const;
     bool dataFillPresent(Addr address) const;
     bool dataFillReady(Addr address) const;
     bool advanceDataFillInstall(Addr address);
     void installDataFill(Addr address);
     void observeDataFillDemandRead(Addr address);
+    // The Sequencer owns the packets; the L1D service owns return bandwidth.
+    void setDataFillResponseWidth(unsigned width)
+    { l1DataService.setReturnWidth(width); }
+    bool hasDataFillResponseLimit() const
+    { return l1DataService.hasReturnLimit(); }
+    bool tryDataFillResponse(uint64_t cycle)
+    { return l1DataService.tryReturn(cycle); }
+    size_t pendingDataFillResponses() const
+    { return l1DataService.pendingResponseCount(); }
+    bool hasPendingDataFillResponses() const
+    { return l1DataService.hasPendingResponses(); }
+    bool hasOverdueDataFillResponse(Cycles now, Cycles threshold) const
+    { return l1DataService.hasOverdueResponse(now, threshold); }
+    void enqueueDataFillResponse(const SequencerRequest &request,
+                                 const DataBlock &data)
+    { l1DataService.enqueueResponse(request, data); }
+    std::optional<L1DataService::PendingResponse>
+    dequeueDataFillResponse(uint64_t cycle)
+    { return l1DataService.dequeueResponse(cycle); }
+    int functionalWriteDataFillResponses(Packet *pkt)
+    { return l1DataService.functionalWriteResponses(pkt); }
+    void admitDataLineRequest(Addr line, PacketPtr packet, bool shareable)
+    { l1DataService.admitLineRequest(line, packet, shareable); }
+    bool mayCompleteDataHit(Addr line, PacketPtr packet) const
+    { return l1DataService.mayCompleteHit(line, packet); }
+    void finishDataLineRequest(Addr line, PacketPtr packet)
+    { l1DataService.finishLineRequest(line, packet); }
+    void registerDataFillRead(PacketPtr packet, bool follower,
+                              bool has_service_source);
+    bool hasDataFillRead(PacketPtr packet) const
+    { return l1DataService.hasFillRead(packet); }
+    void cancelDataFillRead(PacketPtr packet);
+    std::vector<L1DataService::FillParticipant> selectDataFillReads(Addr line);
+    void recordL1DataHitRead();
+    void recordL1DataFillRead();
+    void recordL1OrderedStore(unsigned logical_stores, unsigned enabled_bytes);
+    bool canPublishOrderedStore(Addr line, uint64_t cycle) const
+    { return l1DataService.canPublishStore(line, cycle); }
+    void notePublishedOrderedStore(Addr line, uint64_t cycle)
+    { l1DataService.notePublishedStore(line, cycle); }
+    L1DataAccessResource *dataAccessResource()
+    { return l1DataService.dataAccess(); }
     bool hasReadableData(Addr address) const;
 
     // hardware transactional memory
@@ -237,12 +282,11 @@ class CacheMemory : public SimObject
     unsigned m_index_divisor;
     bool m_resource_stalls;
     int m_block_size;
-    unsigned m_fill_capacity;
-    unsigned m_fill_in_flight = 0;
     std::unordered_map<Addr, int> offcoreOwnership;
     unsigned offcoreDemandRfos = 0;
 
-    DataFillBuffer dataFillBuffer;
+    L1DataService l1DataService;
+    L2CacheService l2CacheService;
     // The L1 controller can use a different clock from RubySystem. Keep the
     // occupancy integral in the controller/core domain when configured.
     class DataFillClock : public Clocked
@@ -253,8 +297,11 @@ class CacheMemory : public SimObject
     std::unique_ptr<DataFillClock> dataFillClock;
     uint64_t lastDataFillCycle = 0;
     uint64_t lastDemandFillBlockedCycle = uint64_t(-1);
-    uint64_t nextDataFillInstallCycle = 0;
-    const unsigned dataFillInstallBytesPerCycle;
+    // Requests are owned by the Sequencer until their mandatory message is
+    // accepted. The pointer is used only as an identity, never dereferenced.
+    std::unordered_map<PacketPtr, bool> demandFillWaiters;
+    unsigned demandFillReadWaiters = 0;
+    unsigned demandFillWriteWaiters = 0;
     uint64_t currentDataFillCycle() const;
     void accountDataFillCycles();
 
@@ -306,6 +353,7 @@ class CacheMemory : public SimObject
           statistics::Scalar fillBlockedRequests;
           statistics::Average fillOccupancy;
           statistics::Scalar dataFillDemandBlockedCycles;
+          statistics::Scalar dataFillDemandWaitFullCycles;
           statistics::Scalar dataFillDemandReadPending;
           statistics::Scalar dataFillDemandReadPendingCycles;
           statistics::Scalar dataFillReadyEntryCycles;
@@ -313,6 +361,15 @@ class CacheMemory : public SimObject
           statistics::Scalar dataFillCancellations;
           statistics::Scalar dataFillInstallBlocked;
           statistics::Scalar dataFillInstallServiceCycles;
+          statistics::Scalar l1DataHitReadRequests;
+          statistics::Scalar l1DataFillReadResponses;
+          statistics::Scalar l1OrderedStorePackets;
+          statistics::Scalar l1OrderedStoreLogicalStores;
+          statistics::Scalar l1OrderedStoreEnabledBytes;
+          statistics::Scalar l1FillReadRegistrations;
+          statistics::Scalar l1FillFollowerRegistrations;
+          statistics::Scalar l1FillReadSelections;
+          statistics::Scalar l1FillReadCancellations;
           statistics::Scalar demandDataReadHits, demandDataReadTrueMisses;
           statistics::Scalar codeReadHits, codeReadTrueMisses;
           statistics::Scalar demandDataReadAccesses, codeReadAccesses;

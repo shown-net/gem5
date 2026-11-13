@@ -48,7 +48,6 @@
 #include "arch/generic/pcstate.hh"
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
-#include <vector>
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/limits.hh"
 #include "sim/faults.hh"
@@ -96,6 +95,14 @@ struct IEWStruct
 {
     int size;
 
+    struct BranchResolution {
+        DynInstPtr instruction;
+        std::unique_ptr<PCStateBase> target;
+        uint64_t predictionVersion;
+        bool taken;
+    };
+    std::vector<BranchResolution> branchResolutions;
+
     // Completion notifications are not a shared physical writeback port.
     std::vector<DynInstPtr> insts;
     DynInstPtr mispredictInst[MaxThreads];
@@ -129,6 +136,20 @@ struct TimeStruct
     };
 
     FetchComm fetchInfo[MaxThreads];
+
+    struct BacComm
+    {
+        InstSeqNum resolvedNoTarget = 0;
+        bool holdFetch = false;
+        bool holdDecodeOnly = false;
+        bool frontendRedirect = false;
+        InstSeqNum redirectSequence = 0;
+        std::unique_ptr<PCStateBase> redirectTarget;
+        DynInstPtr correctionInst;
+        std::unique_ptr<PCStateBase> correctionTarget;
+        uint64_t correctionVersion = 0;
+    };
+    BacComm bacInfo[MaxThreads];
 
     struct DecodeComm
     {
@@ -204,6 +225,13 @@ struct TimeStruct
 
         /// Instruction that caused the a non-mispredict squash
         DynInstPtr squashInst; // *F
+        bool replayBranch = false;
+        Addr replayBranchPC = 0;
+        bool replayBranchTaken = false;
+        std::unique_ptr<PCStateBase> replayBranchTarget;
+        bool predictionCorrection = false;
+        bool lateActualCorrection = false;
+        std::vector<InstSeqNum> releaseLateSequences;
 
         /// Hack for now to send back a strictly ordered access to the
         /// IEW stage.

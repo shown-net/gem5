@@ -57,7 +57,8 @@ FetchTarget::FetchTarget(const ThreadID _tid, const PCStateBase &_start_pc,
       tid(_tid),
       is_branch(false),
       taken(false),
-      bpuHistory(nullptr)
+      bpuHistory(nullptr),
+      state(std::make_shared<FetchTargetState>(_seqNum, _start_pc.instAddr()))
 {
     set(startPC, _start_pc);
 }

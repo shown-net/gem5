@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
 #include "cpu/o3/frontend_record.hh"
-#include <cstring>
-#include "arch/x86/insts/macroop.hh"
+#include "arch/x86/pcstate.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/o3/cpu.hh"
@@ -12,36 +11,18 @@ namespace gem5::o3
 RepStringKind
 repStringKind(const StaticInst *macro)
 {
-    const auto *x86_macro = dynamic_cast<const X86ISA::MacroopBase *>(macro);
-    if (!x86_macro) return RepStringKind::None;
-    const char *block = x86_macro->getMicrocodeBlock();
-    if (std::strcmp(block, "MOVS_E_M_M") == 0) return RepStringKind::Copy;
-    if (std::strcmp(block, "STOS_E_M") == 0) return RepStringKind::Store;
+    if (!macro) return RepStringKind::None;
+    if (macro->macroopKind() == MacroopKind::RepCopy)
+        return RepStringKind::Copy;
+    if (macro->macroopKind() == MacroopKind::RepStore)
+        return RepStringKind::Store;
     return RepStringKind::None;
 }
 
 NearStackControl
 nearStackControl(const StaticInst *macro)
 {
-    const auto *x86_macro = dynamic_cast<const X86ISA::MacroopBase *>(macro);
-    if (!x86_macro) return NearStackControl::None;
-    const auto env =
-        const_cast<X86ISA::MacroopBase *>(x86_macro)->getEmulEnv();
-    if (env.stackSize != 8 || env.dataSize != 8)
-        return NearStackControl::None;
-    const char *block = x86_macro->getMicrocodeBlock();
-    if (std::strcmp(block, "CALL_NEAR_I") == 0)
-        return NearStackControl::DirectCall;
-    if (std::strcmp(block, "CALL_NEAR_R") == 0)
-        return NearStackControl::RegisterCall;
-    if (std::strcmp(block, "CALL_NEAR_M") == 0 ||
-        std::strcmp(block, "CALL_NEAR_P") == 0)
-        return NearStackControl::MemoryCall;
-    if (std::strcmp(block, "RET_NEAR") == 0)
-        return NearStackControl::Return;
-    if (std::strcmp(block, "RET_NEAR_I") == 0)
-        return NearStackControl::ReturnImmediate;
-    return NearStackControl::None;
+    return macro ? macro->nearStackControl() : NearStackControl::None;
 }
 
 StageDemand
@@ -113,11 +94,20 @@ FrontendRecord::FrontendRecord(CPU *cpu, ThreadID tid,
       predictedPC(at.clone()), sequence(cpu->getAndIncrementInstSeq()),
       thread(tid), source(supply), fetchedAt(curTick())
 {
-    demand = initialDemand(*inst, macro.get());
     if (cpu->markerObservation) {
         fromUser = cpu->inUserMode(tid);
         addressSpace = cpu->tcBase(tid)->readMiscRegNoEffect(
             X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+    }
+    if (cpu->coreFunctionalObservation) {
+        coreFunctionalContext = std::make_unique<CoreFunctionalContext>();
+        auto &context = *coreFunctionalContext;
+        context.observeDecoder(at.as<X86ISA::PCState>());
+        context.addressSpace = cpu->tcBase(tid)->readMiscRegNoEffect(
+            X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
+        context.fromUser = cpu->inUserMode(tid);
+        context.frontendKnown = true;
+        context.origin = fastsim::fst::CoreFrontendOrigin::ObserverRecord;
     }
 #if TRACING_ON
     if (trace)
@@ -134,14 +124,26 @@ FrontendRecord::materialize(CPU *cpu)
     arrays.numDests = instruction->numDestRegs();
     DynInstPtr inst = new (arrays) DynInst(
         arrays, instruction, macroop, *pc, *predictedPC, sequence, cpu);
+    inst->functionalBoundary=pc->as<X86ISA::PCState>().functionalBoundary();
+    inst->functionalMacroOrigin=pc->as<X86ISA::PCState>().functionalMacroOrigin();
     inst->setTid(thread);
     inst->setThreadState(cpu->thread[thread]);
     inst->setPredTaken(prediction.taken);
     inst->untrackedFrontendBranch = prediction.untrackedBranch;
+    inst->predictionTransaction = prediction.transaction;
+    inst->predictionVersion = prediction.version;
+    if (auto history = prediction.transaction.lock();
+        history && history->valid && (history->pendingTarget || history->noTargetTaken))
+        history->lateInstruction = inst;
     inst->frontendDsbMiss = dsbMiss;
     inst->frontendDsbMissExposed = dsbMissExposed;
     inst->fetchedFromUser = fromUser;
     inst->fetchedAddressSpaceId = addressSpace;
+    if (coreFunctionalContext) {
+        inst->coreFunctionalFacts = std::make_unique<CoreFunctionalSnapshot>(
+            inst->numSrcRegs(), inst->numDestRegs());
+        inst->coreFunctionalFacts->context = *coreFunctionalContext;
+    }
     inst->fetchedCodeBlocks = codeBlocks;
     inst->fetchedCodeBlockCount = codeBlockCount;
     inst->staleCode = staleCode;

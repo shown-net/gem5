@@ -16,18 +16,33 @@ class TaoTrace(ProbeListenerObject):
     cxx_class = "gem5::o3::TaoTrace"
     cxx_header = "cpu/o3/probe/tao_trace.hh"
 
-    cxx_exports = [PyBindMethod("startFunctionalMeasurement"),
+    cxx_exports = [PyBindMethod("armArchitecturalBoundaryEpoch"),
+                   PyBindMethod("startFunctionalMeasurement"),
+                   PyBindMethod("functionalMeasurementStarted"),
                    PyBindMethod("startMarkerCapture"),
                    PyBindMethod("selectMarkerWindow"),
-                   PyBindMethod("resumeMarkerHandoff")]
+                   PyBindMethod("resumeMarkerHandoff"),
+                   PyBindMethod("startFixedWorkCapture"),
+                   PyBindMethod("finishFixedWorkCapture"),
+                   PyBindMethod("exportFixedWorkResult"),
+                   PyBindMethod("resumeFixedWorkHandoff")]
 
     marker_pc = Param.Addr(0, "CPU calibration Marker PC; zero selects FastSim producer")
+    fixed_work_source_core = Param.Int(-1, "Explicit physical source core; -1 disables fixed work")
+    fixed_work_begin_pcs = VectorParam.Addr([], "Static worker BEGIN NOP PCs")
+    fixed_work_end_pcs = VectorParam.Addr([], "Static worker END NOP PCs")
+    fixed_work_result_pc = Param.Addr(0, "Post-END result-buffer NOP PC; zero uses guest exit")
+    fixed_work_result_max_bytes = Param.UInt64(0, "Maximum bytes per exported input/output buffer")
+    fixed_work_core_ids = VectorParam.Unsigned([], "Worker physical source cores")
+    fixed_work_workids = VectorParam.UInt64([], "Expected workid in RDI; worker index in RSI")
+    fixed_work_snapshot_interval = Param.Tick(0, "Cumulative fixed-work snapshots on the first BEGIN tick grid; zero disables")
     marker_pc_trace_file = Param.String("", "Committed PC protobuf stream")
     marker_worker = Param.Unsigned(0, "Worker ordinal in the core-window contract")
     marker_begin_pcs = VectorParam.Addr([], "Fixed-work BEGIN NOP PCs in worker order")
     marker_end_pcs = VectorParam.Addr([], "Fixed-work END NOP PCs in worker order")
     marker_workids = VectorParam.UInt64([], "Fixed-work identities in worker order")
     marker_stat_objects = VectorParam.SimObject([], "This CPU and its actual private cache controllers")
+    marker_stat_names = VectorParam.String([], "Statistics selected for Marker snapshots; empty selects all")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "
@@ -94,6 +109,30 @@ class TaoTrace(ProbeListenerObject):
         "Retain every committed x86 syscall micro-op and annotate its entry "
         "with sparse ABI metadata. Requires functional_include_kernel and direct FST; "
         "preserves partial macros at the exact common cut.")
+    functional_asid_static_map = Param.Bool(False,
+        "Emit retired static instruction geometry and operands keyed by CR3 and PC in .imap v4. "
+        "Requires direct FST; contains no timing or speculative traffic.")
+    functional_frontend = Param.Bool(False,
+        "Emit retired-only macro spans and exact decoder code bytes in .ffe.gz. "
+        "Requires kernel-inclusive direct FST and raw syscall micro-ops; contains no source timing.")
+    functional_architectural_boundaries = Param.Bool(False,
+        "Observe accepted functional boundary lineage with controls/core v2; default off")
+    functional_mmu_controls = Param.Bool(False,
+        "Observe pure functional logical MMU controls; no model timing")
+    functional_core_facts = Param.Bool(False,
+        "Observe pure decoded/architectural core facts in .core.gz v1 from startup. "
+        "Requires complete FS O3 retired frontend capture; no native source/fusion/rename decisions.")
+    functional_translation_origins = Param.Bool(False,
+        "Preserve data translation origins separately from retirement ASID in policy-bound .xlat.gz v3. "
+        "Requires complete FS O3 retired functional source mode; observation only, no target MMU changes.")
+    functional_instruction_translations = Param.Bool(False,
+        "Observe immutable Execute translation provenance from startup and bind retired macro bytes in .ixlat.gz. "
+        "Requires functional_frontend; restored TLB paths remain explicitly unknown. No timing inputs.")
+    functional_retirement = Param.Bool(False,
+        "Emit full-population-bound .fsem v2 functional hardware-entry and precise-fault "
+        "origin facts without task-state accounting. Requires kernel-inclusive direct FST "
+        "and raw syscall micro-ops; retains all committed kernel records and does not "
+        "certify task ownership or native cache/PMU qualification.")
     functional_warmup = Param.Bool(False,
         "Capture CPL3 records before traceMeasurementBegin as a functional "
         "warmup prefix. The functional user target then counts only records "
@@ -127,6 +166,10 @@ class TaoTrace(ProbeListenerObject):
         "established empty boundary; otherwise 'unknown' (partial coverage).")
     thread_state_marker_pc = Param.Addr(0,
         "Committed fastsim_wait_marker PC; zero disables all task state output.")
+    functional_task_clock = Param.Bool(False,
+        "Observe native BaseCPU task cycles under exact paired lifecycle cuts; oracle only.")
+    scheduler_account_out_pc = Param.Addr(0, "Byte-proved after-record task accounting out cut.")
+    scheduler_account_in_pc = Param.Addr(0, "Byte-proved after-record task accounting in cut.")
     scheduler_switch_pc = Param.Addr(0, "Audited __switch_to_asm entry PC.")
     scheduler_wakeup_pc = Param.Addr(0, "Audited successful trace_sched_wakeup entry PC.")
     scheduler_pid_offset = Param.Unsigned(0, "Verified task_struct PID byte offset.")

@@ -96,6 +96,7 @@ class MemCmd
         CleanEvict,
         SoftPFReq,
         SoftPFExReq,
+        StoreOwnershipReq,
         HardPFReq,
         SoftPFResp,
         HardPFResp,

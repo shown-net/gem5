@@ -41,6 +41,7 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "mem/functional_mmu_controls.hh"
 #include "arch/generic/mmu.hh"
 #include "arch/generic/tlb.hh"
 #include "cpu/thread_context.hh"
@@ -48,6 +49,30 @@
 
 namespace gem5
 {
+
+void
+BaseMMU::registerFunctionalMmuControls(functional_mmu::Observer &observer)
+{
+    using fastsim::fst::mmuctl::Domain;
+    observer.registerEndpoint(this, Domain::ContextAllTranslations);
+    for (auto *first : {itb, dtb}) {
+        std::set<BaseTLB *> visited;
+        for (auto *tlb = first; tlb; tlb = tlb->nextLevel()) {
+            if (!visited.insert(tlb).second || visited.size() > 64) {
+                observer.fail(fastsim::fst::mmuctl::Reason::PropagationUnknown);
+                break;
+            }
+            const auto domain = tlb->type() == TypeTLB::instruction ? Domain::Instruction :
+                tlb->type() == TypeTLB::data ? Domain::Data :
+                tlb->type() == TypeTLB::unified ? Domain::Unified : Domain::Unknown;
+            observer.registerEndpoint(tlb, domain);
+            // flushAll directly visits every registered hierarchy member;
+            // demap/non-global dispatch only to the two roots.
+            observer.edge(this, tlb);
+            if (tlb->nextLevel()) observer.edge(tlb, tlb->nextLevel());
+        }
+    }
+}
 
 void
 BaseMMU::init()
@@ -80,15 +105,19 @@ BaseMMU::init()
 void
 BaseMMU::flushAll()
 {
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushAll);
     for (auto tlb : instruction) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, tlb);
         tlb->flushAll();
     }
 
     for (auto tlb : data) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, tlb);
         tlb->flushAll();
     }
 
     for (auto tlb : unified) {
+        functional_mmu::EdgeScope mmu_edge(mmu_command, this, tlb);
         tlb->flushAll();
     }
 }
@@ -96,6 +125,7 @@ BaseMMU::flushAll()
 void
 BaseMMU::reset()
 {
+    functional_mmu::lifecycle(this);
     // flush the TLBs by defaults
     flushAll();
 }
@@ -103,8 +133,11 @@ BaseMMU::reset()
 void
 BaseMMU::demapPage(Addr vaddr, uint64_t asn)
 {
-    itb->demapPage(vaddr, asn);
-    dtb->demapPage(vaddr, asn);
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, vaddr, asn);
+    { functional_mmu::EdgeScope mmu_edge(mmu_command, this, itb);
+      itb->demapPage(vaddr, asn); }
+    { functional_mmu::EdgeScope mmu_edge(mmu_command, this, dtb);
+      dtb->demapPage(vaddr, asn); }
 }
 
 Fault
@@ -171,6 +204,7 @@ BaseMMU::MMUTranslationGen::translate(Range &range) const
 void
 BaseMMU::takeOverFrom(BaseMMU *old_mmu)
 {
+    functional_mmu::lifecycle(this);
     Port *old_itb_port = old_mmu->itb->getTableWalkerPort();
     Port *old_dtb_port = old_mmu->dtb->getTableWalkerPort();
     Port *new_itb_port = itb->getTableWalkerPort();

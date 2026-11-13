@@ -92,20 +92,17 @@ class BaseO3CPU(BaseCPU):
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
-    sprL1LoadBankConflicts = Param.Bool(
-        False, "Limit a third same-bank L1 data load in one cycle"
-    )
     sprStoreBuffer = Param.Bool(
         False, "Use a shared-credit committed store buffer for x86 TSO"
+    )
+    sprStoreDrainLineCredits = Param.Unsigned(
+        4, "Distinct in-flight committed write lines; zero removes this limit"
     )
     sprEarlyStorePrepare = Param.Bool(
         False, "Speculatively prepare translated ordinary stores before retirement"
     )
     sprRetiredStorePrepare = Param.Bool(
         True, "Allow prepare hints for stores eligible for post-retirement writeback"
-    )
-    sprStorePrepareDemandPriority = Param.Bool(
-        True, "Defer younger store hints behind ready ordinary demand loads"
     )
     sprFullFenceServiceCycles = Param.Cycles(
         0, "Additional service for an architectural x86 MFENCE after stores drain"
@@ -261,30 +258,20 @@ class BaseO3CPU(BaseCPU):
         0, "Shared load result deliveries per cycle; zero disables the limit"
     )
 
-    sprMemoryDependence = Param.Bool(False, "Use the SPR local/global dependence predictor")
+    sprMemoryDependence = Param.Bool(False, "Use SPR load/store ordering semantics")
     sprFastStoreForwarding = Param.Bool(False, "Use the tagged load/store-PC forwarding proxy")
-    sprPredictReadyLoadValues = Param.Bool(
-        False, "Allow trained value forwarding before ready load addresses issue"
-    )
-    sprEarlyStoreDataForwarding = Param.Bool(
-        False, "Supply trained loads from ready integer store-data operands"
-    )
-    sprFastForwardingLatency = Param.Cycles(
-        1, "Predicted store data to load value service delay"
-    )
     sprStoreForwardingLatency = Param.Cycles(
         0, "Service delay for complete ordinary store-to-load forwarding"
     )
-    sprSameStartPartialForwarding = Param.Bool(
-        True, "Allow a same-start partial store value to merge with a cache load"
-    )
-    sprMultiStoreBufferForwarding = Param.Bool(
-        True, "Allow several committed stores to supply one complete load"
+    sprMultiStoreForwarding = Param.Bool(
+        True, "Allow several older stores to supply one load"
     )
     sprContainedForwardingExtraLatency = Param.Cycles(
         0, "Additional service delay for a contained load at a different offset"
     )
-    sprL1WidthService = Param.Bool(False, "Use width-dependent L1 load/store service budgets")
+    sprL1WidthService = Param.Bool(
+        False, "Use SPR L1 load/store width and load-bank service budgets"
+    )
     recvRespMaxCachelines = Param.Unsigned(
         1,
         "Maximum number of different receive response cachelines per cycle",
@@ -313,6 +300,9 @@ class BaseO3CPU(BaseCPU):
     maxFTPerCycle = Param.Unsigned(4, "Max number of FT created per cycle")
     maxTakenPredPerCycle = Param.Unsigned(
         1, "Max number of taken predictions per cycle"
+    )
+    maxDsbTakenPerCycle = Param.Unsigned(
+        1, "Max number of taken targets consumed by DSB per cycle"
     )
 
 

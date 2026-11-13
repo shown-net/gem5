@@ -32,6 +32,7 @@
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/common/MachineID.hh"
 #include "mem/ruby/common/NetDest.hh"
+#include "mem/ruby/common/SPRBankHash.hh"
 #include "mem/ruby/protocol/MachineType.hh"
 
 namespace gem5
@@ -53,14 +54,15 @@ mapAddressToRange(Addr addr, MachineType type, int low_bit,
     return mach;
 }
 
-// Logical slice mapping. Unlike bit selection this reaches every bank when
-// the number of slices is not a power of two (SPR uses 52 in this model).
+// Logical slice mapping. The 52-bank SPR proxy mixes physical line bits;
+// modulo reaches every bank even when the count is not a power of two.
 inline MachineID
 mapAddressToModulo(Addr addr, MachineType type, int low_bit,
                    int banks, int cluster_id)
 {
     assert(banks > 0);
-    return {type, NodeID((addr >> low_bit) % banks + banks * cluster_id)};
+    const Addr line = sprL3IndexLine(addr >> low_bit, banks);
+    return {type, NodeID(line % banks + banks * cluster_id)};
 }
 
 inline NodeID

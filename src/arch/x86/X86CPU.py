@@ -37,7 +37,7 @@ from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
 from m5.objects.ZeroIdiom import ZeroIdiom
 from m5.objects.StackEngine import StackEngine
-from m5.objects.Frontend import FrontendCoordinator
+from m5.objects.Frontend import FrontendCoordinator, InstructionBytes
 from m5.objects.IntExecution import (
     ExecutionPorts,
     IntegerALU,
@@ -174,6 +174,8 @@ def spr_fu_pool():
     return FUPool(
         FUList=[FUDesc(opList=ops, count=1) for ops in ports],
         storeDataPorts=[4, 9], branchPorts=[0, 6],
+        fpDiv64ActiveCycles=8, fpDiv32ActiveCycles=5,
+        fpDiv64PowerOfTwoLatency=13, fpDiv64PowerOfTwoActiveCycles=7,
     )
 
 
@@ -184,28 +186,8 @@ _spr_mem_classes = sorted(
 )
 
 
-def x86_o3_mmu():
-    """Default O3 instruction translation and shared second-level proxy."""
-    mmu = X86MMU()
-    mmu.pagingStructureCache = X86PagingStructureCache()
-    mmu.itb.walker.paging_structure_cache = mmu.pagingStructureCache
-    mmu.dtb.walker.paging_structure_cache = mmu.pagingStructureCache
-    mmu.stlb = X86TLB(size=2048, entry_type="unified", spr_shared_domains=True)
-    mmu.itb.size = 256
-    mmu.itb.itlb_4k_ways = 8
-    mmu.itb.spr_split_l1 = True
-    mmu.itb.next_level = mmu.stlb
-    mmu.dtb.size = 96
-    mmu.dtb.dtlb_4k_ways = 6
-    mmu.dtb.spr_split_l1 = True
-    mmu.dtb.next_level_hit_latency = 6
-    mmu.dtb.walker.max_active_walks = 4
-    mmu.dtb.next_level = mmu.stlb
-    return mmu
-
-
 class X86O3CPU(BaseO3CPU, X86CPU):
-    mmu = x86_o3_mmu()
+    mmu = X86MMU()
     needsTSO = True
     fetchWidth = 8
     fetchBufferSize = 64
@@ -228,9 +210,9 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     numPhysFloatRegEntries = 320
     numPhysFloatRegs = numPhysFloatRegEntries * 8 + numROBEntries * 16 * 2
     numPhysFloatWideEntries = 220
-    sprL1LoadBankConflicts = False
     sprMemoryDependence = True
-    sprFastStoreForwarding = True
+    sprFastStoreForwarding = False
+    sprMultiStoreForwarding = False
     sprL1WidthService = True
     sprStoreBuffer = True
     sprEarlyStorePrepare = True
@@ -238,6 +220,7 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     # from SFENCE and from the embedded fences of locked microcode.
     sprFullFenceServiceCycles = 34
     branchPred = BranchPredictor(
+        requiresBTBHit=True,
         conditionalBranchPred=GoldenCoveBP(), btb=MultiLevelBTB(),
         indirectBranchPred=GoldenCoveIndirectPredictor(),
         ras=ReturnAddrStack(numEntries=16),
@@ -246,6 +229,8 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     # One target range covers the resident 64-byte refill; MITE still receives
     # at most 32 bytes per cycle from InstructionBytes.
     fetchTargetWidth = 64
+    maxTakenPredPerCycle = 2
+    maxDsbTakenPerCycle = 2
 
     # Development measurements always use the implemented integer structure.
     # SimObject cloning preserves shared port references within each core.
@@ -258,12 +243,16 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     resultForwarding = ResultForwarding()
     zeroIdiom = ZeroIdiom()
     stackEngine = StackEngine(enabled=True)
-    frontend = FrontendCoordinator(enableLsdReplay=False)
+    frontend = FrontendCoordinator(
+        enableLsdReplay=False,
+        instructionBytes=InstructionBytes(residentBlocks=16, requestDepth=8),
+    )
     intSHFT = IntExecutionResource(family=2)
     intSlow = IntExecutionResource(family=3)
     intBM = IntExecutionResource(family=4)
     intBranch = IntExecutionResource(family=5)
-    intDivider = IntegerDivider()
+    intDivider = IntegerDivider(quotientLatency32=[12, 11, 10],
+                                quotientLatency64=[14, 14, 14])
 
     # For x86, each CC reg is used to hold only a subset of the
     # flags, so we need 4-5 times the number of CC regs as

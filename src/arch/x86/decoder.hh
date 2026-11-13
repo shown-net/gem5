@@ -30,6 +30,8 @@
 #define __ARCH_X86_DECODER_HH__
 
 #include <cassert>
+#include <optional>
+#include "fst_instruction_fetch.hh"
 #include <unordered_map>
 #include <vector>
 
@@ -100,6 +102,11 @@ class Decoder : public InstDecoder
     // The bytes to be predecoded.
     MachInst fetchChunk;
     InstBytes instBytes;
+    // Observer state follows the actual native decoder chunks/reset lifecycle.
+    fastsim::fst::InstructionByteWitness instructionWitness;
+    std::optional<fastsim::fst::TranslationFragment> instructionChunk;
+    uint64_t instructionAddressSpace=0;
+    bool instructionObservation=false;
     int chunkIdx;
     // The pc of the start of fetchChunk.
     Addr basePC = 0;
@@ -307,6 +314,8 @@ class Decoder : public InstDecoder
     takeOverFrom(InstDecoder *old) override
     {
         InstDecoder::takeOverFrom(old);
+        // Native takeover does not copy byte chunks; do not copy their proof.
+        instructionWitness.clear();instructionChunk.reset();instructionObservation=false;
 
         Decoder *dec = dynamic_cast<Decoder *>(old);
         assert(dec);
@@ -329,6 +338,11 @@ class Decoder : public InstDecoder
     {
         InstDecoder::reset();
         state = ResetState;
+        instructionWitness.clear();instructionChunk.reset();instructionObservation=false;
+    }
+
+    void observeInstructionChunk(const fastsim::fst::TranslationFragment& fragment, uint64_t asid) {
+        instructionChunk=fragment;instructionAddressSpace=asid;instructionObservation=true;
     }
 
     // Use this to give data to the decoder. This should be used
@@ -342,6 +356,7 @@ class Decoder : public InstDecoder
         fetchChunk = letoh(fetchChunk);
         outOfBytes = false;
         process();
+        instructionChunk.reset(); // no later caller can inherit this supply
     }
 
     void

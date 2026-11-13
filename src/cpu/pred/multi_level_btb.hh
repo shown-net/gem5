@@ -32,6 +32,7 @@
 
 #include <vector>
 #include <optional>
+#include <map>
 
 #include "base/cache/associative_cache.hh"
 #include "cpu/pred/btb.hh"
@@ -71,12 +72,18 @@ class BTBLevel : public SimObject
                           std::optional<BTBEntry> *evicted = nullptr);
 
     void doWriteback(ThreadID tid, const BTBEntry &upper_victim);
+    void indexInsert(ThreadID tid, Addr pc);
+    void indexErase(ThreadID tid, Addr pc);
 
     AssociativeCache<BTBEntry> btb;
     const Cycles latency;
     const bool inclusive;
     BTBLevel *nextLevel = nullptr;
     unsigned level = 0;
+    bool exactIndex = false;
+    std::map<std::pair<ThreadID, Addr>, uint64_t> residentMask;
+    std::map<std::pair<ThreadID, Addr>, uint64_t> identities;
+    uint64_t nextIdentity = 1;
 };
 
 class MultiLevelBTB : public BranchTargetBuffer
@@ -87,6 +94,13 @@ class MultiLevelBTB : public BranchTargetBuffer
     void memInvalidate() override;
     bool valid(ThreadID tid, Addr instPC) override;
     bool earlyValid(ThreadID tid, Addr instPC) override;
+    bool rangeCandidates(ThreadID tid, Addr start, unsigned width,
+                         unsigned stride, std::optional<Addr> &early,
+                         std::optional<Addr> &late) const override;
+    std::optional<Snapshot> probe(ThreadID tid, Addr pc) const override;
+    const PCStateBase *consumeSnapshot(const Snapshot &snapshot,
+                                       BranchType type) override;
+    bool snapshotValid(const Snapshot &snapshot) const override;
     void invalidate(ThreadID tid, Addr instPC) override;
     Cycles lookupLatency(ThreadID tid, Addr instPC) const override;
 
@@ -102,6 +116,8 @@ class MultiLevelBTB : public BranchTargetBuffer
 
   private:
     const std::vector<BTBLevel *> levels;
+    uint64_t contextEpoch = 0;
+    std::map<std::pair<ThreadID, Addr>, uint64_t> invalidationEpochs;
 
     struct MultiLevelBTBStats : public statistics::Group
     {

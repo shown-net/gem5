@@ -82,8 +82,13 @@ uint16_t GoldenCoveBP::tag(const GoldenPath &h, Addr pc, unsigned bank) const
 
 GoldenCoveBP::History *GoldenCoveBP::capture(ThreadID tid, Addr pc)
 {
+    return capture(paths[tid], pc);
+}
+
+GoldenCoveBP::History *GoldenCoveBP::capture(const GoldenPath &path, Addr pc)
+{
     auto *h = new History;
-    h->before = paths[tid];
+    h->before = path;
     for (unsigned b = 0; b < 3; ++b) {
         h->index[b] = index(h->before, pc, b);
         h->tag[b] = tag(h->before, pc, b);
@@ -95,6 +100,11 @@ bool GoldenCoveBP::lookup(ThreadID tid, Addr pc, void *&history)
 {
     auto *h = capture(tid, pc);
     history = h;
+    return lookupHistory(h, pc);
+}
+
+bool GoldenCoveBP::lookupHistory(History *h, Addr pc)
+{
     h->prediction = base[pc & 8191] >= 2;
     for (unsigned b = 0; b < 3; ++b)
         for (unsigned w = 0; w < 4; ++w) {
@@ -108,6 +118,40 @@ bool GoldenCoveBP::lookup(ThreadID tid, Addr pc, void *&history)
             }
         }
     return h->prediction;
+}
+
+std::shared_ptr<const void> GoldenCoveBP::pathSnapshot(ThreadID tid) const
+{
+    return std::make_shared<const GoldenPath>(paths[tid]);
+}
+
+bool GoldenCoveBP::lookupNotTakenSnapshot(
+        const std::shared_ptr<const void> &snapshot, Addr pc, void *&history)
+{
+    if (!snapshot) return false;
+    auto *h = capture(*static_cast<const GoldenPath *>(snapshot.get()), pc);
+    h->prediction = base[pc & 8191] >= 2;
+    std::array<int, 3> matches = {-1, -1, -1};
+    for (unsigned b = 0; b < 3; ++b)
+        for (unsigned w = 0; w < 4; ++w) {
+            const auto &entry = tables[b][h->index[b]][w];
+            if (entry.valid && entry.tag == h->tag[b]) {
+                h->provider = b;
+                h->way = w;
+                matches[b] = w;
+                h->prediction = entry.counter >= 2;
+                break;
+            }
+        }
+    if (h->prediction) {
+        delete h;
+        return false;
+    }
+    for (unsigned b = 0; b < matches.size(); ++b)
+        if (matches[b] >= 0)
+            tables[b][h->index[b]][matches[b]].age = ++age;
+    history = h;
+    return true;
 }
 
 void GoldenCoveBP::branchPlaceholder(ThreadID tid, Addr pc, bool uncond,
@@ -234,6 +278,30 @@ const PCStateBase *GoldenCoveIndirectPredictor::lookup(ThreadID tid,
     return h->predicted ? h->predicted->clone() : nullptr;
 }
 
+void GoldenCoveIndirectPredictor::setReturnFallback(void *history)
+{
+    if (history) static_cast<History *>(history)->returnFallback = true;
+}
+
+std::shared_ptr<const void>
+GoldenCoveIndirectPredictor::pathSnapshot(ThreadID tid) const
+{
+    return std::make_shared<const GoldenPath>(paths[tid]);
+}
+
+bool
+GoldenCoveIndirectPredictor::notTakenSnapshot(ThreadID tid, Addr pc,
+        const std::shared_ptr<const void> &snapshot, void *&history)
+{
+    if (!snapshot) return false;
+    auto *h = new History;
+    h->before = *static_cast<const GoldenPath *>(snapshot.get());
+    h->pc = pc;
+    h->user = userMode[tid];
+    history = h;
+    return true;
+}
+
 void GoldenCoveIndirectPredictor::update(ThreadID tid, InstSeqNum sn,
         Addr pc, bool squash, bool taken, const PCStateBase &target,
         BranchType type, void *&history)
@@ -247,7 +315,7 @@ void GoldenCoveIndirectPredictor::update(ThreadID tid, InstSeqNum sn,
     }
     auto *h = static_cast<History *>(history);
     if (squash) paths[tid] = h->before;
-    h->indirect = type == BranchType::IndirectCond ||
+    h->indirect = h->returnFallback || type == BranchType::IndirectCond ||
                   type == BranchType::IndirectUncond ||
                   type == BranchType::CallIndirect;
     h->taken = taken;

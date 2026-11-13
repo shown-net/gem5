@@ -399,9 +399,17 @@ let {{
                 " | ((log2i(%s) & AddrSizeFlagMask) << AddrSizeFlagShift)" % \
                 addressSize
 
-        def getAllocator(self, microFlags):
+        def getAllocator(self, microFlags, *, full_temp_write=False):
+            full_write = '(%s >= 4)' % self.dataSize
+            if full_temp_write:
+                # A memory operand's internal value has no architectural
+                # upper bits to merge. Keep real byte/word GPR merge inputs.
+                full_write = (
+                    '(%s || ((%s).index >= X86ISA::int_reg::MicroBegin && '
+                    '(%s).index < X86ISA::int_reg::MicroEnd))' %
+                    (full_write, self.data, self.data))
             allocString = '''
-                (%(dataSize)s >= 4) ?
+                %(fullWrite)s ?
                     (StaticInstPtr)(new %(class_name)sBig(machInst,
                         macrocodeBlock, %(flags)s, %(dataSize)s,
                         %(addressSize)s, %(memFlags)s, %(data)s, %(scale)s,
@@ -413,6 +421,7 @@ let {{
             '''
             allocator = allocString % {
                 "class_name" : self.className,
+                "fullWrite" : full_write,
                 "flags" : self.microFlagsText(microFlags) + self.instFlags,
                 "scale" : self.scale, "index" : self.index,
                 "base" : self.base,
@@ -539,6 +548,12 @@ let {{
                         atCPL0, prefetch, nonSpec, uncacheable)
                 self.className = Name
                 self.mnemonic = name
+
+            def getAllocator(self, microFlags):
+                if big and not is_float:
+                    return super().getAllocator(microFlags,
+                                                full_temp_write=True)
+                return super().getAllocator(microFlags)
 
         microopClasses[name] = LoadOp
 

@@ -6,6 +6,7 @@
 #include <limits>
 
 #include "base/logging.hh"
+#include "debug/IntDividerTiming.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/fu_pool.hh"
@@ -241,9 +242,13 @@ ResultForwarding::ResultForwarding(const ResultForwardingParams &p)
 {}
 
 void
-ResultForwarding::bindCPU(CPU *owner)
+ResultForwarding::bindCPU(CPU *owner, unsigned num_registers)
 {
     panic_if(cpu && cpu != owner, "Result forwarding shared between different cores");
+    // IQ binds during CPU construction, before the physical register file.
+    // Its already-computed flat register count supplies the storage geometry.
+    if (!cpu)
+        producers.resize(num_registers);
     cpu = owner;
 }
 
@@ -252,17 +257,17 @@ ResultForwarding::track(const DynInstPtr &inst, bool managed)
 {
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
         auto reg = inst->renamedDestIdx(i);
-        if (reg->isAlwaysReady())
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
             continue;
-        auto found = producers.find(reg->flatIndex());
-        panic_if(found != producers.end() && found->second.producer &&
-                 found->second.producer != inst && !found->second.producer->isSquashed(),
+        auto &slot = producers[reg->flatIndex()];
+        panic_if(slot.producer && slot.producer != inst &&
+                 !slot.producer->isSquashed(),
                  "Result version reused before PRF writeback");
         const bool vector = !managed && !inst->bypassesIQ() &&
             (inst->isFloating() || inst->isVector() ||
              inst->opClass() == FloatAddOp || inst->opClass() == SimdFloatAddOp);
         if (!managed && !vector) {
-            producers.erase(reg->flatIndex());
+            slot = {};
             continue;
         }
         Reference reference;
@@ -275,7 +280,7 @@ ResultForwarding::track(const DynInstPtr &inst, bool managed)
         reference.role = inst->staticInst->intResultRole(i);
         reference.version = inst->seqNum;
         reference.tracked = true;
-        producers[reg->flatIndex()] = std::move(reference);
+        slot = std::move(reference);
     }
 }
 
@@ -284,11 +289,14 @@ ResultForwarding::dispatched(const DynInstPtr &inst, unsigned port,
                              Cycles latency)
 {
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
-        auto found = producers.find(inst->renamedDestIdx(i)->flatIndex());
-        if (found == producers.end() || found->second.version != inst->seqNum ||
-            !found->second.vectorResult)
+        auto reg = inst->renamedDestIdx(i);
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
             continue;
-        auto &result = *found->second.vectorResult;
+        auto &slot = producers[reg->flatIndex()];
+        if (!slot.tracked || slot.version != inst->seqNum ||
+            !slot.vectorResult)
+            continue;
+        auto &result = *slot.vectorResult;
         result.domain = vectorDomain(inst, port, latency);
         result.nominalAt = cpu->clockEdge(latency);
     }
@@ -297,13 +305,13 @@ ResultForwarding::dispatched(const DynInstPtr &inst, unsigned port,
 ResultForwarding::Reference
 ResultForwarding::source(PhysRegIdPtr reg) const
 {
-    if (reg->isAlwaysReady())
+    if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
         return {};
-    auto found = producers.find(reg->flatIndex());
-    if (found == producers.end()) return {};
-    if (!found->second.producer && !found->second.vectorResult)
-        stats.lateSources[unsigned(found->second.family)]++;
-    return found->second;
+    const auto &slot = producers[reg->flatIndex()];
+    if (!slot.tracked) return {};
+    if (!slot.producer && !slot.vectorResult)
+        stats.lateSources[unsigned(slot.family)]++;
+    return slot;
 }
 
 bool
@@ -405,11 +413,53 @@ ResultForwarding::armWake()
     if (when == std::numeric_limits<Tick>::max()) {
         if (wakeEvent.scheduled()) deschedule(wakeEvent);
     } else {
-        panic_if(when <= curTick(), "Result-path wake must be in the future");
+        // Another event at this tick may change the waiter set before the
+        // already-scheduled wake event runs. Keep that wake at the current
+        // tick so due consumers are handled without adding a cycle.
+        panic_if(when < curTick(), "Result-path wake is overdue");
         if (wakeEvent.scheduled()) {
             if (wakeEvent.when() != when) reschedule(wakeEvent, when);
         } else schedule(wakeEvent, when);
     }
+}
+
+void
+ResultForwarding::beginIssuePass()
+{
+    assert(!inIssuePass);
+    inIssuePass = true;
+    issueWaitersClean = false;
+}
+
+void
+ResultForwarding::endIssuePass()
+{
+    assert(inIssuePass);
+    inIssuePass = false;
+}
+
+void
+ResultForwarding::updateWake(Tick old_when, Tick new_when)
+{
+    // The first update removes stale records, including memory instructions
+    // resumed earlier in this synchronous issue pass. Any later waiter that
+    // issues clears its own wait first, and no event runs mid-pass.
+    if (!inIssuePass || !issueWaitersClean) {
+        armWake();
+        issueWaitersClean = inIssuePass;
+        return;
+    }
+    if (wakeEvent.scheduled()) {
+        const Tick earliest = wakeEvent.when();
+        if (old_when == earliest && new_when > old_when)
+            armWake();
+        else if (new_when < earliest)
+            reschedule(wakeEvent, new_when);
+    } else if (new_when != std::numeric_limits<Tick>::max()) {
+        schedule(wakeEvent, new_when);
+    }
+    // Schedule/reschedule still occurs at the original update call. Moving
+    // insertion to the end would reorder equal-tick, equal-priority events.
 }
 
 void
@@ -418,16 +468,22 @@ ResultForwarding::defer(const DynInstPtr &inst, Tick when)
     panic_if(!cpu || when <= curTick() || when == std::numeric_limits<Tick>::max(),
              "Invalid deferred result consumer");
     auto [it, inserted] = waiters.emplace(inst->seqNum, Waiter{inst, when});
+    const Tick old_when = inserted ?
+        std::numeric_limits<Tick>::max() : it->second.when;
     if (inserted) stats.deferred++;
     else it->second.when = when;
-    armWake();
+    updateWake(old_when, when);
 }
 
 void
 ResultForwarding::clearWait(const DynInstPtr &inst)
 {
-    waiters.erase(inst->seqNum);
-    armWake();
+    const auto found = waiters.find(inst->seqNum);
+    const Tick old_when = found == waiters.end() ?
+        std::numeric_limits<Tick>::max() : found->second.when;
+    if (found != waiters.end())
+        waiters.erase(found);
+    updateWake(old_when, std::numeric_limits<Tick>::max());
     checkDrain();
 }
 
@@ -450,18 +506,17 @@ ResultForwarding::release(const DynInstPtr &inst)
 {
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
         auto reg = inst->renamedDestIdx(i);
-        if (reg->isAlwaysReady())
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
             continue;
-        auto found = producers.find(reg->flatIndex());
-        if (found == producers.end() || found->second.version != inst->seqNum)
+        auto &reference = producers[reg->flatIndex()];
+        if (!reference.tracked || reference.version != inst->seqNum)
             continue;
         if (inst->isSquashed() || inst->getFault() != NoFault ||
-            (found->second.vectorResult && !inst->isIssued())) {
-            if (found->second.vectorResult)
-                found->second.vectorResult->cancelled = true;
-            producers.erase(found);
+            (reference.vectorResult && !inst->isIssued())) {
+            if (reference.vectorResult)
+                reference.vectorResult->cancelled = true;
+            reference = {};
         } else {
-            auto &reference = found->second;
             if (reference.vectorResult) {
                 panic_if(inst->lastWakeDependents == Tick(-1),
                          "Vector result released before wakeup");
@@ -482,11 +537,14 @@ ResultForwarding::cancel(const DynInstPtr &inst)
 {
     bool removed = false;
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
-        auto found = producers.find(inst->renamedDestIdx(i)->flatIndex());
-        if (found != producers.end() && found->second.version == inst->seqNum) {
-            if (found->second.vectorResult)
-                found->second.vectorResult->cancelled = true;
-            producers.erase(found);
+        auto reg = inst->renamedDestIdx(i);
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
+            continue;
+        auto &reference = producers[reg->flatIndex()];
+        if (reference.tracked && reference.version == inst->seqNum) {
+            if (reference.vectorResult)
+                reference.vectorResult->cancelled = true;
+            reference = {};
             removed = true;
         }
     }
@@ -501,7 +559,7 @@ bool
 ResultForwarding::empty() const
 {
     if (!waiters.empty() || wakeEvent.scheduled()) return false;
-    for (const auto &[index, reference] : producers)
+    for (const auto &reference : producers)
         if (reference.producer || (reference.vectorResult &&
             !reference.vectorResult->ready && !reference.vectorResult->cancelled))
             return false;
@@ -524,7 +582,7 @@ void
 ResultForwarding::reset()
 {
     panic_if(!empty(), "Result forwarding reset before pending transfers drained");
-    producers.clear();
+    std::fill(producers.begin(), producers.end(), Reference{});
 }
 
 IntExecutionResource::Stats::Stats(statistics::Group *parent)
@@ -554,7 +612,7 @@ void
 IntExecutionResource::finishEvent(const std::shared_ptr<Operation> &operation)
 {
     if (--operation->events == 0) {
-        operations.remove(operation);
+        operations.erase(operation->position);
         if (operations.empty() && drainState() == DrainState::Draining)
             signalDrainDone();
     }
@@ -577,7 +635,7 @@ IntExecutionResource::admit(CPU *cpu, ResultForwarding *forwarding,
     inst->prepareResultValues(port, cpu->clockEdge(latency));
     auto operation = std::make_shared<Operation>();
     operation->inst = inst;
-    operations.push_back(operation);
+    operation->position = operations.insert(operations.end(), operation);
     stats.admitted++;
     const Tick value_at = cpu->clockEdge(Cycles(evaluation));
     auto send = [operation, complete] {
@@ -775,6 +833,14 @@ IntegerDivider::service()
             times[info.quotientDest] = op->outputs[0];
             times[info.remainderDest] = op->outputs[1];
             inst->prepareDivideValues(times);
+            DPRINTF(IntDividerTiming,
+                "launch seq=%llu pc=%#llx bytes=%u low=%#llx high=%#llx "
+                "divisor=%#llx admitted=%llu qready=%llu rready=%llu\n",
+                inst->seqNum, inst->pcState().instAddr(), info.bytes,
+                inst->getRegOperand(inst->staticInst.get(), info.lowSource),
+                inst->getRegOperand(inst->staticInst.get(), info.highSource),
+                inst->getRegOperand(inst->staticInst.get(), info.divisorSource),
+                op->admitted, op->outputs[0], op->outputs[1]);
             inst->evaluateResultValues(now);
             ++stats.evaluated;
             releaseAction(inst);

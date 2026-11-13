@@ -63,6 +63,16 @@
 namespace gem5
 {
 
+enum class MacroopKind : uint8_t {
+    None, RepCopy, RepStore, CallImmediate, CallRegister, CallMemory,
+    CallPcRelative, Return, ReturnImmediate, PushRegister, PushImmediate,
+    PopRegister, AddImmediate, SubImmediate, Lea, RegisterMove, MemoryMove
+};
+
+enum class NearStackControl : uint8_t {
+    None, DirectCall, RegisterCall, MemoryCall, Return, ReturnImmediate
+};
+
 // forward declarations
 class Packet;
 
@@ -92,8 +102,12 @@ class StaticInst : public RefCounted, public StaticInstFlags
   protected:
     IntExecutionInfo intExecutionInfo;
     ZeroIdiomKind zeroIdiomInfo = ZeroIdiomKind::None;
+    MacroopKind macroopInfo = MacroopKind::None;
+    NearStackControl nearStackInfo = NearStackControl::None;
 
   public:
+    MacroopKind macroopKind() const { return macroopInfo; }
+    NearStackControl nearStackControl() const { return nearStackInfo; }
     const IntExecutionInfo &intExecution() const { return intExecutionInfo; }
     virtual IntDivideInfo intDivide() const { return {}; }
     void clearIntExecution() { intExecutionInfo = {}; }
@@ -114,10 +128,12 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual unsigned earlyForwardingSize() const { return 0; }
     // Address eligibility applies independently to the load and its producer.
     virtual bool hasFastForwardingAddress() const { return false; }
-    // Nonzero only for an ordinary integer store-data operation whose
-    // complete payload is the low bytes of its sole register source.
-    virtual unsigned earlyStoreDataSize() const { return 0; }
     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
+    // Observer-only decoded predicates. Native acceptance does not call these.
+    virtual bool coreFusionFactsKnown() const { return false; }
+    virtual unsigned coreFusionProducerFamily() const { return 0; }
+    virtual unsigned coreFusionAllowedJccMask() const { return 0; }
+    virtual unsigned coreFusionJccCondition() const { return 255; }
     ZeroIdiomKind zeroIdiom() const { return zeroIdiomInfo; }
     bool isZeroIdiom() const { return zeroIdiomInfo != ZeroIdiomKind::None; }
     virtual RegVal zeroIdiomResult(RegIndex destination) const { return 0; }
@@ -360,6 +376,8 @@ class StaticInst : public RefCounted, public StaticInstFlags
     {}
 
   public:
+    virtual uint8_t functionalRomKind() const { return 0; }
+
     virtual ~StaticInst() {};
 
     virtual Fault execute(ExecContext *xc,

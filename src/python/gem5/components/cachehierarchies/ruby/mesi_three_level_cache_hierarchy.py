@@ -54,6 +54,9 @@ from .caches.mesi_three_level.l3_cache import L3Cache
 from .topologies.simple_pt2pt import SimplePt2Pt, SimpleUncore
 
 
+from .topologies.spr_mesh import SPRMesh
+
+
 class MESIThreeLevelCacheHierarchy(
     AbstractRubyCacheHierarchy, AbstractThreeLevelCacheHierarchy
 ):
@@ -112,8 +115,10 @@ class MESIThreeLevelCacheHierarchy(
         self.ruby_system.number_of_virtual_networks = 3
 
         self.ruby_system.network = (
-            SimpleUncore(self.ruby_system) if self._uncore_clock
-            else SimplePt2Pt(self.ruby_system)
+            SPRMesh(self.ruby_system, self._spr_network_parameters)
+            if hasattr(self, "_spr_network_parameters") else
+            (SimpleUncore(self.ruby_system) if self._uncore_clock
+             else SimplePt2Pt(self.ruby_system))
         )
         self.ruby_system.network.clk_domain = self.ruby_system.clk_domain
         self.ruby_system.network.number_of_virtual_networks = 3
@@ -206,10 +211,17 @@ class MESIThreeLevelCacheHierarchy(
         for cache in self._l3_controllers:
             cache.ruby_system = self.ruby_system
 
-        self._directory_controllers = [
-            Directory(self.ruby_system.network, cache_line_size, range, port)
-            for range, port in board.get_mem_ports()
-        ]
+        # Multiple physical RAM ranges can share one subchannel timing port.
+        # One directory per port retains the same controller/queue ownership.
+        directories = {}
+        for mem_range, port in board.get_mem_ports():
+            key = id(port)
+            if key in directories:
+                directories[key].addr_ranges = [*directories[key].addr_ranges, mem_range]
+            else:
+                directories[key] = Directory(self.ruby_system.network,
+                                              cache_line_size, mem_range, port)
+        self._directory_controllers = list(directories.values())
         # TODO: Make this prettier: The problem is not being able to proxy
         # the ruby system correctly
         for dir in self._directory_controllers:
@@ -243,13 +255,17 @@ class MESIThreeLevelCacheHierarchy(
             self.ruby_system.dma_controllers = self._dma_controllers
 
         # Create the network and connect the controllers.
-        self.ruby_system.network.connectControllers(
-            self._l1_controllers
-            + self._l2_controllers
-            + self._l3_controllers
-            + self._directory_controllers
-            + self._dma_controllers
-        )
+        controllers = (self._l1_controllers + self._l2_controllers +
+                       self._l3_controllers + self._directory_controllers +
+                       self._dma_controllers)
+        if hasattr(self, "_spr_network_parameters"):
+            self.ruby_system.network.connectControllers(
+                controllers, core_count=len(self._l1_controllers),
+                bank_count=len(self._l3_controllers),
+                directory_count=len(self._directory_controllers),
+                channels=board.get_memory()._num_channels)
+        else:
+            self.ruby_system.network.connectControllers(controllers)
         self.ruby_system.network.setup_buffers()
 
         # Set up a proxy port for the system_port. Used for load binaries and
@@ -272,24 +288,29 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
     """Selected SPR private caches with system-supplied LLC geometry."""
 
     def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int,
-                 uncore_clock: str = "2.5GHz", l1_refill_bytes_per_cycle: int = 64,
-                 l1_fill_response_width: int = 0, l1_fill_capacity: int = 16,
-                 store_prepare_outstanding: int = 16,
-                 l1_write_fill_capacity: int = 0,
-                 l1d_data_access_cycles: int = 3):
-        super().__init__(
-            l1i_size="32KiB", l1i_assoc=8,
-            l1d_size="48KiB", l1d_assoc=12,
-            l2_size="2MiB", l2_assoc=16,
-            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
-            uncore_clock=uncore_clock,
-        )
+                 l1i_size: str, l1i_assoc: int, l1d_size: str, l1d_assoc: int,
+                 l2_size: str, l2_assoc: int, uncore_clock: str,
+                 l1_refill_bytes_per_cycle: int, l1_fill_response_width: int,
+                 l1_fill_capacity: int, l1_write_fill_capacity: int,
+                 l1d_data_access_cycles: int, l2_fill_capacity: int,
+                 sequencer_max_outstanding_requests: int,
+                 l1_tbe_capacity: int, l2_tbe_capacity: int,
+                 network_parameters: dict):
+        super().__init__(l1i_size=l1i_size, l1i_assoc=l1i_assoc,
+                         l1d_size=l1d_size, l1d_assoc=l1d_assoc,
+                         l2_size=l2_size, l2_assoc=l2_assoc,
+                         l3_size=l3_size, l3_assoc=l3_assoc,
+                         num_l3_banks=num_l3_banks, uncore_clock=uncore_clock)
+        self._spr_network_parameters = dict(network_parameters)
         self._l1_refill_bytes_per_cycle = l1_refill_bytes_per_cycle
-        self._l1_fill_response_width = l1_fill_response_width
         self._l1_fill_capacity = l1_fill_capacity
         self._l1_write_fill_capacity = l1_write_fill_capacity
-        self._store_prepare_outstanding = store_prepare_outstanding
+        self._l1_fill_response_width = l1_fill_response_width
         self._l1d_data_access_cycles = l1d_data_access_cycles
+        self._l2_fill_capacity = l2_fill_capacity
+        self._sequencer_max_outstanding_requests = sequencer_max_outstanding_requests
+        self._l1_tbe_capacity = l1_tbe_capacity
+        self._l2_tbe_capacity = l2_tbe_capacity
 
     def incorporate_cache(self, board: AbstractBoard) -> None:
         super().incorporate_cache(board)
@@ -302,4 +323,8 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
             controller.Dcache.fill_capacity = self._l1_fill_capacity
             controller.Dcache.write_fill_capacity = self._l1_write_fill_capacity
             controller.sequencer.data_fill_response_width = self._l1_fill_response_width
-            controller.sequencer.max_store_prepare_outstanding = self._store_prepare_outstanding
+            controller.sequencer.max_outstanding_requests = self._sequencer_max_outstanding_requests
+            controller.number_of_TBEs = self._l1_tbe_capacity
+        for controller in self._l2_controllers:
+            controller.cache.fill_capacity = self._l2_fill_capacity
+            controller.number_of_TBEs = self._l2_tbe_capacity
