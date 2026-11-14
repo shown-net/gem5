@@ -51,6 +51,11 @@ output header {{
                 OpClass __opClass) :
             X86ISA::X86StaticInst(_mnemonic, _machInst, __opClass)
         {
+            // Keep allocation and retirement, but use the existing no-execute
+            // path for architectural NOPs. PAUSE and REX.B XCHG are excluded
+            // by the encoding predicate.
+            if (isArchitecturalNop())
+                flags[IsNop] = true;
         }
 
         std::string generateDisassembly(Addr pc,

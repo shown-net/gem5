@@ -61,6 +61,9 @@ class MemCtrl(QoSMemCtrl):
 
     # single-ported on the system interface side, instantiate with a
     # bus in front of the controller for multiple ports
+    range_backings = VectorParam.AbstractMemory(
+        [], "Additional physical data ranges sharing this controller timing")
+
     port = ResponsePort("This port responds to memory requests")
 
     # Interface to memory media

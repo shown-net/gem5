@@ -53,6 +53,7 @@
 #include "base/statistics.hh"
 #include "cpu/pc_event.hh"
 #include "enums/MemoryMode.hh"
+#include "mem/cache_eviction.hh"
 #include "mem/mem_requestor.hh"
 #include "mem/physical.hh"
 #include "mem/port.hh"
@@ -248,6 +249,8 @@ class System : public SimObject, public PCEventScope
      * @return a reference to the system port we own
      */
     RequestPort& getSystemPort() { return _systemPort; }
+
+    CapacityReadObservations capacityReadObservations;
 
     /**
      * Additional function to return the Port of a memory object.

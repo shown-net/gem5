@@ -402,21 +402,15 @@ class ExecContext : public gem5::ExecContext
   public:
     // monitor/mwait funtions
     void
-    armMonitor(Addr address) override
+    armMonitor(Addr address, Addr paddr) override
     {
-        getCpuPtr()->armMonitor(inst->id.threadId, address);
+        getCpuPtr()->armMonitor(inst->id.threadId, address, paddr);
     }
 
     bool
-    mwait(PacketPtr pkt) override
+    mwait(bool break_on_interrupt) override
     {
-        return getCpuPtr()->mwait(inst->id.threadId, pkt);
-    }
-
-    void
-    mwaitAtomic(ThreadContext *tc) override
-    {
-        return getCpuPtr()->mwaitAtomic(inst->id.threadId, tc, thread.mmu);
+        return getCpuPtr()->mwait(inst->id.threadId, break_on_interrupt);
     }
 
     AddressMonitor *

@@ -162,14 +162,12 @@ Check::initiateFlush(Cycles current_time)
 
     PacketPtr pkt = new Packet(req, cmd);
 
-    // push the subblock onto the sender state.  The sequencer will
-    // update the subblock on the return
-    pkt->senderState = new SenderState(m_address, req->getSize(),
-                                       CACHE_LINE_BITS);
-
     if (port->sendTimingReq(pkt)) {
-        m_tester_ptr->updateProgress(index, m_address, current_time);
+        // FlushReq has no response, so it must not enter the tester's
+        // response-based progress table. The Sequencer tracks its completion.
         DPRINTF(RubyTest, "initiating Flush - successful\n");
+    } else {
+        delete pkt;
     }
 }
 

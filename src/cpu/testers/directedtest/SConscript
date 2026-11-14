@@ -40,11 +40,12 @@ if not env['CONF']['RUBY']:
 
 SimObject('RubyDirectedTester.py', sim_objects=[
     'DirectedGenerator', 'SeriesRequestGenerator', 'InvalidateGenerator',
-    'RubyDirectedTester'])
+    'RubyDirectedTester', 'LoadLinkedUpgradeGenerator'])
 
 Source('RubyDirectedTester.cc')
 Source('DirectedGenerator.cc')
 Source('SeriesRequestGenerator.cc')
 Source('InvalidateGenerator.cc')
+Source('LoadLinkedUpgradeGenerator.cc')
 
 DebugFlag('DirectedTest')

@@ -45,13 +45,15 @@ Import('*')
 if env['CONF']['BUILD_ISA']:
     SimObject('FUPool.py', sim_objects=['FUPool'])
     SimObject('ZeroIdiom.py', sim_objects=['ZeroIdiom'])
+    SimObject('StackEngine.py', sim_objects=['StackEngine'])
     SimObject('Frontend.py', sim_objects=[
         'InstructionBytes', 'InstructionDeliveryQueue', 'MiteService',
         'DsbTemplates', 'MicrocodeService', 'FrontendCoordinator'])
     Source('zero_idiom.cc')
+    Source('stack_engine.cc')
     SimObject('IntExecution.py', sim_objects=[
         'ExecutionPort', 'ExecutionPorts', 'IntExecutionResource', 'IntegerALU',
-        'ResultPathRule', 'ResultForwarding'])
+        'ResultPathRule', 'ResultForwarding', 'IntegerDivider'])
     SimObject('FuncUnitConfig.py', sim_objects=[])
     SimObject('BaseO3CPU.py', sim_objects=['BaseO3CPU'],
         enums=[])
@@ -77,7 +79,9 @@ if env['CONF']['BUILD_ISA']:
     Source('int_execution.cc')
     Source('lsq.cc')
     Source('lsq_unit.cc')
+    Source('lsq_fsfp.cc')
     Source('mem_dep_unit.cc')
+    Source('spr_memory_predictor.cc')
     Source('regfile.cc')
     Source('rename.cc')
     Source('rename_map.cc')
@@ -92,13 +96,16 @@ if env['CONF']['BUILD_ISA']:
     DebugFlag('FTQ')
     DebugFlag('IEW')
     DebugFlag('IQ')
+    DebugFlag('IntDividerTiming')
     DebugFlag('LSQ')
     DebugFlag('LSQUnit')
+    DebugFlag('MemoryOrdering')
     DebugFlag('MemDepUnit')
     DebugFlag('O3CPU')
     DebugFlag('ROB')
     DebugFlag('Rename')
     DebugFlag('Scoreboard')
+    DebugFlag('StackEngine')
     DebugFlag('StoreSet')
     DebugFlag('Writeback')
 

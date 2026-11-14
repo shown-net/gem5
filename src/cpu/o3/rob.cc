@@ -40,6 +40,7 @@
 
 #include "cpu/o3/rob.hh"
 
+#include <algorithm>
 #include <list>
 
 #include "base/logging.hh"
@@ -104,7 +105,11 @@ ROB::ROB(CPU *_cpu, const BaseO3CPUParams &params)
 void
 ROB::resetState()
 {
+    trackingEntries.clear();
+    reservations.clear();
+    reservedEntries = 0;
     for (ThreadID tid = 0; tid  < MaxThreads; tid++) {
+        reservedByThread[tid] = 0;
         threadEntries[tid] = 0;
         squashIt[tid] = instList[tid].end();
         squashedSeqNum[tid] = 0;
@@ -137,6 +142,8 @@ ROB::drainSanityCheck() const
     for (ThreadID tid = 0; tid  < numThreads; tid++)
         assert(instList[tid].empty());
     assert(isEmpty());
+    assert(trackingEntries.empty());
+    assert(reservations.empty());
 }
 
 void
@@ -198,8 +205,19 @@ ROB::insertInst(const DynInstPtr &inst)
 
     DPRINTF(ROB, "Adding inst PC %s to the ROB.\n", inst->pcState());
 
-    const bool shared = inst->allocationGroup && !inst->independentBackendEntries();
-    const unsigned slots = shared ? !inst->allocationGroup->robMembers : 1;
+    if (!hasReservation(inst))
+        reserve(inst);
+    auto &entry = trackingEntries.at(inst->robKey());
+    assert(entry.reserved);
+    --entry.reserved;
+    ++entry.resident;
+    reservations.erase(inst->seqNum);
+    const unsigned slots = entry.active ? 0 : entry.slots;
+    if (!entry.active) {
+        reservedEntries -= slots;
+        reservedByThread[inst->threadNumber] -= slots;
+        entry.active = true;
+    }
     assert(numInstsInROB + slots <= numEntries);
 
     ThreadID tid = inst->threadNumber;
@@ -207,7 +225,7 @@ ROB::insertInst(const DynInstPtr &inst)
     instList[tid].push_back(inst);
 
     //Set Up head iterator if this is the 1st instruction in the ROB
-    if (numInstsInROB == 0) {
+    if (countInsts() == 1) {
         head = instList[tid].begin();
         assert((*head) == inst);
     }
@@ -219,7 +237,7 @@ ROB::insertInst(const DynInstPtr &inst)
 
     inst->setInROB();
 
-    numInstsInROB += shared ? inst->allocationGroup->enterROB() : 1;
+    numInstsInROB += slots;
     threadEntries[tid] += slots;
 
     assert((*tail) == inst);
@@ -233,7 +251,7 @@ ROB::retireHead(ThreadID tid)
 {
     stats.writes++;
 
-    assert(numInstsInROB > 0);
+    assert(!instList[tid].empty());
 
     // Get the head ROB instruction by copying it and remove it from the list
     InstIt head_it = instList[tid].begin();
@@ -247,11 +265,10 @@ ROB::retireHead(ThreadID tid)
             "instruction PC %s, [sn:%llu]\n", tid, head_inst->pcState(),
             head_inst->seqNum);
 
-    const bool shared = head_inst->allocationGroup &&
-                        !head_inst->independentBackendEntries();
-    const unsigned slots = shared ? head_inst->allocationGroup->leaveROB() : 1;
-    numInstsInROB -= slots;
-    threadEntries[tid] -= slots;
+    auto &entry = trackingEntries.at(head_inst->robKey());
+    assert(entry.resident);
+    --entry.resident;
+    releaseTrackingEntry(head_inst->robKey());
 
     head_inst->clearInROB();
     head_inst->setCommitted();
@@ -269,7 +286,7 @@ bool
 ROB::isHeadReady(ThreadID tid)
 {
     stats.reads++;
-    if (threadEntries[tid] != 0) {
+    if (!instList[tid].empty()) {
         return instList[tid].front()->readyToCommit();
     }
 
@@ -292,13 +309,111 @@ ROB::canCommit()
 unsigned
 ROB::numFreeEntries()
 {
-    return numEntries - numInstsInROB;
+    return numEntries - numInstsInROB - reservedEntries;
 }
 
 unsigned
 ROB::numFreeEntries(ThreadID tid)
 {
-    return maxEntries[tid] - threadEntries[tid];
+    return std::min(numFreeEntries(),
+        maxEntries[tid] - threadEntries[tid] - reservedByThread[tid]);
+}
+
+bool
+ROB::hasReservation(const DynInstPtr &inst) const
+{
+    return reservations.count(inst->seqNum);
+}
+
+bool
+ROB::canReserve(const std::vector<DynInstPtr> &insts) const
+{
+    unsigned need = 0;
+    std::array<unsigned, MaxThreads> per_thread{};
+    assert(insts.size() <= MaxWidth);
+    std::array<InstSeqNum, MaxWidth> seen;
+    unsigned seen_count = 0;
+    for (const auto &inst : insts) {
+        const auto key = inst->robKey();
+        if (hasReservation(inst) || trackingEntries.count(inst->robKey()) ||
+            std::find(seen.begin(), seen.begin() + seen_count, key) !=
+                seen.begin() + seen_count)
+            continue;
+        seen[seen_count++] = key;
+        need += inst->backendSlots();
+        per_thread[inst->threadNumber] += inst->backendSlots();
+    }
+    if (need > numEntries - numInstsInROB - reservedEntries)
+        return false;
+    for (ThreadID tid = 0; tid < MaxThreads; ++tid)
+        if (per_thread[tid] > maxEntries[tid] - threadEntries[tid] -
+                              reservedByThread[tid])
+            return false;
+    return true;
+}
+
+void
+ROB::reserve(const DynInstPtr &inst)
+{
+    if (hasReservation(inst))
+        return;
+    auto found = trackingEntries.find(inst->robKey());
+    if (found == trackingEntries.end()) {
+        const unsigned slots = inst->backendSlots();
+        panic_if(numFreeEntries(inst->threadNumber) < slots,
+                 "ROB reservation without tracking-entry credits");
+        found = trackingEntries.emplace(inst->robKey(),
+            TrackingEntry{inst->threadNumber, slots}).first;
+        reservedEntries += slots;
+        reservedByThread[inst->threadNumber] += slots;
+    }
+    ++found->second.reserved;
+    reservations.emplace(inst->seqNum, inst->robKey());
+}
+
+void
+ROB::releaseTrackingEntry(InstSeqNum key)
+{
+    auto found = trackingEntries.find(key);
+    auto &entry = found->second;
+    if (entry.reserved || entry.resident)
+        return;
+    if (entry.active) {
+        numInstsInROB -= entry.slots;
+        threadEntries[entry.thread] -= entry.slots;
+    } else {
+        reservedEntries -= entry.slots;
+        reservedByThread[entry.thread] -= entry.slots;
+    }
+    trackingEntries.erase(found);
+}
+
+void
+ROB::cancelReservation(InstSeqNum sequence)
+{
+    auto it = reservations.find(sequence);
+    if (it == reservations.end())
+        return;
+    const auto key = it->second;
+    auto &entry = trackingEntries.at(key);
+    assert(entry.reserved);
+    --entry.reserved;
+    reservations.erase(it);
+    releaseTrackingEntry(key);
+}
+
+void
+ROB::cancelReservations(ThreadID tid, InstSeqNum through)
+{
+    for (auto it = reservations.upper_bound(through); it != reservations.end();) {
+        const auto key = it->second;
+        auto &entry = trackingEntries.at(key);
+        if (entry.thread != tid) { ++it; continue; }
+        assert(entry.reserved);
+        --entry.reserved;
+        it = reservations.erase(it);
+        releaseTrackingEntry(key);
+    }
 }
 
 void
@@ -322,17 +437,20 @@ ROB::doSquash(ThreadID tid)
 
     bool robTailUpdate = false;
 
-    auto numInstsToSquash = squashWidth.has_value() ? squashWidth : numEntries;
+    // Without an explicit squash bandwidth, visit every resident functional
+    // member. ROB entry capacity is not a bound on the number of such members.
+    size_t numInstsToSquash = squashWidth.has_value() ?
+        *squashWidth : instList[tid].size();
 
     // If the CPU is exiting, squash all of the instructions
     // it is told to, even if that exceeds the squashWidth.
-    // Set the number to the number of entries (the max).
+    // Include every functional member of every tracking entry.
     if (cpu->isThreadExiting(tid))
     {
-        numInstsToSquash = numEntries;
+        numInstsToSquash = instList[tid].size();
     }
 
-    for (int numSquashed = 0;
+    for (size_t numSquashed = 0;
          numSquashed < numInstsToSquash &&
          squashIt[tid] != instList[tid].end() &&
          (*squashIt[tid])->seqNum > squashedSeqNum[tid];
@@ -458,6 +576,16 @@ ROB::updateTail()
 void
 ROB::squash(InstSeqNum squash_num, ThreadID tid)
 {
+    cancelReservations(tid, squash_num);
+    // Include materialized records still between Fetch, Rename and the ROB.
+    // Commit receives correct-path messages during cleanup, so an old Rename
+    // message arriving in this cycle must already be invalid.
+    for (const auto &inst : cpu->instList) {
+        if (inst->threadNumber == tid && inst->seqNum > squash_num) {
+            inst->setSquashed();
+            inst->setCanCommit();
+        }
+    }
     if (isEmpty(tid)) {
         DPRINTF(ROB, "Does not need to squash due to being empty "
                 "[sn:%llu]\n",
@@ -474,6 +602,10 @@ ROB::squash(InstSeqNum squash_num, ThreadID tid)
 
     squashedSeqNum[tid] = squash_num;
 
+    // The bandwidth-limited walk owns the remaining tracking cleanup. A
+    // nested redirect can replace its cursor; invalid records are already
+    // retireable once their thread leaves this cleanup phase.
+
     if (!instList[tid].empty()) {
         InstIt tail_thread = instList[tid].end();
         tail_thread--;
@@ -487,7 +619,7 @@ ROB::squash(InstSeqNum squash_num, ThreadID tid)
 const DynInstPtr&
 ROB::readHeadInst(ThreadID tid)
 {
-    if (threadEntries[tid] != 0) {
+    if (!instList[tid].empty()) {
         InstIt head_thread = instList[tid].begin();
 
         assert((*head_thread)->isInROB());
@@ -525,6 +657,33 @@ ROB::findInst(ThreadID tid, InstSeqNum squash_inst)
         }
     }
     return NULL;
+}
+
+bool
+ROB::retirementGroupReady(const DynInstPtr &head_inst, bool &fault_ready) const
+{
+    const auto &insts = instList[head_inst->threadNumber];
+    auto member = insts.begin();
+    assert(member != insts.end() && *member == head_inst);
+
+    bool group_ready = true;
+    fault_ready = false;
+    const bool stack_sync_gaps = cpu->instSeqStride() == 2;
+    // ROB insertion preserves sequence order. Walk only this group's records;
+    // absent odd sequences reserve space for optional StackSync instructions.
+    for (InstSeqNum sn = head_inst->seqNum;
+         sn <= head_inst->retirementEnd(); ++sn) {
+        if (member == insts.end() || (*member)->seqNum != sn) {
+            if (!stack_sync_gaps || !(sn & 1))
+                group_ready = false;
+            continue;
+        }
+        const bool ready = (*member)->readyToCommit();
+        group_ready &= ready;
+        fault_ready |= ready && (*member)->getFault() != NoFault;
+        ++member;
+    }
+    return group_ready;
 }
 
 } // namespace o3

@@ -70,6 +70,8 @@ namespace X86ISA
 
         // The beginning of the virtual page this entry maps.
         Addr vaddr;
+        // PCID is separate from the virtual page and its page offset.
+        uint16_t pcid = 0;
         // The size of the page this represents, in address bits.
         unsigned logBytes;
 
@@ -78,9 +80,9 @@ namespace X86ISA
         bool writable;
         // Whether this page is accesible without being in supervisor mode.
         bool user;
-        // Whether to use write through or write back. M5 ignores this and
-        // lets the caches handle the writeback policy.
-        //bool pwt;
+        // Leaf PWT is retained for fast string access admission. Cache
+        // protocol behavior continues to own the actual writeback policy.
+        bool pwt;
         // Whether the page is cacheable or not.
         bool uncacheable;
         // Whether or not to kick this page out on a write to CR3.

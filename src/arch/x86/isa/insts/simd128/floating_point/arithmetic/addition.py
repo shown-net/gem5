@@ -35,55 +35,51 @@
 
 microcode = """
 def macroop ADDSS_XMM_XMM {
-    maddf xmml, xmml, xmmlm, size=4, ext=Scalar
+    mxmmadds xmml, xmmh, xmml, xmmh, xmmlm, size=4
 };
 
 def macroop ADDSS_XMM_M {
     .microfused_load
     ldfp ufp1, seg, sib, disp, dataSize=4
-    maddf xmml, xmml, ufp1, size=4, ext=Scalar
+    mxmmadds xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop ADDSS_XMM_P {
     .microfused_load
     ldfprip ufp1, seg, riprel, disp, dataSize=4
-    maddf xmml, xmml, ufp1, size=4, ext=Scalar
+    mxmmadds xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop ADDSD_XMM_XMM {
-    maddf xmml, xmml, xmmlm, size=8, ext=Scalar
+    mxmmadds xmml, xmmh, xmml, xmmh, xmmlm, size=8
 };
 
 def macroop ADDSD_XMM_M {
     .microfused_load
     ldfp ufp1, seg, sib, disp, dataSize=8
-    maddf xmml, xmml, ufp1, size=8, ext=Scalar
+    mxmmadds xmml, xmmh, xmml, xmmh, ufp1, size=8
 };
 
 def macroop ADDSD_XMM_P {
     .microfused_load
     ldfprip ufp1, seg, riprel, disp, dataSize=8
-    maddf xmml, xmml, ufp1, size=8, ext=Scalar
+    mxmmadds xmml, xmmh, xmml, xmmh, ufp1, size=8
 };
 
 def macroop ADDPS_XMM_XMM {
-    maddf xmml, xmml, xmmlm, size=4, ext=0
-    maddf xmmh, xmmh, xmmhm, size=4, ext=0
+    mxmmaddf xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=4
 };
 
 def macroop ADDPS_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    maddf xmml, xmml, ufp1, size=4, ext=0
-    maddf xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmaddf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop ADDPS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    maddf xmml, xmml, ufp1, size=4, ext=0
-    maddf xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmaddf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop ADDPD_XMM_XMM {

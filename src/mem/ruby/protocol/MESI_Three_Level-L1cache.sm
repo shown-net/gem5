@@ -40,7 +40,7 @@
 
 machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
  : CacheMemory * cache;
-   int l2_select_num_bits;
+   int l2_select_num_banks;
    Cycles l1_request_latency := 2;
    Cycles l1_response_latency := 2;
    Cycles to_l2_latency := 1;
@@ -176,9 +176,15 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     bool Dirty, default="false",   desc="data is dirty";
     int pendingAcks, default="0", desc="number of pending acks";
     bool countsLineFill, default="false", desc="This TBE owns an L2 fill credit";
+    Addr SprRetiredService, default="0", desc="Observer-only current data service";
+    Addr PrefetchOracleGeneration, default="0", desc="Oracle-only private-L2-begun prefetch generation";
+    Addr PrefetchOracleParentGeneration, default="0", desc="Observer-only carried L1D prefetch generation; finished by L0, never here";
+    int ServiceSource, default="0", desc="Data supplier for this fill version";
+    int ServiceL3Outcome, default="0", desc="LLC outcome for this fill version";
   }
 
   structure(TBETable, external="yes") {
+    bool areNSlotsAvailable(int n, Tick current_time);
     TBE lookup(Addr);
     void allocate(Addr);
     void deallocate(Addr);
@@ -478,11 +484,16 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         NodeID nid := machineIDToNodeID(mid);
         if (IDToInt(nid) >= machineCount(MachineType:Directory) ||
             pf_state != State:I) {
+          if (is_valid(pf_entry) && is_invalid(pf_tbe)) {
+            cache.profileNativeRequest(7, false, false);
+          }
           prefetcher.prefetchDequeued(in_msg.LineAddress);
           prefetchQueue_in.dequeue(clockEdge());
-        } else if (!cache.canAllocateFill()) {
-          cache.recordFillBlocked();
-          prefetchQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
+        } else if (bufferFromL0.isReady(clockEdge()) ||
+                   !TBEs.areNSlotsAvailable(1, clockEdge()) ||
+                   !cache.canAllocateFill()) {
+          prefetcher.prefetchDropped(in_msg.LineAddress);
+          prefetchQueue_in.dequeue(clockEdge());
         } else if (cache.cacheAvail(in_msg.LineAddress)) {
           trigger(Event:Prefetch, in_msg.LineAddress, pf_entry, pf_tbe);
         } else {
@@ -495,7 +506,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
                victim_state != State:SS && victim_state != State:E &&
                victim_state != State:EE && victim_state != State:M &&
                victim_state != State:MM)) {
-            prefetchQueue_in.recycle(clockEdge(), cyclesToTicks(intToCycles(1)));
+            prefetcher.prefetchDropped(in_msg.LineAddress);
+            prefetchQueue_in.dequeue(clockEdge());
           } else if (inL0Cache(victim_state)) {
             trigger(Event:L0_Invalidate_Own, victim, victim_entry, victim_tbe);
           } else {
@@ -508,15 +520,18 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   // ACTIONS
   action(pa_issuePrefetchGETS, "pa", desc="Issue a private L2 prefetch") {
+    tbe.PrefetchOracleGeneration := prefetchOracleBegin(version, address);
+    cache.profileNativeRequest(7, true, false);
     enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceRequestType:GETS;
       out_msg.Requestor := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                        l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                        l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Control;
       out_msg.AccessMode := RubyAccessMode:Supervisor;
       out_msg.Prefetch := PrefetchBit:Yes;
+      out_msg.PrefetchOracleGeneration := tbe.PrefetchOracleGeneration;
     }
   }
 
@@ -529,21 +544,65 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(pm_markPrefetched, "pm", desc="Mark a completed private L2 prefetch") {
     cache_entry.isPrefetched := true;
-    cache.setMRU(address);
+    cache.setMRUOnFill(address);
   }
 
   action(pl_observeLatePrefetch, "pl", desc="Observe demand merging into an L2 prefetch") {
     prefetcher.observePfMiss(address);
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 3);
+      perfCacheNativeLookup(in_msg.PerfTransactionId, version,
+          in_msg.Prefetch, 1, 3);
+    }
+  }
+
+  // Oracle-only demand identity for an in-flight private-L2 prefetch.
+  action(otl_observeLatePrefetch, "otl", desc="Observe late prefetch identity") {
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      taotraceLatePrefetchByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1);
+      prefetchOracleAttach(tbe.PrefetchOracleGeneration, version, address,
+          in_msg.TraceValid, in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId);
+    }
+  }
+
+  action(opi_invalidatePrefetchOracle, "opi", desc="Invalidate oracle prefetch witness") {
+    prefetchOracleInvalidate(tbe.PrefetchOracleGeneration, version, address);
+    prefetchOracleInvalidate(tbe.PrefetchOracleParentGeneration, version, address);
+  }
+
+  action(opd_observePrefetchData, "opd", desc="Observe immediate DATA sender") {
+    peek(responseNetwork_in, ResponseMsg) {
+      prefetchOracleResponse(tbe.PrefetchOracleGeneration, version, address,
+          in_msg.Sender, 1);
+      prefetchOracleResponse(tbe.PrefetchOracleParentGeneration, version, address,
+          in_msg.Sender, 1);
+    }
+  }
+
+  action(opx_observePrefetchExclusiveData, "opx", desc="Observe immediate DATA_EXCLUSIVE sender") {
+    peek(responseNetwork_in, ResponseMsg) {
+      prefetchOracleResponse(tbe.PrefetchOracleGeneration, version, address,
+          in_msg.Sender, 2);
+      prefetchOracleResponse(tbe.PrefetchOracleParentGeneration, version, address,
+          in_msg.Sender, 2);
+    }
   }
 
   action(a_issueGETS, "a", desc="Issue GETS") {
     peek(messageBufferFromL0_in, CoherenceMsg) {
+      tbe.SprRetiredService := in_msg.PerfTransactionId;
+      sprRetiredServiceRetain(tbe.SprRetiredService);
+      // Carry the L1D-begun generation; the private L2 must not finish it.
+      tbe.PrefetchOracleParentGeneration := in_msg.PrefetchOracleGeneration;
       enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:GETS;
         out_msg.Requestor := machineID;
-        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+        out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
         DPRINTF(RubySlicc, "address: %#x, destination: %s\n",
                 address, out_msg.Destination);
         out_msg.MessageSize := MessageSizeType:Control;
@@ -551,22 +610,27 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.Prefetch := in_msg.Prefetch;
         out_msg.FillAuditRole := in_msg.FillAuditRole;
         out_msg.PerfTransactionId := in_msg.PerfTransactionId;
+        out_msg.NativeRequest := in_msg.NativeRequest;
         out_msg.TraceValid := in_msg.TraceValid;
         out_msg.TraceContextId := in_msg.TraceContextId;
         out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
+        out_msg.PrefetchOracleGeneration := in_msg.PrefetchOracleGeneration;
       }
     }
   }
 
   action(b_issueGETX, "b", desc="Issue GETX") {
     peek(messageBufferFromL0_in, CoherenceMsg) {
+      tbe.SprRetiredService := in_msg.PerfTransactionId;
+      sprRetiredServiceRetain(tbe.SprRetiredService);
+      cache.beginOffcoreOwnership(address, in_msg.FillAuditRole);
       enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:GETX;
         out_msg.Requestor := machineID;
         DPRINTF(RubySlicc, "%s\n", machineID);
-        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+        out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
         DPRINTF(RubySlicc, "address: %#x, destination: %s\n",
                 address, out_msg.Destination);
         out_msg.MessageSize := MessageSizeType:Control;
@@ -574,6 +638,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.Prefetch := in_msg.Prefetch;
         out_msg.FillAuditRole := in_msg.FillAuditRole;
         out_msg.PerfTransactionId := in_msg.PerfTransactionId;
+        out_msg.NativeRequest := in_msg.NativeRequest;
         out_msg.TraceValid := in_msg.TraceValid;
         out_msg.TraceContextId := in_msg.TraceContextId;
         out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
@@ -583,12 +648,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   action(c_issueUPGRADE, "c", desc="Issue GETX") {
     peek(messageBufferFromL0_in, CoherenceMsg) {
+      cache.beginOffcoreOwnership(address, in_msg.FillAuditRole);
       enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:UPGRADE;
         out_msg.Requestor := machineID;
-        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+        out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
         DPRINTF(RubySlicc, "address: %#x, destination: %s\n",
                 address, out_msg.Destination);
         out_msg.MessageSize := MessageSizeType:Control;
@@ -596,6 +662,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.Prefetch := in_msg.Prefetch;
         out_msg.FillAuditRole := in_msg.FillAuditRole;
         out_msg.PerfTransactionId := in_msg.PerfTransactionId;
+        out_msg.NativeRequest := in_msg.NativeRequest;
         out_msg.TraceValid := in_msg.TraceValid;
         out_msg.TraceContextId := in_msg.TraceContextId;
         out_msg.TraceInstSeqNum := in_msg.TraceInstSeqNum;
@@ -626,8 +693,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.DataBlk := cache_entry.DataBlk;
       out_msg.Dirty := cache_entry.Dirty;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
@@ -655,8 +722,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.DataBlk := tbe.DataBlk;
       out_msg.Dirty := tbe.Dirty;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
@@ -681,8 +748,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.DataBlk := cache_entry.DataBlk;
       out_msg.Dirty := cache_entry.Dirty;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Writeback_Data;
     }
   }
@@ -695,8 +762,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.DataBlk := tbe.DataBlk;
       out_msg.Dirty := tbe.Dirty;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Writeback_Data;
     }
   }
@@ -712,6 +779,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.AckCount := 1;
       }
     }
+    perfCacheNativeInvalidation(version, 1);
   }
 
   action(forward_eviction_to_L0_own, "\cc", desc="sends (own) eviction information to the processor") {
@@ -735,21 +803,18 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(g_issuePUTX, "g", desc="send data to the L2 cache") {
-    perfCacheNativeWriteback(version, cache_entry.Dirty);
+    perfCacheNativeWriteback(version, 1, cache_entry.Dirty);
     enqueue(requestNetwork_out, RequestMsg, l1_response_latency) {
       assert(is_valid(cache_entry));
       out_msg.addr := address;
       out_msg.Type := CoherenceRequestType:PUTX;
       out_msg.Dirty := cache_entry.Dirty;
       out_msg.Requestor:= machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
-      if (cache_entry.Dirty) {
-        out_msg.MessageSize := MessageSizeType:Writeback_Data;
-        out_msg.DataBlk := cache_entry.DataBlk;
-      } else {
-        out_msg.MessageSize := MessageSizeType:Writeback_Control;
-      }
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
+      // A noninclusive LLC may retain only owner metadata, even for E data.
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      out_msg.DataBlk := cache_entry.DataBlk;
     }
   }
 
@@ -758,8 +823,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:UNBLOCK;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Response_Control;
       DPRINTF(RubySlicc, "%#x\n", address);
     }
@@ -770,8 +835,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:EXCLUSIVE_UNBLOCK;
       out_msg.Sender := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Response_Control;
       DPRINTF(RubySlicc, "%#x\n", address);
 
@@ -784,8 +849,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:FLUSH;
         out_msg.Requestor := machineID;
-        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                            l2_select_low_bit, l2_select_num_bits, clusterID));
+        out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                            l2_select_low_bit, l2_select_num_banks, clusterID));
         if (in_msg.Dirty) {
           out_msg.MessageSize := MessageSizeType:Data;
           out_msg.DataBlk := in_msg.DataBlk;
@@ -795,9 +860,22 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
           out_msg.DataBlk := cache_entry.DataBlk;
           out_msg.Dirty := true;
         } else {
-          out_msg.MessageSize := in_msg.MessageSize;
+          // Clean exclusive data may be the only on-chip copy after LLC
+          // data replacement; a flush must not rely on an LLC backup.
+          out_msg.MessageSize := MessageSizeType:Data;
+          out_msg.DataBlk := cache_entry.DataBlk;
           out_msg.Dirty := false;
         }
+      }
+    }
+  }
+
+  action(f_captureFlushData, "fcf", desc="Preserve the latest L0 flush data in the TBE") {
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      assert(is_valid(tbe));
+      if (in_msg.Dirty) {
+        tbe.DataBlk := in_msg.DataBlk;
+        tbe.Dirty := true;
       }
     }
   }
@@ -808,8 +886,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:FLUSH_NP;
         out_msg.Requestor := machineID;
-        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                            l2_select_low_bit, l2_select_num_bits, clusterID));
+        out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                            l2_select_low_bit, l2_select_num_banks, clusterID));
         out_msg.MessageSize := in_msg.MessageSize;
         out_msg.Dirty := false;
       }
@@ -830,11 +908,25 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       out_msg.addr := address;
       out_msg.Type := CoherenceRequestType:FLUSH_DATA;
       out_msg.Requestor := machineID;
-      out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                          l2_select_low_bit, l2_select_num_bits, clusterID));
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
       out_msg.MessageSize := MessageSizeType:Data;
       out_msg.DataBlk := cache_entry.DataBlk;
       out_msg.Dirty := cache_entry.Dirty;
+    }
+  }
+
+  action(ft_sendFlushDataFromTBE, "ftfd", desc="respond to flush during writeback") {
+    enqueue(requestNetwork_out, RequestMsg, l1_request_latency) {
+      assert(is_valid(tbe));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:FLUSH_DATA;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
+      out_msg.MessageSize := MessageSizeType:Data;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Dirty := tbe.Dirty;
     }
   }
 
@@ -845,10 +937,14 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.addr := address;
         out_msg.Type := CoherenceRequestType:FLUSH_DATA;
         out_msg.Requestor := machineID;
-        out_msg.Destination.add(mapAddressToRange(address, MachineType:L2Cache,
-                            l2_select_low_bit, l2_select_num_bits, clusterID));
+        out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                            l2_select_low_bit, l2_select_num_banks, clusterID));
         out_msg.MessageSize := MessageSizeType:Data;
-        out_msg.DataBlk := in_msg.DataBlk;
+        if (in_msg.Dirty) {
+          out_msg.DataBlk := in_msg.DataBlk;
+        } else {
+          out_msg.DataBlk := cache_entry.DataBlk;
+        }
         out_msg.Dirty := in_msg.Dirty;
       }
     }
@@ -871,10 +967,29 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
           out_msg.Sender := machineID;
           out_msg.Dest := createMachineID(MachineType:L0Cache, version);
           out_msg.DataBlk := cache_entry.DataBlk;
+          if (is_valid(tbe)) {
+            if (tbe.countsLineFill) {
+              out_msg.ServiceSource := tbe.ServiceSource;
+              out_msg.ServiceL2Outcome := 2;
+              out_msg.ServiceL3Outcome := tbe.ServiceL3Outcome;
+            }
+          } else {
+            out_msg.ServiceSource := 1;
+            out_msg.ServiceL2Outcome := 1;
+            out_msg.ServiceL3Outcome := 3;
+          }
           out_msg.MessageSize := MessageSizeType:Response_Data;
       }
 
-      cache.setMRU(address);
+      if (is_valid(tbe)) {
+        if (tbe.countsLineFill) {
+          cache.setMRUOnFill(address);
+        } else {
+          cache.setMRU(address);
+        }
+      } else {
+        cache.setMRU(address);
+      }
   }
 
   action(hh_xdata_to_l0, "\h", desc="If not prefetch, notify sequencer that store completed.") {
@@ -886,13 +1001,32 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
           out_msg.Sender := machineID;
           out_msg.Dest := createMachineID(MachineType:L0Cache, version);
           out_msg.DataBlk := cache_entry.DataBlk;
+          if (is_valid(tbe)) {
+            if (tbe.countsLineFill) {
+              out_msg.ServiceSource := tbe.ServiceSource;
+              out_msg.ServiceL2Outcome := 2;
+              out_msg.ServiceL3Outcome := tbe.ServiceL3Outcome;
+            }
+          } else {
+            out_msg.ServiceSource := 1;
+            out_msg.ServiceL2Outcome := 1;
+            out_msg.ServiceL3Outcome := 3;
+          }
           out_msg.Dirty := cache_entry.Dirty;
           out_msg.MessageSize := MessageSizeType:Response_Data;
 
           //cache_entry.Dirty := true;
       }
 
-      cache.setMRU(address);
+      if (is_valid(tbe)) {
+        if (tbe.countsLineFill) {
+          cache.setMRUOnFill(address);
+        } else {
+          cache.setMRU(address);
+        }
+      } else {
+        cache.setMRU(address);
+      }
   }
 
   action(h_stale_data_to_l0, "hs", desc="If not prefetch, send data to the L0 cache.") {
@@ -935,6 +1069,11 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(k_popL0RequestQueue, "k", desc="Pop mandatory queue.") {
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      if (in_msg.Class == CoherenceClass:GETS) {
+        cache.profileNativeReadAccess(in_msg.FillAuditRole);
+      }
+    }
     messageBufferFromL0_in.dequeue(clockEdge());
   }
 
@@ -951,6 +1090,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(s_deallocateTBE, "s", desc="Deallocate TBE") {
+    sprRetiredServiceRelease(tbe.SprRetiredService);
+    prefetchOracleFinish(tbe.PrefetchOracleGeneration, version, address);
+    cache.endOffcoreOwnership(address);
     if (tbe.countsLineFill) {
       cache.releaseFill();
     }
@@ -973,6 +1115,23 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       assert(is_valid(cache_entry));
       cache_entry.DataBlk := in_msg.DataBlk;
       cache_entry.Dirty := in_msg.Dirty;
+      if (is_valid(tbe)) {
+        // Shared responses to an invalidated transient are delivered stale;
+        // DATA_EXCLUSIVE instead transitions both transient states to a
+        // persistent exclusive line.
+        if (tbe.countsLineFill &&
+            ((tbe.TBEState != State:IS_I && tbe.TBEState != State:PF_IS_I) ||
+             in_msg.Type == CoherenceResponseType:DATA_EXCLUSIVE)) {
+          cache.profileDataLineFill();
+        }
+        tbe.ServiceSource := in_msg.ServiceSource;
+        tbe.ServiceL3Outcome := in_msg.ServiceL3Outcome;
+        // A peer directly supplies data; Sender is not an LLC data hit.
+        if (machineIDToMachineType(in_msg.Sender) == MachineType:L1Cache) {
+          tbe.ServiceSource := 4;
+          tbe.ServiceL3Outcome := 0;
+        }
+      }
     }
   }
 
@@ -1025,8 +1184,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
     cache.profileDemandMiss();
     peek(messageBufferFromL0_in, CoherenceMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      cache.profileNativeRequest(in_msg.FillAuditRole, true,
+          in_msg.Class == CoherenceClass:GETX);
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 1, 1);
       perfCacheNativeLookup(in_msg.PerfTransactionId, version,
           in_msg.Prefetch, 1, 1);
       if (enable_prefetch && in_msg.TrainPrefetch) {
@@ -1039,8 +1203,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
     cache.profileDemandHit();
     peek(messageBufferFromL0_in, CoherenceMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      cache.profileNativeRequest(in_msg.FillAuditRole, false,
+          in_msg.Class == CoherenceClass:GETX);
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 0);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 1, 0);
       perfCacheNativeLookup(in_msg.PerfTransactionId, version,
           in_msg.Prefetch, 1, 0);
       if (enable_prefetch && in_msg.TrainPrefetch &&
@@ -1058,10 +1227,38 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   action(uu_profileUpgrade, "\uu", desc="Profile permission upgrade") {
     cache.profileDemandMiss();
     peek(messageBufferFromL0_in, CoherenceMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      cache.profileNativeRequest(in_msg.FillAuditRole, false, true);
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 2);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 1, 2);
       perfCacheNativeLookup(in_msg.PerfTransactionId, version,
           in_msg.Prefetch, 1, 2);
+    }
+  }
+
+  action(uc_profileMergedMiss, "\uc",
+      desc="Profile demand merged into an outstanding miss") {
+    // Keep the controller demand-miss statistic identical to the plain miss
+    // action; only the observer-only request outcome is typed MergedMiss(3),
+    // so coalesced followers never masquerade as independent tag misses in
+    // the request conservation ledger.
+    cache.profileDemandMiss();
+    peek(messageBufferFromL0_in, CoherenceMsg) {
+      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum, 1, 1);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 1, 1);
+      perfCacheNativeLookup(in_msg.PerfTransactionId, version,
+          in_msg.Prefetch, 1, 3);
+      sprRetiredServiceFollow(in_msg.PerfTransactionId, tbe.SprRetiredService);
+      sprRetiredPrefetchFollow(in_msg.PerfTransactionId, tbe.PrefetchOracleGeneration);
+      if (enable_prefetch && in_msg.TrainPrefetch) {
+        prefetcher.observeMiss(in_msg.addr, RubyRequestType:LD);
+        prefetcher.observeAdjacent(in_msg.addr);
+      }
     }
   }
 
@@ -1072,8 +1269,21 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   // Transitions for Load/Store/Replacement/WriteBack from transient states
   transition({IS, IM, IS_I, M_I, SM, SINK_WB_ACK, S_IL0, M_IL0, E_IL0, MM_IL0, I_F, V_F, D_F},
-             {Load, Store, L1_Replacement, Flush, External_Flush_Data, Flush_NP}) {
+             {Load, Store, L1_Replacement, Flush, Flush_NP}) {
     z0_stallAndWaitL0Queue;
+  }
+
+  // External flush data requests arrive from the shared cache, not L0.
+  transition({IS, IM, IS_I, SM, SINK_WB_ACK, S_IL0, M_IL0, E_IL0, MM_IL0, I_F, V_F, D_F}, External_Flush_Data) {
+    z2_stallAndWaitL2Queue;
+  }
+
+  // The LLC may request data after our PUTX has departed but before its
+  // acknowledgement. Waiting for that acknowledgement would deadlock with
+  // the LLC's flush. The TBE retains the exact data sent by PUTX.
+  transition(M_I, External_Flush_Data, SINK_WB_ACK) {
+    ft_sendFlushDataFromTBE;
+    l_popL2RequestQueue;
   }
 
   transition(I, Load, IS) {
@@ -1096,7 +1306,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(PF_IS, Load, IS) {
-    uu_profileMiss;
+    otl_observeLatePrefetch;
     pl_observeLatePrefetch;
     k_popL0RequestQueue;
   }
@@ -1110,6 +1320,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition({PF_IS, PF_IS_I}, Inv, PF_IS_I) {
+    opi_invalidatePrefetchOracle;
     fi_sendInvAck;
     l_popL2RequestQueue;
   }
@@ -1218,8 +1429,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(EE, Inv, I) {
-    // don't send data
-    fi_sendInvAck;
+    // LLC need not retain a backup of this clean exclusive line.
+    d2_sendDataToL2;
     ff_deallocateCacheBlock;
     l_popL2RequestQueue;
   }
@@ -1307,11 +1518,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   // Transitions from IS
   transition({IS,IS_I}, Inv, IS_I) {
+    opi_invalidatePrefetchOracle;
     fi_sendInvAck;
     l_popL2RequestQueue;
   }
 
   transition(IS, Data_all_Acks, S) {
+    opd_observePrefetchData;
     u_writeDataFromL2Response;
     h_data_to_l0;
     s_deallocateTBE;
@@ -1320,6 +1533,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(IS_I, Data_all_Acks, I) {
+    opd_observePrefetchData;
     u_writeDataFromL2Response;
     h_stale_data_to_l0;
     s_deallocateTBE;
@@ -1329,6 +1543,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(IS, DataS_fromL1, S) {
+    opd_observePrefetchData;
     u_writeDataFromL2Response;
     j_sendUnblock;
     h_data_to_l0;
@@ -1338,6 +1553,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   transition(IS_I, DataS_fromL1, I) {
+    opd_observePrefetchData;
     u_writeDataFromL2Response;
     j_sendUnblock;
     h_stale_data_to_l0;
@@ -1349,6 +1565,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   // directory is blocked when sending exclusive data
   transition({IS,IS_I}, Data_Exclusive, E) {
+    opx_observePrefetchExclusiveData;
     u_writeDataFromL2Response;
     hh_xdata_to_l0;
     jj_sendExclusiveUnblock;
@@ -1509,10 +1726,38 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     k_popL0RequestQueue;
   }
 
+  // The L0 flush can be waiting while an earlier invalidation and L1
+  // replacement return the line to the shared hierarchy. Its data was
+  // transferred by that transaction; request a flush of the current owner.
+  transition(I, Flush, I_F) {
+    i_allocateTBE_flush;
+    f_sendFlushNPToL2;
+    k_popL0RequestQueue;
+  }
+
   transition({S, SS, E, EE, M, MM}, {Flush, Flush_NP}, V_F) {
     i_allocateTBE;
+    f_captureFlushData;
     f_sendFlushToL2;
     k_popL0RequestQueue;
+  }
+
+  // A previously forwarded request can arrive before our flush reaches L2.
+  // Supply the captured data and retain the flush TBE until its own ack.
+  transition(V_F, Fwd_GETX) {
+    dt_sendDataToRequestor_fromTBE;
+    l_popL2RequestQueue;
+  }
+
+  transition(V_F, Fwd_GETS) {
+    dt_sendDataToRequestor_fromTBE;
+    d2t_sendDataToL2_fromTBE;
+    l_popL2RequestQueue;
+  }
+
+  transition(I_F, Inv) {
+    fi_sendInvAck;
+    l_popL2RequestQueue;
   }
 
   transition(V_F, Flush_Ack, I) {
@@ -1544,7 +1789,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   transition(D_F, External_Flush_Data_Ack, I) {
     f_fwdFlushDataToL2;
+    s_deallocateTBE;
     ff_deallocateCacheBlock;
     k_popL0RequestQueue;
+    kd_wakeUpDependents;
   }
 }

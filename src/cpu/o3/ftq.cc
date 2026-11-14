@@ -57,7 +57,8 @@ FetchTarget::FetchTarget(const ThreadID _tid, const PCStateBase &_start_pc,
       tid(_tid),
       is_branch(false),
       taken(false),
-      bpuHistory(nullptr)
+      bpuHistory(nullptr),
+      state(std::make_shared<FetchTargetState>(_seqNum, _start_pc.instAddr()))
 {
     set(startPC, _start_pc);
 }
@@ -211,9 +212,27 @@ FTQ::squash(ThreadID tid)
 void
 FTQ::squashSanityCheck(ThreadID tid)
 {
-    for (auto ft : ftq[tid]) {
+    for (auto ft : ftq[tid]) assert(ft->bpuHistory == nullptr);
+}
+
+bool
+FTQ::contains(ThreadID tid, FTSeqNum sequence) const
+{
+    for (const auto &ft : ftq[tid]) if (ft->ftNum() == sequence) return true;
+    return false;
+}
+
+void
+FTQ::squashAfter(ThreadID tid, FTSeqNum through)
+{
+    while (!ftq[tid].empty() && ftq[tid].back()->ftNum() > through) {
+        auto ft = ftq[tid].back();
         assert(ft->bpuHistory == nullptr);
+        ppFTQRemove->notify(ft);
+        ftq[tid].pop_back();
     }
+    ftqStatus[tid] = Valid;
+    ++stats.squashes;
 }
 
 bool
@@ -231,6 +250,17 @@ FTQ::readHead(ThreadID tid)
     }
 
     return ftq[tid].front();
+}
+
+FetchTargetPtr
+FTQ::readAhead(ThreadID tid, unsigned index)
+{
+    if (!isHeadReady(tid) || (index && ftqStatus[tid] == Locked) ||
+        index >= ftq[tid].size())
+        return nullptr;
+    auto it = ftq[tid].begin();
+    std::advance(it, index);
+    return (*it)->ready(uint64_t(cpu->curCycle())) ? *it : nullptr;
 }
 
 bool

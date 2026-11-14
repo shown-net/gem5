@@ -2,11 +2,14 @@
 #include "cpu/o3/int_execution.hh"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 
 #include "base/logging.hh"
+#include "debug/IntDividerTiming.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/fu_pool.hh"
 #include "sim/eventq.hh"
 
 namespace gem5::o3
@@ -14,6 +17,81 @@ namespace gem5::o3
 
 namespace
 {
+using VectorDomain = ResultForwarding::VectorDomain;
+
+VectorDomain
+vectorDomain(const DynInstPtr &inst, unsigned port, Cycles latency)
+{
+    const auto op = inst->opClass();
+    // Partial memory-load merges use the one-cycle register/shuffle path,
+    // not the SIMD ALU bypass penalty. SPR MOVL/HPD dependency controls
+    // distinguish the merge from both load latency and ordinary packing.
+    const auto &name = inst->staticInst->getName();
+    if ((name == "mxmmmergehi" || name == "mxmmmergelo") &&
+        (port == 1 || port == 5) && latency == Cycles(1))
+        return VectorDomain::Shuffle;
+    if ((op == FloatAddOp || op == SimdFloatAddOp) &&
+        (port == 1 || port == 5) && latency == Cycles(3))
+        return VectorDomain::FastAdder;
+    if ((op == FloatMultAccOp || op == SimdFloatMultAccOp) &&
+        port <= 1 && latency == Cycles(4))
+        return VectorDomain::Fma;
+    if ((op == FloatMultOp || op == SimdFloatMultOp) &&
+        port <= 1 && latency == Cycles(4))
+        return VectorDomain::Mul;
+    if ((op == SimdPackOp || op == SimdInsertOp) &&
+        (port == 1 || port == 5) &&
+        (latency == Cycles(1) || latency == Cycles(3)))
+        return VectorDomain::Shuffle;
+    bool integer_source = false, vector_source = false;
+    for (RegIndex i = 0; i < inst->numSrcRegs(); ++i) {
+        integer_source |= inst->srcRegIdx(i).is(IntRegClass);
+        vector_source |= inst->srcRegIdx(i).is(FloatRegClass) ||
+                         inst->srcRegIdx(i).is(VecRegClass);
+    }
+    if (port == 0 && latency == Cycles(3) && vector_source &&
+        inst->numDestRegs(IntRegClass))
+        return VectorDomain::V2I;
+    if (port == 5 && latency == Cycles(1) && integer_source &&
+        (inst->numDestRegs(FloatRegClass) || inst->numDestRegs(VecRegClass)))
+        return VectorDomain::I2V;
+    const bool simd = op == SimdAddOp || op == SimdAddAccOp ||
+        op == SimdAluOp || op == SimdCmpOp || op == SimdCvtOp ||
+        op == SimdMiscOp || op == SimdMultOp || op == SimdMultAccOp ||
+        op == SimdShiftOp || op == SimdShiftAccOp ||
+        op == SimdFloatAluOp || op == SimdFloatCmpOp ||
+        op == SimdFloatCvtOp || op == SimdFloatMiscOp;
+    if (simd && port <= 1 && latency == Cycles(1))
+        return VectorDomain::Simd01;
+    if (simd && port == 5 &&
+        (latency == Cycles(1) || latency == Cycles(3)))
+        return VectorDomain::Simd5;
+    return VectorDomain::None;
+}
+
+int
+vectorBypass(VectorDomain producer, VectorDomain consumer)
+{
+    // Intel 248966-051 Table 2-5, printed p.2-14. The Fast Adder row's
+    // port label differs from the port table; the selected 1/5 execution
+    // mapping determines that unit. Unidentified lowering forms use their
+    // ordinary result latency, never an inferred table match.
+    static constexpr int delay[8][7] = {
+        {0, 1, 1, 1, 0, 0, 0}, // SIMD ports 0/1, latency 1
+        {1, 0, 1, 0, 0, 0, 0}, // FMA
+        {1, 0, 1, 0, 0, 0, 0}, // MUL
+        {1, 0, 1,-1, 0, 0, 0}, // Fast Adder
+        {0, 1, 1, 1, 0, 0, 0}, // SIMD port 5
+        {0, 0, 1, 0, 0, 0, 0}, // Shuffle
+        {0, 0, 1, 0, 0, 0, 0}, // Vector to integer
+        {0, 1, 1, 0, 0, 0, 0}, // Integer to vector
+    };
+    if (producer == VectorDomain::None || consumer == VectorDomain::None ||
+        consumer == VectorDomain::I2V)
+        return 0;
+    return delay[unsigned(producer) - 1][unsigned(consumer) - 1];
+}
+
 IntExecutionFamily
 parseFamily(const std::string &name)
 {
@@ -23,6 +101,7 @@ parseFamily(const std::string &name)
     if (name == "SlowInt") return IntExecutionFamily::SlowInt;
     if (name == "BM") return IntExecutionFamily::BM;
     if (name == "Branch") return IntExecutionFamily::Branch;
+    if (name == "Divider") return IntExecutionFamily::Divider;
     fatal("Unknown result-path execution family: %s", name);
 }
 
@@ -96,9 +175,9 @@ ExecutionPorts::Stats::Stats(statistics::Group *parent)
                "Shared grants by execution family and port")
 {
     accepted.init(12);
-    acceptedByFamily.init(6, 12);
-    const char *families[] = {"none", "alu", "shft", "slow", "bm", "branch"};
-    for (unsigned i = 0; i < 6; ++i) acceptedByFamily.subname(i, families[i]);
+    acceptedByFamily.init(7, 12);
+    const char *families[] = {"none", "alu", "shft", "slow", "bm", "branch", "divider"};
+    for (unsigned i = 0; i < 7; ++i) acceptedByFamily.subname(i, families[i]);
     for (unsigned i = 0; i < 12; ++i)
     {
         accepted.subname(i, "p" + std::to_string(i));
@@ -152,9 +231,9 @@ ResultForwarding::Stats::Stats(statistics::Group *parent)
       ADD_STAT(unissuedCancelled, statistics::units::Count::get(), "Cancelled unissued result producers"),
       ADD_STAT(lateSources, statistics::units::Count::get(), "Source bindings after producer PRF writeback")
 {
-    lateSources.init(6);
-    const char *names[] = {"None", "ALU", "SHFT", "SlowInt", "BM", "Branch"};
-    for (unsigned i = 0; i < 6; ++i) lateSources.subname(i, names[i]);
+    lateSources.init(7);
+    const char *names[] = {"None", "ALU", "SHFT", "SlowInt", "BM", "Branch", "Divider"};
+    for (unsigned i = 0; i < 7; ++i) lateSources.subname(i, names[i]);
 }
 
 ResultForwarding::ResultForwarding(const ResultForwardingParams &p)
@@ -163,9 +242,13 @@ ResultForwarding::ResultForwarding(const ResultForwardingParams &p)
 {}
 
 void
-ResultForwarding::bindCPU(CPU *owner)
+ResultForwarding::bindCPU(CPU *owner, unsigned num_registers)
 {
     panic_if(cpu && cpu != owner, "Result forwarding shared between different cores");
+    // IQ binds during CPU construction, before the physical register file.
+    // Its already-computed flat register count supplies the storage geometry.
+    if (!cpu)
+        producers.resize(num_registers);
     cpu = owner;
 }
 
@@ -174,21 +257,22 @@ ResultForwarding::track(const DynInstPtr &inst, bool managed)
 {
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
         auto reg = inst->renamedDestIdx(i);
-        if (reg->isAlwaysReady())
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
             continue;
-        auto found = producers.find(reg->flatIndex());
-        panic_if(found != producers.end() && found->second.producer &&
-                 found->second.producer != inst && !found->second.producer->isSquashed(),
+        auto &slot = producers[reg->flatIndex()];
+        panic_if(slot.producer && slot.producer != inst &&
+                 !slot.producer->isSquashed(),
                  "Result version reused before PRF writeback");
-        const bool fp_fast = !managed &&
-            inst->opClass() == FloatAddOp && reg->classValue() == FloatRegClass;
-        if (!managed && !fp_fast) {
-            producers.erase(reg->flatIndex());
+        const bool vector = !managed && !inst->bypassesIQ() &&
+            (inst->isFloating() || inst->isVector() ||
+             inst->opClass() == FloatAddOp || inst->opClass() == SimdFloatAddOp);
+        if (!managed && !vector) {
+            slot = {};
             continue;
         }
         Reference reference;
-        if (fp_fast)
-            reference.fastAdder = std::make_shared<FastAdderState>();
+        if (vector)
+            reference.vectorResult = std::make_shared<VectorResultState>();
         else
             reference.producer = inst;
         reference.destination = i;
@@ -196,20 +280,38 @@ ResultForwarding::track(const DynInstPtr &inst, bool managed)
         reference.role = inst->staticInst->intResultRole(i);
         reference.version = inst->seqNum;
         reference.tracked = true;
-        producers[reg->flatIndex()] = std::move(reference);
+        slot = std::move(reference);
+    }
+}
+
+void
+ResultForwarding::dispatched(const DynInstPtr &inst, unsigned port,
+                             Cycles latency)
+{
+    for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
+        auto reg = inst->renamedDestIdx(i);
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
+            continue;
+        auto &slot = producers[reg->flatIndex()];
+        if (!slot.tracked || slot.version != inst->seqNum ||
+            !slot.vectorResult)
+            continue;
+        auto &result = *slot.vectorResult;
+        result.domain = vectorDomain(inst, port, latency);
+        result.nominalAt = cpu->clockEdge(latency);
     }
 }
 
 ResultForwarding::Reference
 ResultForwarding::source(PhysRegIdPtr reg) const
 {
-    if (reg->isAlwaysReady())
+    if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
         return {};
-    auto found = producers.find(reg->flatIndex());
-    if (found == producers.end()) return {};
-    if (!found->second.producer && !found->second.fastAdder)
-        stats.lateSources[unsigned(found->second.family)]++;
-    return found->second;
+    const auto &slot = producers[reg->flatIndex()];
+    if (!slot.tracked) return {};
+    if (!slot.producer && !slot.vectorResult)
+        stats.lateSources[unsigned(slot.family)]++;
+    return slot;
 }
 
 bool
@@ -225,12 +327,28 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
     RegIndex source = 0;
     for (const auto &ref : inst->sourceResults()) {
         if (!ref.tracked) { ++source; continue; }
-        if (ref.fastAdder) {
-            if (!ref.fastAdder->ready || ref.fastAdder->cancelled)
+        if (ref.vectorResult) {
+            if (!ref.vectorResult->ready || ref.vectorResult->cancelled)
                 return std::numeric_limits<Tick>::max();
-            const Tick extra = inst->opClass() == FloatAddOp ? 0 :
-                cpu->clockPeriod();
-            ready = std::max(ready, ref.fastAdder->readyAt + extra);
+            const Cycles latency = inst->iq ?
+                inst->iq->fuPool()->getOpLatency(inst) : Cycles(0);
+            const auto consumer = vectorDomain(inst, consumer_port, latency);
+            int adjustment = vectorBypass(ref.vectorResult->domain, consumer);
+            // These legacy SSE forms use the instruction package's complete
+            // 4-cycle MUL latency. Native destination/second-source MUL
+            // chains and non-identity ADD/MUL chains confirm no additional
+            // cycle on these paths. Keep other Table 2-5 cells unchanged.
+            const auto &name = inst->staticInst->getName();
+            if (consumer == VectorDomain::Mul &&
+                (ref.vectorResult->domain == VectorDomain::Mul ||
+                 ref.vectorResult->domain == VectorDomain::FastAdder) &&
+                (name == "mxmmmulf" || name == "mxmmmuls"))
+                adjustment = 0;
+            const Tick delta = std::abs(adjustment) * cpu->clockPeriod();
+            const Tick at = adjustment < 0 ?
+                ref.vectorResult->nominalAt - delta :
+                ref.vectorResult->nominalAt + delta;
+            ready = std::max(ready, std::max(at, ref.vectorResult->readyAt));
             ++source;
             continue;
         }
@@ -244,7 +362,7 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
                 return std::numeric_limits<Tick>::max();
             family = ref.producer->staticInst->intExecution().family;
             port = ref.producer->resultProducerPort();
-            nominal = ref.producer->resultNominalAt();
+            nominal = ref.producer->resultNominalAt(ref.destination);
         }
         int adjustment = 0;
         bool matched = false;
@@ -263,7 +381,7 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
             Tick(signed_delta < 0 ? -signed_delta : signed_delta) * cpu->clockPeriod();
         panic_if(signed_delta < 0 && nominal < delta, "Result path precedes simulation start");
         const Tick at = signed_delta < 0 ? nominal - delta : nominal + delta;
-        panic_if(ref.producer && at < ref.producer->resultAvailableAt(),
+        panic_if(ref.producer && at < ref.producer->resultAvailableAt(ref.destination),
                  "Result path precedes production of its real value");
         ready = std::max(ready, at);
         ++source;
@@ -295,11 +413,53 @@ ResultForwarding::armWake()
     if (when == std::numeric_limits<Tick>::max()) {
         if (wakeEvent.scheduled()) deschedule(wakeEvent);
     } else {
-        panic_if(when <= curTick(), "Result-path wake must be in the future");
+        // Another event at this tick may change the waiter set before the
+        // already-scheduled wake event runs. Keep that wake at the current
+        // tick so due consumers are handled without adding a cycle.
+        panic_if(when < curTick(), "Result-path wake is overdue");
         if (wakeEvent.scheduled()) {
             if (wakeEvent.when() != when) reschedule(wakeEvent, when);
         } else schedule(wakeEvent, when);
     }
+}
+
+void
+ResultForwarding::beginIssuePass()
+{
+    assert(!inIssuePass);
+    inIssuePass = true;
+    issueWaitersClean = false;
+}
+
+void
+ResultForwarding::endIssuePass()
+{
+    assert(inIssuePass);
+    inIssuePass = false;
+}
+
+void
+ResultForwarding::updateWake(Tick old_when, Tick new_when)
+{
+    // The first update removes stale records, including memory instructions
+    // resumed earlier in this synchronous issue pass. Any later waiter that
+    // issues clears its own wait first, and no event runs mid-pass.
+    if (!inIssuePass || !issueWaitersClean) {
+        armWake();
+        issueWaitersClean = inIssuePass;
+        return;
+    }
+    if (wakeEvent.scheduled()) {
+        const Tick earliest = wakeEvent.when();
+        if (old_when == earliest && new_when > old_when)
+            armWake();
+        else if (new_when < earliest)
+            reschedule(wakeEvent, new_when);
+    } else if (new_when != std::numeric_limits<Tick>::max()) {
+        schedule(wakeEvent, new_when);
+    }
+    // Schedule/reschedule still occurs at the original update call. Moving
+    // insertion to the end would reorder equal-tick, equal-priority events.
 }
 
 void
@@ -308,16 +468,22 @@ ResultForwarding::defer(const DynInstPtr &inst, Tick when)
     panic_if(!cpu || when <= curTick() || when == std::numeric_limits<Tick>::max(),
              "Invalid deferred result consumer");
     auto [it, inserted] = waiters.emplace(inst->seqNum, Waiter{inst, when});
+    const Tick old_when = inserted ?
+        std::numeric_limits<Tick>::max() : it->second.when;
     if (inserted) stats.deferred++;
     else it->second.when = when;
-    armWake();
+    updateWake(old_when, when);
 }
 
 void
 ResultForwarding::clearWait(const DynInstPtr &inst)
 {
-    waiters.erase(inst->seqNum);
-    armWake();
+    const auto found = waiters.find(inst->seqNum);
+    const Tick old_when = found == waiters.end() ?
+        std::numeric_limits<Tick>::max() : found->second.when;
+    if (found != waiters.end())
+        waiters.erase(found);
+    updateWake(old_when, std::numeric_limits<Tick>::max());
     checkDrain();
 }
 
@@ -340,26 +506,25 @@ ResultForwarding::release(const DynInstPtr &inst)
 {
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
         auto reg = inst->renamedDestIdx(i);
-        if (reg->isAlwaysReady())
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
             continue;
-        auto found = producers.find(reg->flatIndex());
-        if (found == producers.end() || found->second.version != inst->seqNum)
+        auto &reference = producers[reg->flatIndex()];
+        if (!reference.tracked || reference.version != inst->seqNum)
             continue;
         if (inst->isSquashed() || inst->getFault() != NoFault ||
-            (found->second.fastAdder && !inst->isIssued())) {
-            if (found->second.fastAdder)
-                found->second.fastAdder->cancelled = true;
-            producers.erase(found);
+            (reference.vectorResult && !inst->isIssued())) {
+            if (reference.vectorResult)
+                reference.vectorResult->cancelled = true;
+            reference = {};
         } else {
-            auto &reference = found->second;
-            if (reference.fastAdder) {
+            if (reference.vectorResult) {
                 panic_if(inst->lastWakeDependents == Tick(-1),
-                         "Fast-adder result released before wakeup");
-                reference.fastAdder->readyAt = inst->lastWakeDependents;
-                reference.fastAdder->ready = true;
+                         "Vector result released before wakeup");
+                reference.vectorResult->readyAt = inst->lastWakeDependents;
+                reference.vectorResult->ready = true;
             } else {
                 reference.port = inst->resultProducerPort();
-                reference.nominal = inst->resultNominalAt();
+                reference.nominal = inst->resultNominalAt(i);
                 reference.producer = nullptr;
             }
         }
@@ -372,11 +537,14 @@ ResultForwarding::cancel(const DynInstPtr &inst)
 {
     bool removed = false;
     for (RegIndex i = 0; i < inst->numDestRegs(); ++i) {
-        auto found = producers.find(inst->renamedDestIdx(i)->flatIndex());
-        if (found != producers.end() && found->second.version == inst->seqNum) {
-            if (found->second.fastAdder)
-                found->second.fastAdder->cancelled = true;
-            producers.erase(found);
+        auto reg = inst->renamedDestIdx(i);
+        if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
+            continue;
+        auto &reference = producers[reg->flatIndex()];
+        if (reference.tracked && reference.version == inst->seqNum) {
+            if (reference.vectorResult)
+                reference.vectorResult->cancelled = true;
+            reference = {};
             removed = true;
         }
     }
@@ -391,9 +559,9 @@ bool
 ResultForwarding::empty() const
 {
     if (!waiters.empty() || wakeEvent.scheduled()) return false;
-    for (const auto &[index, reference] : producers)
-        if (reference.producer || (reference.fastAdder &&
-            !reference.fastAdder->ready && !reference.fastAdder->cancelled))
+    for (const auto &reference : producers)
+        if (reference.producer || (reference.vectorResult &&
+            !reference.vectorResult->ready && !reference.vectorResult->cancelled))
             return false;
     return true;
 }
@@ -401,7 +569,7 @@ ResultForwarding::empty() const
 void
 ResultForwarding::checkDrain()
 {
-    if (empty() && drainState() == DrainState::Draining) signalDrainDone();
+    if (drainState() == DrainState::Draining && empty()) signalDrainDone();
 }
 
 DrainState
@@ -414,7 +582,7 @@ void
 ResultForwarding::reset()
 {
     panic_if(!empty(), "Result forwarding reset before pending transfers drained");
-    producers.clear();
+    std::fill(producers.begin(), producers.end(), Reference{});
 }
 
 IntExecutionResource::Stats::Stats(statistics::Group *parent)
@@ -444,7 +612,7 @@ void
 IntExecutionResource::finishEvent(const std::shared_ptr<Operation> &operation)
 {
     if (--operation->events == 0) {
-        operations.remove(operation);
+        operations.erase(operation->position);
         if (operations.empty() && drainState() == DrainState::Draining)
             signalDrainDone();
     }
@@ -467,7 +635,7 @@ IntExecutionResource::admit(CPU *cpu, ResultForwarding *forwarding,
     inst->prepareResultValues(port, cpu->clockEdge(latency));
     auto operation = std::make_shared<Operation>();
     operation->inst = inst;
-    operations.push_back(operation);
+    operation->position = operations.insert(operations.end(), operation);
     stats.admitted++;
     const Tick value_at = cpu->clockEdge(Cycles(evaluation));
     auto send = [operation, complete] {
@@ -513,6 +681,204 @@ DrainState
 IntExecutionResource::drain()
 {
     return empty() ? DrainState::Drained : DrainState::Draining;
+}
+
+IntegerDivider::Stats::Stats(statistics::Group *parent)
+    : statistics::Group(parent),
+      ADD_STAT(admitted, statistics::units::Count::get(), "Integer divide instructions admitted"),
+      ADD_STAT(evaluated, statistics::units::Count::get(), "Integer divide values formed once"),
+      ADD_STAT(cancelled, statistics::units::Count::get(), "Integer divide instructions cancelled before completion"),
+      ADD_STAT(actions, statistics::units::Count::get(), "Preparation, divide launch and two further p1 action grants")
+{
+    actions.init(4);
+}
+
+IntegerDivider::IntegerDivider(const IntegerDividerParams &p)
+    : SimObject(p), serviceEvent([this] { service(); }, name() + ".service", false,
+                               Event::Priority(0)), stats(this)
+{
+    const auto assign = [](auto &matrix, const auto &quotient,
+                           const auto &remainder) {
+        fatal_if(quotient.size() != 3 || remainder.size() != 3,
+                 "Integer divide latency rows require three input paths");
+        std::copy(quotient.begin(), quotient.end(), matrix[0].begin());
+        std::copy(remainder.begin(), remainder.end(), matrix[1].begin());
+    };
+    assign(latency32, p.quotientLatency32, p.remainderLatency32);
+    assign(latency64, p.quotientLatency64, p.remainderLatency64);
+}
+
+void
+IntegerDivider::releaseAction(const DynInstPtr &inst)
+{
+    if (inst->isInIQ() && inst->iq->releaseOneAction(inst) == 0)
+        inst->clearInIQ();
+}
+
+bool
+IntegerDivider::issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
+    const DynInstPtr &inst, std::function<void()> available,
+    std::function<void()> complete, std::function<void()> issued_action)
+{
+    fatal_if(cpu && cpu != owner, "Integer divider shared between different cores");
+    cpu = owner;
+    const auto info = inst->staticInst->intDivide();
+    assert((info.bytes == 4 || info.bytes == 8) && inst->numDestRegs() == 2);
+    const unsigned candidates = inst->boundExecutionPort >= 0 ?
+        1u << inst->boundExecutionPort : inst->staticInst->intExecution().ports;
+    unsigned eligible = 0;
+    for (unsigned p = 0; p < 12; ++p)
+        if ((candidates & (1u << p)) && pool->portAvailable(p, curTick()) &&
+            forwarding->availableAt(inst, p) <= curTick())
+            eligible |= 1u << p;
+    const int port = pool->sharedPorts()->probe(IntExecutionFamily::Divider,
+                                               candidates, curTick(), eligible);
+    if (port < 0) return false;
+    pool->sharedPorts()->commit(IntExecutionFamily::Divider, candidates, port, curTick());
+    cpu->recordExecutionAction(inst, port);
+    pool->releasePortBinding(inst);
+    inst->divisionManaged = true;
+    auto op = std::make_shared<Operation>();
+    op->inst = inst;
+    op->pool = pool;
+    op->forwarding = forwarding;
+    op->available = available;
+    op->complete = complete;
+    op->issuedAction = issued_action;
+    op->admitted = curTick();
+    op->inputs = {inst->renamedSrcIdx(info.lowSource)->valueReadyAt(),
+                  inst->renamedSrcIdx(info.highSource)->valueReadyAt(),
+                  inst->renamedSrcIdx(info.divisorSource)->valueReadyAt()};
+    for (const Tick at : op->inputs)
+        panic_if(at == MaxTick, "Divide input has no published physical value");
+    operations.push_back(op);
+    ++stats.admitted;
+    ++stats.actions[0];
+    releaseAction(inst);
+    arm();
+    return true;
+}
+
+void
+IntegerDivider::arm()
+{
+    if (!operations.empty() && !serviceEvent.scheduled())
+        schedule(serviceEvent, cpu->clockEdge(Cycles(1)));
+}
+
+void
+IntegerDivider::finish(const std::shared_ptr<Operation> &op)
+{
+    if (op->arithmeticActive) {
+        cpu->dividerStats.finish(false);
+        op->arithmeticActive = false;
+    }
+    if (op->inst->isSquashed() || op->inst->getFault() != NoFault) {
+        if (op->inst->isInIQ()) op->inst->clearInIQ();
+        op->forwarding->cancel(op->inst);
+        ++stats.cancelled;
+    } else {
+        op->forwarding->release(op->inst);
+    }
+    op->complete();
+    operations.remove(op);
+    cpu->wakeCPU();
+    if (operations.empty()) {
+        if (serviceEvent.scheduled()) deschedule(serviceEvent);
+        if (drainState() == DrainState::Draining) signalDrainDone();
+    }
+}
+
+void
+IntegerDivider::service()
+{
+    const Tick now = curTick();
+    const Tick period = cpu->clockPeriod();
+    for (auto it = operations.begin(); it != operations.end();) {
+        const auto op = *it++;
+        auto inst = op->inst;
+        if (op->arithmeticActive && now >= op->arithmeticEnd) {
+            cpu->dividerStats.finish(false);
+            op->arithmeticActive = false;
+        }
+        if (inst->isSquashed()) { finish(op); continue; }
+        const auto info = inst->staticInst->intDivide();
+        if (!op->launched) {
+            if (now < nextLaunch || now < op->admitted + period ||
+                !op->pool->portAvailable(1, now)) continue;
+            op->pool->sharedPorts()->commit(IntExecutionFamily::Divider, 2, 1, now);
+            cpu->recordExecutionAction(inst, 1);
+            op->issuedAction();
+            ++stats.actions[1];
+            nextLaunch = now + period * (info.bytes == 4 ? 6 : 10);
+            op->launched = true;
+            // Native SPR controls count six/ten arithmetic-active cycles
+            // per 32/64-bit divide, independently of output publication.
+            op->arithmeticEnd = nextLaunch;
+            op->arithmeticActive = true;
+            cpu->dividerStats.start(false);
+            // EMR input -> output matrices, ordered low dividend, high
+            // dividend, divisor. They are parameter priors, not an SPR
+            // value-dependent duration function or a sum of duop latencies.
+            const auto &matrix = info.bytes == 4 ? latency32 : latency64;
+            const Tick wait = now - (op->admitted + period);
+            for (unsigned result = 0; result < 2; ++result) {
+                const auto &row = matrix[result];
+                Tick ready = op->admitted + period * *std::min_element(row.begin(), row.end());
+                for (unsigned input = 0; input < 3; ++input)
+                    ready = std::max(ready, op->inputs[input] + period * row[input]);
+                op->outputs[result] = ready + wait;
+            }
+            std::array<Tick, 2> times;
+            times[info.quotientDest] = op->outputs[0];
+            times[info.remainderDest] = op->outputs[1];
+            inst->prepareDivideValues(times);
+            DPRINTF(IntDividerTiming,
+                "launch seq=%llu pc=%#llx bytes=%u low=%#llx high=%#llx "
+                "divisor=%#llx admitted=%llu qready=%llu rready=%llu\n",
+                inst->seqNum, inst->pcState().instAddr(), info.bytes,
+                inst->getRegOperand(inst->staticInst.get(), info.lowSource),
+                inst->getRegOperand(inst->staticInst.get(), info.highSource),
+                inst->getRegOperand(inst->staticInst.get(), info.divisorSource),
+                op->admitted, op->outputs[0], op->outputs[1]);
+            inst->evaluateResultValues(now);
+            ++stats.evaluated;
+            releaseAction(inst);
+            if (inst->getFault() != NoFault) { finish(op); continue; }
+        }
+        // The published duop list gives three p1 actions but does not give
+        // their internal graph. Use a bounded sequence of port grants, then
+        // apply the independent input/output matrix to result publication.
+        if (op->internalStages < 2 && op->pool->portAvailable(1, now)) {
+            op->pool->sharedPorts()->commit(IntExecutionFamily::Divider, 2, 1, now);
+            cpu->recordExecutionAction(inst, 1);
+            op->issuedAction();
+            ++stats.actions[2 + op->internalStages];
+            ++op->internalStages;
+            releaseAction(inst);
+        }
+        for (unsigned result = 0; result < 2; ++result) {
+            if (op->internalStages != 2 || (op->transferred & (1u << result)) ||
+                now < op->outputs[result]) continue;
+            const unsigned dest = result == 0 ? info.quotientDest : info.remainderDest;
+            op->transferred |= 1u << result;
+            inst->publishDivideResult(dest, now);
+            op->available();
+            cpu->schedule(new EventFunctionWrapper([this, op, dest, result] {
+                if (!op->inst->isSquashed() && op->inst->getFault() == NoFault)
+                    op->inst->writeResultValue(dest);
+                op->written |= 1u << result;
+                if (op->written == 3) finish(op);
+            }, name() + ".prf", true, Event::Priority(1)), now);
+        }
+    }
+    arm();
+}
+
+DrainState
+IntegerDivider::drain()
+{
+    return operations.empty() ? DrainState::Drained : DrainState::Draining;
 }
 
 IntegerALU::IntegerALU(const IntegerALUParams &p)

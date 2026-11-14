@@ -60,10 +60,12 @@
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/allocation_group.hh"
 #include "cpu/o3/core_functional_facts.hh"
+#include "cpu/o3/stage_demand.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/o3/int_execution.hh"
 #include "cpu/o3/lsq_unit.hh"
 #include "cpu/op_class.hh"
+#include "cpu/pred/bpred_unit.hh"
 #include "cpu/reg_class.hh"
 #include "cpu/static_inst.hh"
 #include "cpu/translation.hh"
@@ -124,11 +126,29 @@ class DynInst : public ExecContext, public RefCounted
     void evaluateResultValues(Tick available_at);
     void writeResultValues();
     bool hasResultValue(RegIndex index) const
-    { return index < resultValues.size() && resultValues[index].isValid(); }
+    { return index < resultValues.size() && resultValues[index].isValid() &&
+        (!divisionManaged || divideAvailableTicks.at(index) != MaxTick); }
     RegVal resultValue(RegIndex index) const
     { return resultValues.at(index).asRegVal(); }
     Tick resultAvailableAt() const { return resultAvailableTick; }
+    Tick resultAvailableAt(RegIndex index) const
+    { return divisionManaged ? divideAvailableTicks.at(index) : resultAvailableTick; }
     Tick resultNominalAt() const { return resultNominalTick; }
+    Tick resultNominalAt(RegIndex index) const
+    { return divisionManaged ? divideNominalTicks.at(index) : resultNominalTick; }
+    bool divisionManaged = false;
+    void prepareDivideValues(const std::array<Tick, 2> &times)
+    {
+        divideNominalTicks = times;
+        prepareResultValues(1, std::max(times[0], times[1]));
+    }
+    void publishDivideResult(RegIndex index, Tick time)
+    { divideAvailableTicks.at(index) = time; divideNominalTicks.at(index) = time; }
+    bool divideResultWoken(RegIndex index) const { return divideWakeMask & (1u << index); }
+    void markDivideResultWoken(RegIndex index) { divideWakeMask |= 1u << index; }
+    bool allDivideResultsWoken() const { return divideWakeMask == 3; }
+    void writeResultValue(RegIndex index)
+    { cpu->setReg(renamedDestIdx(index), resultValues.at(index).asRegVal(), threadNumber); }
     unsigned resultProducerPort() const { return resultPort; }
     const auto &sourceResults() const { return sourceResultValues; }
     bool wasEvaluatedByResource() const { return resourceEvaluated; }
@@ -144,6 +164,9 @@ class DynInst : public ExecContext, public RefCounted
     Tick resultAvailableTick = 0;
     Tick resultNominalTick = 0;
     unsigned resultPort = 0;
+    std::array<Tick, 2> divideAvailableTicks{MaxTick, MaxTick};
+    std::array<Tick, 2> divideNominalTicks{};
+    unsigned divideWakeMask = 0;
 
   public:
 
@@ -257,6 +280,7 @@ class DynInst : public ExecContext, public RefCounted
      * the instruction is out of its speculative state.
      */
     std::vector<short> _destMiscRegIdx;
+    std::vector<std::pair<int, RegVal>> _orMiscRegs;
 
     size_t _numSrcs;
     size_t _numDests;
@@ -362,28 +386,85 @@ class DynInst : public ExecContext, public RefCounted
     // Optional Marker observations; none drive the pipeline.
     bool fetchedFromUser = false;
     bool pendingFrontendAcceptance = false;
+    RecoveryCause replayCause = RecoveryCause::OtherMachine;
+    // Per-dynamic-operation stack operands and state transitions.
+    uint64_t stackSourceMask = 0;
+    int64_t stackSourceDelta = 0;
+    int64_t stackDeltaAfter = 0;
+    int64_t stackSyncImmediate = 0;
+    bool stackStateChanged = false;
+    bool stackTrackedWrite = false;
+    bool stackAbsorbed = false;
+    bool stackSync = false;
+    bool stackSyncSatisfied = false;
     AllocationGroupPtr allocationGroup;
+    StageDemand stageDemand;
+    // Selected on scheduler admission, retained until dispatch or squash.
+    int boundExecutionPort = -1;
+    // Earliest completion notification; bypass data may be usable sooner.
+    Tick completionNotBefore = 0;
+    unsigned hardwareDestEntries(RegClassType type) const;
     unsigned allocationSlots() const
-    { return !allocationGroup || seqNum == allocationGroup->leader; }
-    bool independentBackendEntries() const
-    { return allocationGroup && allocationGroup->independentBackendEntries; }
-    bool independentIQEntries() const
-    {
-        return allocationGroup && (allocationGroup->independentBackendEntries ||
-                                   allocationGroup->independentIQEntries);
-    }
+    { return stageDemand.allocationUnits; }
+    InstSeqNum allocationKey() const
+    { return stageDemand.allocationGroup ? stageDemand.allocationGroup : seqNum; }
+    InstSeqNum allocationEnd() const
+    { return allocationGroup && stageDemand.allocationGroup ? allocationGroup->end :
+        stageDemand.allocationLast ? stageDemand.allocationLast : seqNum; }
+    InstSeqNum robKey() const
+    { return stageDemand.robGroup ? stageDemand.robGroup : seqNum; }
+    InstSeqNum robEnd() const
+    { return allocationGroup && stageDemand.robGroup ? allocationGroup->end :
+        stageDemand.robLast ? stageDemand.robLast : seqNum; }
+    InstSeqNum retirementKey() const
+    { return stageDemand.retirementGroup ? stageDemand.retirementGroup : seqNum; }
+    InstSeqNum retirementEnd() const
+    { return allocationGroup && stageDemand.retirementGroup ? allocationGroup->end :
+        stageDemand.retirementLast ? stageDemand.retirementLast : seqNum; }
+    unsigned retirementGroupSlots() const
+    { return stageDemand.retirementUnits; }
+    unsigned retirementSlots() const
+    { return seqNum == retirementEnd() ? stageDemand.retirementUnits : 0; }
+    bool retirementGroupEnd() const { return seqNum == retirementEnd(); }
     unsigned backendSlots() const
-    { return independentBackendEntries() ? 1 : allocationSlots(); }
+    { return stageDemand.robUnits; }
     unsigned iqSlots() const
-    { return independentIQEntries() ? 1 : backendSlots(); }
+    { return stageDemand.schedulerUnits; }
+    unsigned issueSlots() const
+    { return stageDemand.schedulerActions; }
+    InstSeqNum schedulerKey() const
+    { return stageDemand.schedulerGroup ? stageDemand.schedulerGroup : seqNum; }
     bool fusedLeader() const
     { return allocationGroup && allocationGroup->branch && allocationGroup->branchProducer == seqNum; }
     bool fusedFollower() const
     { return allocationGroup && allocationGroup->branch && allocationGroup->branch == seqNum; }
-    bool allocationLeader() const
-    { return allocationGroup && allocationGroup->leader == seqNum; }
     bool executionBranchMispredicted = false;
+    bool executionBranchResolved = false;
+    bool executionBranchTaken = false;
+    void recordExecutionBranch()
+    {
+        if (isControl() && !staticInst->isMicrocodeControl() &&
+            isExecuted() && getFault() == NoFault) {
+            executionBranchResolved = true;
+            executionBranchTaken = isUncondCtrl() || pcState().branching();
+        }
+    }
     uint64_t fetchedAddressSpaceId = 0;
+    std::array<Addr, 2> fetchedCodeBlocks{};
+    unsigned fetchedCodeBlockCount = 0;
+    bool staleCode = false;
+
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+    {
+        if (threadNumber != tid || seqNum <= after || isSquashed()) return false;
+        for (unsigned i = 0; i < fetchedCodeBlockCount; ++i) {
+            if (fetchedCodeBlocks[i] == block) {
+                staleCode = true;
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** Iterator pointing to this BaseDynInst in the list of all insts. */
     ListIt instListIt;
@@ -410,7 +491,7 @@ class DynInst : public ExecContext, public RefCounted
     std::vector<fastsim::fst::TranslationFragment> functionalTranslations;
 
     /** The memory request flags (from translation). */
-    unsigned memReqFlags = 0;
+    Request::FlagsType memReqFlags = 0;
 
     /** The size of the request */
     unsigned effSize;
@@ -432,7 +513,7 @@ class DynInst : public ExecContext, public RefCounted
      * Saved memory request (needed when the DTB address translation is
      * delayed due to a hw page table walk).
      */
-    LSQ::LSQRequest *savedRequest;
+    LSQ::LSQRequest *savedRequest = nullptr;
 
     /////////////////////// Checker //////////////////////
     // Need a copy of main request pointer to verify on writes.
@@ -655,8 +736,23 @@ class DynInst : public ExecContext, public RefCounted
     //
     bool isNop()          const { return staticInst->isNop(); }
     bool eliminatedMove = false;
+    bool untrackedFrontendBranch = false;
+    branch_prediction::BPredUnit::HistoryHandle predictionTransaction;
+    uint64_t predictionVersion = 0;
+    bool predictionResolutionSent = false;
+    bool commitResolutionObserved = false;
+    bool commitResolutionTaken = false;
+    uint64_t commitResolutionVersion = 0;
+    std::unique_ptr<PCStateBase> commitResolutionTarget;
+    bool frontendDsbMiss = false;
+    std::shared_ptr<bool> frontendDsbMissExposed;
+    // A ready implicit PUSH update was evaluated using the normal PRF at rename.
+    bool renameComputed = false;
+    // A 32-bit MOV has a new zero-extended PRF value but no execution grant.
+    bool moveProjection = false;
     bool bypassesIQ() const
-    { return isNop() || staticInst->isZeroIdiom() || eliminatedMove; }
+    { return isNop() || staticInst->isZeroIdiom() || eliminatedMove ||
+             renameComputed || moveProjection || stackAbsorbed; }
     bool isMemRef()       const { return staticInst->isMemRef(); }
     bool isLoad()         const { return staticInst->isLoad(); }
     bool isStore()        const { return staticInst->isStore(); }
@@ -698,7 +794,8 @@ class DynInst : public ExecContext, public RefCounted
     bool isSyscall() const { return staticInst->isSyscall(); }
     bool isMacroop() const { return staticInst->isMacroop(); }
     bool isMicroop() const { return staticInst->isMicroop(); }
-    bool isDelayedCommit() const { return staticInst->isDelayedCommit(); }
+    bool repFunctional() const;
+    bool isDelayedCommit() const;
     bool isLastMicroop() const { return staticInst->isLastMicroop(); }
     bool isFirstMicroop() const { return staticInst->isFirstMicroop(); }
     // hardware transactional memory
@@ -892,7 +989,7 @@ class DynInst : public ExecContext, public RefCounted
     void clearCanCommit() { status.reset(CanCommit); }
 
     /** Returns whether or not this instruction is ready to commit. */
-    bool readyToCommit() const { return status[CanCommit]; }
+    bool readyToCommit() const { return status[CanCommit] || staleCode; }
 
     void setAtCommit() { status.set(AtCommit); }
 
@@ -1107,19 +1204,14 @@ class DynInst : public ExecContext, public RefCounted
   public:
     // monitor/mwait funtions
     void
-    armMonitor(Addr address) override
+    armMonitor(Addr address, Addr paddr) override
     {
-        cpu->armMonitor(threadNumber, address);
+        cpu->armMonitor(threadNumber, address, paddr);
     }
     bool
-    mwait(PacketPtr pkt) override
+    mwait(bool break_on_interrupt) override
     {
-        return cpu->mwait(threadNumber, pkt);
-    }
-    void
-    mwaitAtomic(gem5::ThreadContext *tc) override
-    {
-        return cpu->mwaitAtomic(threadNumber, tc, cpu->mmu);
+        return cpu->mwait(threadNumber, break_on_interrupt);
     }
     AddressMonitor *
     getAddrMonitor() override
@@ -1149,6 +1241,8 @@ class DynInst : public ExecContext, public RefCounted
     /* Values used by LoadToUse stat */
     Tick firstIssue = -1;
     Tick lastWakeDependents = -1;
+    // Absolute tick of the completed load value; absent for unobserved paths.
+    Tick dataReturnTick = Tick(-1);
 
     /** Reads a misc. register, including any side-effects the read
      * might have as defined by the architecture.
@@ -1178,6 +1272,15 @@ class DynInst : public ExecContext, public RefCounted
 
         _destMiscRegIdx.push_back(misc_reg);
         _destMiscRegVal.push_back(val);
+    }
+
+    void orMiscReg(int misc_reg, RegVal bits) override
+    {
+        if (!bits) return;
+        for (auto &entry : _orMiscRegs) {
+            if (entry.first == misc_reg) { entry.second |= bits; return; }
+        }
+        _orMiscRegs.emplace_back(misc_reg, bits);
     }
 
     /** Reads a misc. register, including any side-effects the read
@@ -1236,6 +1339,12 @@ class DynInst : public ExecContext, public RefCounted
             cpu->setMiscReg(
                 _destMiscRegIdx[i], _destMiscRegVal[i], threadNumber);
         }
+        for (const auto &entry : _orMiscRegs) {
+            functional_mmu::OwnerScope mmu_owner(tcBase(), seqNum, fastsim::fst::mmuctl::Application::Deferred, mmuControlGeneration);
+            cpu->setMiscReg(entry.first,
+                cpu->readMiscRegNoEffect(entry.first, threadNumber) | entry.second,
+                threadNumber);
+        }
 
         thread->noSquashFromTC = no_squash_from_TC;
     }
@@ -1286,14 +1395,19 @@ class DynInst : public ExecContext, public RefCounted
         const PhysRegIdPtr reg = renamedSrcIdx(idx);
         if (reg->is(InvalidRegClass))
             return 0;
+        RegVal value;
         if (idx < sourceResultValues.size() && sourceResultValues[idx].producer) {
             const auto &ref = sourceResultValues[idx];
             panic_if(!ref.producer->hasResultValue(ref.destination) ||
-                     ref.producer->resultAvailableAt() > curTick(),
+                     ref.producer->resultAvailableAt(ref.destination) > curTick(),
                      "Consumer read a result before its value was available");
-            return ref.producer->resultValue(ref.destination);
+            value = ref.producer->resultValue(ref.destination);
+        } else {
+            value = cpu->getReg(reg, threadNumber);
         }
-        return cpu->getReg(reg, threadNumber);
+        if (idx < 64 && (stackSourceMask & (uint64_t(1) << idx)))
+            value += uint64_t(stackSourceDelta);
+        return value;
     }
 
     void
@@ -1303,6 +1417,8 @@ class DynInst : public ExecContext, public RefCounted
         if (reg->is(InvalidRegClass))
             return;
         cpu->getReg(reg, val, threadNumber);
+        if (idx < 64 && (stackSourceMask & (uint64_t(1) << idx)))
+            *static_cast<RegVal *>(val) += uint64_t(stackSourceDelta);
     }
 
     void *

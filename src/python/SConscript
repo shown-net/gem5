@@ -40,6 +40,11 @@
 
 Import('*')
 
+PySource('gem5.components.memory',
+    'gem5/components/memory/spr_memory.py')
+PySource('gem5.components.cachehierarchies.ruby.topologies',
+    'gem5/components/cachehierarchies/ruby/topologies/spr_mesh.py')
+
 PySource('gem5', 'gem5/__init__.py')
 PySource('gem5', 'gem5/coherence_protocol.py')
 PySource('gem5', 'gem5/isas.py')

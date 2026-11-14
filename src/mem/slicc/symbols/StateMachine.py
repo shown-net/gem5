@@ -1308,7 +1308,7 @@ $c_ident::recordCacheTrace(int cntrl, CacheRecorder* tr)
         for param in self.config_parameters:
             if param.type_ast.type.ident == "CacheMemory":
                 assert param.pointer
-                code("m_${{param.ident}}_ptr->recordCacheContents(cntrl, tr);")
+                code("m_${{param.ident}}_ptr->recordCacheContents(cntrl, tr, this);")
 
         code.dedent()
         code(

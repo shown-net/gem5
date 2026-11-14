@@ -49,6 +49,7 @@
 #include "sim/clocked_object.hh"
 #include "sim/faults.hh"
 #include "sim/system.hh"
+#include "arch/x86/paging_structure_cache.hh"
 
 namespace gem5
 {
@@ -103,24 +104,41 @@ namespace X86ISA
             State nextState;
             int dataSize;
             bool enableNX;
+            bool enableGlobal;
             unsigned inflight;
             TlbEntry entry;
+            unsigned observedLeafLogBytes = 0;
             PacketPtr read;
             std::vector<PacketPtr> writes;
             Fault timingFault;
             BaseMMU::Translation * translation;
             BaseMMU::Mode mode;
+            BaseMMU::Mode requestMode;
             bool functional;
             bool timing;
             bool retrying;
             bool started;
             bool squashed;
+            bool abandoned = false;
+            bool cancelled = false;
+            bool faultPresent = false;
+            bool faultReserved = false;
+            bool prefixHit = false;
+            bool cacheablePrefix = true;
+            unsigned physicalAddressBits = 48;
             uint64_t translationGeneration = 0;
+            uint64_t walkCr3 = 0;
+            uint64_t walkCr4 = 0;
+            uint64_t walkEfer = 0;
+            // Followers retain their own request/translation and never own
+            // walk packets.  Their permissions are checked independently.
+            WalkerState *leader = nullptr;
+            std::vector<WalkerState *> followers;
           public:
             WalkerState(Walker * _walker, BaseMMU::Translation *_translation,
                         const RequestPtr &_req, bool _isFunctional = false) :
                 walker(_walker), req(_req), state(Ready),
-                nextState(Ready), inflight(0),
+                nextState(Ready), inflight(0), read(nullptr),
                 translation(_translation),
                 functional(_isFunctional), timing(false),
                 retrying(false), started(false), squashed(false)
@@ -137,14 +155,18 @@ namespace X86ISA
             bool isTiming();
             void retry();
             void squash();
+            bool hasLiveUsers() const;
+            void stopPendingRead();
             std::string name() const {return walker->name();}
 
           private:
             void setupWalk(Addr vaddr);
             Fault stepWalk(PacketPtr &write);
             void sendPackets();
+            void sendPrefixResponse();
             void endWalk();
-            Fault pageFault(bool present);
+            void releaseFollowers(bool completed, bool shared_fault = false);
+            Fault pageFault(bool present, bool reserved = false);
         };
 
         friend class WalkerState;
@@ -162,6 +184,12 @@ namespace X86ISA
         };
 
       public:
+
+        PagingStructureCache *pagingStructureCache;
+        const Cycles prefixHitLatency;
+        const Cycles pteResponseLatency;
+        const bool coalesceFaultResults;
+        const bool cancelSquashedWalks;
         // Kick off the state machine.
         Fault start(ThreadContext * _tc, BaseMMU::Translation *translation,
                 const RequestPtr &req, BaseMMU::Mode mode);
@@ -169,6 +197,8 @@ namespace X86ISA
                 unsigned &logBytes, BaseMMU::Mode mode);
         Port &getPort(const std::string &if_name,
                       PortID idx=InvalidPortID) override;
+        void dumpProgressState() const;
+        void squashTiming(ThreadContext *tc);
 
       protected:
         // The TLB we're supposed to load.
@@ -180,6 +210,7 @@ namespace X86ISA
         unsigned numSquashable;
         const unsigned maxActiveWalks;
         bool portBlocked = false;
+        bool startingWalks = false;
 
         struct ItlbStats : statistics::Group
         {
@@ -187,20 +218,43 @@ namespace X86ISA
             void preDumpStats() override;
             void resetStats() override;
             Walker *owner;
-            statistics::Scalar WALK_COMPLETED_4K, WALK_COMPLETED;
+            statistics::Scalar WALK_COMPLETED_4K, WALK_COMPLETED_2M_4M, WALK_COMPLETED;
+            statistics::Scalar WALK_COMPLETED_1G, unclassifiedCompleted;
             statistics::Scalar WALK_ACTIVE, WALK_PENDING;
+            statistics::Scalar COALESCED_REQUESTS;
         } itlbStats;
-        struct DtlbLoadStats : statistics::Group
+        struct DtlbWalkStats : statistics::Group
         {
-            explicit DtlbLoadStats(Walker *owner);
-            statistics::Scalar WALK_COMPLETED;
-        } dtlbLoadStats;
+            DtlbWalkStats(Walker *owner, const char *name);
+            void preDumpStats() override;
+            void resetStats() override;
+            Walker *owner;
+            statistics::Scalar WALK_COMPLETED, WALK_COMPLETED_4K;
+            statistics::Scalar WALK_COMPLETED_2M_4M, WALK_COMPLETED_1G;
+            statistics::Scalar unclassifiedCompleted;
+            statistics::Scalar WALK_ACTIVE, WALK_PENDING;
+            statistics::Scalar COALESCED_REQUESTS;
+            statistics::Scalar pteReadResponses;
+            statistics::Scalar pteReadRequests;
+            statistics::Scalar cancelledQueued, cancelledStarted;
+            statistics::Scalar sharedFaultRequests;
+        } dtlbLoadStats, dtlbStoreStats;
+        struct DtlbLoadWalkOutcomeStats : statistics::Group
+        {
+            explicit DtlbLoadWalkOutcomeStats(Walker *owner);
+            statistics::Scalar faultSquashed, faultNotSquashed;
+            statistics::Scalar noFaultSquashed, noFaultNotSquashed;
+        } dtlbLoadWalkOutcomeStats;
         unsigned activeInstructionWalks = 0;
         uint64_t lastInstructionWalkCycle = 0;
         void accountInstructionWalks();
+        unsigned activeDataLoads = 0, activeDataStores = 0;
+        uint64_t lastDataWalkCycle = 0;
+        void accountDataWalks();
 
         // Wrapper for checking for squashes before starting a translation.
         void startWalkWrapper();
+        void retireWalk(WalkerState *walk);
 
         /**
          * Event used to call startWalkWrapper.
@@ -209,6 +263,7 @@ namespace X86ISA
 
         // Functions for dealing with packets.
         bool recvTimingResp(PacketPtr pkt);
+        void completeTimingResp(PacketPtr pkt);
         void recvReqRetry();
         bool sendTiming(WalkerState * sendingState, PacketPtr pkt);
 
@@ -223,14 +278,23 @@ namespace X86ISA
 
         Walker(const Params &params) :
             ClockedObject(params), port(name() + ".port", this),
-            funcState(this, NULL, NULL, true), tlb(NULL), sys(params.system),
+            funcState(this, NULL, NULL, true),
+            pagingStructureCache(params.paging_structure_cache),
+            prefixHitLatency(params.prefix_hit_latency),
+            pteResponseLatency(params.pte_response_latency),
+            coalesceFaultResults(params.coalesce_fault_results),
+            cancelSquashedWalks(params.cancel_squashed_walks), tlb(NULL), sys(params.system),
             requestorId(sys->getRequestorId(this)),
             numSquashable(params.num_squash_per_cycle),
             maxActiveWalks(params.max_active_walks), itlbStats(this),
-            dtlbLoadStats(this),
+            dtlbLoadStats(this, "DTLB_LOAD_MISSES"),
+            dtlbStoreStats(this, "DTLB_STORE_MISSES"),
+            dtlbLoadWalkOutcomeStats(this),
             startWalkWrapperEvent([this]{ startWalkWrapper(); }, name())
         {
             fatal_if(!maxActiveWalks, "Page walker needs an active walk slot");
+            fatal_if(pagingStructureCache && !prefixHitLatency,
+                     "Prefix-cache service needs a positive latency");
         }
     };
 

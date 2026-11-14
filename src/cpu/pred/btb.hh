@@ -43,6 +43,8 @@
 
 
 #include "arch/generic/pcstate.hh"
+#include <memory>
+#include <optional>
 #include "base/statistics.hh"
 #include "cpu/pred/branch_type.hh"
 #include "cpu/static_inst.hh"
@@ -60,6 +62,20 @@ class BranchTargetBuffer : public ClockedObject
   public:
     typedef BranchTargetBufferParams Params;
     typedef enums::BranchType BranchType;
+
+    struct Snapshot {
+        ThreadID tid;
+        Addr pc;
+        Addr residentPC;
+        unsigned level;
+        uint64_t identity;
+        uint64_t contextEpoch;
+        uint64_t invalidationEpoch;
+        uint64_t queryInvalidationEpoch;
+        Cycles latency;
+        StaticInstPtr inst;
+        std::unique_ptr<PCStateBase> target;
+    };
 
     BranchTargetBuffer(const Params &params);
 
@@ -79,6 +95,20 @@ class BranchTargetBuffer : public ClockedObject
     {
         return Cycles(0);
     }
+    virtual bool earlyValid(ThreadID tid, Addr instPC)
+    { return valid(tid, instPC); }
+
+    // Optional side-effect-free range index. false requests the legacy scan.
+    virtual bool rangeCandidates(ThreadID tid, Addr start, unsigned width,
+                                 unsigned stride, std::optional<Addr> &early,
+                                 std::optional<Addr> &late) const
+    { return false; }
+    virtual std::optional<Snapshot> probe(ThreadID tid, Addr pc) const
+    { return std::nullopt; }
+    virtual const PCStateBase *consumeSnapshot(const Snapshot &snapshot,
+                                              BranchType type)
+    { return lookup(snapshot.tid, snapshot.pc, type); }
+    virtual bool snapshotValid(const Snapshot &snapshot) const { return true; }
 
     /** Looks up an address in the BTB to get the target of the branch.
      *  @param inst_PC The address of the branch to look up.

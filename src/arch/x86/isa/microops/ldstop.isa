@@ -82,6 +82,15 @@ def template MicroLeaDeclare {{
         {
             %(set_reg_idx_arr)s;
             %(constructor)s;
+            if (dataSize >= 4 &&
+                (std::string(mnemonic) == "lea" || std::string(mnemonic) == "learip")) {
+                // SPR controls with base=index and a scaled index plus
+                // displacement give two cycles; simple and RIP LEA retain
+                // the one-cycle prior. Encoding and address form matter.
+                const bool three_terms = std::string(mnemonic) == "lea" &&
+                    base != int_reg::T0.index() && index != int_reg::T0.index() && disp != 0;
+                intExecutionInfo = {IntExecutionFamily::ALU, 0x863, three_terms ? 2u : 1u};
+            }
         }
 
         Fault execute(ExecContext *, trace::InstRecord *) const override;
@@ -339,6 +348,7 @@ let {{
             self.instFlags = ""
             if prefetch:
                 self.memFlags += " | Request::PREFETCH"
+                self.memFlags += " | ((machInst.opcode.type == TwoByteOpcode && uint8_t(machInst.opcode.op) == 0x0d && machInst.modRM.reg == 1) ? Request::PF_EXCLUSIVE : 0)"
                 self.instFlags += " | (1ULL << StaticInst::IsDataPrefetch)"
             if nonSpec:
                 self.instFlags += " | (1ULL << StaticInst::IsNonSpeculative)"
@@ -379,6 +389,7 @@ let {{
             self.instFlags = ""
             if prefetch:
                 self.memFlags += " | Request::PREFETCH"
+                self.memFlags += " | ((machInst.opcode.type == TwoByteOpcode && uint8_t(machInst.opcode.op) == 0x0d && machInst.modRM.reg == 1) ? Request::PF_EXCLUSIVE : 0)"
                 self.instFlags += " | (1ULL << StaticInst::IsDataPrefetch)"
             if nonSpec:
                 self.instFlags += " | (1ULL << StaticInst::IsNonSpeculative)"
@@ -388,9 +399,17 @@ let {{
                 " | ((log2i(%s) & AddrSizeFlagMask) << AddrSizeFlagShift)" % \
                 addressSize
 
-        def getAllocator(self, microFlags):
+        def getAllocator(self, microFlags, *, full_temp_write=False):
+            full_write = '(%s >= 4)' % self.dataSize
+            if full_temp_write:
+                # A memory operand's internal value has no architectural
+                # upper bits to merge. Keep real byte/word GPR merge inputs.
+                full_write = (
+                    '(%s || ((%s).index >= X86ISA::int_reg::MicroBegin && '
+                    '(%s).index < X86ISA::int_reg::MicroEnd))' %
+                    (full_write, self.data, self.data))
             allocString = '''
-                (%(dataSize)s >= 4) ?
+                %(fullWrite)s ?
                     (StaticInstPtr)(new %(class_name)sBig(machInst,
                         macrocodeBlock, %(flags)s, %(dataSize)s,
                         %(addressSize)s, %(memFlags)s, %(data)s, %(scale)s,
@@ -402,6 +421,7 @@ let {{
             '''
             allocator = allocString % {
                 "class_name" : self.className,
+                "fullWrite" : full_write,
                 "flags" : self.microFlagsText(microFlags) + self.instFlags,
                 "scale" : self.scale, "index" : self.index,
                 "base" : self.base,
@@ -529,10 +549,60 @@ let {{
                 self.className = Name
                 self.mnemonic = name
 
+            def getAllocator(self, microFlags):
+                if big and not is_float:
+                    return super().getAllocator(microFlags,
+                                                full_temp_write=True)
+                return super().getAllocator(microFlags)
+
         microopClasses[name] = LoadOp
 
     defineMicroLoadOp('Ld', 'Data = merge(Data, data, Mem, dataSize);',
                             'Data = Mem & mask(dataSize * 8);')
+
+    # One bounded REP read/write goes through the same dynamic LSQ request,
+    # timing translation, cache ports and store buffer as ordinary accesses.
+    # Eight functional words carry one line; they are not eight hardware uops.
+    def defineRepAccess(Name, store=False, fill=False):
+        global header_output, exec_output
+        name = Name.lower()
+        words = ['RepWord%d' % i for i in range(8)]
+        if store:
+            code = ('\n'.join('Mem_u8qw[%d] = %s;' % (i, word)
+                               for i, word in enumerate(words)) if not fill else
+                    '\n'.join('Mem_u8qw[%d] = (Rax & 0xff) * '
+                              '0x0101010101010101ULL;' % i for i in range(8)))
+        else:
+            code = '\n'.join('%s = Mem_u8qw[%d];' % (word, i)
+                              for i, word in enumerate(words))
+        iop = InstObjParams(name, Name, 'X86ISA::LdStOp',
+                            {"code": code, "complete_code": "",
+                             "ea_code": calculateEA, "memDataSize": "RepCount"})
+        header_output += MicroLdStOpDeclare.subst(iop)
+        if store:
+            for template in (MicroStoreExecute, MicroStoreInitiateAcc,
+                             MicroStoreCompleteAcc):
+                exec_output += template.subst(iop).replace(
+                    'writeMemAtomic(', 'writeRepMem(').replace(
+                    'writeMemTiming(', 'writeRepMem(')
+        else:
+            exec_output += MicroLoadExecute.subst(iop).replace(
+                'readMemAtomic(', 'readRepMemAtomic(')
+            exec_output += MicroLoadInitiateAcc.subst(iop)
+            exec_output += MicroLoadCompleteAcc.subst(iop).replace(
+                'getMem(', 'getRepMem(')
+        class RepAccess(LdStOp):
+            def __init__(self, data, segment, addr, disp=0,
+                         dataSize=1, addressSize="env.addressSize"):
+                super().__init__(data, segment, addr, disp, dataSize,
+                                 addressSize, "Request::REP_BULK", False, False, False, False)
+                self.className = Name
+                self.mnemonic = name
+        microopClasses[name] = RepAccess
+
+    defineRepAccess('Ldrep')
+    defineRepAccess('Strep', store=True)
+    defineRepAccess('Stosrep', store=True, fill=True)
     rip_load_ea = (
         'EA = SegBase + bits(xc->pcState().as<PCState>().npc() + disp, '
         'addressSize * 8 - 1, 0);')
@@ -602,6 +672,10 @@ let {{
 
     defineMicroFpPairLoad('Ldfpxmm', calculateEA)
     defineMicroFpPairLoad('Ldfpxmmrip', rip_load_ea)
+    # Legacy PMADDWD faults before accessing a misaligned m128 operand.
+    aligned_check = ' if (EA & 15) return std::make_shared<GeneralProtection>(0);'
+    defineMicroFpPairLoad('Ldfpxmmaligned', calculateEA + aligned_check)
+    defineMicroFpPairLoad('Ldfpxmmalignedrip', rip_load_ea + aligned_check)
     defineMicroFpPairLoad('Ldfpxmms', calculateEA, "dataSize")
     defineMicroFpPairLoad('Ldfpxmmsrip', rip_load_ea, "dataSize")
     for size in (4, 8):
@@ -876,11 +950,37 @@ let {{
 
     microopClasses["lea"] = LeaOp
 
+    for name, code in (("Learip", "Data = merge(Data, data, EA, dataSize);"),
+                       ("LearipBig", "Data = EA & mask(dataSize * 8);")):
+        iop = InstObjParams("learip", name, 'X86ISA::LdStOp',
+                            {"code": code,
+                             "ea_code": "EA = bits(xc->pcState().as<PCState>().npc() + disp, addressSize * 8 - 1, 0);",
+                             "memDataSize": "dataSize"})
+        header_output += MicroLeaDeclare.subst(iop)
+        exec_output += MicroLeaExecute.subst(iop)
+
+    class LearipOp(LeaOp):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.className = "Learip"
+            self.mnemonic = "learip"
+
+    microopClasses["learip"] = LearipOp
+
 
     iop = InstObjParams("tia", "Tia", 'X86ISA::MemNoDataOp',
-                        { "code": "xc->demapPage(EA, 0);",
+                        { "code": '''
+                            CR4 cr4 = CR4Op;
+                            CR3 cr3 = CR3Op;
+                            // INVLPG ignores non-canonical addresses.
+                            Efer efer = EferOp;
+                            if (!efer.lma || EA == szext<48>(EA))
+                                xc->demapPage(EA, cr4.pcide ?
+                                              uint64_t(cr3.pcid) : 0);
+                          ''',
                           "ea_code": calculateEA,
-                          "memDataSize": "dataSize" })
+                          "memDataSize": "dataSize" },
+                        ["IsNonSpeculative"])
     header_output += MicroLeaDeclare.subst(iop)
     exec_output += MicroLeaExecute.subst(iop)
 

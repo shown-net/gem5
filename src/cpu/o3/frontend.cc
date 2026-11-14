@@ -2,11 +2,39 @@
 #include "cpu/o3/frontend.hh"
 #include <algorithm>
 #include <cstring>
+#include <iterator>
+#include "arch/x86/insts/static_inst.hh"
+#include "arch/x86/pcstate.hh"
 #include "base/logging.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/cpu.hh"
 
 namespace gem5::o3
 {
+namespace {
+void describeDemand(FrontendRecord &r)
+{
+    r.demand = initialDemand(*r.instruction, r.macroop.get());
+    if (!r.allocationGroup) return;
+    const auto &g = *r.allocationGroup;
+    const bool first = r.sequence == g.leader;
+    r.demand.frontendUnits = first;
+    r.demand.idqUnits = first;
+    r.demand.allocationUnits = first;
+    r.demand.allocationGroup = g.leader;
+    r.demand.allocationLast = g.end;
+    if (!g.independentBackendEntries) {
+        r.demand.robUnits = first;
+        r.demand.robGroup = g.leader;
+        r.demand.robLast = g.end;
+        r.demand.schedulerGroup = g.leader;
+    }
+    r.demand.retirementGroup = g.leader;
+    r.demand.retirementLast = g.end;
+    r.demand.retirementUops = first;
+    r.demand.schedulerActions = r.sequence != g.branch;
+}
+}
 InstructionBytes::Stats::Stats(statistics::Group *parent)
     : statistics::Group(parent),
       ADD_STAT(returnedBytes, statistics::units::Byte::get(),
@@ -24,10 +52,15 @@ InstructionBytes::Stats::Stats(statistics::Group *parent)
 {}
 
 InstructionBytes::InstructionBytes(const InstructionBytesParams &p)
-    : SimObject(p), budget(p.bytesPerCycle), data(p.bufferBytes), stats(this)
+    : SimObject(p), budget(p.bytesPerCycle), blocks(p.residentBlocks), stats(this),
+      lookaheadEnabled(p.lookaheadEnabled), requestDepth(p.requestDepth)
 {
-    fatal_if(!budget || (budget & (budget - 1)) || data.empty() ||
-             data.size() % budget, "Invalid instruction byte geometry");
+    fatal_if(!budget || (budget & (budget - 1)) || !p.bufferBytes ||
+             p.bufferBytes % budget || !requestDepth ||
+             blocks.size() < requestDepth + 1,
+             "Invalid instruction byte geometry");
+    for (auto &block : blocks)
+        block.data.resize(p.bufferBytes);
 }
 
 void
@@ -43,78 +76,113 @@ InstructionBytes::complete(Addr va, Addr pa, const uint8_t *bytes,
         unsigned count, uint64_t cycle, bool can_reuse,
         std::optional<fastsim::fst::TranslationFragment> facts)
 {
-    fatal_if(count != data.size(), "Instruction response size mismatch");
-    std::memcpy(data.data(), bytes, count);
-    translation=std::move(facts);
-    virtualBase = va;
-    physicalBase = pa;
-    valid = true;
-    reusable = can_reuse;
-    readyCycle = cycle + 1;
+    auto &block = blocks[nextBlock];
+    nextBlock = (nextBlock + 1) % blocks.size();
+    fatal_if(count != block.data.size(), "Instruction response size mismatch");
+    std::memcpy(block.data.data(), bytes, count);
+    block.virtualBase = va;
+    block.physicalBase = pa;
+    block.valid = true;
+    block.reusable = can_reuse;
+    block.readyCycle = cycle + 1;
+    block.translation = std::move(facts);
     stats.returnedBytes += count;
+}
+
+const InstructionBytes::Block *
+InstructionBytes::find(Addr address) const
+{
+    for (const auto &block : blocks)
+        if (block.valid && address >= block.virtualBase &&
+            address - block.virtualBase < block.data.size())
+            return &block;
+    return nullptr;
 }
 
 fastsim::fst::TranslationFragment
 InstructionBytes::instructionTranslation(Addr address, unsigned count) const
 {
     fastsim::fst::TranslationFragment result;
-    result.virtual_address=address;result.size=count;
-    if (!contains(address) || !count || !contains(address+count-1)) return result;
-    result.physical_address=physicalBase+(address-virtualBase);
-    if (translation) result.mapping=translation->mapping;
+    result.virtual_address = address;
+    result.size = count;
+    const auto *block = find(address);
+    if (!count || !block || find(address + count - 1) != block)
+        return result;
+    result.physical_address = block->physicalBase + address - block->virtualBase;
+    if (block->translation)
+        result.mapping = block->translation->mapping;
     return result;
 }
 
 bool
 InstructionBytes::contains(Addr address) const
 {
-    return valid && address >= virtualBase && address - virtualBase < data.size();
+    return find(address);
+}
+
+uint64_t
+InstructionBytes::nextReady(uint64_t cycle) const
+{
+    uint64_t next = ~uint64_t(0);
+    for (const auto &block : blocks)
+        if (block.valid && block.readyCycle > cycle)
+            next = std::min(next, block.readyCycle);
+    return next;
 }
 
 bool
 InstructionBytes::matchesPhysicalBlock(Addr block, unsigned size) const
 {
-    return valid && physicalBase / size == block / size;
+    return std::any_of(blocks.begin(), blocks.end(), [&](const auto &entry) {
+        return entry.valid && entry.physicalBase / size == block / size;
+    });
 }
 
-bool
-InstructionBytes::serve(Addr address, unsigned count, uint64_t cycle)
+InstructionBytes::ChunkResult
+InstructionBytes::copyChunk(Addr address, unsigned count, uint64_t cycle,
+        const std::function<bool(Addr)> &pendingWrite, void *output,
+        Addr &physicalAddress, bool &reusable)
 {
-    if (!count || !contains(address) || !contains(address + count - 1) ||
-        cycle < readyCycle)
-        return false;
-    const Addr block = address & ~Addr(budget - 1);
-    if ((address + count - 1) / budget != address / budget)
-        return false;
-    if (serviceCycle == cycle)
-        return block == serviceBlock;
-    serviceCycle = cycle;
-    serviceBlock = block;
-    ++stats.serviceBlocks;
-    return true;
-}
-
-const uint8_t *
-InstructionBytes::at(Addr address) const
-{
-    assert(contains(address));
-    return data.data() + address - virtualBase;
+    if (!count) return ChunkResult::NotReady;
+    const auto *first = find(address);
+    const auto *last = find(address + count - 1);
+    if (!first || !last) return ChunkResult::Missing;
+    physicalAddress = first->physicalBase + address - first->virtualBase;
+    if (pendingWrite(physicalAddress)) return ChunkResult::Invalidated;
+    if (first != last || cycle < first->readyCycle ||
+        (address + count - 1) / budget != address / budget)
+        return ChunkResult::NotReady;
+    const Addr service = address & ~Addr(budget - 1);
+    if (serviceCycle == cycle && service != serviceBlock)
+        return ChunkResult::NotReady;
+    if (serviceCycle != cycle) {
+        serviceCycle = cycle;
+        serviceBlock = service;
+        ++stats.serviceBlocks;
+    }
+    reusable = first->reusable;
+    std::memcpy(output, first->data.data() + address - first->virtualBase, count);
+    return ChunkResult::Served;
 }
 
 Addr
 InstructionBytes::physical(Addr address) const
 {
-    assert(contains(address));
-    return physicalBase + address - virtualBase;
+    const auto *block = find(address);
+    assert(block);
+    return block->physicalBase + address - block->virtualBase;
 }
 
 void
 InstructionBytes::invalidate()
 {
-    if (valid)
-        ++stats.invalidations;
-    valid = reusable = false;
-    translation.reset();
+    for (auto &block : blocks) {
+        if (block.valid)
+            ++stats.invalidations;
+        block.valid = block.reusable = false;
+        block.translation.reset();
+    }
+    nextBlock = 0;
 }
 
 InstructionDeliveryQueue::Stats::Stats(statistics::Group *parent, unsigned cap)
@@ -127,8 +195,12 @@ InstructionDeliveryQueue::Stats::Stats(statistics::Group *parent, unsigned cap)
                "Queued or in-flight ops cancelled before acceptance"),
       ADD_STAT(bypassedOps, statistics::units::Count::get(),
                "New ready ops sent using the remaining ordered output budget"),
+      ADD_STAT(enqueuedUnits, statistics::units::Count::get(), "IDQ units admitted"),
+      ADD_STAT(sentUnits, statistics::units::Count::get(), "IDQ units sent downstream"),
+      ADD_STAT(acceptedUnits, statistics::units::Count::get(), "IDQ units released by acceptance"),
+      ADD_STAT(cancelledUnits, statistics::units::Count::get(), "IDQ units cancelled"),
       ADD_STAT(occupancy, statistics::units::Count::get(),
-               "Queued plus sent but unaccepted allocation slots")
+               "Queued plus sent but unaccepted IDQ units")
 {
     occupancy.init(0, cap, 1);
 }
@@ -144,7 +216,7 @@ void
 InstructionDeliveryQueue::enqueue(FrontendRecordPtr record,
         uint64_t ready, uint64_t cycle)
 {
-    fatal_if(freeEntries() < record->allocationSlots(), "IDQ enqueue without capacity");
+    fatal_if(freeEntries() < record->demand.idqUnits, "IDQ enqueue without capacity");
     if (!records.empty())
         fatal_if(records.back().record->sequence >= record->sequence,
                  "IDQ sequence order violation: tail sn=%llu pc=%#x "
@@ -155,7 +227,8 @@ InstructionDeliveryQueue::enqueue(FrontendRecordPtr record,
                     records.back().record->fault->name() : "none",
                  record->sequence, record->pc->instAddr(),
                  record->fault ? record->fault->name() : "none");
-    queuedSlots += record->allocationSlots();
+    queuedSlots += record->demand.idqUnits;
+    stats.enqueuedUnits += record->demand.idqUnits;
     records.push_back({std::move(record), ready, cycle});
     ++stats.enqueuedOps;
 }
@@ -174,9 +247,11 @@ InstructionDeliveryQueue::send(uint64_t cycle)
         ++stats.bypassedOps;
     auto record = std::move(records.front().record);
     records.pop_front();
-    queuedSlots -= record->allocationSlots();
-    inFlightSlots += record->allocationSlots();
-    fatal_if(!inFlight.emplace(record->sequence, record->allocationSlots()).second,
+    queuedSlots -= record->demand.idqUnits;
+    inFlightSlots += record->demand.idqUnits;
+    stats.sentUnits += record->demand.idqUnits;
+    fatal_if(!inFlight.emplace(record->sequence,
+             InFlight{record->demand.idqUnits, record->allocationGroup}).second,
              "Duplicate IDQ send");
     ++stats.sentOps;
     return record;
@@ -188,24 +263,57 @@ InstructionDeliveryQueue::accepted(InstSeqNum sequence)
     auto found = inFlight.find(sequence);
     fatal_if(found == inFlight.end(),
              "Rename acceptance without an outstanding IDQ operation");
-    inFlightSlots -= found->second;
+    inFlightSlots -= found->second.units;
+    stats.acceptedUnits += found->second.units;
     inFlight.erase(found);
     ++stats.acceptedOps;
     checkDrain();
 }
 
 void
+InstructionDeliveryQueue::collectTruncatedGroups(InstSeqNum through,
+        std::set<AllocationGroupPtr> &groups) const
+{
+    for (const auto &entry : records) {
+        const auto &group = entry.record->allocationGroup;
+        if (group && group->leader <= through && group->end > through)
+            groups.insert(group);
+    }
+    for (const auto &[sequence, entry] : inFlight) {
+        const auto &group = entry.group;
+        if (group && group->leader <= through && group->end > through)
+            groups.insert(group);
+    }
+}
+
+void
+InstructionDeliveryQueue::refreshGroups(const std::set<AllocationGroupPtr> &groups)
+{
+    for (auto &entry : records) {
+        if (!groups.count(entry.record->allocationGroup)) continue;
+        queuedSlots -= entry.record->demand.idqUnits;
+        describeDemand(*entry.record);
+        queuedSlots += entry.record->demand.idqUnits;
+    }
+}
+
+void
 InstructionDeliveryQueue::cancelAfter(InstSeqNum through)
 {
     while (!records.empty() && records.back().record->sequence > through) {
-        queuedSlots -= records.back().record->allocationSlots();
+        queuedSlots -= records.back().record->demand.idqUnits;
+        stats.cancelledUnits += records.back().record->demand.idqUnits;
         if (records.back().record->allocationGroup)
             records.back().record->allocationGroup->truncate(through);
         records.pop_back();
         ++stats.cancelledOps;
     }
     auto begin = inFlight.upper_bound(through);
-    for (auto it = begin; it != inFlight.end(); ++it) inFlightSlots -= it->second;
+    for (auto it = begin; it != inFlight.end(); ++it) {
+        inFlightSlots -= it->second.units;
+        stats.cancelledUnits += it->second.units;
+        if (it->second.group) it->second.group->truncate(through);
+    }
     stats.cancelledOps += std::distance(begin, inFlight.end());
     inFlight.erase(begin, inFlight.end());
     checkDrain();
@@ -222,14 +330,15 @@ DrainState InstructionDeliveryQueue::drain()
     return empty() ? DrainState::Drained : DrainState::Draining;
 }
 
-MiteService::Stats::Stats(statistics::Group *parent, unsigned budget)
+MiteService::Stats::Stats(statistics::Group *parent, unsigned budget,
+                          unsigned batch_limit)
     : statistics::Group(parent),
       ADD_STAT(acceptedInstructions, statistics::units::Count::get(),
                "Machine instructions accepted into source service"),
       ADD_STAT(deliveredOps, statistics::units::Count::get(),
                "Gem5 operations delivered from source service into IDQ"),
       ADD_STAT(deliveredSlots, statistics::units::Count::get(),
-               "Allocation units delivered from source service into IDQ"),
+               "IDQ units delivered from source service into IDQ"),
       ADD_STAT(activeCycles, statistics::units::Cycle::get(),
                "Cycles delivering at least one gem5 operation into IDQ"),
       ADD_STAT(cyclesGe6, statistics::units::Cycle::get(),
@@ -251,7 +360,7 @@ MiteService::Stats::Stats(statistics::Group *parent, unsigned budget)
       ADD_STAT(sourceWidths, statistics::units::Count::get(),
                "Nonempty delivery groups by source and operation count"),
       ADD_STAT(sourceSlots, statistics::units::Count::get(),
-               "IDQ allocation-unit deliveries by model source"),
+               "IDQ unit deliveries by model source"),
       ADD_STAT(sourceSlotCycles, statistics::units::Cycle::get(),
                "Cycles delivering allocation units by model source"),
       ADD_STAT(sourceSlotCyclesGe6, statistics::units::Cycle::get(),
@@ -259,32 +368,36 @@ MiteService::Stats::Stats(statistics::Group *parent, unsigned budget)
       ADD_STAT(sourceSlotWidths, statistics::units::Count::get(),
                "Nonempty delivery groups by source and allocation-unit count")
 {
-    delivery.init(0, 4 * budget, 1);
-    sourceWidths.init(3, 4 * budget + 1);
-    sourceSlotWidths.init(3, budget + 1);
+    const unsigned max_records = std::max(4 * budget, batch_limit);
+    delivery.init(0, max_records, 1);
+    sourceWidths.init(4, max_records + 1);
+    sourceSlotWidths.init(4, budget + 1);
     sourceWidths.subname(0, "mite");
     sourceWidths.subname(1, "dsb");
     sourceWidths.subname(2, "ms");
+    sourceWidths.subname(3, "lsd");
     sourceSlotWidths.subname(0, "mite");
     sourceSlotWidths.subname(1, "dsb");
     sourceSlotWidths.subname(2, "ms");
-    for (unsigned i = 0; i <= 4 * budget; ++i)
+    sourceSlotWidths.subname(3, "lsd");
+    for (unsigned i = 0; i <= max_records; ++i)
         sourceWidths.ysubname(i, std::to_string(i));
     for (unsigned i = 0; i <= budget; ++i)
         sourceSlotWidths.ysubname(i, std::to_string(i));
     for (auto *v : {&sourceOps, &sourceCycles, &sourceCyclesGe6,
                     &sourceSlots, &sourceSlotCycles, &sourceSlotCyclesGe6}) {
-        v->init(3);
+        v->init(4);
         v->subname(0, "mite");
         v->subname(1, "dsb");
         v->subname(2, "ms");
+        v->subname(3, "lsd");
     }
 }
 
 MiteService::MiteService(const MiteServiceParams &p)
     : SimObject(p), instructionBudget(p.instructionsPerBatch),
       outputBudget(p.opsPerCycle), batchLimit(p.batchOps), latency(p.latency),
-      stats(this, p.opsPerCycle)
+      stats(this, p.opsPerCycle, p.batchOps)
 {
     fatal_if(!instructionBudget || !outputBudget || !batchLimit,
              "Source service budgets must be positive");
@@ -304,32 +417,79 @@ MiteService::submit(std::vector<FrontendRecordPtr> records,
     stats.acceptedInstructions += instructions;
 }
 
+void
+MiteService::collectTruncatedGroups(InstSeqNum through,
+        std::set<AllocationGroupPtr> &groups) const
+{
+    for (const auto &entry : pending) {
+        const auto &group = entry.record->allocationGroup;
+        if (group && group->leader <= through && group->end > through)
+            groups.insert(group);
+    }
+}
+
+void
+MiteService::refreshGroups(const std::set<AllocationGroupPtr> &groups)
+{
+    for (auto &entry : pending)
+        if (groups.count(entry.record->allocationGroup)) describeDemand(*entry.record);
+}
+
+void
+MiteService::refreshTailGroup(const AllocationGroupPtr &group)
+{
+    assert(group && !pending.empty() &&
+           pending.back().record->allocationGroup == group);
+    for (auto it = pending.rbegin(); it != pending.rend() &&
+         it->record->allocationGroup == group; ++it)
+        describeDemand(*it->record);
+}
+
 unsigned
-MiteService::deliver(InstructionDeliveryQueue &idq, uint64_t cycle)
+MiteService::deliver(InstructionDeliveryQueue &idq, uint64_t cycle,
+        InstSeqNum before,
+        const std::function<void(const FrontendRecord &, uint64_t)> &observe)
 {
     unsigned delivered = 0;
-    unsigned sources[3] = {};
-    unsigned allocation_sources[3] = {}, delivered_slots = 0;
+    unsigned sources[4] = {};
+    unsigned allocation_sources[4] = {}, delivered_slots = 0;
     unsigned group = 0, slots = 0;
     const unsigned limit = std::min(outputBudget, idq.capacityValue());
-    for (const auto &entry : pending) {
-        const unsigned cost = entry.record->allocationSlots();
-        if (entry.ready > cycle || slots + cost > limit || group == 4 * limit) break;
-        slots += cost;
-        ++group;
-    }
-    if (group && idq.freeEntries() < slots) {
-        if (!idq.freeEntries()) ++stats.backpressureCycles;
-        ++stats.groupCreditStalls;
-        group = 0;
+    for (auto it = pending.begin(); it != pending.end();) {
+        const auto allocation_group = it->record->allocationGroup;
+        unsigned records = 0, group_slots = 0;
+        auto end = it;
+        do {
+            if (end->ready > cycle || end->record->sequence >= before) break;
+            group_slots += end->record->demand.idqUnits;
+            ++records;
+            ++end;
+        } while (allocation_group && end != pending.end() &&
+                 end->record->allocationGroup == allocation_group);
+        if (end != pending.end() && allocation_group &&
+            end->record->allocationGroup == allocation_group)
+            break;
+        if (!records || slots + group_slots > limit ||
+            (group && group + records > 4 * limit))
+            break;
+        if (slots + group_slots > idq.freeEntries()) {
+            if (slots == idq.freeEntries()) ++stats.backpressureCycles;
+            ++stats.groupCreditStalls;
+            break;
+        }
+        slots += group_slots;
+        group += records;
+        it = end;
     }
     while (delivered < group) {
         const unsigned source = static_cast<unsigned>(pending.front().record->source);
         ++sources[source];
-        const unsigned cost = pending.front().record->allocationSlots();
+        const unsigned cost = pending.front().record->demand.idqUnits;
         allocation_sources[source] += cost;
         delivered_slots += cost;
         deliveredThrough = pending.front().record->sequence;
+        if (observe)
+            observe(*pending.front().record, cycle);
         idq.enqueue(std::move(pending.front().record), cycle, cycle);
         pending.pop_front();
         ++delivered;
@@ -341,7 +501,7 @@ MiteService::deliver(InstructionDeliveryQueue &idq, uint64_t cycle)
     if (delivered >= 6)
         ++stats.cyclesGe6;
     stats.delivery.sample(delivered);
-    for (unsigned i = 0; i < 3; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         stats.sourceOps[i] += sources[i];
         if (sources[i]) ++stats.sourceCycles[i];
         if (sources[i] >= 6) ++stats.sourceCyclesGe6[i];
@@ -382,20 +542,19 @@ DsbTemplates::CacheStats::CacheStats(statistics::Group *parent)
       ADD_STAT(lookups, statistics::units::Count::get(), "Template lookups"),
       ADD_STAT(hits, statistics::units::Count::get(), "Validated template hits"),
       ADD_STAT(fills, statistics::units::Count::get(), "Complete template fills"),
-      ADD_STAT(evictions, statistics::units::Count::get(), "Whole LRU evictions"),
+      ADD_STAT(evictions, statistics::units::Count::get(), "Decoded entry LRU evictions"),
       ADD_STAT(invalidatedTemplates, statistics::units::Count::get(),
                "Templates invalidated by code or translation context changes"),
       ADD_STAT(staleFills, statistics::units::Count::get(),
                "Fills rejected after an intervening invalidation"),
       ADD_STAT(oversizeTemplates, statistics::units::Count::get(),
-               "Templates exceeding the configured operation capacity"),
-      ADD_STAT(branchLimitedBlocks, statistics::units::Count::get(),
-               "32-byte code blocks rejected by the Intel decoded-cache branch prior")
+               "Templates exceeding the configured operation capacity")
 {}
 
 DsbTemplates::DsbTemplates(const DsbTemplatesParams &p)
     : MiteService(p), numSets(p.numSets), associativity(p.associativity),
-      opsPerEntry(p.opsPerEntry), cacheStats(this)
+      opsPerEntry(p.opsPerEntry), maxRegionOps(p.maxRegionOps),
+      sets(p.numSets), cacheStats(this)
 {
     fatal_if(!numSets || (numSets & (numSets - 1)) || !associativity ||
              !opsPerEntry, "DSB needs nonzero power-of-two sets and geometry");
@@ -410,8 +569,17 @@ DsbTemplates::setIndex(Addr address) const
 void
 DsbTemplates::erase(Entry entry)
 {
-    index.erase(entry->identity);
-    templates.erase(entry);
+    auto &entries = sets[setIndex(entry->members.front().identity.address)];
+    for (const auto &member : entry->members) {
+        index.erase(member.identity);
+        for (Addr block : member.physicalBlocks) {
+            auto found = physicalIndex.find(block);
+            if (found == physicalIndex.end()) continue;
+            found->second.erase(&*entry);
+            if (found->second.empty()) physicalIndex.erase(found);
+        }
+    }
+    entries.erase(entry);
 }
 
 const FrontendTemplate *
@@ -419,29 +587,78 @@ DsbTemplates::candidate(const FrontendCodeIdentity &identity,
         uint64_t cycle) const
 {
     auto found = index.find(identity);
-    return found != index.end() && found->second->available <= cycle ?
-        &*found->second : nullptr;
+    if (found == index.end()) return nullptr;
+    const auto &member = found->second.entry->members[found->second.member];
+    return member.available <= cycle ? &member : nullptr;
 }
 
-const FrontendTemplate *
+DsbLookupResult
 DsbTemplates::lookup(const FrontendCodeIdentity &identity,
-        const std::vector<Addr> &validated_blocks, uint64_t cycle)
+        uint64_t cycle,
+        const std::function<bool(Addr, unsigned, std::vector<Addr> &, Addr &)> &resolve)
 {
-    ++cacheStats.lookups;
     auto found = index.find(identity);
-    if (found == index.end())
-        return nullptr;
-    const auto entry = found->second;
-    if (entry->available > cycle)
-        return nullptr;
-    if (entry->physicalBlocks != validated_blocks) {
-        ++cacheStats.invalidatedTemplates;
-        erase(entry);
-        return nullptr;
+    if (found == index.end()) {
+        ++cacheStats.lookups;
+        return {DsbLookupResult::State::Miss};
     }
-    templates.splice(templates.begin(), templates, entry);
+    const auto entry = found->second.entry;
+    const size_t member_index = found->second.member;
+    const auto &member = entry->members[member_index];
+    if (member.available > cycle) {
+        ++cacheStats.lookups;
+        return {DsbLookupResult::State::Miss};
+    }
+    std::vector<Addr> validated_blocks;
+    Addr missing = 0;
+    if (!resolve(identity.address, member.bytes, validated_blocks, missing))
+        return {DsbLookupResult::State::NeedsValidation, nullptr, missing};
+    ++cacheStats.lookups;
+    if (member.physicalBlocks != validated_blocks) {
+        cacheStats.invalidatedTemplates += entry->members.size();
+        erase(entry);
+        return {DsbLookupResult::State::Miss};
+    }
+    auto &entries = sets[setIndex(identity.address)];
+    entries.splice(entries.begin(), entries, entry);
     ++cacheStats.hits;
-    return &templates.front();
+    return {DsbLookupResult::State::Hit, &entry->members[member_index]};
+}
+
+unsigned
+FrontendTemplate::encodedSlots() const
+{
+    if (macroop && macroop->usesMicrocodeService())
+        return std::max(1U, macroop->microcodePrefixOps());
+    // Decode/encoding qualification owns storage. Backend allocation groups
+    // are deliberately not consulted: an unlaminated memory form can retain
+    // one encoded slot while allocating separate backend entries.
+    if (macroop && (macroop->isMicroFusedMemory() || macroop->isStackRegAllocation()))
+        return 1;
+    switch (nearStackControl(macroop.get())) {
+      case NearStackControl::DirectCall:
+      case NearStackControl::RegisterCall:
+        return 2;
+      case NearStackControl::MemoryCall:
+        return 3;
+      case NearStackControl::Return:
+        return 1;
+      case NearStackControl::ReturnImmediate:
+        return 3;
+      case NearStackControl::None:
+        break;
+    }
+    unsigned slots = 0;
+    for (const auto &op : operations) {
+        const auto divide = op->intDivide();
+        if (divide.bytes)
+            slots += divide.bytes == 8 ? 5 : 4;
+        else
+            // Effective fallback for forms not yet given a distinct encoding
+            // description; this is not evidence of physical uop count.
+            ++slots;
+    }
+    return slots;
 }
 
 bool
@@ -452,12 +669,11 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
         ++cacheStats.staleFills;
         return false;
     }
-    if (value.operations.empty() || value.physicalBlocks.empty())
+    if ((value.operations.empty() &&
+         !(value.macroop && value.macroop->usesMicrocodeService())) ||
+        value.physicalBlocks.empty())
         return false;
-    auto allocationUnits = [](const FrontendTemplate &entry) {
-        return entry.sharedAllocation ? size_t(1) : entry.operations.size();
-    };
-    if (allocationUnits(value) > opsPerEntry) {
+    if (value.encodedSlots() > opsPerEntry) {
         ++cacheStats.oversizeTemplates;
         return false;
     }
@@ -469,77 +685,65 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
     }
     auto existing = index.find(value.identity);
     if (existing != index.end())
-        erase(existing->second);
-    const FrontendCodeIdentity branch_block{value.identity.address & ~Addr(31),
-        value.identity.addressSpace, value.identity.decoderContext};
-    if (branchLimitedBlocks.count(branch_block)) return false;
-    auto unconditional = [](const FrontendTemplate &entry) {
-        return !entry.operations.empty() && entry.operations.back()->isUncondCtrl();
+        erase(existing->second.entry);
+    auto &entries = sets[setIndex(value.identity.address)];
+    const auto same_region = [&value](const CacheEntry &entry) {
+        const auto &identity = entry.members.front().identity;
+        return identity.addressSpace == value.identity.addressSpace &&
+            identity.decoderContext == value.identity.decoderContext &&
+            (identity.address >> 6) == (value.identity.address >> 6);
     };
-    unsigned branches = unconditional(value);
-    for (const auto &entry : templates)
-        if ((entry.identity.address & ~Addr(31)) == branch_block.address &&
-            entry.identity.addressSpace == branch_block.addressSpace &&
-            entry.identity.decoderContext == branch_block.decoderContext)
-            branches += unconditional(entry);
-    // Approximate the Intel decoded-cache branch prior by rejecting a
-    // 32-byte chunk with more than three unconditional branch templates.
-    // Capacity below is rounded per 64-byte line; it does not partition
-    // the modeled ways at each individual branch boundary.
-    if (branches > 3) {
-        for (auto it = templates.begin(); it != templates.end();) {
-            auto entry = it++;
-            if ((entry->identity.address & ~Addr(31)) == branch_block.address &&
-                entry->identity.addressSpace == branch_block.addressSpace &&
-                entry->identity.decoderContext == branch_block.decoderContext)
-                erase(entry);
+    if (maxRegionOps) {
+        unsigned region_units = value.encodedSlots();
+        for (const auto &entry : entries)
+            if (same_region(entry))
+                region_units += entry.units;
+        if (region_units > maxRegionOps) {
+            // A failed region qualification discards its partial templates.
+            // The bounded cache itself owns this state; redecoding on the
+            // next traversal may qualify a different observed path.
+            for (auto it = entries.begin(); it != entries.end();) {
+                auto entry = it++;
+                if (same_region(*entry))
+                    erase(entry);
+            }
+            ++cacheStats.oversizeTemplates;
+            return false;
         }
-        branchLimitedBlocks.insert(branch_block);
-        ++cacheStats.branchLimitedBlocks;
-        return false;
     }
-    using Line = std::tuple<uint64_t, uint64_t, Addr>;
-    auto lineOf = [](const FrontendCodeIdentity &id) -> Line {
-        return {id.addressSpace, id.decoderContext, id.address >> 6};
-    };
-    const Line incoming = lineOf(value.identity);
-    const unsigned set = setIndex(value.identity.address);
-    auto occupied = [&]() {
-        std::map<Line, unsigned> counts;
-        for (const auto &entry : templates)
-            if (setIndex(entry.identity.address) == set)
-                counts[lineOf(entry.identity)] += allocationUnits(entry);
-        counts[incoming] += allocationUnits(value);
-        unsigned ways = 0;
-        for (const auto &item : counts)
-            ways += (item.second + opsPerEntry - 1) / opsPerEntry;
-        return ways;
-    };
-    unsigned own_ops = allocationUnits(value);
-    for (const auto &entry : templates)
-        if (lineOf(entry.identity) == incoming) own_ops += allocationUnits(entry);
-    if (own_ops > associativity * opsPerEntry) {
-        ++cacheStats.oversizeTemplates;
-        return false;
+    // Pack consecutive instructions from the same observed path. A taken
+    // branch seals its entry; this is an effective model, not a physical tag.
+    const unsigned units = value.encodedSlots();
+    auto target = entries.end();
+    for (auto it = entries.begin(); it != entries.end(); ++it) {
+        const auto &first = it->members.front();
+        const auto &last = it->members.back();
+        if (!it->closed && it->units + units <= opsPerEntry &&
+            first.identity.addressSpace == value.identity.addressSpace &&
+            first.identity.decoderContext == value.identity.decoderContext &&
+            (first.identity.address >> 6) == (value.identity.address >> 6) &&
+            last.identity.address + last.bytes == value.identity.address)
+            target = it;
     }
-    while (occupied() > associativity) {
-        auto victim = templates.end();
-        for (auto it = templates.end(); it != templates.begin();) {
-            --it;
-            if (setIndex(it->identity.address) == set &&
-                lineOf(it->identity) != incoming) { victim = it; break; }
+    if (target == entries.end()) {
+        if (entries.size() >= associativity) {
+            erase(std::prev(entries.end()));
+            ++cacheStats.evictions;
         }
-        fatal_if(victim == templates.end(), "DSB set has no evictable line");
-        const Line evicted = lineOf(victim->identity);
-        for (auto it = templates.begin(); it != templates.end();) {
-            auto entry = it++;
-            if (lineOf(entry->identity) == evicted) erase(entry);
-        }
-        ++cacheStats.evictions;
+        entries.emplace_front();
+        target = entries.begin();
+    } else {
+        entries.splice(entries.begin(), entries, target);
     }
     value.available = cycle + 1;
-    templates.push_front(std::move(value));
-    index.emplace(templates.front().identity, templates.begin());
+    const bool closed = value.endsEntry;
+    target->members.push_back(std::move(value));
+    target->units += units;
+    target->closed = closed;
+    const size_t offset = target->members.size() - 1;
+    index.emplace(target->members.back().identity, Location{target, offset});
+    for (Addr block : target->members.back().physicalBlocks)
+        physicalIndex[block].insert(&*target);
     ++cacheStats.fills;
     return true;
 }
@@ -547,15 +751,14 @@ DsbTemplates::fill(FrontendTemplate value, uint64_t accepted_epoch,
 void
 DsbTemplates::invalidate(Addr physical_block)
 {
-    ++codeEpoch;
-    branchLimitedBlocks.clear();
-    for (auto it = templates.begin(); it != templates.end();) {
-        auto entry = it++;
-        if (std::find(entry->physicalBlocks.begin(), entry->physicalBlocks.end(),
-                      physical_block) != entry->physicalBlocks.end()) {
-            ++cacheStats.invalidatedTemplates;
-            erase(entry);
-        }
+    auto found = physicalIndex.find(physical_block);
+    if (found == physicalIndex.end()) return;
+    const auto affected = found->second;
+    for (const auto *entry : affected) {
+        const auto location = index.find(entry->members.front().identity);
+        assert(location != index.end());
+        cacheStats.invalidatedTemplates += entry->members.size();
+        erase(location->second.entry);
     }
 }
 
@@ -563,18 +766,27 @@ void
 DsbTemplates::invalidateAll()
 {
     ++codeEpoch;
-    branchLimitedBlocks.clear();
-    cacheStats.invalidatedTemplates += templates.size();
-    templates.clear();
+    for (auto &entries : sets) {
+        for (const auto &entry : entries)
+            cacheStats.invalidatedTemplates += entry.members.size();
+        entries.clear();
+    }
     index.clear();
+    physicalIndex.clear();
 }
 
 FrontendCoordinator::Stats::Stats(statistics::Group *parent)
     : statistics::Group(parent),
       ADD_STAT(sourceTransitions, statistics::units::Count::get(),
-               "Source changes at batch boundaries"),
-      ADD_STAT(extraSwitchCycles, statistics::units::Cycle::get(),
-               "Configured extra DSB to MITE source wait"),
+               "Source changes at actual IDQ handoff"),
+      ADD_STAT(dsbToMiteDeliveries, statistics::units::Count::get(),
+               "Observed DSB-to-MITE source transitions at IDQ handoff; model diagnostic"),
+      ADD_STAT(switchWaitCycles, statistics::units::Cycle::get(),
+               "Observed frontend cycles in a DSB to MITE wait; not a certified hardware penalty"),
+      ADD_STAT(switchWaitRenameBlocked, statistics::units::Cycle::get(),
+               "Switch-wait cycles overlapping Rename backpressure"),
+      ADD_STAT(switchWaitIdqFull, statistics::units::Cycle::get(),
+               "Switch-wait cycles overlapping a full IDQ"),
       ADD_STAT(outputs, statistics::units::Count::get(), "IDQ output operations"),
       ADD_STAT(redirects, statistics::units::Count::get(), "Frontend cancellations"),
       ADD_STAT(translationValidations, statistics::units::Count::get(),
@@ -583,33 +795,65 @@ FrontendCoordinator::Stats::Stats(statistics::Group *parent)
                "Frontend records actually accepted by Rename"),
       ADD_STAT(allocationSlots, statistics::units::Count::get(),
                "Allocation units accepted by Rename, including fused pairs"),
-      ADD_STAT(notDeliveredSlots, statistics::units::Count::get(),
-               "Missing allocation units while the backend can accept"),
       ADD_STAT(allocationCycles, statistics::units::Cycle::get(),
                "Observed active Rename cycles"),
+      ADD_STAT(notDeliveredSlots, statistics::units::Count::get(),
+               "Missing IDQ output units within the delayed receiver-capacity candidate"),
+      ADD_STAT(fullReceiverNotDeliveredSlots, statistics::units::Count::get(),
+               "Missing IDQ output units when the delayed receiver can accept the full output width"),
       ADD_STAT(backendAcceptingCycles, statistics::units::Cycle::get(),
-               "Rename cycles with full-width resource headroom and no block"),
+               "IDQ output cycles with positive receiver capacity and no backward block"),
       ADD_STAT(backendBlockedCycles, statistics::units::Cycle::get(),
-               "Rename cycles excluded from frontend delivery shortage"),
+               "IDQ output cycles excluded by actual backward block or zero receiver capacity"),
       ADD_STAT(notDeliveredOps, statistics::units::Count::get(),
-               "Missing allocation slots while the model backend can accept"),
+               "Missing IDQ output records, clipped to the receiver-capacity candidate"),
       ADD_STAT(zeroDeliveryCycles, statistics::units::Cycle::get(),
-               "Backend-accepting cycles with no actual Rename acceptance"),
+               "Receiver-accepting cycles with no actual IDQ output"),
+      ADD_STAT(fullDeliveryCycles, statistics::units::Cycle::get(),
+               "Receiver-accepting IDQ output cycles delivering the configured full width"),
+      ADD_STAT(receiverUnknownCycles, statistics::units::Cycle::get(),
+               "IDQ output cycles without a valid delayed receiver observation"),
+      ADD_STAT(partialReceiverCycles, statistics::units::Cycle::get(),
+               "Receiver-accepting IDQ output cycles with capacity below the full width"),
       ADD_STAT(allocationWidths, statistics::units::Count::get(),
-               "Actual Rename acceptance width on backend-accepting cycles"),
+               "Actual Rename acceptance width, independently of IDQ output"),
       ADD_STAT(backendBlocks, statistics::units::Cycle::get(),
                "Exclusion reasons; multiple reasons may overlap"),
       ADD_STAT(sqHeadroomAcceptingCycles, statistics::units::Cycle::get(),
-               "Backend-accepting cycles by free SQ entries before Rename"),
+               "Receiver-accepting IDQ output cycles by delayed free SQ entries"),
       ADD_STAT(sqHeadroomMissingSlots, statistics::units::Count::get(),
-               "Missing slots by free SQ entries before Rename; correlation only")
+               "Missing IDQ output units by delayed free SQ entries; correlation only")
 {}
 
 FrontendCoordinator::FrontendCoordinator(const FrontendCoordinatorParams &p)
-    : SimObject(p), switchDelay(p.dsbToMiteDelay), stats(this),
+    : SimObject(p), wakeEvent([this] { if (owner) owner->wakeFrontend(); },
+                              name() + ".ready", false, Event::CPU_Tick_Pri - 1),
+      enableLsdReplay(p.enableLsdReplay),
+      stats(this),
       instructionBytes(p.instructionBytes), mite(p.mite), dsb(p.dsb),
-      ms(p.ms), idq(p.idq)
+      ms(p.ms), lsd(p.lsd), idq(p.idq)
 {}
+
+void
+FrontendCoordinator::cancelWake()
+{
+    if (owner && wakeEvent.scheduled()) owner->deschedule(wakeEvent);
+}
+
+void
+FrontendCoordinator::refreshWake()
+{
+    cancelWake();
+    if (!owner || owner->switchedOut() ||
+        owner->drainState() == DrainState::Drained) return;
+    const uint64_t now = uint64_t(owner->curCycle());
+    uint64_t due = idq->nextReady(now);
+    for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                          static_cast<MiteService *>(ms), lsd})
+        due = std::min(due, service->nextReady(now));
+    if (due != ~uint64_t(0))
+        owner->schedule(wakeEvent, owner->clockEdge(Cycles(due - now)));
+}
 
 void
 FrontendCoordinator::configure(unsigned threads, unsigned width, unsigned size)
@@ -636,108 +880,203 @@ FrontendCoordinator::configure(unsigned threads, unsigned width, unsigned size)
 
 bool FrontendCoordinator::canAccept() const
 {
-    return !stoppedThisCycle && sourceService(selected)->freeBatchOps();
+    return !stoppedThisCycle && (mite->freeBatchOps() || dsb->freeBatchOps() ||
+                                ms->freeBatchOps() || lsd->freeBatchOps());
 }
 MiteService *FrontendCoordinator::sourceService(FrontendSource source) const
 {
     if (source == FrontendSource::Dsb) return dsb;
     if (source == FrontendSource::Microcode) return ms;
+    if (source == FrontendSource::Lsd) return lsd;
     return mite;
 }
 bool FrontendCoordinator::canAccept(FrontendSource source) const
 {
-    if (!canAccept()) return false;
-    if ((!mite->idle() || !dsb->idle() || !ms->idle()) && source != selected)
-        return false;
-    return sourceService(source)->freeBatchOps();
+    return !stoppedThisCycle && sourceService(source)->freeBatchOps();
 }
-void FrontendCoordinator::allocation(unsigned accepted, unsigned slots,
-                                     unsigned blocked, unsigned sq_headroom)
+void FrontendCoordinator::allocation(unsigned accepted, unsigned slots)
 {
     panic_if(slots > outputWidth, "Rename acceptance exceeds allocation width");
     ++stats.allocationCycles;
     stats.allocationOps += accepted;
     stats.allocationSlots += slots;
-    if (blocked) {
-        ++stats.backendBlockedCycles;
-        for (unsigned i = 0; i < 7; ++i)
-            if (blocked & (1U << i)) ++stats.backendBlocks[i];
-    } else {
-        ++stats.backendAcceptingCycles;
-        const unsigned sq_bin = std::min(sq_headroom, outputWidth);
-        ++stats.sqHeadroomAcceptingCycles[sq_bin];
-        stats.sqHeadroomMissingSlots[sq_bin] += outputWidth - slots;
-        ++stats.allocationWidths[accepted];
-        stats.notDeliveredOps += accepted < outputWidth ? outputWidth - accepted : 0;
-        stats.notDeliveredSlots += outputWidth - slots;
-        if (!slots) ++stats.zeroDeliveryCycles;
-    }
+    ++stats.allocationWidths[accepted];
 }
 bool FrontendCoordinator::empty() const
 {
-    return mite->idle() && dsb->idle() && ms->idle() &&
+    return mite->idle() && dsb->idle() && ms->idle() && lsd->idle() &&
         idq->empty() && pendingFills.empty();
 }
 
 void
 FrontendCoordinator::advance(uint64_t cycle, bool rename_blocked,
-        const std::function<bool(FrontendRecordPtr)> &emit)
+        const TimeStruct::RenameComm &receiver,
+        const std::function<bool(FrontendRecordPtr)> &emit, bool hold)
 {
-    stoppedThisCycle = false;
+    stoppedThisCycle = hold;
     unsigned sent = 0, sent_records = 0;
     auto output = [&] {
         while (!rename_blocked && !stoppedThisCycle && sent_records < MaxWidth &&
                idq->headReady(cycle)) {
+            if (idq->headSlots() > outputWidth - sent) break;
             if (sent == outputWidth) {
                 // A zero-cost follower completes the last accepted group.
                 // The IDQ's ordered head determines its remaining cost.
                 if (idq->headSlots()) break;
             }
             auto record = idq->send(cycle);
-            sent += record->allocationSlots();
+            sent += record->demand.idqUnits;
+            if (deliveryObserver && record->source == FrontendSource::Lsd)
+                deliveryObserver(*record, cycle);
             ++sent_records;
             ++stats.outputs;
             if (!emit(std::move(record))) stoppedThisCycle = true;
         }
     };
     output();
-    fatal_if(unsigned(!mite->idle()) + unsigned(!dsb->idle()) +
-             unsigned(!ms->idle()) > 1, "Concurrent frontend source batches");
     if (!stoppedThisCycle) {
-        sourceService(selected)->deliver(*idq, cycle);
+        // Sources prepare independently. Only the globally oldest source can
+        // hand off this cycle, and it cannot pass another source's head.
+        MiteService *oldest = nullptr;
+        InstSeqNum before = ~InstSeqNum(0);
+        for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                              static_cast<MiteService *>(ms), lsd}) {
+            if (service->idle()) continue;
+            if (!oldest || service->headSequence() < oldest->headSequence()) {
+                if (oldest) before = std::min(before, oldest->headSequence());
+                oldest = service;
+            } else before = std::min(before, service->headSequence());
+        }
+        if (fusionTail)
+            before = std::min(before, fusionTail->allocationGroup ?
+                fusionTail->allocationGroup->leader : fusionTail->sequence);
+        if (haveSource && selected == FrontendSource::Dsb && oldest == mite &&
+            mite->preparingHead(cycle)) {
+            ++stats.switchWaitCycles;
+            if (rename_blocked) ++stats.switchWaitRenameBlocked;
+            if (!idq->freeEntries()) ++stats.switchWaitIdqFull;
+        }
+        const bool ms_active = !msIntervals.empty();
+        bool positive_delivery = false;
+        auto observe = [this, &positive_delivery](const FrontendRecord &record, uint64_t at) {
+            if (record.demand.idqUnits) {
+                if (havePositiveDeliverySource &&
+                    positiveDeliverySource == FrontendSource::Dsb &&
+                    record.source == FrontendSource::Mite)
+                    ++stats.dsbToMiteDeliveries;
+                positiveDeliverySource = record.source;
+                havePositiveDeliverySource = true;
+            }
+            // LSD's existing output and CPU accounting happen when the
+            // record leaves IDQ, rather than at this internal handoff.
+            if (record.source == FrontendSource::Lsd) return;
+            positive_delivery |= record.demand.idqUnits != 0;
+            if (haveSource && selected != record.source)
+                ++stats.sourceTransitions;
+            selected = record.source;
+            haveSource = true;
+            if (deliveryObserver) deliveryObserver(record, at);
+            if (record.source == FrontendSource::Microcode) {
+                const auto it = std::find_if(msIntervals.begin(), msIntervals.end(),
+                    [&record](const MsInterval &interval) {
+                        return interval.last && interval.last == record.sequence;
+                    });
+                if (it != msIntervals.end()) msIntervals.erase(it);
+            }
+        };
+        if (oldest) oldest->deliver(*idq, cycle, before, observe);
+        if (ms_active && positive_delivery && owner)
+            owner->recordMsActiveDelivery();
         const InstSeqNum delivered = std::max({mite->lastDelivered(),
-            dsb->lastDelivered(), ms->lastDelivered()});
-        while (!pendingFills.empty() && pendingFills.front().through <= delivered) {
-            for (auto &value : pendingFills.front().templates)
-                dsb->fill(std::move(value), pendingFills.front().epoch, cycle);
+            dsb->lastDelivered(), ms->lastDelivered(), lsd->lastDelivered()});
+        while (!pendingFills.empty()) {
+            auto &fill = pendingFills.front();
+            const InstSeqNum through = fill.group ?
+                std::max(fill.last, fill.group->end) : fill.last;
+            if (through > delivered ||
+                (fusionTail && (fusionTail->sequence == fill.last ||
+                    (fill.group && fusionTail->allocationGroup == fill.group))))
+                break;
+            dsb->fill(std::move(fill.value), fill.epoch, cycle);
             pendingFills.pop_front();
         }
         output();
     }
+    if (!receiver.receiverValid) {
+        ++stats.receiverUnknownCycles;
+    } else if (rename_blocked || !receiver.receiverCapacity) {
+        ++stats.backendBlockedCycles;
+        const unsigned reasons = receiver.receiverBlocks |
+            (rename_blocked ? unsigned(RenameSignal) : 0U);
+        for (unsigned i = 0; i < 7; ++i)
+            if (reasons & (1U << i)) ++stats.backendBlocks[i];
+    } else {
+        ++stats.backendAcceptingCycles;
+        const unsigned capacity = std::min(receiver.receiverCapacity, outputWidth);
+        const unsigned missing = capacity - std::min(sent, capacity);
+        if (missing) {
+            // An unfinished decode or the oldest unready source can expose
+            // this miss. Ready queued records hiding the delay do not.
+            if (decodingMiss && idq->occupied() == 0 &&
+                mite->idle() && dsb->idle() && ms->idle())
+                *decodingMiss = true;
+            MiteService *head = nullptr;
+            for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                                  static_cast<MiteService *>(ms), lsd}) {
+                if (service->idle()) continue;
+                if (!head || service->headSequence() < head->headSequence())
+                    head = service;
+            }
+            if (head && head->preparingHead(cycle) &&
+                head->headRecord()->dsbMissExposed)
+                *head->headRecord()->dsbMissExposed = true;
+        }
+        stats.notDeliveredSlots += missing;
+        if (capacity == outputWidth)
+            stats.fullReceiverNotDeliveredSlots += missing;
+        stats.notDeliveredOps += capacity - std::min(sent_records, capacity);
+        if (!sent) ++stats.zeroDeliveryCycles;
+        if (sent == outputWidth) ++stats.fullDeliveryCycles;
+        if (capacity < outputWidth) ++stats.partialReceiverCycles;
+        const unsigned sq_bin = std::min(receiver.freeSQEntries, outputWidth);
+        ++stats.sqHeadroomAcceptingCycles[sq_bin];
+        stats.sqHeadroomMissingSlots[sq_bin] += missing;
+    }
     idq->sample();
+    refreshWake();
     checkDrain();
 }
 
 void
 FrontendCoordinator::submit(FrontendSource source,
         std::vector<FrontendRecordPtr> records, unsigned instructions,
-        std::vector<FrontendTemplate> fills, uint64_t cycle)
+        std::vector<FrontendFillCandidate> fills, uint64_t cycle)
 {
     fatal_if(!canAccept(source), "Frontend submitted while accepting is blocked");
-    Cycles wait(0);
-    if (haveSource && selected != source) {
-        ++stats.sourceTransitions;
-        if (selected == FrontendSource::Dsb && source == FrontendSource::Mite) {
-            wait = switchDelay;
-            stats.extraSwitchCycles += uint64_t(wait);
+    fuseAcrossBatches(records);
+    if (source == FrontendSource::Microcode) {
+        for (const auto &record : records) {
+            if (!msInputOpen) {
+                msIntervals.push_back({record->sequence, 0});
+                msInputOpen = true;
+            }
+            if (record->instruction->isLastMicroop() ||
+                record->pc->instAddr() != record->predictedPC->instAddr()) {
+                msIntervals.back().last = record->sequence;
+                msInputOpen = false;
+            }
         }
     }
-    selected = source;
-    haveSource = true;
-    if (!fills.empty())
-        pendingFills.push_back({records.back()->sequence, dsb->epoch(), std::move(fills)});
+    for (auto &record : records) {
+        describeDemand(*record);
+        observeLoop(*record);
+    }
+    for (auto &fill : fills)
+        pendingFills.push_back({fill.first, fill.last, dsb->epoch(),
+            fill.lastRecord->allocationGroup, std::move(fill.value)});
     auto *service = sourceService(source);
-    service->submit(std::move(records), instructions, cycle + uint64_t(wait));
+    service->submit(std::move(records), instructions, cycle);
+    refreshWake();
 }
 
 void FrontendCoordinator::accepted(InstSeqNum sequence)
@@ -747,30 +1086,58 @@ void FrontendCoordinator::accepted(InstSeqNum sequence)
 }
 void FrontendCoordinator::cancelAfter(InstSeqNum through)
 {
+    decodingMiss.reset();
+    msIntervals.erase(std::remove_if(msIntervals.begin(), msIntervals.end(),
+        [through](const MsInterval &interval) {
+            return !interval.last || interval.first > through || interval.last > through;
+        }), msIntervals.end());
+    msInputOpen = false;
+    fusionTail = nullptr;
+    std::set<AllocationGroupPtr> groups;
+    idq->collectTruncatedGroups(through, groups);
+    for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                          static_cast<MiteService *>(ms), lsd})
+        service->collectTruncatedGroups(through, groups);
+    pendingFills.erase(std::remove_if(pendingFills.begin(), pendingFills.end(),
+        [through](const PendingFill &fill) {
+            return fill.first > through || fill.last > through ||
+                (fill.group && fill.group->end > through);
+        }), pendingFills.end());
     mite->cancelAfter(through);
     dsb->cancelAfter(through);
     ms->cancelAfter(through);
+    lsd->cancelAfter(through);
     idq->cancelAfter(through);
-    pendingFills.clear();
+    for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                          static_cast<MiteService *>(ms), lsd})
+        service->refreshGroups(groups);
+    idq->refreshGroups(groups);
+    clearLoop();
+    refreshWake();
     checkDrain();
 }
 void FrontendCoordinator::reset()
 {
+    ++translationEpochValue;
     cancelAfter(0);
+    pendingFills.clear();
     dsb->invalidateAll();
     instructionBytes->invalidate();
     leases.clear();
     haveSource = false;
+    havePositiveDeliverySource = false;
 }
 
-void
+bool
 FrontendCoordinator::context(uint64_t space, uint64_t decoder)
 {
     if (addressSpace != space || decoderContext != decoder) {
         addressSpace = space;
         decoderContext = decoder;
         invalidateTranslations();
+        return true;
     }
+    return false;
 }
 FrontendCodeIdentity FrontendCoordinator::identity(Addr address) const
 {
@@ -785,8 +1152,10 @@ FrontendCoordinator::translated(Addr va, Addr pa,
     leases.erase(std::remove_if(leases.begin(), leases.end(),
         [&](const CodeLease &lease) { return lease.virtualBlock == va; }), leases.end());
     leases.push_back({va, pa, std::move(facts)});
-    // Two adjacent blocks suffice for a maximum-length x86 instruction.
-    while (leases.size() > 2) leases.pop_front();
+    // Predicted translations must not evict the current decode's lease
+    // before its resident bytes can be turned into a DSB template.
+    while (leases.size() > instructionBytes->residentCapacity())
+        leases.pop_front();
     ++stats.translationValidations;
 }
 
@@ -820,40 +1189,157 @@ FrontendCoordinator::physicalBlocks(Addr address, unsigned bytes,
     return true;
 }
 
-const FrontendTemplate *
-FrontendCoordinator::lookup(Addr address, uint64_t cycle)
+bool
+FrontendCoordinator::physicalBlocks(Addr address, unsigned bytes,
+        std::array<Addr, 2> &out, unsigned &count) const
 {
-    const auto *value = dsb->candidate(identity(address), cycle);
-    if (!value) return dsb->lookup(identity(address), {}, cycle);
-    std::vector<Addr> blocks;
-    if (!physicalBlocks(address, value->bytes, blocks)) return nullptr;
-    return dsb->lookup(identity(address), blocks, cycle);
+    count = 0;
+    for (Addr block = address & ~Addr(lineSize - 1);
+         block <= ((address + std::max(bytes, 1u) - 1) & ~Addr(lineSize - 1));
+         block += lineSize) {
+        auto found = std::find_if(leases.begin(), leases.end(),
+            [&](const CodeLease &lease) { return lease.virtualBlock == block; });
+        if (found == leases.end()) { count = 0; return false; }
+        panic_if(count == out.size(), "Instruction spans too many physical code blocks");
+        out[count++] = found->physicalBlock;
+    }
+    return true;
 }
 
-Addr
-FrontendCoordinator::validationAddress(Addr address, uint64_t cycle) const
+DsbLookupResult
+FrontendCoordinator::lookup(Addr address, uint64_t cycle)
 {
-    const auto *value = dsb->candidate(identity(address), cycle);
-    const unsigned bytes = value ? value->bytes : 1;
-    for (Addr block = address & ~Addr(lineSize - 1);
-         block <= ((address + bytes - 1) & ~Addr(lineSize - 1)); block += lineSize) {
-        if (std::none_of(leases.begin(), leases.end(),
-            [&](const CodeLease &lease) { return lease.virtualBlock == block; }))
-            return block;
-    }
-    return address;
+    return dsb->lookup(identity(address), cycle,
+        [this](Addr at, unsigned bytes, std::vector<Addr> &blocks, Addr &missing) {
+            for (Addr block = at & ~Addr(lineSize - 1);
+                 block <= ((at + std::max(bytes, 1u) - 1) & ~Addr(lineSize - 1));
+                 block += lineSize) {
+                auto found = std::find_if(leases.begin(), leases.end(),
+                    [block](const CodeLease &lease) { return lease.virtualBlock == block; });
+                if (found == leases.end()) { missing = block; return false; }
+                blocks.push_back(found->physicalBlock);
+            }
+            return true;
+        });
+}
+
+std::vector<Addr>
+FrontendCoordinator::virtualCodeBlocks(Addr physical_block) const
+{
+    std::vector<Addr> blocks;
+    for (const auto &lease : leases)
+        if (lease.physicalBlock == physical_block)
+            blocks.push_back(lease.virtualBlock);
+    return blocks;
 }
 
 void FrontendCoordinator::invalidateCode(Addr block)
 {
+    fusionTail = nullptr;
+    clearLoop();
     dsb->invalidate(block);
+    // Physical invalidation revokes only templates using this line. A
+    // global epoch change here would reject unrelated pending code fills
+    // whenever the snooping instruction port observes a data eviction.
+    pendingFills.erase(std::remove_if(pendingFills.begin(), pendingFills.end(),
+        [block](const PendingFill &fill) {
+            const auto &blocks = fill.value.physicalBlocks;
+            return std::find(blocks.begin(), blocks.end(), block) != blocks.end();
+        }), pendingFills.end());
     leases.erase(std::remove_if(leases.begin(), leases.end(),
         [&](const CodeLease &lease) { return lease.physicalBlock == block; }), leases.end());
     if (instructionBytes->matchesPhysicalBlock(block, lineSize))
         instructionBytes->invalidate();
 }
+
+bool
+InstructionDeliveryQueue::markCodeWrite(ThreadID tid, InstSeqNum after,
+                                         Addr block)
+{
+    bool matched = false;
+    for (auto &entry : records)
+        matched |= entry.record->markCodeWrite(tid, after, block);
+    return matched;
+}
+
+FrontendRecord *
+InstructionDeliveryQueue::findRecord(InstSeqNum sequence)
+{
+    for (auto &entry : records)
+        if (entry.record->sequence == sequence) return entry.record.get();
+    return nullptr;
+}
+
+bool
+MiteService::markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+{
+    bool matched = false;
+    for (auto &entry : pending)
+        matched |= entry.record->markCodeWrite(tid, after, block);
+    return matched;
+}
+
+FrontendRecord *
+MiteService::findRecord(InstSeqNum sequence)
+{
+    for (auto &entry : pending)
+        if (entry.record->sequence == sequence) return entry.record.get();
+    return nullptr;
+}
+
+FrontendCoordinator::LateRetarget
+FrontendCoordinator::retargetRecord(InstSeqNum sequence,
+        const PCStateBase &target, uint64_t version, InstSeqNum &boundary,
+        std::unique_ptr<PCStateBase> &restart)
+{
+    const auto find = [this](InstSeqNum seq) -> FrontendRecord * {
+        auto *record = idq->findRecord(seq);
+        if (record) return record;
+        for (auto *service : {mite, static_cast<MiteService *>(dsb),
+                              static_cast<MiteService *>(ms), lsd}) {
+            record = service->findRecord(seq);
+            if (record) return record;
+        }
+        return nullptr;
+    };
+    auto *record = find(sequence);
+    if (!record) return LateRetarget::Missing;
+    if (record->allocationGroup &&
+        record->allocationGroup->leader != record->allocationGroup->end) {
+        auto *leader = find(record->allocationGroup->leader);
+        if (!leader) return LateRetarget::AwaitBackend;
+        boundary = record->allocationGroup->leader - 1;
+        restart.reset(leader->pc->clone());
+        return LateRetarget::Replay;
+    }
+    set(record->predictedPC, target);
+    record->prediction.taken = true;
+    record->prediction.targetValid = true;
+    record->prediction.version = version;
+    return LateRetarget::Applied;
+}
+
+bool
+FrontendCoordinator::markCodeWrite(ThreadID tid, InstSeqNum after, Addr block)
+{
+    pendingFills.erase(std::remove_if(pendingFills.begin(), pendingFills.end(),
+        [after, block](const PendingFill &fill) {
+            const auto &blocks = fill.value.physicalBlocks;
+            return (fill.last > after || (fill.group && fill.group->end > after)) &&
+                std::find(blocks.begin(), blocks.end(), block) != blocks.end();
+        }), pendingFills.end());
+    bool matched = idq->markCodeWrite(tid, after, block);
+    matched |= mite->markCodeWrite(tid, after, block);
+    matched |= dsb->markCodeWrite(tid, after, block);
+    matched |= ms->markCodeWrite(tid, after, block);
+    matched |= lsd->markCodeWrite(tid, after, block);
+    return matched;
+}
 void FrontendCoordinator::invalidateTranslations()
 {
+    ++translationEpochValue;
+    fusionTail = nullptr;
+    clearLoop();
     leases.clear();
     instructionBytes->invalidate();
     dsb->invalidateAll();
@@ -865,6 +1351,129 @@ void FrontendCoordinator::checkDrain()
 }
 DrainState FrontendCoordinator::drain()
 {
+    // No successor is required once fetch has stopped for drain.
+    fusionTail = nullptr;
     return empty() ? DrainState::Drained : DrainState::Draining;
+}
+
+bool
+FrontendCoordinator::fusionEligibleProducer(const StaticInst &inst)
+{
+    if (inst.intExecution().family == IntExecutionFamily::ALU) return true;
+    const auto *x86 = dynamic_cast<const X86ISA::X86StaticInst *>(&inst);
+    return x86 && x86->isByteTestRegisterFusionCandidate();
+}
+
+void
+FrontendCoordinator::fuseAcrossBatches(std::vector<FrontendRecordPtr> &records)
+{
+    if (records.empty()) return;
+    auto &next = *records.front();
+    if (fusionTail && fusionTail->source == next.source &&
+        fusionTail->source != FrontendSource::Microcode &&
+        fusionTail->thread == next.thread &&
+        fusionTail->addressSpace == next.addressSpace &&
+        fusionTail->fromUser == next.fromUser &&
+        !fusionTail->prediction.taken &&
+        fusionTail->predictedPC->instAddr() == next.pc->instAddr() &&
+        fusionTail->pc->instAddr() / 64 == next.pc->instAddr() / 64 &&
+        (!next.instruction->isMicroop() || next.instruction->isLastMicroop()) &&
+        fusionTail->instruction->canMacroFuseWith(*next.instruction)) {
+        auto group = fusionTail->allocationGroup;
+        if (!group) {
+            group = std::make_shared<AllocationGroup>(fusionTail->sequence,
+                next.sequence, fusionTail->sequence, next.sequence);
+        }
+        group->branchProducer = fusionTail->sequence;
+        group->branch = group->end = next.sequence;
+        fusionTail->allocationGroup = next.allocationGroup = group;
+        for (auto &fill : pendingFills)
+            if (fill.last == fusionTail->sequence) fill.group = group;
+        sourceService(fusionTail->source)->refreshTailGroup(group);
+    }
+    fusionTail = nullptr;
+    auto &last = *records.back();
+    // Keep one flag-producing instruction as decode lookahead. This avoids
+    // making a software preparation-batch boundary a hardware fusion limit.
+    if (last.source != FrontendSource::Microcode && !last.prediction.taken &&
+        !last.instruction->isControl() &&
+        last.instruction->numDestRegs(CCRegClass) &&
+        fusionEligibleProducer(*last.instruction) &&
+        (!last.instruction->isMicroop() || last.instruction->isLastMicroop()) &&
+        (!last.allocationGroup || !last.allocationGroup->branch))
+        fusionTail = &last;
+}
+
+void FrontendCoordinator::clearLoop()
+{
+    loopCapture.clear();
+    loopTemplates.clear();
+    loopBuilding.reset();
+    loopCaptureUnits = 0;
+}
+
+const FrontendTemplate *
+FrontendCoordinator::loopCandidate(Addr address) const
+{
+    if (!enableLsdReplay) return nullptr;
+    for (const auto &entry : loopTemplates)
+        if (entry.identity.address == address &&
+            entry.identity.addressSpace == addressSpace &&
+            entry.identity.decoderContext == decoderContext)
+            return &entry;
+    return nullptr;
+}
+
+void FrontendCoordinator::observeLoop(const FrontendRecord &record)
+{
+    if (!enableLsdReplay) return;
+    const auto &op = record.instruction;
+    if (record.source == FrontendSource::Lsd) {
+        if (op->isControl() && !record.prediction.taken) clearLoop();
+        return;
+    }
+    if (record.source == FrontendSource::Microcode || record.fault != NoFault ||
+        op->isCall() || op->isReturn() || op->isIndirectCtrl() ||
+        op->isSerializeBefore() || op->isSerializeAfter() || op->isQuiesce() ||
+        op->isMicrocodeControl()) {
+        clearLoop();
+        return;
+    }
+    if (!loopBuilding) {
+        std::vector<Addr> blocks;
+        const unsigned bytes = record.pc->as<X86ISA::PCState>().size();
+        if (!physicalBlocks(record.pc->instAddr(), bytes, blocks)) {
+            clearLoop();
+            return;
+        }
+        loopBuilding = FrontendTemplate{identity(record.pc->instAddr()),
+            record.macroop ? record.macroop : op, {}, bytes,
+            std::move(blocks), 0};
+        const auto &decoded = record.pc->as<X86ISA::PCState>();
+        loopBuilding->functionalBytes = decoded.functionalBytes();
+        loopBuilding->functionalByteCount = decoded.functionalByteCount();
+        loopBuilding->functionalDecoderContext = decoded.functionalDecoderContext();
+    }
+    loopBuilding->operations.push_back(op);
+    loopCaptureUnits += record.demand.idqUnits;
+    if (loopCaptureUnits > idq->capacityValue()) {
+        clearLoop();
+        return;
+    }
+    if (op->isMicroop() && !op->isLastMicroop()) return;
+    loopCapture.push_back(std::move(*loopBuilding));
+    loopBuilding.reset();
+    if (!op->isControl()) return;
+    const Addr target = record.predictedPC->instAddr();
+    const auto begin = std::find_if(loopCapture.begin(), loopCapture.end(),
+        [target](const auto &entry) { return entry.identity.address == target; });
+    // Bounded simple-loop candidate: one direct taken backedge, no internal
+    // control transfer. Eligibility is deliberately not inferred from size alone.
+    if (record.prediction.taken && target <= record.pc->instAddr() &&
+        begin != loopCapture.end())
+        loopTemplates.assign(begin, loopCapture.end());
+    else loopTemplates.clear();
+    loopCapture.clear();
+    loopCaptureUnits = 0;
 }
 }

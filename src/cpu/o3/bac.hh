@@ -39,6 +39,7 @@
 #define __CPU_O3_BAC_HH__
 
 #include <list>
+#include <deque>
 
 #include "base/statistics.hh"
 #include "cpu/o3/comm.hh"
@@ -48,6 +49,7 @@
 #include "cpu/pred/bpred_unit.hh"
 #include "cpu/pred/branch_type.hh"
 #include "cpu/timebuf.hh"
+#include "sim/eventq.hh"
 
 namespace gem5
 {
@@ -60,6 +62,7 @@ namespace o3
 class CPU;
 class FTQ;
 class FetchTarget;
+struct FetchTargetState;
 typedef std::shared_ptr<FetchTarget> FetchTargetPtr;
 
 /********************************************************************
@@ -140,6 +143,13 @@ class BAC
 
     /** Sets the main backwards communication time buffer pointer. */
     void setTimeBuffer(TimeBuffer<TimeStruct> *tb_ptr);
+    void setIEWQueue(TimeBuffer<IEWStruct> *queue);
+    void refreshWake();
+    void cancelWake();
+    void invalidateCodeSnapshots(ThreadID tid, Addr virtualBlock, unsigned lineSize);
+    void invalidateAllCodeSnapshots();
+    void waitForTarget(ThreadID tid, const FetchTargetPtr &ft,
+                       const PCStateBase &branch, const PCStateBase &next);
 
     /** Sets pointer to list of active threads. */
     void setActiveThreads(std::list<ThreadID> *at_ptr);
@@ -251,7 +261,8 @@ class BAC
      * @return Returns if the branch is taken or not.
      */
     bool predict(ThreadID tid, const StaticInstPtr &inst,
-                 const FetchTargetPtr &ft, PCStateBase &pc);
+                 const FetchTargetPtr &ft, PCStateBase &pc,
+                 const branch_prediction::BranchTargetBuffer::Snapshot *snapshot = nullptr);
 
     /**
      * Main function that feeds the FTQ with new fetch targets.
@@ -337,7 +348,8 @@ class BAC
 
   private:
     /** Squashes BAC for a specific thread and resets the PC. */
-    void squash(const PCStateBase &new_pc, ThreadID tid);
+    void squash(const PCStateBase &new_pc, ThreadID tid,
+                InstSeqNum through = ~InstSeqNum(0));
 
     /**
      * Squashes the BPU histories in the FTQ.
@@ -348,6 +360,7 @@ class BAC
   private:
     /** Pointer to the main CPU. */
     CPU *cpu;
+    EventFunctionWrapper wakeEvent;
 
     /** BPredUnit. */
     branch_prediction::BPredUnit *bpu;
@@ -356,7 +369,7 @@ class BAC
     FTQ *ftq;
 
     /** Time buffer interface. */
-    TimeBuffer<TimeStruct> *timeBuffer;
+    TimeBuffer<TimeStruct> *timeBuffer = nullptr;
 
     /** Wire to get fetches's information from backwards time buffer. */
     TimeBuffer<TimeStruct>::wire fromFetch;
@@ -366,6 +379,8 @@ class BAC
 
     /** Wire to get commit's information from backwards time buffer. */
     TimeBuffer<TimeStruct>::wire fromCommit;
+    TimeBuffer<TimeStruct>::wire toFrontend;
+    TimeBuffer<IEWStruct>::wire fromIEWResolution;
 
     /** Wire used to write any information heading to fetch. */
     TimeBuffer<FetchStruct>::wire toFetch;
@@ -373,6 +388,18 @@ class BAC
     /** The decoupled PC which runs ahead of fetch */
     std::unique_ptr<PCStateBase> bacPC[MaxThreads];
     uint64_t targetReadyCycle[MaxThreads] = {};
+    struct LateTarget {
+        std::weak_ptr<FetchTarget> owner;
+        std::shared_ptr<FetchTargetState> state;
+        StaticInstPtr instruction;
+        std::unique_ptr<PCStateBase> branchPC;
+        uint64_t ready;
+        bool discovery;
+        std::optional<branch_prediction::BranchTargetBuffer::Snapshot> snapshot;
+    };
+    std::deque<LateTarget> lateTargets[MaxThreads];
+    void enqueueLateTarget(ThreadID tid, LateTarget late);
+    void completeLateTargets(ThreadID tid, uint64_t cycle);
 
     /** Variable that tracks if BAC has written to the time buffer this
      * cycle. Used to tell CPU if there is activity this cycle.
@@ -388,7 +415,7 @@ class BAC
     };
 
     /** Tracks which stages are telling the ftq to stall. */
-    Stalls stalls[MaxThreads];
+    Stalls stalls[MaxThreads]{};
 
     /** Enables the decoupled front-end */
     const bool decoupledFrontEnd;
@@ -449,6 +476,8 @@ class BAC
 
         /** Stat for total number fetch targets created. */
         statistics::Scalar fetchTargets;
+        statistics::Scalar lateDiscoveries, lateIndirectTargets;
+        statistics::Scalar lateRedirects, staleLateTargets;
         /** Total number of branches detected. */
         statistics::Scalar branches;
         /** Total number of branches predicted taken. */

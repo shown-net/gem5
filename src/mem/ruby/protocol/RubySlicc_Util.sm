@@ -64,13 +64,40 @@ int countBoolVec(BoolVec bVec);
 RequestorID getRequestorID(RequestPtr req);
 void taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
                                     int level, int outcome);
+void taotraceAttemptCacheOutcome(bool valid, int context_id, Addr seq_num,
+                                Addr attempt, int level, int outcome);
+void taotraceLatePrefetchByIdentity(bool valid, int context_id, Addr seq_num, int level);
+Addr prefetchOracleBegin(NodeID, Addr);
+void prefetchOracleAttach(Addr, NodeID, Addr, bool, int, Addr, Addr);
+void prefetchOracleLookup(Addr, MachineID, Addr, PrefetchBit, int);
+void prefetchOracleInvalidate(Addr, NodeID, Addr);
+void prefetchOracleResponse(Addr, NodeID, Addr, MachineID, int);
+void prefetchOracleFinish(Addr, NodeID, Addr);
+void prefetchOracleFinishL1Parent(Addr, NodeID, Addr);
+void nativeCacheOutcome(RequestPtr req, bool valid, int context_id, Addr seq_num,
+                        int level, int outcome);
 void taotraceUniqueFillByIdentity(bool valid, int context_id, Addr seq_num);
 void taotraceRubyMemoryFetchByIdentity(bool valid, int context_id,
                                        Addr seq_num);
 
 // Independent native transaction observation; no committed trace identity gate.
 void perfCacheNativeLookup(Addr, NodeID, PrefetchBit, int, int);
+void sprRetiredServiceRetain(Addr);
+void sprRetiredServiceRelease(Addr);
+void sprRetiredServiceFollow(Addr, Addr);
+void sprRetiredPrefetchFollow(Addr, Addr);
+void sprRetiredAliasAdmission(RequestPtr, int, bool);
+void sprRetiredL1Resident(Addr);
+void sprRetiredAliasUnclassified(RequestPtr, int);
+Addr sprPrepareBegin(NodeID, Addr, bool);
+void sprPrepareFollow(RequestPtr, NodeID, Addr);
+void sprPrepareData(Addr);
+void sprPrepareClose(Addr);
+void sprPrepareInvalidate(NodeID, Addr, int);
+void sprPrepareLeader(Addr, Addr);
 void perfCacheNativeLookupFromRequestor(Addr, MachineID, PrefetchBit, int, int);
-void perfCacheNativeWriteback(NodeID, bool);
+void perfCacheNativeWriteback(NodeID, int, bool);
+void perfCacheNativeWritebackGlobal(int, bool);
+void perfCacheNativeInvalidation(NodeID, int);
 void llcFillAuditComplete(Addr, int, MachineID, bool, int, Addr);
 void llcFillAuditEvict(Addr);

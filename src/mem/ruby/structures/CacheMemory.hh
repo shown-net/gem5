@@ -42,6 +42,7 @@
 #ifndef __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 #define __MEM_RUBY_STRUCTURES_CACHEMEMORY_HH__
 
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -54,8 +55,11 @@
 #include "mem/ruby/slicc_interface/AbstractCacheEntry.hh"
 #include "mem/ruby/structures/ALUFreeListArray.hh"
 #include "mem/ruby/structures/BankedArray.hh"
+#include "mem/ruby/structures/L1DataService.hh"
+#include "mem/ruby/structures/L2CacheService.hh"
 #include "mem/ruby/system/CacheRecorder.hh"
 #include "params/RubyCache.hh"
+#include "sim/clocked_object.hh"
 #include "sim/sim_object.hh"
 
 namespace gem5
@@ -63,6 +67,8 @@ namespace gem5
 
 namespace ruby
 {
+
+class AbstractController;
 
 class CacheMemory : public SimObject
 {
@@ -115,6 +121,14 @@ class CacheMemory : public SimObject
     AbstractCacheEntry* lookup(Addr address);
     const AbstractCacheEntry* lookup(Addr address) const;
 
+    // Logical noninclusive directory. The protocol supplies a metadata-only
+    // entry (no DataBlock); data remains exclusively in the bounded ways.
+    // Its capacity is an explicit model proxy, not a measured SPR capacity.
+    AbstractCacheEntry* lookupDirectory(Addr address);
+    AbstractCacheEntry* allocateDirectory(Addr address,
+                                         AbstractCacheEntry* entry);
+    void deallocateDirectory(Addr address);
+
     Cycles getTagLatency() const { return tagArray.getLatency(); }
     Cycles getDataLatency() const { return dataArray.getLatency(); }
 
@@ -122,10 +136,12 @@ class CacheMemory : public SimObject
     bool isBlockNotBusy(int64_t cache_set, int64_t loc);
 
     // Hook for checkpointing the contents of the cache
-    void recordCacheContents(int cntrl, CacheRecorder* tr) const;
+    void recordCacheContents(int cntrl, CacheRecorder* tr,
+                             AbstractController *owner) const;
 
     // Set this address to most recently used
     void setMRU(Addr address);
+    void setMRUOnFill(Addr address);
     void setMRU(Addr addr, int occupancy);
     void setMRU(AbstractCacheEntry* entry);
     int getReplacementWeight(int64_t set, int64_t loc);
@@ -153,6 +169,68 @@ class CacheMemory : public SimObject
     void allocateFill();
     void releaseFill();
     void recordFillBlocked();
+
+    // L0 data fill-buffer ownership is distinct from the protocol TBE and
+    // from the legacy lower-level fill budget. Addresses are cache lines.
+    bool canAllocateDataFill(bool write_initiated) const;
+    void allocateDataFill(Addr address, bool demand_read, bool write_initiated);
+    void markSoftwarePrefetchFill(Addr address);
+    void observeSoftwarePrefetchHit(Addr address);
+    void markDataFillReady(Addr address);
+    void releaseDataFill(Addr address);
+    void finishDataFill(Addr address);
+    void recordDemandFillBlocked();
+    void beginDemandFillWait(PacketPtr packet, bool write_initiated);
+    void endDemandFillWait(PacketPtr packet);
+    bool dataFillPending(Addr address) const;
+    bool dataFillPresent(Addr address) const;
+    bool dataFillReady(Addr address) const;
+    bool advanceDataFillInstall(Addr address);
+    void installDataFill(Addr address);
+    void observeDataFillDemandRead(Addr address);
+    // The Sequencer owns the packets; the L1D service owns return bandwidth.
+    void setDataFillResponseWidth(unsigned width)
+    { l1DataService.setReturnWidth(width); }
+    bool hasDataFillResponseLimit() const
+    { return l1DataService.hasReturnLimit(); }
+    bool tryDataFillResponse(uint64_t cycle)
+    { return l1DataService.tryReturn(cycle); }
+    size_t pendingDataFillResponses() const
+    { return l1DataService.pendingResponseCount(); }
+    bool hasPendingDataFillResponses() const
+    { return l1DataService.hasPendingResponses(); }
+    bool hasOverdueDataFillResponse(Cycles now, Cycles threshold) const
+    { return l1DataService.hasOverdueResponse(now, threshold); }
+    void enqueueDataFillResponse(const SequencerRequest &request,
+                                 const DataBlock &data)
+    { l1DataService.enqueueResponse(request, data); }
+    std::optional<L1DataService::PendingResponse>
+    dequeueDataFillResponse(uint64_t cycle)
+    { return l1DataService.dequeueResponse(cycle); }
+    int functionalWriteDataFillResponses(Packet *pkt)
+    { return l1DataService.functionalWriteResponses(pkt); }
+    void admitDataLineRequest(Addr line, PacketPtr packet, bool shareable)
+    { l1DataService.admitLineRequest(line, packet, shareable); }
+    bool mayCompleteDataHit(Addr line, PacketPtr packet) const
+    { return l1DataService.mayCompleteHit(line, packet); }
+    void finishDataLineRequest(Addr line, PacketPtr packet)
+    { l1DataService.finishLineRequest(line, packet); }
+    void registerDataFillRead(PacketPtr packet, bool follower,
+                              bool has_service_source);
+    bool hasDataFillRead(PacketPtr packet) const
+    { return l1DataService.hasFillRead(packet); }
+    void cancelDataFillRead(PacketPtr packet);
+    std::vector<L1DataService::FillParticipant> selectDataFillReads(Addr line);
+    void recordL1DataHitRead();
+    void recordL1DataFillRead();
+    void recordL1OrderedStore(unsigned logical_stores, unsigned enabled_bytes);
+    bool canPublishOrderedStore(Addr line, uint64_t cycle) const
+    { return l1DataService.canPublishStore(line, cycle); }
+    void notePublishedOrderedStore(Addr line, uint64_t cycle)
+    { l1DataService.notePublishedStore(line, cycle); }
+    L1DataAccessResource *dataAccessResource()
+    { return l1DataService.dataAccess(); }
+    bool hasReadableData(Addr address) const;
 
     // hardware transactional memory
     void htmAbortTransaction();
@@ -186,6 +264,7 @@ class CacheMemory : public SimObject
     // The first index is the # of cache lines.
     // The second index is the the amount associativity.
     std::unordered_map<Addr, int> m_tag_index;
+    std::unordered_map<Addr, std::unique_ptr<AbstractCacheEntry>> m_directory;
     std::vector<std::vector<AbstractCacheEntry*> > m_cache;
 
     /** We use the replacement policies from the Classic memory system. */
@@ -200,10 +279,31 @@ class CacheMemory : public SimObject
     int m_cache_num_set_bits;
     int m_cache_assoc;
     int m_start_index_bit;
+    unsigned m_index_divisor;
     bool m_resource_stalls;
     int m_block_size;
-    unsigned m_fill_capacity;
-    unsigned m_fill_in_flight = 0;
+    std::unordered_map<Addr, int> offcoreOwnership;
+    unsigned offcoreDemandRfos = 0;
+
+    L1DataService l1DataService;
+    L2CacheService l2CacheService;
+    // The L1 controller can use a different clock from RubySystem. Keep the
+    // occupancy integral in the controller/core domain when configured.
+    class DataFillClock : public Clocked
+    {
+      public:
+        explicit DataFillClock(ClockDomain &domain) : Clocked(domain) {}
+    };
+    std::unique_ptr<DataFillClock> dataFillClock;
+    uint64_t lastDataFillCycle = 0;
+    uint64_t lastDemandFillBlockedCycle = uint64_t(-1);
+    // Requests are owned by the Sequencer until their mandatory message is
+    // accepted. The pointer is used only as an identity, never dereferenced.
+    std::unordered_map<PacketPtr, bool> demandFillWaiters;
+    unsigned demandFillReadWaiters = 0;
+    unsigned demandFillWriteWaiters = 0;
+    uint64_t currentDataFillCycle() const;
+    void accountDataFillCycles();
 
     /**
      * We store all the ReplacementData in a 2-dimensional array. By doing
@@ -232,7 +332,10 @@ class CacheMemory : public SimObject
     private:
       struct CacheMemoryStats : public statistics::Group
       {
-          CacheMemoryStats(statistics::Group *parent);
+          explicit CacheMemoryStats(CacheMemory *parent);
+          void preDumpStats() override;
+          void resetStats() override;
+          CacheMemory *owner;
 
           statistics::Scalar numDataArrayReads;
           statistics::Scalar numDataArrayWrites;
@@ -249,6 +352,36 @@ class CacheMemory : public SimObject
           statistics::Scalar fillCompletions;
           statistics::Scalar fillBlockedRequests;
           statistics::Average fillOccupancy;
+          statistics::Scalar dataFillDemandBlockedCycles;
+          statistics::Scalar dataFillDemandWaitFullCycles;
+          statistics::Scalar dataFillDemandReadPending;
+          statistics::Scalar dataFillDemandReadPendingCycles;
+          statistics::Scalar dataFillReadyEntryCycles;
+          statistics::Scalar dataFillInstalls;
+          statistics::Scalar dataFillCancellations;
+          statistics::Scalar dataFillInstallBlocked;
+          statistics::Scalar dataFillInstallServiceCycles;
+          statistics::Scalar l1DataHitReadRequests;
+          statistics::Scalar l1DataFillReadResponses;
+          statistics::Scalar l1OrderedStorePackets;
+          statistics::Scalar l1OrderedStoreLogicalStores;
+          statistics::Scalar l1OrderedStoreEnabledBytes;
+          statistics::Scalar l1FillReadRegistrations;
+          statistics::Scalar l1FillFollowerRegistrations;
+          statistics::Scalar l1FillReadSelections;
+          statistics::Scalar l1FillReadCancellations;
+          statistics::Scalar demandDataReadHits, demandDataReadTrueMisses;
+          statistics::Scalar codeReadHits, codeReadTrueMisses;
+          statistics::Scalar demandDataReadAccesses, codeReadAccesses;
+          statistics::Scalar rfoHits, rfoTrueMisses;
+          statistics::Scalar softwarePrefetchHits, softwarePrefetchTrueMisses;
+          statistics::Scalar hardwarePrefetchHits, hardwarePrefetchTrueMisses;
+          statistics::Scalar storePrepareHits, storePrepareTrueMisses;
+          statistics::Scalar dataLineFills;
+          statistics::Scalar dataReplacements, allRfo, softwarePrefetchRfo;
+          statistics::Scalar softwarePrefetchFillHits;
+          statistics::Scalar offcoreDemandRfoRequests, offcoreDemandRfoCycles;
+          statistics::Scalar offcorePrepareRequests, offcoreSoftwareRfoRequests;
 
           // hardware transactional memory
           statistics::Histogram htmTransCommitReadSet;
@@ -272,6 +405,12 @@ class CacheMemory : public SimObject
       // each time they are called
       void profileDemandHit();
       void profileDemandMiss();
+      void profileNativeRequest(int role, bool miss, bool ownership);
+      void profileNativeReadAccess(int role);
+    void beginOffcoreOwnership(Addr address, int role);
+    void endOffcoreOwnership(Addr address);
+    void profileDataReplacement(Addr address);
+      void profileDataLineFill();
       void profilePrefetchHit();
       void profilePrefetchMiss();
 };

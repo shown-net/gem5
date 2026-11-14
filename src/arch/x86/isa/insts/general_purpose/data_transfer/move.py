@@ -84,9 +84,8 @@ def macroop MOV_M_I {
 };
 
 def macroop MOV_P_I {
-    rdip t7
     limm t1, imm
-    st t1, seg, riprel, disp
+    strip t1, seg, riprel, disp
 };
 
 #

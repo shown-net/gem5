@@ -125,6 +125,7 @@ class Scoreboard
                 phys_reg->index(), phys_reg->className());
 
         regScoreBoard[phys_reg->flatIndex()] = true;
+        phys_reg->recordValueReady(curTick());
     }
 
     /** Sets the register as not ready. */

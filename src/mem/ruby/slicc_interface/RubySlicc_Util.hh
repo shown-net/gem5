@@ -53,6 +53,7 @@
 #include "debug/RubySlicc.hh"
 #include "mem/packet.hh"
 #include "mem/taotrace_response.hh"
+#include "mem/prefetch_lineage_oracle.hh"
 #include "mem/perf_cache_native.hh"
 #include "mem/llc_fill_audit.hh"
 #include "mem/ruby/common/Address.hh"
@@ -70,6 +71,142 @@ namespace gem5
 namespace ruby
 {
 
+// Observer-only generation IDs do not participate in protocol decisions.
+inline prefetch_lineage::Oracle &prefetchOracle()
+{
+    return prefetch_lineage::globalOracle();
+}
+inline Addr prefetchOracleBegin(int core, Addr line)
+{
+    auto generation = TaoTraceNativeAccessRegistry::retirementObservationActive()
+        ? prefetchOracle().begin(core, line) : 0;
+    TaoTraceNativeAccessRegistry::sprPrefetchBegin(generation);
+    return generation;
+}
+inline void prefetchOracleRejectFollower(
+    const prefetch_lineage::Follower &follower, unsigned chain,
+    TaoTraceParentReject reason)
+{
+    TaoTraceNativeAccessRegistry::notePrefetchParentRejected(
+        follower.context, follower.sequence, chain,
+        uint8_t(reason));
+}
+
+inline void prefetchOracleRejectFollowers(
+    const std::vector<prefetch_lineage::Follower> &followers,
+    unsigned chain, TaoTraceParentReject reason)
+{
+    for (const auto &follower : followers)
+        prefetchOracleRejectFollower(follower, chain, reason);
+}
+
+inline void prefetchOracleAttach(Addr id, int core, Addr line, bool valid,
+                                 int context, Addr seq, Addr attempt)
+{
+    if (!(id && valid && context >= 0 && attempt)) return;
+    prefetch_lineage::Follower previous;
+    const auto join = prefetchOracle().attachDiagnosed(
+        id, core, line, uint32_t(context), seq, attempt, previous);
+    if (join != prefetch_lineage::Join::Ambiguous) return;
+    // Conflicting identity or bounded-storage overflow rejects the complete
+    // generation. Distinct followers remain individually linked facts.
+    const prefetch_lineage::Follower current{
+        uint32_t(context), uint64_t(seq), uint64_t(attempt)};
+    for (unsigned chain = 0; chain < 2; ++chain) {
+        prefetchOracleRejectFollower(current, chain,
+            TaoTraceParentReject::Uniqueness);
+        prefetchOracleRejectFollowers(
+            prefetchOracle().followersOf(id, core, line), chain,
+            TaoTraceParentReject::Uniqueness);
+    }
+}
+inline void prefetchOracleLookup(Addr id, MachineID origin, Addr line,
+                                 PrefetchBit prefetch, int outcome)
+{
+    if (!id || origin.type != MachineType_L1Cache ||
+        prefetch != PrefetchBit_Yes)
+        return;
+    TaoTraceNativeAccessRegistry::sprPrefetchLookup(id, unsigned(outcome));
+    const auto edge = prefetchOracle().lookupDiagnosed(
+        id, origin.num, line, outcome);
+    if (edge != prefetch_lineage::Edge::Ambiguous) return;
+    const auto followers = prefetchOracle().followersOf(
+        id, origin.num, line);
+    for (unsigned chain = 0; chain < 2; ++chain)
+        prefetchOracleRejectFollowers(followers, chain,
+            TaoTraceParentReject::Uniqueness);
+}
+inline void prefetchOracleInvalidate(Addr id, int core, Addr line)
+{
+    if (id) prefetchOracle().invalidate(id, core, line);
+}
+inline void prefetchOracleResponse(Addr id, int core, Addr line,
+                                   MachineID sender, int response_kind)
+{
+    if (!id) return;
+    int kind = 0, sender_id = -1;
+    if (sender.type == MachineType_L2Cache) {
+        kind = 1;
+        sender_id = sender.num;
+    } else if (sender.type == MachineType_L1Cache && sender.num != core) {
+        kind = 2;
+        sender_id = sender.num;
+    }
+    const auto edge = prefetchOracle().responseDiagnosed(
+        id, core, line, kind, sender_id, response_kind);
+    if (edge != prefetch_lineage::Edge::Ambiguous) return;
+    const auto followers = prefetchOracle().followersOf(id, core, line);
+    for (unsigned chain = 0; chain < 2; ++chain)
+        prefetchOracleRejectFollowers(followers, chain,
+            TaoTraceParentReject::Uniqueness);
+}
+template <unsigned Chain>
+inline void
+prefetchOracleFinishChain(Addr id, int core, Addr line)
+{
+    if (!id) return;
+    auto diagnosis = prefetchOracle().finishDiagnosed(id, core, line);
+    TaoTraceNativeAccessRegistry::sprPrefetchFinish(id);
+    static_assert(Chain == 0 || Chain == 1, "chain must be 0 (G0) or 1 (G1)");
+    for (const auto &w : diagnosis.witnesses) {
+        if constexpr (Chain == 1) {
+            TaoTraceNativeAccessRegistry::noteL2PrefetchParentLlc(
+                w.context, w.sequence, w.attempt,
+                unsigned(w.llc_outcome), w.response_sender_kind,
+                w.response_sender_id, w.response_kind);
+        } else {
+            TaoTraceNativeAccessRegistry::noteL1PrefetchParentLlc(
+                w.context, w.sequence, w.attempt,
+                unsigned(w.llc_outcome), w.response_sender_kind,
+                w.response_sender_id, w.response_kind);
+        }
+    }
+    if (diagnosis.responseAmbiguous) {
+        // Legacy witness contract still reports the zeroed witness; the
+        // estimated rule must reject it as a uniqueness failure.
+        prefetchOracleRejectFollowers(diagnosis.followers, Chain,
+            TaoTraceParentReject::Uniqueness);
+    }
+    TaoTraceParentReject reason = TaoTraceParentReject::None;
+    if (diagnosis.reject == prefetch_lineage::Reject::StaleInvalidated)
+        reason = TaoTraceParentReject::StaleInvalidated;
+    else if (diagnosis.reject == prefetch_lineage::Reject::Uniqueness)
+        reason = TaoTraceParentReject::Uniqueness;
+    if (reason != TaoTraceParentReject::None)
+        prefetchOracleRejectFollowers(diagnosis.followers, Chain, reason);
+}
+inline void prefetchOracleFinish(Addr id, int core, Addr line)
+{
+    prefetchOracleFinishChain<1>(id, core, line);
+}
+// L1D (L0 controller) begun generation; its witness population is kept
+// independent of the private-L2-begun chain.  Called from the L0 TBE
+// deallocation so the late demand attach at L0 can never race an L1 finish.
+inline void prefetchOracleFinishL1Parent(Addr id, int core, Addr line)
+{
+    prefetchOracleFinishChain<0>(id, core, line);
+}
+
 // Actual LLC response/eviction only; no functional trace labels are read.
 inline void llcFillAuditComplete(Addr address,int role,MachineID origin,
                                  bool valid,int context,Addr sequence) {
@@ -82,10 +219,33 @@ inline void llcFillAuditEvict(Addr address) {
 }
 
 // Physical controller facts, independent of TraceValid and retirement joins.
+inline void sprRetiredL1Resident(Addr transaction)
+{
+    TaoTraceNativeAccessRegistry::sprLookup(transaction, 0, 0);
+}
+inline void sprRetiredAliasUnclassified(RequestPtr req, int category)
+{
+    TaoTraceNativeAccessRegistry::sprAliasUnclassified(req, unsigned(category));
+}
+inline Addr sprPrepareBegin(int core, Addr line, bool pending_fill)
+{ return TaoTraceNativeAccessRegistry::sprPrepareBegin(core,line,pending_fill); }
+inline void sprPrepareFollow(RequestPtr req, int core, Addr line)
+{ TaoTraceNativeAccessRegistry::sprPrepareFollow(req,core,line); }
+inline void sprPrepareData(Addr generation)
+{ TaoTraceNativeAccessRegistry::sprPrepareData(generation); }
+inline void sprPrepareClose(Addr generation)
+{ TaoTraceNativeAccessRegistry::sprPrepareClose(generation); }
+inline void sprPrepareInvalidate(int core, Addr line, int reason)
+{ TaoTraceNativeAccessRegistry::sprPrepareInvalidate(core,line,unsigned(reason)); }
+inline void sprPrepareLeader(Addr id, Addr generation)
+{ TaoTraceNativeAccessRegistry::sprMarkPrepareLeader(id,generation); }
+
 inline void
 perfCacheNativeLookup(Addr transaction, int origin, PrefetchBit prefetch,
                       int level, int outcome)
 {
+    TaoTraceNativeAccessRegistry::sprLookup(transaction, unsigned(level),
+                                            unsigned(outcome));
     auto &observer = perf_cache_native::observer();
     if (transaction) {
         observer.lookup(transaction,unsigned(level),
@@ -98,6 +258,27 @@ perfCacheNativeLookup(Addr transaction, int origin, PrefetchBit prefetch,
         observer.unidentifiedLookup(origin, kind, unsigned(level),
             perf_cache_native::Outcome(outcome),uint64_t(curTick()));
     }
+}
+inline void sprRetiredServiceRetain(Addr id)
+{
+    TaoTraceNativeAccessRegistry::sprRetain(id);
+}
+inline void sprRetiredServiceRelease(Addr id)
+{
+    TaoTraceNativeAccessRegistry::sprRelease(id);
+}
+inline void sprRetiredServiceFollow(Addr id, Addr parent)
+{
+    TaoTraceNativeAccessRegistry::sprFollow(id, parent);
+}
+inline void sprRetiredPrefetchFollow(Addr id, Addr generation)
+{
+    TaoTraceNativeAccessRegistry::sprPrefetchFollow(id, generation);
+}
+inline void sprRetiredAliasAdmission(RequestPtr req, int outcome, bool rmw)
+{
+    if (rmw) TaoTraceNativeAccessRegistry::sprAliasRmwAdmission(req, unsigned(outcome));
+    else TaoTraceNativeAccessRegistry::sprAliasAdmission(req, unsigned(outcome));
 }
 inline void
 perfCacheNativeLookupFromRequestor(Addr transaction, MachineID origin,
@@ -112,9 +293,22 @@ perfCacheNativeLookupFromRequestor(Addr transaction, MachineID origin,
     perfCacheNativeLookup(transaction,origin.num,prefetch,level,outcome);
 }
 inline void
-perfCacheNativeWriteback(int origin, bool dirty)
+perfCacheNativeWriteback(int origin, int level, bool dirty)
 {
-    perf_cache_native::observer().writeback(origin,dirty,uint64_t(curTick()));
+    perf_cache_native::observer().writebackAt(
+        origin,unsigned(level),dirty,uint64_t(curTick()));
+}
+// LLC slice evictions carry no core requestor in the trigger transition.
+inline void
+perfCacheNativeWritebackGlobal(int level, bool dirty)
+{
+    perf_cache_native::observer().globalWriteback(unsigned(level),dirty);
+}
+inline void
+perfCacheNativeInvalidation(int origin, int level)
+{
+    perf_cache_native::observer().invalidation(
+        origin,unsigned(level),uint64_t(curTick()));
 }
 
 inline void
@@ -130,6 +324,43 @@ taotraceCacheOutcomeByIdentity(bool valid, int context_id, Addr seq_num,
     TaoTraceNativeAccessRegistry::noteHierarchy(
         uint32_t(context_id), uint64_t(seq_num), unsigned(level),
         TaoTraceNativeCacheOutcome(outcome));
+}
+
+inline void
+taotraceAttemptCacheOutcome(bool valid, int context_id, Addr seq_num,
+                           Addr attempt, int level, int outcome)
+{
+    if (!valid || context_id < 0 || level < 0 || level >= 3 ||
+        outcome < 0 || outcome > 4) return;
+    TaoTraceNativeAccessRegistry::noteAttemptHierarchy(
+        uint32_t(context_id), uint64_t(seq_num), uint64_t(attempt),
+        unsigned(level), TaoTraceNativeCacheOutcome(outcome));
+}
+
+inline void
+taotraceLatePrefetchByIdentity(bool valid, int context_id, Addr seq_num, int level)
+{
+    if (!valid || context_id < 0 || level < 0 ||
+        level >= int(TaoTraceNativeHierarchyFacts::Levels)) return;
+    TaoTraceNativeAccessRegistry::noteLatePrefetch(
+        uint32_t(context_id), uint64_t(seq_num), unsigned(level));
+}
+
+inline void
+nativeCacheOutcome(const RequestPtr &req, bool valid, int context_id,
+                   Addr seq_num, int level, int outcome)
+{
+    if (level < 0 || level >= int(TaoTraceNativeHierarchyFacts::Levels) ||
+        outcome < int(TaoTraceNativeCacheOutcome::Hit) ||
+        outcome > int(TaoTraceNativeCacheOutcome::RemoteSupply))
+        return;
+    if (req) {
+        TaoTraceNativeAccessRegistry::noteHierarchy(
+            req, unsigned(level), TaoTraceNativeCacheOutcome(outcome));
+    } else {
+        taotraceCacheOutcomeByIdentity(valid, context_id, seq_num, level,
+                                      outcome);
+    }
 }
 
 inline void

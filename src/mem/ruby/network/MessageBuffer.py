@@ -64,6 +64,9 @@ class MessageBuffer(SimObject):
         "Maximum number of entries to buffer \
                                      (0 allows infinite entries)",
     )
+    data_transfer_clock = Param.ClockDomain(
+        NULL, "Optional clock for one cache-line data transfer per cycle"
+    )
     randomization = Param.MessageRandomization(
         "ruby_system", "Randomization parameter"
     )

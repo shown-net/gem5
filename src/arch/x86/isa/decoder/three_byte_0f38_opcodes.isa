@@ -29,6 +29,29 @@
 // Decode the three byte opcodes with the 0f38 prefix.
 //
 'X86ISA::ThreeByte0F38Opcode': decode OPCODE_OP {
+    0x82: decode VEX_PRESENT {
+        0: decode LEGACY_OP {
+            1: decode LEGACY_LOCK {
+                0: decode LEGACY_REP {
+                    0: decode LEGACY_REPNE {
+                        0: decode MODE_SUBMODE {
+                            'X86ISA::RealMode',
+                            'X86ISA::Virtual8086Mode': Inst::UD2();
+                            default: decode MODRM_MOD {
+                                3: Inst::UD2();
+                                default: Inst::INVPCID(Gdp, M);
+                            }
+                        }
+                        default: Inst::UD2();
+                    }
+                    default: Inst::UD2();
+                }
+                default: Inst::UD2();
+            }
+            default: Inst::UD2();
+        }
+        default: Inst::UD2();
+    }
     0xF2: decode VEX_PRESENT {
         1: decode MODE_SUBMODE {
             'X86ISA::RealMode', 'X86ISA::Virtual8086Mode': Inst::UD2();

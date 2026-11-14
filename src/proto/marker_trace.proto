@@ -16,6 +16,8 @@ message MarkerPcBatch {
   repeated sint32 dispatch_from_fetch = 4 [packed = true];
   repeated sint32 issue_from_fetch = 5 [packed = true];
   repeated sint32 complete_from_fetch = 6 [packed = true];
+  repeated sint64 data_return_tick = 7 [packed = true];
+  repeated sint64 wake_tick = 8 [packed = true];
   optional uint32 row_count = 100;
 }
 

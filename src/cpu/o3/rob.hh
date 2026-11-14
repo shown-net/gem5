@@ -42,6 +42,8 @@
 #define __CPU_O3_ROB_HH__
 
 #include <string>
+#include <array>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -70,6 +72,20 @@ struct DerivO3CPUParams;
  */
 class ROB
 {
+    struct TrackingEntry
+    {
+        ThreadID thread;
+        unsigned slots;
+        unsigned reserved = 0;
+        unsigned resident = 0;
+        bool active = false;
+    };
+    std::map<InstSeqNum, TrackingEntry> trackingEntries;
+    std::map<InstSeqNum, InstSeqNum> reservations;
+    unsigned reservedEntries = 0;
+    unsigned reservedByThread[MaxThreads] = {};
+    void releaseTrackingEntry(InstSeqNum key);
+
   public:
     typedef std::pair<RegIndex, RegIndex> UnmapInfo;
     typedef typename std::list<DynInstPtr>::iterator InstIt;
@@ -133,6 +149,10 @@ class ROB
      */
     DynInstPtr findInst(ThreadID tid, InstSeqNum squash_inst);
 
+    /** Check the head's retirement group, including ready interior faults. */
+    bool retirementGroupReady(const DynInstPtr &head_inst,
+                              bool &fault_ready) const;
+
     /** Returns pointer to the tail instruction within the ROB.  There is
      *  no guarantee as to the return value if the ROB is empty.
      *  @retval Pointer to the DynInst that is at the tail of the ROB.
@@ -173,6 +193,11 @@ class ROB
 
     /** Returns the number of free entries in a specific ROB paritition. */
     unsigned numFreeEntries(ThreadID tid);
+    bool canReserve(const std::vector<DynInstPtr> &insts) const;
+    void reserve(const DynInstPtr &inst);
+    bool hasReservation(const DynInstPtr &inst) const;
+    void cancelReservation(InstSeqNum sequence);
+    void cancelReservations(ThreadID tid, InstSeqNum through);
 
     /** Returns the maximum number of entries for a specific thread. */
     unsigned getMaxEntries(ThreadID tid)
@@ -184,19 +209,23 @@ class ROB
 
     /** Returns if the ROB is full. */
     bool isFull()
-    { return numInstsInROB == numEntries; }
+    { return numInstsInROB + reservedEntries == numEntries; }
 
     /** Returns if a specific thread's partition is full. */
     bool isFull(ThreadID tid)
-    { return threadEntries[tid] == numEntries; }
+    { return threadEntries[tid] + reservedByThread[tid] == maxEntries[tid]; }
 
     /** Returns if the ROB is empty. */
     bool isEmpty() const
-    { return numInstsInROB == 0; }
+    {
+        for (ThreadID tid = 0; tid < numThreads; ++tid)
+            if (!instList[tid].empty()) return false;
+        return true;
+    }
 
     /** Returns if a specific thread's partition is empty. */
     bool isEmpty(ThreadID tid) const
-    { return threadEntries[tid] == 0; }
+    { return instList[tid].empty(); }
 
     /** Executes the squash, marking squashed instructions. */
     void doSquash(ThreadID tid);

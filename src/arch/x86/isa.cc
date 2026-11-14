@@ -41,6 +41,7 @@
 #include "debug/MatRegs.hh"
 #include "debug/X86.hh"
 #include "params/X86ISA.hh"
+#include "sim/core.hh"
 #include "sim/serialize.hh"
 
 namespace gem5
@@ -125,6 +126,9 @@ ISA::clear()
 
     regVal[misc_reg::McgCap] = 0x104;
 
+    // IA32_MISC_ENABLE.FAST_STRING is enabled at architectural reset.
+    regVal[misc_reg::MiscEnable] = 1;
+
     regVal[misc_reg::Pat] = 0x0007040600070406ULL;
 
     // Bit 11 is mttr enable (1), bit 10 is fixed range enable (1)
@@ -159,8 +163,16 @@ RegClass matRegClass(MatRegClass, MatRegClassName, 0, debug::MatRegs);
 } // anonymous namespace
 
 ISA::ISA(const X86ISAParams &p)
-    : BaseISA(p, "x86"), cpuid(new X86CPUID(p.vendor_string, p.name_string))
+    : BaseISA(p, "x86"), tscFrequency(p.tsc_frequency),
+      cpuid(new X86CPUID(p.vendor_string, p.name_string))
 {
+    fatal_if(!tscFrequency || tscFrequency > mask(32),
+             "TSC frequency must fit in CPUID.15H's non-zero 32-bit field");
+    // The x86 local APIC's bus clock is CPU/16. In the SPR configuration
+    // CPU and invariant TSC both run at 2.6 GHz. Linux also uses CPUID.15H's
+    // crystal frequency to program this timer, so report that bus clock.
+    cpuid->addStandardFunc(TscFrequency,
+                          {1, 16, 0, uint32_t(tscFrequency / 16)});
     cpuid->addStandardFunc(FamilyModelStepping, p.FamilyModelStepping);
     cpuid->addStandardFunc(CacheParams, p.CacheParams);
     cpuid->addStandardFunc(ExtendedFeatures, p.ExtendedFeatures);
@@ -198,8 +210,7 @@ copyMiscRegs(ThreadContext *src, ThreadContext *dest)
         dest->setMiscRegNoEffect(i, src->readMiscRegNoEffect(i));
     }
 
-    // The TSC has to be updated with side-effects if the CPUs in a
-    // CPU switch have different frequencies.
+    // Transfer the architectural TSC value against the fixed time base.
     dest->setMiscReg(misc_reg::Tsc, src->readMiscReg(misc_reg::Tsc));
 
     dest->getMMUPtr()->flushAll();
@@ -233,13 +244,19 @@ ISA::readMiscRegNoEffect(RegIndex idx) const
 }
 
 RegVal
+ISA::tscCycles(Tick tick) const
+{
+    return (__uint128_t(tick) * tscFrequency) / sim_clock::Frequency;
+}
+
+RegVal
 ISA::readMiscReg(RegIndex idx)
 {
 
     DPRINTF(X86, "Reading misc reg %#x, value: %#llx\n", idx, regVal[idx]);
 
     if (idx == misc_reg::Tsc) {
-        return regVal[misc_reg::Tsc] + tc->getCpuPtr()->curCycle();
+        return regVal[misc_reg::Tsc] + tscCycles(curTick());
     }
 
     if (idx == misc_reg::Fsw) {
@@ -332,6 +349,9 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
 
     RegVal newVal = val;
     switch (idx) {
+      case misc_reg::PredCmd:
+        // Command register: IBPB is acted on by the timing CPU, not stored.
+        return;
       case misc_reg::Cr0:
         {
             CR0 toggled = regVal[idx] ^ val;
@@ -364,12 +384,23 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
       case misc_reg::Cr2:
         break;
       case misc_reg::Cr3:
-        static_cast<MMU *>(tc->getMMUPtr())->flushNonGlobal();
+        {
+            auto *mmu = static_cast<MMU *>(tc->getMMUPtr());
+            CR4 cr4 = regVal[misc_reg::Cr4];
+            if (cr4.pcide && bits(val, 63)) {
+                mmu->contextChanged();
+            } else {
+                mmu->flushNonGlobal(cr4.pcide ? int(bits(val, 11, 0)) : -1);
+            }
+            // The no-flush request is not part of the stored CR3.
+            newVal = val & ~(RegVal(1) << 63);
+        }
         break;
       case misc_reg::Cr4:
         {
             CR4 toggled = regVal[idx] ^ val;
-            if (toggled.pae || toggled.pse || toggled.pge) {
+            if (toggled.pae || toggled.pse || toggled.pge ||
+                bits(uint64_t(toggled), 17)) {
                 tc->getMMUPtr()->flushAll();
             }
         }
@@ -441,7 +472,7 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
         }
         break;
       case misc_reg::Tsc:
-        regVal[misc_reg::Tsc] = val - tc->getCpuPtr()->curCycle();
+        regVal[misc_reg::Tsc] = val - tscCycles(curTick());
         return;
       case misc_reg::Dr0:
       case misc_reg::Dr1:

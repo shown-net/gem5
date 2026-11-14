@@ -46,6 +46,7 @@ SimObject('BranchPredictor.py',
     'BranchPredictor',
     'ConditionalPredictor',
     'IndirectPredictor', 'SimpleIndirectPredictor',
+    'GoldenCoveBP', 'GoldenCoveIndirectPredictor',
     'BranchTargetBuffer', 'SimpleBTB', 'BTBLevel', 'MultiLevelBTB',
     'BTBIndexingPolicy', 'BTBSetAssociative',
     'ReturnAddrStack',
@@ -89,6 +90,7 @@ Source('gshare.cc')
 Source('btb.cc')
 Source('simple_btb.cc')
 Source('multi_level_btb.cc')
+Source('golden_cove.cc')
 DebugFlag('Indirect')
 DebugFlag('BTB')
 DebugFlag('RAS')

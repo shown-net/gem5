@@ -4,6 +4,7 @@
 #include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/stack_engine.hh"
 #include "cpu/thread_context.hh"
 #include "mem/taotrace_response.hh"
 #include "mem/translating_port_proxy.hh"
@@ -12,6 +13,7 @@
 #include "sim/core.hh"
 #include "sim/cur_tick.hh"
 #include "sim/sim_exit.hh"
+#include "sim/sim_object.hh"
 #include "sim/system.hh"
 #include <algorithm>
 #include <fstream>
@@ -29,6 +31,7 @@ FixedWorkMarker::FixedWorkMarker(TaoTrace &owner, const TaoTraceParams &params)
     : owner_(owner), cpu_(dynamic_cast<CPU *>(params.manager)),
       begins_(params.fixed_work_begin_pcs), ends_(params.fixed_work_end_pcs),
       cores_(params.fixed_work_core_ids), workids_(params.fixed_work_workids),
+      stat_objects_(params.marker_stat_objects),
       result_pc_(params.fixed_work_result_pc),
       result_max_bytes_(params.fixed_work_result_max_bytes),
       snapshot_interval_(params.fixed_work_snapshot_interval),
@@ -124,6 +127,11 @@ void FixedWorkMarker::snapshot(const char *kind, Addr pc)
 {
     // CPU native retirement counters are updated before the Commit probe.
     cpu_->unhaltedClockStats.account();
+    auto *mmu = cpu_->tcBase(0)->getMMUPtr();
+    cpu_->preDumpStats();
+    mmu->preDumpStats();
+    for (auto *object : stat_objects_)
+        if (object && object != cpu_) object->preDumpStats();
     std::fprintf(snapshots_,
         "{\"schema\":\"gem5-fixed-work-snapshot\",\"kind\":\"%s\","
         "\"worker\":%u,\"source_core\":%u,\"workid\":%lu,\"cr3\":%lu,"
@@ -138,7 +146,7 @@ void FixedWorkMarker::snapshot(const char *kind, Addr pc)
         "\"MEM_LOAD_RETIRED.L1_HIT\":%.0f,\"MEM_LOAD_RETIRED.L1_MISS\":%.0f,"
         "\"MEM_LOAD_RETIRED.L2_HIT\":%.0f,\"MEM_LOAD_RETIRED.L2_MISS\":%.0f,"
         "\"MEM_LOAD_RETIRED.L3_HIT\":%.0f,\"MEM_LOAD_RETIRED.L3_MISS\":%.0f,"
-        "\"MEM_LOAD_RETIRED.FB_HIT\":%.0f,\"MEM_LOAD_RETIRED.unknownSource\":%.0f,"
+        "\"MEM_LOAD_RETIRED.FB_HIT\":%.0f,\"MEM_LOAD_RETIRED.sourceIncompleteResponse\":%.0f,"
         "\"tma.slots\":%.0f,\"tma.retiring\":%.0f,\"tma.badSpeculation\":%.0f,"
         "\"tma.frontendBound\":%.0f,\"tma.backendBound\":%.0f,\"tma.pending\":%.0f",
         kind, worker_, cores_[worker_], workids_[worker_],
@@ -147,14 +155,15 @@ void FixedWorkMarker::snapshot(const char *kind, Addr pc)
         uint64_t(snapshot_interval_), uint64_t(snapshot_origin_),
         uint64_t(cpu_->clockPeriod()), cpu_->baseStats.numCycles.value(),
         cpu_->instRetiredStats.ANY.value(), cpu_->uopsRetiredStats.SLOTS.value(),
-        cpu_->commitStats[0]->numOps.value(),
+        cpu_->commitStats[0]->numOps.value() -
+            (cpu_->stackEngine ? cpu_->stackEngine->retiredSynchronizations() : 0),
         cpu_->unhaltedClockStats.THREAD.value(), cpu_->unhaltedClockStats.REF_TSC.value(),
         cpu_->branchInstStats.ALL_BRANCHES.value(), cpu_->branchMispStats.ALL_BRANCHES.value(),
         cpu_->memoryInstRetiredStats.ALL_LOADS.value(), cpu_->memoryInstRetiredStats.ALL_STORES.value(),
         cpu_->memoryLoadRetiredStats.L1_HIT.value(), cpu_->memoryLoadRetiredStats.L1_MISS.value(),
         cpu_->memoryLoadRetiredStats.L2_HIT.value(), cpu_->memoryLoadRetiredStats.L2_MISS.value(),
         cpu_->memoryLoadRetiredStats.L3_HIT.value(), cpu_->memoryLoadRetiredStats.L3_MISS.value(),
-        cpu_->memoryLoadRetiredStats.FB_HIT.value(), cpu_->memoryLoadRetiredStats.unknownSource.value(),
+        cpu_->memoryLoadRetiredStats.FB_HIT.value(), cpu_->memoryLoadRetiredStats.sourceIncompleteResponse.value(),
         cpu_->tmaStats.slots.value(), cpu_->tmaStats.retiring.value(),
         cpu_->tmaStats.badSpeculation.value(), cpu_->tmaStats.frontendBound.value(),
         cpu_->tmaStats.backendBound.value(), cpu_->tmaStats.pending.value());
@@ -163,13 +172,46 @@ void FixedWorkMarker::snapshot(const char *kind, Addr pc)
         const auto *stat = dynamic_cast<const statistics::ScalarInfo *>(group->resolveStat(path));
         if (stat) std::fprintf(snapshots_, ",\"%s\":%.0f", name, double(stat->value()));
     };
-    const auto *mmu = cpu_->tcBase(0)->getMMUPtr();
     emitScalar(mmu, "dtb.DTLB_LOAD_MISSES.STLB_HIT", "DTLB_LOAD_MISSES.STLB_HIT");
     emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.WALK_COMPLETED", "DTLB_LOAD_MISSES.WALK_COMPLETED");
+    emitScalar(mmu, "dtb.walker.dtlbLoadWalkOutcome.faultSquashed", "model.dtlb.walkCompletedFaultSquashed");
+    emitScalar(mmu, "dtb.walker.dtlbLoadWalkOutcome.faultNotSquashed", "model.dtlb.walkCompletedFaultNotSquashed");
+    emitScalar(mmu, "dtb.walker.dtlbLoadWalkOutcome.noFaultSquashed", "model.dtlb.walkCompletedNoFaultSquashed");
+    emitScalar(mmu, "dtb.walker.dtlbLoadWalkOutcome.noFaultNotSquashed", "model.dtlb.walkCompletedNoFaultNotSquashed");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.WALK_ACTIVE", "DTLB_LOAD_MISSES.WALK_ACTIVE");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.cancelledQueued", "model.mmu.walkCancelledQueued");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.cancelledStarted", "model.mmu.walkCancelledStarted");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.sharedFaultRequests", "model.mmu.walkSharedFaultRequests");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.pteReadRequests", "model.mmu.pteReadRequests");
+    emitScalar(mmu, "dtb.walker.DTLB_LOAD_MISSES.pteReadResponses", "model.mmu.pteReadResponses");
+    emitScalar(cpu_, "RESOURCE_STALLS.SB", "RESOURCE_STALLS.SB");
+    emitScalar(cpu_, "lsq0.storeDrainLineCreditBlocked", "model.lsq.storeDrainLineCreditBlocked");
+    emitScalar(cpu_, "lsq0.storeBufferSent", "model.lsq.storeBufferSent");
+    emitScalar(cpu_, "lsq0.storeBufferCompleted", "model.lsq.storeBufferCompleted");
+    emitScalar(cpu_, "lsq0.storeBufferMerged", "model.lsq.storeBufferMerged");
+    emitScalar(cpu_, "lsq0.storePrepareSpeculativeIssued", "model.lsq.storePrepareSpeculativeIssued");
+    // Framework passes the actual private L1 and L2 controllers, in that
+    // order. Keep their object identities alongside the candidate counters.
+    if (stat_objects_.size() >= 2 && stat_objects_[0] && stat_objects_[1]) {
+        const auto *l1 = stat_objects_[0];
+        const auto *l2 = stat_objects_[1];
+        std::fprintf(snapshots_, ",\"model_stat_l1_source\":\"%s\",\"model_stat_l2_source\":\"%s\"",
+                     l1->name().c_str(), l2->name().c_str());
+        emitScalar(l1, "Dcache.dataFillDemandWaitFullCycles", "L1D_PEND_MISS.FB_FULL");
+        emitScalar(l1, "Dcache.dataFillDemandBlockedCycles", "model.l1.fillAdmissionBlockedCycles");
+        emitScalar(l1, "Dcache.dataReplacements", "L1D.REPLACEMENT");
+        emitScalar(l2, "cache.rfoHits", "L2_RQSTS.RFO_HIT");
+        emitScalar(l2, "cache.rfoTrueMisses", "L2_RQSTS.RFO_MISS");
+        emitScalar(l2, "cache.storePrepareHits", "model.l2.storePrepareHits");
+        emitScalar(l2, "cache.storePrepareTrueMisses", "model.l2.storePrepareTrueMisses");
+        emitScalar(l2, "cache.softwarePrefetchRfo", "model.l2.softwarePrefetchRfo");
+    }
     emitScalar(cpu_, "frontend.notDeliveredSlots", "frontend.notDeliveredSlots");
     emitScalar(cpu_, "frontend.zeroDeliveryCycles", "frontend.zeroDeliveryCycles");
     emitScalar(cpu_, "frontend.mite.sourceOps", "frontend.mite.sourceOps");
     emitScalar(cpu_, "frontend.dsb.sourceOps", "frontend.dsb.sourceOps");
+    std::fprintf(snapshots_, ",\"spec_ctrl\":%lu",
+        uint64_t(cpu_->tcBase(0)->readMiscRegNoEffect(X86ISA::misc_reg::SpecCtrl)));
     if (kind[0] == 'E')
         std::fprintf(snapshots_, ",\"completed_work\":%lu", completed_work_);
     else

@@ -37,6 +37,12 @@ class TaoTrace(ProbeListenerObject):
     fixed_work_workids = VectorParam.UInt64([], "Expected workid in RDI; worker index in RSI")
     fixed_work_snapshot_interval = Param.Tick(0, "Cumulative fixed-work snapshots on the first BEGIN tick grid; zero disables")
     marker_pc_trace_file = Param.String("", "Committed PC protobuf stream")
+    marker_worker = Param.Unsigned(0, "Worker ordinal in the core-window contract")
+    marker_begin_pcs = VectorParam.Addr([], "Fixed-work BEGIN NOP PCs in worker order")
+    marker_end_pcs = VectorParam.Addr([], "Fixed-work END NOP PCs in worker order")
+    marker_workids = VectorParam.UInt64([], "Fixed-work identities in worker order")
+    marker_stat_objects = VectorParam.SimObject([], "This CPU and its actual private cache controllers")
+    marker_stat_names = VectorParam.String([], "Statistics selected for Marker snapshots; empty selects all")
 
     output_dir = Param.String("tao_trace",
         "Output directory for per-CPU JSONL traces "

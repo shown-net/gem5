@@ -43,8 +43,9 @@
 #define __CPU_O3_LSQ_HH__
 
 #include <cassert>
-#include <array>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <list>
 #include <map>
 #include <memory>
@@ -60,6 +61,7 @@
 #include "cpu/o3/dyn_inst_ptr.hh"
 #include "cpu/utils.hh"
 #include "enums/SMTQueuePolicy.hh"
+#include "mem/l1_data_access.hh"
 #include "mem/port.hh"
 #include "mem/taotrace_response.hh"
 #include "sim/sim_object.hh"
@@ -130,6 +132,9 @@ class LSQ
 
             /* Number of retry responses sent */
             statistics::Scalar numSendRetryResp;
+            statistics::Scalar loadCompletionQueued;
+            statistics::Scalar loadCompletionDelivered;
+            statistics::Scalar loadCompletionBlockedCycles;
         } dcachePortStats;
 
       protected:
@@ -378,6 +383,10 @@ class LSQ
 
         bool hasStaleTranslation() const { return _hasStaleTranslation; }
 
+        // A complete physical byte set, including split-page mappings and
+        // byte enables. Partial translation success is not a complete access.
+        bool physicalBytes(std::vector<Addr> &bytes) const;
+
         virtual void markAsStaleTranslation() = 0;
 
         /** Set up virtual request.
@@ -409,6 +418,7 @@ class LSQ
         virtual void initiateTranslation() = 0;
 
         PacketPtr packet(int idx = 0) { return _packets.at(idx); }
+        bool hasBuiltPackets() const { return !_packets.empty(); }
 
         virtual PacketPtr
         mainPacket()
@@ -519,6 +529,11 @@ class LSQ
             return flags.isSet(Flag::Complete);
         }
 
+        virtual bool hasReturnedData() const
+        {
+            return flags.isSet(Flag::Complete);
+        }
+
         bool
         isInTranslation()
         {
@@ -588,7 +603,7 @@ class LSQ
         {
             assert(_numOutstandingPackets > 0);
             _numOutstandingPackets--;
-            if (_numOutstandingPackets == 0 && isReleased())
+            if (isReleased() && !isAnyOutstandingRequest())
                 delete this;
         }
 
@@ -711,6 +726,10 @@ class LSQ
                 gem5::ThreadContext* tc, BaseMMU::Mode mode);
         virtual bool recvTimingResp(PacketPtr pkt);
         virtual void initiateTranslation();
+        bool hasReturnedData() const override
+        {
+            return numReceivedPackets != 0;
+        }
         virtual void sendPacketToCache();
         virtual void buildPackets();
 
@@ -888,6 +907,9 @@ class LSQ
      */
     bool hasStoresToWB(ThreadID tid);
 
+    bool hasPendingCodeWrite(ThreadID tid, Addr physical_block);
+    unsigned demandLoadStages(ThreadID tid) const;
+
     /** Returns the number of stores a specific thread has to write back. */
     int numStoresToWB(ThreadID tid);
 
@@ -924,6 +946,11 @@ class LSQ
     void recvReqRetry();
 
     void completeDataAccess(PacketPtr pkt);
+    bool usesLoadCompletion(const DynInstPtr &inst,
+                            const RequestPtr &request) const;
+    void enqueueLoadCompletion(const DynInstPtr &inst,
+                               std::function<void()> complete,
+                               bool same_cycle = false);
     /**
      * Handles writing back and completing the load or store that has
      * returned from memory.
@@ -950,11 +977,15 @@ class LSQ
     /** Set D-cache blocked status */
     void cacheBlocked(bool v);
     /** Is any store port available to use? */
-    bool cachePortAvailable(bool is_load) const;
+    bool cachePortAvailable(bool is_load, unsigned bytes = 0);
     /** Another store port is in use */
-    void cachePortBusy(bool is_load);
-    bool loadBankAvailable(Addr addr) const;
+    void cachePortBusy(bool is_load, unsigned bytes = 0);
+    bool loadBankAvailable(Addr addr);
     void noteLoadBank(Addr addr);
+    std::vector<DynInstPtr> olderStores(const DynInstPtr &load) const;
+    bool memorySpeculationAllowed(const DynInstPtr &load) const;
+    bool hasFastForwardingPrediction(const DynInstPtr &load) const;
+    void clearFastForwarding(ThreadID tid);
 
     RequestPort &getDataPort() { return dcachePort; }
 
@@ -971,8 +1002,24 @@ class LSQ
     int cacheLoadPorts;
     /** The number of used cache ports in this cycle by loads. */
     int usedLoadPorts;
-    const bool sprL1LoadBankConflicts;
-    std::array<unsigned, 16> loadBankUses{};
+    const bool sprL1WidthService;
+    uint64_t widthServiceEpoch = 0;
+    // Engineering request limiter for zero-byte ownership hints. These are
+    // not STD/data actions and never consume the L1 store data budget.
+    L1DataAccessResource *cachedL1DataResource = nullptr;
+    std::unique_ptr<L1DataAccessBudget> localL1DataResource;
+    L1DataAccessResource *l1DataResource();
+    const unsigned loadCompletionWidth;
+    unsigned usedLoadCompletions = 0;
+    Cycles loadCompletionCycle = Cycles(0);
+    void updateLoadCompletionBudget();
+    struct LoadCompletion {
+        Tick ready;
+        InstSeqNum sequence;
+        DynInstPtr inst;
+        std::function<void()> complete;
+    };
+    std::deque<LoadCompletion> loadCompletions;
 
     /** If the LSQ is currently waiting for stale translations */
     bool waitingForStaleTranslation;

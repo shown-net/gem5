@@ -43,6 +43,7 @@
 #define __CPU_PRED_CONDITIONAL_BASE_HH__
 
 #include "arch/generic/pcstate.hh"
+#include <memory>
 #include "cpu/inst_seq.hh"
 #include "cpu/pred/branch_type.hh"
 #include "params/ConditionalPredictor.hh"
@@ -73,6 +74,11 @@ class ConditionalPredictor : public SimObject
      * @return Whether the branch is taken or not taken.
      */
     virtual bool lookup(ThreadID tid, Addr pc, void * &bp_history) = 0;
+    virtual std::shared_ptr<const void> pathSnapshot(ThreadID tid) const { return {}; }
+    // Return a history only when this path predicts not-taken; a taken or
+    // unsupported lookup has no predictor side effects.
+    virtual bool lookupNotTakenSnapshot(const std::shared_ptr<const void> &snapshot,
+                                        Addr pc, void *&history) { return false; }
 
     /**
      * Ones done with the prediction this function updates the

@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/rename_map.hh"
+#include "arch/x86/regs/int.hh"
 
 #include <vector>
 
@@ -69,7 +70,7 @@ SimpleRenameMap::init(const RegClass &reg_class, SimpleFreeList *_freeList)
 }
 
 SimpleRenameMap::RenameInfo
-SimpleRenameMap::rename(const RegId& arch_reg)
+SimpleRenameMap::rename(const RegId& arch_reg, PhysRegIdPtr entry_peer)
 {
     PhysRegIdPtr renamed_reg;
     // Record the current physical register that is renamed to the
@@ -88,7 +89,8 @@ SimpleRenameMap::rename(const RegId& arch_reg)
         renamed_reg = prev_reg;
         renamed_reg->decrNumPinnedWrites();
     } else {
-        renamed_reg = freeList->getReg();
+        renamed_reg = freeList->getReg(entry_peer,
+                                     !arch_reg.regClass().isFunctional(arch_reg));
         map[arch_reg.index()] = renamed_reg;
         renamed_reg->setNumPinnedWrites(arch_reg.getNumPinnedWrites());
         renamed_reg->setNumPinnedWritesToComplete(
@@ -108,9 +110,10 @@ SimpleRenameMap::rename(const RegId& arch_reg)
 
 void
 UnifiedRenameMap::init(const BaseISA::RegClasses &regClasses,
-        PhysRegFile *_regFile, UnifiedFreeList *freeList)
+        PhysRegFile *_regFile, UnifiedFreeList *_freeList)
 {
     regFile = _regFile;
+    freeList = _freeList;
 
     for (int i = 0; i < renameMaps.size(); i++)
         renameMaps[i].init(*regClasses.at(i), &(freeList->freeLists[i]));
@@ -121,12 +124,35 @@ UnifiedRenameMap::canRename(DynInstPtr inst) const
 {
     if (inst->eliminatedMove) return true;
     for (int i = 0; i < renameMaps.size(); i++) {
-        const unsigned required = inst->allocationLeader() ?
-            inst->allocationGroup->renameDests[i] : inst->numDestRegs((RegClassType)i);
-        if (required >
-                renameMaps[i].numFreeEntries()) {
+        if (!canRename(inst, static_cast<RegClassType>(i))) {
             return false;
         }
+    }
+    return true;
+}
+
+bool
+UnifiedRenameMap::canRename(DynInstPtr inst, RegClassType type) const
+{
+    if (inst->eliminatedMove)
+        return true;
+    unsigned fragments = inst->numDestRegs(type);
+    if (type == IntRegClass && inst->stackTrackedWrite) {
+        auto *isa = inst->tcBase()->getIsaPtr();
+        for (unsigned i = 0; i < inst->numDestRegs(); ++i)
+            if (inst->destRegIdx(i).flatten(*isa) ==
+                X86ISA::int_reg::Rsp.flatten(*isa))
+                --fragments;
+    }
+    if (fragments > renameMaps[type].numFreeEntries())
+        return false;
+    if (type == IntRegClass || type == FloatRegClass) {
+        const unsigned entries = inst->hardwareDestEntries(type);
+        if (type == IntRegClass)
+            return entries <= freeList->numFreeIntEntries();
+        const unsigned wide = entries ? inst->stageDemand.floatWideEntries : 0;
+        return entries <= freeList->numFreeFloatEntries() &&
+            wide <= freeList->numFreeFloatWideEntries();
     }
     return true;
 }

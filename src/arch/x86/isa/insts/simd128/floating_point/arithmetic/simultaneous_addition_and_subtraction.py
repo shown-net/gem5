@@ -34,25 +34,35 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 microcode = """
-# ADDSUBPS
+def macroop ADDSUBPS_XMM_XMM {
+    mxmmaddsubf xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=4
+};
+
+def macroop ADDSUBPS_XMM_M {
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmaddsubf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
+};
+
+def macroop ADDSUBPS_XMM_P {
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmaddsubf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
+};
 
 def macroop ADDSUBPD_XMM_XMM {
-    msubf xmml, xmml, xmmlm, size=8, ext=Scalar
-    maddf xmmh, xmmh, xmmhm, size=8, ext=Scalar
+    mxmmaddsubf xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=8
 };
 
 def macroop ADDSUBPD_XMM_M {
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT+8", dataSize=8
-    msubf xmmlm, xmml, ufp1, size=8, ext=0
-    maddf xmmhm, xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmaddsubf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 
 def macroop ADDSUBPD_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, sib, disp, dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT+8", dataSize=8
-    msubf xmmlm, xmml, ufp1, size=8, ext=0
-    maddf xmmhm, xmmh, ufp2, size=8, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmaddsubf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=8
 };
 """

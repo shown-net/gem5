@@ -47,6 +47,14 @@ def template BrDeclare {{
         {
             %(set_reg_idx_arr)s;
             %(constructor)s;
+            if (std::string(inst_mnem) == "MOVS_E_M_M" ||
+                std::string(inst_mnem) == "STOS_E_M") {
+                _opClass = No_OpClass;
+                // REP controls occur before an access or after the complete
+                // count/pointer update. Interrupts may restart at the parent
+                // instruction with that already committed progress.
+                flags[IsDelayedCommit] = false;
+            }
         }
 
         uint8_t functionalRomKind() const override { return %(functional_rom_kind)s; }

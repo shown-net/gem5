@@ -29,6 +29,7 @@ import math
 from m5.objects import (
     ClockDomain,
     LRURP,
+    QLRUH00M1R0U1RP,
     MESI_Three_Level_L1Cache_Controller,
     MessageBuffer,
     RubyCache,
@@ -69,19 +70,20 @@ class L2Cache(MESI_Three_Level_L1Cache_Controller):
             size=l2_size,
             assoc=l2_assoc,
             fill_capacity=48,
+            fill_stats_clock=clk_domain,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
-            replacement_policy=LRURP(),
+            replacement_policy=(QLRUH00M1R0U1RP() if target_isa == ISA.X86
+                                else LRURP()),
         )
-        # l2_select_num_bits is ruby backend terminology.
-        # In stdlib terms, it is number of bits for selecting L3 cache.
-        self.l2_select_num_bits = int(math.log(num_l3Caches, 2))
+        # Logical L3 bank count, including non-power-of-two geometries.
+        self.l2_select_num_banks = num_l3Caches
         self.cluster_id = cluster_id
         self.clk_domain = clk_domain
         self.prefetcher = RubyPrefetcher(
             block_size=cache_line_size, queue_dedup=True
         )
-        self.enable_prefetch = True
+        self.enable_prefetch = False
         self.transitions_per_cycle = 32
         # l1_request_latency, l1_response_latency, to_l2_latency are
         # ruby backend terminology.

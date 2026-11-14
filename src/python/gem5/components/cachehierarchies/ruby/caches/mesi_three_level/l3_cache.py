@@ -59,7 +59,8 @@ class L3Cache(MESI_Three_Level_L2Cache_Controller):
         self.L2cache = RubyCache(
             size=l3_size,
             assoc=l3_assoc,
-            start_index_bit=self.getIndexBit(num_l3Caches, cache_line_size),
+            start_index_bit=int(math.log2(cache_line_size)),
+            index_divisor=num_l3Caches,
             replacement_policy=LRURP(),
         )
 
@@ -71,11 +72,6 @@ class L3Cache(MESI_Three_Level_L2Cache_Controller):
 
         self.version = self.versionCount()
         self.connectQueues(network)
-
-    def getIndexBit(self, num_l3Caches, cache_line_size):
-        l3_bits = int(math.log(num_l3Caches, 2))
-        bits = int(math.log(cache_line_size, 2)) + l3_bits
-        return bits
 
     def connectQueues(self, network):
         # In the below terms, L1 and L2 are ruby backend terminology.

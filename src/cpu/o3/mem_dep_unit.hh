@@ -41,6 +41,7 @@
 #ifndef __CPU_O3_MEM_DEP_UNIT_HH__
 #define __CPU_O3_MEM_DEP_UNIT_HH__
 
+#include <array>
 #include <list>
 #include <memory>
 #include <set>
@@ -75,17 +76,16 @@ namespace o3
 
 class CPU;
 class InstructionQueue;
+class LSQ;
 
 /**
  * Memory dependency unit class.  This holds the memory dependence predictor.
  * As memory operations are issued to the IQ, they are also issued to this
  * unit, which then looks up the prediction as to what they are dependent
- * upon.  This unit must be checked prior to a memory operation being able
- * to issue.  Although this is templated, it's somewhat hard to make a generic
- * memory dependence unit.  This one is mostly for store sets; it will be
- * quite limited in what other memory dependence predictions it can also
- * utilize.  Thus this class should be most likely be rewritten for other
- * dependence prediction schemes.
+ * upon. This unit must be checked prior to a memory operation being able
+ * to issue. The SPR policy preserves physical load ranges for ordering
+ * checks and conservatively waits for older store addresses in the LSQ.
+ * Other configurations retain the generic StoreSet predictor.
  */
 class MemDepUnit
 {
@@ -119,6 +119,16 @@ class MemDepUnit
 
     /** Sets the pointer to the IQ. */
     void setIQ(InstructionQueue *iq_ptr);
+
+    /** Address resolution is distinct from store data/completion. */
+    void setLSQ(LSQ *lsq_ptr) { lsq = lsq_ptr; }
+    void addressGenerated(const DynInstPtr &inst);
+    void addressReady(const DynInstPtr &inst);
+    void storeOrderChecked(const DynInstPtr &inst, InstSeqNum firstViolation = 0);
+    void noteAddressWait(const DynInstPtr &load);
+    void loadRetired(const DynInstPtr &load);
+    bool canSpeculate(const DynInstPtr &inst);
+    const std::vector<Addr> *physicalReadBytes(const DynInstPtr &inst) const;
 
     /** Inserts a memory instruction. */
     void insert(const DynInstPtr &inst);
@@ -244,7 +254,17 @@ class MemDepUnit
      *  this unit what instruction the newly added instruction is dependent
      *  upon.
      */
-    StoreSet depPred;
+    std::unique_ptr<StoreSet> depPred;
+
+    // Select the SPR ordering path; prediction is not enabled by this flag.
+    bool sprPredictor = false;
+    LSQ *lsq = nullptr;
+    struct LoadObservation {
+        std::vector<Addr> bytes;
+        bool physicalReady = false;
+        bool addressWaitObserved = false;
+    };
+    std::unordered_map<InstSeqNum, LoadObservation, SNHash> loadObservations;
 
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;
@@ -279,6 +299,7 @@ class MemDepUnit
         /** Stat for number of conflicting stores that had to wait for a
          *  store. */
         statistics::Scalar conflictingStores;
+        statistics::Scalar addressWaits;
     } stats;
 };
 

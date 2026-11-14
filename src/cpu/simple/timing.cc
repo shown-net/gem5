@@ -639,10 +639,9 @@ void
 TimingSimpleCPU::threadSnoop(PacketPtr pkt, ThreadID sender)
 {
     for (ThreadID tid = 0; tid < numThreads; tid++) {
+        if (getCpuAddrMonitor(tid)->doMonitor(pkt))
+            wakeup(tid);
         if (tid != sender) {
-            if (getCpuAddrMonitor(tid)->doMonitor(pkt)) {
-                wakeup(tid);
-            }
             threadInfo[tid]->thread->getIsaPtr()->handleLockedSnoop(pkt,
                     dcachePort.cacheBlockMask);
         }

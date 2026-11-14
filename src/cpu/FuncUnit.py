@@ -136,6 +136,8 @@ class OpClass(Enum):
         "SimdBf16MultAcc",
         "Bf16Cvt",
         "System",
+        "X86FloatSqrt32",
+        "X86FloatSqrt64",
     ]
 
 

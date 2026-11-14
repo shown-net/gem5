@@ -36,7 +36,6 @@
  */
 
 #include "cpu/kvm/base.hh"
-#include "cpu/o3/probe/calibration_marker.hh"
 
 #include <linux/kvm.h>
 #include <sys/ioctl.h>

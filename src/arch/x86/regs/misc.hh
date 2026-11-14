@@ -408,6 +408,11 @@ enum : RegIndex
     XcrBase,
     Xcr0 = XcrBase,
 
+    // Preserve earlier register indices used by context transfer.
+    SpecCtrl,
+    PredCmd,
+    MiscEnable,
+
     NumRegs
 };
 

@@ -81,6 +81,7 @@ RubyPrefetcherStats::RubyPrefetcherStats(statistics::Group *parent)
                                     "prefetching"),
       ADD_STAT(numPrefetchRequested, "Number of prefetch requests made"),
       ADD_STAT(numDuplicateCandidates, "Duplicate targets already queued"),
+      ADD_STAT(numDroppedCandidates, "Unadmitted candidates discarded under resource pressure"),
       ADD_STAT(numStreamCandidates, "Stream candidates submitted"),
       ADD_STAT(numIpCandidates, "Per-PC stride candidates submitted"),
       ADD_STAT(numIpPageStops, "Per-PC stride candidates stopped at a page boundary"),
@@ -112,6 +113,13 @@ void
 RubyPrefetcher::prefetchDequeued(Addr address)
 {
     queuedPrefetches.erase(makeLineAddress(address, m_block_size_bits));
+}
+
+void
+RubyPrefetcher::prefetchDropped(Addr address)
+{
+    prefetchDequeued(address);
+    ++rubyPrefetcherStats.numDroppedCandidates;
 }
 
 void

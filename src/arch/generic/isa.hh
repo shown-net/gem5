@@ -85,6 +85,11 @@ class BaseISA : public SimObject
     virtual void setThreadContext(ThreadContext *_tc) { tc = _tc; }
 
     virtual uint64_t getExecutingAsid() const { return 0; }
+    // Return an absolute, offset-free architectural reference-clock reading.
+    // Architectures without such a clock leave the corresponding PMU proxy
+    // unavailable rather than assuming it equals the core clock.
+    virtual bool referenceClockCycles(Tick, uint64_t &) const
+    { return false; }
     virtual bool inUserMode() const = 0;
     virtual void copyRegsFrom(ThreadContext *src) = 0;
 

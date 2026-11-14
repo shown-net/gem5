@@ -50,8 +50,10 @@
 #include "arch/x86/pagetable_walker.hh"
 
 #include <memory>
+#include <utility>
 
 #include "arch/x86/faults.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/pagetable.hh"
 #include "arch/x86/regs/misc.hh"
 #include "arch/x86/tlb.hh"
@@ -72,20 +74,88 @@ namespace X86ISA {
 Walker::ItlbStats::ItlbStats(Walker *parent)
     : statistics::Group(parent, "ITLB_MISSES"), owner(parent),
       ADD_STAT(WALK_COMPLETED_4K, statistics::units::Count::get(),
-               "Successful modeled instruction walks with a 4 KiB leaf"),
+               "Completed instruction walks with an identified 4 KiB leaf"),
+      ADD_STAT(WALK_COMPLETED_2M_4M, statistics::units::Count::get(),
+               "Completed instruction walks with an identified 2 or 4 MiB leaf"),
       ADD_STAT(WALK_COMPLETED, statistics::units::Count::get(),
                "Completed modeled instruction walks including faults"),
+      ADD_STAT(WALK_COMPLETED_1G, statistics::units::Count::get(),
+               "Completed instruction walks with an identified 1 GiB leaf"),
+      ADD_STAT(unclassifiedCompleted, statistics::units::Count::get(),
+               "Completed instruction walks ending before leaf size was established"),
       ADD_STAT(WALK_ACTIVE, statistics::units::Cycle::get(),
                "Cycles with an instruction walk in service"),
       ADD_STAT(WALK_PENDING, statistics::units::Cycle::get(),
-               "Integral of instruction walks in service; excludes queue")
+               "Integral of instruction walks in service; excludes queue"),
+      ADD_STAT(COALESCED_REQUESTS, statistics::units::Count::get(),
+               "Model instruction translations joined to an in-flight walk")
 {}
 
-Walker::DtlbLoadStats::DtlbLoadStats(Walker *parent)
-    : statistics::Group(parent, "DTLB_LOAD_MISSES"),
+Walker::DtlbWalkStats::DtlbWalkStats(Walker *parent, const char *name)
+    : statistics::Group(parent, name), owner(parent),
       ADD_STAT(WALK_COMPLETED, statistics::units::Count::get(),
-               "Completed timing demand-read walks including faults and completed speculation")
+               "Completed timing demand walks, including faults and completed speculation"),
+      ADD_STAT(WALK_COMPLETED_4K, statistics::units::Count::get(),
+               "Completed demand walks with an identified 4 KiB leaf"),
+      ADD_STAT(WALK_COMPLETED_2M_4M, statistics::units::Count::get(),
+               "Completed demand walks with an identified 2 or 4 MiB leaf"),
+      ADD_STAT(WALK_COMPLETED_1G, statistics::units::Count::get(),
+               "Completed demand walks with an identified 1 GiB leaf"),
+      ADD_STAT(unclassifiedCompleted, statistics::units::Count::get(),
+               "Completed demand walks ending before leaf size was established"),
+      ADD_STAT(WALK_ACTIVE, statistics::units::Cycle::get(),
+               "Cycles with at least one demand walk in service"),
+      ADD_STAT(WALK_PENDING, statistics::units::Cycle::get(),
+               "Integral of demand walks in service; excludes queued requests"),
+      ADD_STAT(COALESCED_REQUESTS, statistics::units::Count::get(),
+               "Model translations joined to an in-flight walk"),
+      ADD_STAT(pteReadResponses, statistics::units::Count::get(),
+               "Real PTE read replies for timing demand walks; excludes synthetic prefix replies"),
+      ADD_STAT(pteReadRequests, statistics::units::Count::get(),
+               "Accepted real PTE reads for timing demand walks"),
+      ADD_STAT(cancelledQueued, statistics::units::Count::get(),
+               "Queued walk leaders cancelled before starting"),
+      ADD_STAT(cancelledStarted, statistics::units::Count::get(),
+               "Started walks stopped before a terminal page-table result"),
+      ADD_STAT(sharedFaultRequests, statistics::units::Count::get(),
+               "Live joined translations completed from the leader's page-table fault")
 {}
+
+Walker::DtlbLoadWalkOutcomeStats::DtlbLoadWalkOutcomeStats(Walker *parent)
+    : statistics::Group(parent, "dtlbLoadWalkOutcome"),
+      ADD_STAT(faultSquashed, statistics::units::Count::get(),
+               "Load walks with walker fault and squashed translation at completion"),
+      ADD_STAT(faultNotSquashed, statistics::units::Count::get(),
+               "Load walks with walker fault and not squashed at completion"),
+      ADD_STAT(noFaultSquashed, statistics::units::Count::get(),
+               "Load walks without walker fault and squashed translation at completion"),
+      ADD_STAT(noFaultNotSquashed, statistics::units::Count::get(),
+               "Load walks without walker fault and not squashed at completion")
+{}
+
+void
+Walker::accountDataWalks()
+{
+    const uint64_t now = uint64_t(curCycle());
+    const uint64_t elapsed = now - lastDataWalkCycle;
+    if (activeDataLoads) dtlbLoadStats.WALK_ACTIVE += elapsed;
+    if (activeDataStores) dtlbStoreStats.WALK_ACTIVE += elapsed;
+    dtlbLoadStats.WALK_PENDING += elapsed * activeDataLoads;
+    dtlbStoreStats.WALK_PENDING += elapsed * activeDataStores;
+    lastDataWalkCycle = now;
+}
+
+void Walker::DtlbWalkStats::preDumpStats()
+{
+    owner->accountDataWalks();
+    statistics::Group::preDumpStats();
+}
+
+void Walker::DtlbWalkStats::resetStats()
+{
+    owner->accountDataWalks();
+    statistics::Group::resetStats();
+}
 
 void
 Walker::accountInstructionWalks()
@@ -113,9 +183,6 @@ Fault
 Walker::start(ThreadContext * _tc, BaseMMU::Translation *_translation,
               const RequestPtr &_req, BaseMMU::Mode _mode)
 {
-    // TODO: in timing mode, instead of blocking when there are other
-    // outstanding requests, see if this request can be coalesced with
-    // another one (i.e. either coalesce or start walk)
     WalkerState * newState = new WalkerState(this, _translation, _req);
     newState->initState(_tc, _mode, sys->isTimingMode());
     if (!newState->isTiming()) {
@@ -123,6 +190,54 @@ Walker::start(ThreadContext * _tc, BaseMMU::Translation *_translation,
         Fault fault = newState->startWalk();
         delete newState;
         return fault;
+    }
+    // A walk may be shared only while its translation context is unchanged.
+    // Limit joining to a 4 KiB subpage even for a later large-page leaf.
+    // Keep prefetches separate so a prefetch leader cannot conceal a demand
+    // walk from the demand activity accounting.
+    const uint64_t cr3 = _tc->readMiscRegNoEffect(misc_reg::Cr3);
+    const uint64_t cr4 = _tc->readMiscRegNoEffect(misc_reg::Cr4);
+    const uint64_t efer = _tc->readMiscRegNoEffect(misc_reg::Efer);
+    newState->translationGeneration = tlb->generation();
+    newState->walkCr3 = cr3;
+    newState->walkCr4 = cr4;
+    newState->walkEfer = efer;
+    for (auto *walk : currStates) {
+        // recvPacket marks a completed walk Ready before invoking callbacks.
+        // A callback may reenter start() before recvTimingResp removes it;
+        // never attach a follower to that already-completed leader.
+        if ((walk->wasStarted() && walk->state == WalkerState::Ready) ||
+            walk->leader || walk->squashed || walk->abandoned ||
+            (cancelSquashedWalks ? !walk->hasLiveUsers() :
+                                  walk->translation->squashed()) ||
+            walk->tc != _tc || walk->requestMode != _mode ||
+            walk->req->isPrefetch() != _req->isPrefetch() ||
+            walk->translationGeneration != tlb->generation() ||
+            walk->walkCr3 != cr3 || walk->walkCr4 != cr4 ||
+            walk->walkEfer != efer ||
+            (walk->req->getVaddr() >> 12) != (_req->getVaddr() >> 12))
+            continue;
+        newState->leader = walk;
+        walk->followers.push_back(newState);
+        currStates.push_back(newState);
+        if (auto facts = _req->getExtension<TranslationMissExtension>();
+            facts && facts->stlbMiss) {
+            facts->stlbWalkFollower = true;
+        }
+        DPRINTF(PageTableWalker, "Joining %s walk vaddr %#x leader %#x\n",
+                walk->wasStarted() ? "active" : "queued",
+                _req->getVaddr(), walk->req->getVaddr());
+        if (_mode == BaseMMU::Execute)
+            ++itlbStats.COALESCED_REQUESTS;
+        else if (_mode == BaseMMU::Read)
+            ++dtlbLoadStats.COALESCED_REQUESTS;
+        else
+            ++dtlbStoreStats.COALESCED_REQUESTS;
+        return NoFault;
+    }
+    if (auto facts = _req->getExtension<TranslationMissExtension>();
+        facts && facts->stlbMiss) {
+        facts->stlbWalkLeader = true;
     }
     currStates.push_back(newState);
     startWalkWrapper();
@@ -146,34 +261,81 @@ Walker::WalkerPort::recvTimingResp(PacketPtr pkt)
 bool
 Walker::recvTimingResp(PacketPtr pkt)
 {
+    if (pkt->isRead()) {
+        const auto *sender = pkt->findNextSenderState<WalkerSenderState>();
+        assert(sender);
+        const auto *walk = sender->senderWalk;
+        if (!walk->req->isPrefetch() &&
+            walk->requestMode != BaseMMU::Execute) {
+            auto &stats = walk->requestMode == BaseMMU::Read ?
+                dtlbLoadStats : dtlbStoreStats;
+            ++stats.pteReadResponses;
+        }
+    }
+    if (pkt->isRead() && pteResponseLatency) {
+        // Keep sender state and the in-flight reference until processing.
+        // Squash/context races use the same completion owner as a memory reply.
+        schedule(new EventFunctionWrapper(
+            [this, pkt] { completeTimingResp(pkt); },
+            name() + ".pteResponse", true),
+            clockEdge(pteResponseLatency));
+    } else {
+        completeTimingResp(pkt);
+    }
+    return true;
+}
+
+void
+Walker::completeTimingResp(PacketPtr pkt)
+{
     WalkerSenderState * senderState =
         dynamic_cast<WalkerSenderState *>(pkt->popSenderState());
     WalkerState * senderWalk = senderState->senderWalk;
     bool walkComplete = senderWalk->recvPacket(pkt);
     delete senderState;
     if (walkComplete) {
-        if (senderWalk->mode == BaseMMU::Execute && senderWalk->wasStarted()) {
+        retireWalk(senderWalk);
+    }
+}
+
+void
+Walker::retireWalk(WalkerState *walk)
+{
+    if (walk->wasStarted()) {
+        if (walk->requestMode == BaseMMU::Execute) {
             accountInstructionWalks();
             assert(activeInstructionWalks);
             --activeInstructionWalks;
+        } else if (!walk->req->isPrefetch()) {
+            accountDataWalks();
+            auto &active = walk->requestMode == BaseMMU::Read ?
+                activeDataLoads : activeDataStores;
+            assert(active);
+            --active;
         }
-        std::list<WalkerState *>::iterator iter;
-        for (iter = currStates.begin(); iter != currStates.end(); iter++) {
-            WalkerState * walkerState = *(iter);
-            if (walkerState == senderWalk) {
-                iter = currStates.erase(iter);
-                break;
-            }
-        }
-        delete senderWalk;
-        // Since we block requests when another is outstanding, we
-        // need to check if there is a waiting request to be serviced
-        if (currStates.size() && !startWalkWrapperEvent.scheduled())
-            // delay sending any new requests until we are finished
-            // with the responses
-            schedule(startWalkWrapperEvent, clockEdge());
     }
-    return true;
+    currStates.remove(walk);
+    delete walk;
+    if (!currStates.empty() && !startWalkWrapperEvent.scheduled())
+        schedule(startWalkWrapperEvent, clockEdge());
+}
+
+void
+Walker::squashTiming(ThreadContext *tc)
+{
+    if (!cancelSquashedWalks) return;
+    for (auto *walk : currStates) {
+        // Ready walks may be inside a finish callback whose Translation has
+        // already destroyed itself. Followers belong to their leader.
+        if (walk->leader || walk->tc != tc ||
+            (walk->wasStarted() && walk->state == WalkerState::Ready) ||
+            walk->hasLiveUsers())
+            continue;
+        walk->abandoned = true;
+        if (walk->wasStarted()) walk->stopPendingRead();
+    }
+    if (!currStates.empty() && !startWalkWrapperEvent.scheduled())
+        schedule(startWalkWrapperEvent, clockEdge());
 }
 
 void
@@ -202,6 +364,12 @@ bool Walker::sendTiming(WalkerState* sendingState, PacketPtr pkt)
     WalkerSenderState* walker_state = new WalkerSenderState(sendingState);
     pkt->pushSenderState(walker_state);
     if (port.sendTimingReq(pkt)) {
+        if (pkt->isRead() && sendingState->requestMode != BaseMMU::Execute &&
+            !sendingState->req->isPrefetch()) {
+            auto &stats = sendingState->requestMode == BaseMMU::Read ?
+                dtlbLoadStats : dtlbStoreStats;
+            ++stats.pteReadRequests;
+        }
         return true;
     } else {
         portBlocked = true;
@@ -224,6 +392,29 @@ Walker::getPort(const std::string &if_name, PortID idx)
 }
 
 void
+Walker::dumpProgressState() const
+{
+    cprintf("%s walk_queue:%u instruction_active:%u data_active:%u "
+            "port_blocked:%d start_scheduled:%d generation:%llu\n",
+            name(), currStates.size(), activeInstructionWalks,
+            activeDataLoads + activeDataStores, portBlocked,
+            startWalkWrapperEvent.scheduled(), tlb->generation());
+    for (const auto *walk : currStates) {
+        cprintf("%s vaddr:%#x mode:%d started:%d state:%d next:%d "
+                "leader:%#x followers:%u inflight:%u read_pending:%d "
+                "writes_pending:%u retrying:%d cancelled:%d "
+                "generation:%llu cr3:%#x current_cr3:%#x\n",
+                name(), walk->req->getVaddr(), walk->requestMode,
+                walk->started, walk->state, walk->nextState,
+                walk->leader ? walk->leader->req->getVaddr() : 0,
+                walk->followers.size(), walk->inflight, bool(walk->read),
+                walk->writes.size(), walk->retrying,
+                walk->translation->squashed(), walk->translationGeneration,
+                walk->walkCr3, walk->tc->readMiscRegNoEffect(misc_reg::Cr3));
+    }
+}
+
+void
 Walker::WalkerState::initState(ThreadContext * _tc,
         BaseMMU::Mode _mode, bool _isTiming)
 {
@@ -231,38 +422,70 @@ Walker::WalkerState::initState(ThreadContext * _tc,
     started = false;
     tc = _tc;
     mode = _mode;
+    requestMode = _mode;
     timing = _isTiming;
 }
 
 void
 Walker::startWalkWrapper()
 {
+    // Completing a queued squash can synchronously start another translation.
+    // Defer that nested pass so it cannot erase the outer list iterator.
+    if (startingWalks) {
+        if (!startWalkWrapperEvent.scheduled())
+            schedule(startWalkWrapperEvent, clockEdge(Cycles(1)));
+        return;
+    }
+    startingWalks = true;
     unsigned active = 0, num_squashed = 0;
     for (auto *walk : currStates)
         if (walk->wasStarted()) ++active;
     bool more_squashes = false;
-    for (auto it = currStates.begin(); it != currStates.end();) {
-        WalkerState *walk = *it;
-        if (walk->wasStarted()) { ++it; continue; }
-        if (walk->translation->squashed()) {
+    // Completion callbacks may append new walks or remove this leader's
+    // followers. Snapshot leaders so neither operation invalidates traversal.
+    std::vector<WalkerState *> leaders;
+    for (auto *walk : currStates)
+        if (!walk->leader) leaders.push_back(walk);
+    for (auto *walk : leaders) {
+        if (walk->wasStarted()) {
+            if (walk->cancelled && !walk->inflight && walk->writes.empty()) {
+                currStates.remove(walk);
+                auto &stats = walk->requestMode == BaseMMU::Read ?
+                    dtlbLoadStats : dtlbStoreStats;
+                if (walk->requestMode != BaseMMU::Execute && !walk->req->isPrefetch())
+                    ++stats.cancelledStarted;
+                walk->releaseFollowers(true);
+                walk->translation->finish(std::make_shared<UnimpFault>("Squashed Inst"),
+                                          walk->req, walk->tc, walk->mode);
+                retireWalk(walk);
+                --active;
+            }
+            continue;
+        }
+        const bool gone = cancelSquashedWalks ? !walk->hasLiveUsers() :
+                                               walk->translation->squashed();
+        if (gone) {
             if (num_squashed >= numSquashable) {
                 more_squashes = true;
-                ++it;
                 continue;
             }
-            it = currStates.erase(it);
+            currStates.remove(walk);
             ++num_squashed;
+            if (walk->requestMode != BaseMMU::Execute && !walk->req->isPrefetch()) {
+                auto &stats = walk->requestMode == BaseMMU::Read ?
+                    dtlbLoadStats : dtlbStoreStats;
+                ++stats.cancelledQueued;
+            }
+            walk->releaseFollowers(cancelSquashedWalks);
             walk->translation->finish(std::make_shared<UnimpFault>("Squashed Inst"),
                                       walk->req, walk->tc, walk->mode);
             delete walk;
         } else if (active < maxActiveWalks) {
-            ++it;
             ++active;
             walk->startWalk();
-        } else {
-            ++it;
         }
     }
+    startingWalks = false;
     if (more_squashes && !startWalkWrapperEvent.scheduled())
         schedule(startWalkWrapperEvent, clockEdge(Cycles(1)));
 }
@@ -272,17 +495,35 @@ Walker::WalkerState::startWalk()
 {
     Fault fault = NoFault;
     assert(!started);
+    if (timing && (translationGeneration != walker->tlb->generation() ||
+        walkCr3 != tc->readMiscRegNoEffect(misc_reg::Cr3) ||
+        walkCr4 != tc->readMiscRegNoEffect(misc_reg::Cr4) ||
+        walkEfer != tc->readMiscRegNoEffect(misc_reg::Efer))) {
+        // Queued followers joined under the admission context. Detach them
+        // before starting a leader under a different translation context.
+        releaseFollowers(false);
+    }
     started = true;
     if (timing && mode == BaseMMU::Execute) {
         walker->accountInstructionWalks();
         ++walker->activeInstructionWalks;
+    } else if (timing && !req->isPrefetch()) {
+        walker->accountDataWalks();
+        if (requestMode == BaseMMU::Read)
+            ++walker->activeDataLoads;
+        else
+            ++walker->activeDataStores;
     }
     setupWalk(req->getVaddr());
     if (timing) {
         nextState = state;
         state = Waiting;
         timingFault = NoFault;
-        sendPackets();
+        if (prefixHit) {
+            sendPrefixResponse();
+        } else {
+            sendPackets();
+        }
     } else {
         do {
             walker->port.sendAtomic(read);
@@ -301,6 +542,24 @@ Walker::WalkerState::startWalk()
         nextState = Waiting;
     }
     return fault;
+}
+
+void
+Walker::WalkerState::sendPrefixResponse()
+{
+    // A delayed prefix response owns no FB or PTE memory transaction. Reuse
+    // walk completion so cancellation and context races have one owner.
+    assert(prefixHit && read);
+    PacketPtr cached = read;
+    read = nullptr;
+    cached->makeTimingResponse();
+    cached->pushSenderState(new WalkerSenderState(this));
+    ++inflight;
+    Walker *owner = walker;
+    owner->schedule(new EventFunctionWrapper(
+        [owner, cached] { owner->completeTimingResp(cached); },
+        owner->name() + ".prefixResponse", true),
+        owner->clockEdge(owner->prefixHitLatency));
 }
 
 Fault
@@ -335,8 +594,11 @@ Fault
 Walker::WalkerState::stepWalk(PacketPtr &write)
 {
     assert(state != Ready && state != Waiting);
-    recordFunctionalTranslationPte(entry.functionalTranslation,
-                                   read->getAddr());
+    const bool fromPrefix = prefixHit;
+    prefixHit = false;
+    if (!fromPrefix)
+        recordFunctionalTranslationPte(entry.functionalTranslation,
+                                       read->getAddr());
     Fault fault = NoFault;
     write = NULL;
     PageTableEntry pte;
@@ -348,11 +610,26 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     bool uncacheable = pte.pcd;
     Addr nextRead = 0;
     bool doWrite = false;
+    if (state == LongPTE || state == PAEPTE || state == PTE)
+        observedLeafLogBytes = 12;
+    else if (pte.p && pte.ps) {
+        if (state == LongPDP) observedLeafLogBytes = 30;
+        if (state == LongPD || state == PAEPD) observedLeafLogBytes = 21;
+        if (state == PSEPD) observedLeafLogBytes = 22;
+    }
     bool doTLBInsert = false;
     bool doEndWalk = false;
     bool badNX = pte.nx && mode == BaseMMU::Execute && enableNX;
     if (dataSize == 8 && enableNX)
         entry.noExec = entry.noExec || pte.nx;
+    if ((state == LongPML4 || state == LongPDP || state == LongPD || state == LongPTE) &&
+        pte.p && ((pte.nx && !enableNX) ||
+                  (state == LongPML4 && pte.ps) ||
+                  (physicalAddressBits < 52 &&
+                   bits(uint64_t(pte), 51, physicalAddressBits)))) {
+        endWalk();
+        return pageFault(true, true);
+    }
     switch(state) {
       case LongPML4:
         DPRINTF(PageTableWalker, "Got long mode PML4 entry %#016x.\n", pte);
@@ -380,6 +657,27 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             fault = pageFault(pte.p);
             break;
         }
+        if (pte.ps) {
+            CpuidResult features;
+            auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+            isa->cpuid->doCpuid(tc, 0x80000001, 0, features);
+            if (!(features.rdx & (1U << 26)) ||
+                bits(uint64_t(pte), 29, 13) || bits(uint64_t(pte), 51, 48)) {
+                doEndWalk = true;
+                doWrite = false;
+                fault = pageFault(true, true);
+                break;
+            }
+            entry.logBytes = 30;
+            entry.paddr = mbits(pte, 51, 30);
+            entry.uncacheable = uncacheable;
+            entry.global = enableGlobal && pte.g;
+            entry.patBit = bits(pte, 12);
+            entry.vaddr = mbits(entry.vaddr, 63, 30);
+            doTLBInsert = true;
+            doEndWalk = true;
+            break;
+        }
         nextState = LongPD;
         break;
       case LongPD:
@@ -404,7 +702,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             entry.logBytes = 21;
             entry.paddr = mbits(pte, 51, 21);
             entry.uncacheable = uncacheable;
-            entry.global = pte.g;
+            entry.global = enableGlobal && pte.g;
             entry.patBit = bits(pte, 12);
             entry.vaddr = mbits(entry.vaddr, 63, 21);
             doTLBInsert = true;
@@ -424,7 +722,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         }
         entry.paddr = mbits(pte, 51, 12);
         entry.uncacheable = uncacheable;
-        entry.global = pte.g;
+        entry.global = enableGlobal && pte.g;
         entry.patBit = bits(pte, 12);
         entry.vaddr = mbits(entry.vaddr, 63, 12);
         doTLBInsert = true;
@@ -463,7 +761,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             entry.logBytes = 21;
             entry.paddr = mbits(pte, 51, 21);
             entry.uncacheable = uncacheable;
-            entry.global = pte.g;
+            entry.global = enableGlobal && pte.g;
             entry.patBit = bits(pte, 12);
             entry.vaddr = mbits(entry.vaddr, 63, 21);
             doTLBInsert = true;
@@ -484,7 +782,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         }
         entry.paddr = mbits(pte, 51, 12);
         entry.uncacheable = uncacheable;
-        entry.global = pte.g;
+        entry.global = enableGlobal && pte.g;
         entry.patBit = bits(pte, 7);
         entry.vaddr = mbits(entry.vaddr, 63, 12);
         doTLBInsert = true;
@@ -509,10 +807,10 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             break;
         } else {
             // 4 MB page
-            entry.logBytes = 21;
+            entry.logBytes = 22;
             entry.paddr = bits(pte, 20, 13) << 32 | mbits(pte, 31, 22);
             entry.uncacheable = uncacheable;
-            entry.global = pte.g;
+            entry.global = enableGlobal && pte.g;
             entry.patBit = bits(pte, 12);
             entry.vaddr = mbits(entry.vaddr, 63, 22);
             doTLBInsert = true;
@@ -548,7 +846,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         }
         entry.paddr = mbits(pte, 31, 12);
         entry.uncacheable = uncacheable;
-        entry.global = pte.g;
+        entry.global = enableGlobal && pte.g;
         entry.patBit = bits(pte, 7);
         entry.vaddr = mbits(entry.vaddr, 31, 12);
         doTLBInsert = true;
@@ -557,27 +855,33 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
       default:
         panic("Unknown page table walker state %d!\n");
     }
+    if (state == LongPML4 || state == LongPDP || state == LongPD) {
+        // SDM 5.10.3 requires every relevant upper Accessed flag to be set in
+        // memory before caching. An outstanding A-bit write keeps this walk
+        // uncached; later walks can fill after that write has completed.
+        cacheablePrefix &= !doWrite;
+        if (!fromPrefix && timing && walker->pagingStructureCache &&
+            cacheablePrefix && !doEndWalk && fault == NoFault &&
+            translationGeneration == walker->tlb->generation()) {
+            const unsigned level = state == LongPML4 ? 0 : state == LongPDP ? 1 : 2;
+            PageTableEntry aggregate = pte;
+            aggregate.w = entry.writable;
+            aggregate.u = entry.user;
+            aggregate.nx = entry.noExec;
+            walker->pagingStructureCache->insert({level, walkCr3, walkCr4, walkEfer,
+                entry.pcid, (entry.vaddr & mask(48)) >> PagingStructureCache::shift(level),
+                read->getAddr(), uint64_t(aggregate), entry.functionalTranslation});
+        }
+    }
     if (doTLBInsert) {
+        entry.pwt = pte.pwt;
         completeFunctionalTranslationLeaf(entry.functionalTranslation,
             entry.vaddr, entry.paddr, entry.logBytes, entry.global);
     }
     if (doEndWalk) {
-        if (doTLBInsert)
-            if (!functional && !timing) {
-
-                // Check if PCIDE is set in CR4
-                CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
-                if (cr4.pcide){
-                    CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
-                    walker->tlb->insert(entry.vaddr, entry, cr3.pcid);
-                }
-                else{
-                    // The current PCID is always 000H if PCIDE
-                    // is not set [sec 4.10.1 of Intel's Software
-                    // Developer Manual]
-                    walker->tlb->insert(entry.vaddr, entry, 0x000);
-                }
-            }
+        if (doTLBInsert && !functional && !timing)
+            walker->tlb->insert(entry.vaddr, entry, entry.pcid,
+                                true, requestMode);
 
         endWalk();
     } else {
@@ -617,12 +921,26 @@ Walker::WalkerState::endWalk()
 void
 Walker::WalkerState::setupWalk(Addr vaddr)
 {
+    observedLeafLogBytes = 0;
+    prefixHit = false;
+    cacheablePrefix = true;
     if (timing) translationGeneration = walker->tlb->generation();
     VAddr addr = vaddr;
     CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+    walkCr3 = uint64_t(cr3);
     CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+    walkCr4 = uint64_t(cr4);
+    entry.pcid = cr4.pcide ? uint64_t(cr3.pcid) : 0;
+    enableGlobal = cr4.pge;
     // Check if we're in long mode or not
     Efer efer = tc->readMiscRegNoEffect(misc_reg::Efer);
+    walkEfer = uint64_t(efer);
+    CpuidResult width;
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    if (isa->cpuid->doCpuid(tc, 0x80000008, 0, width))
+        physicalAddressBits = bits(width.rax, 7, 0);
+    fatal_if(physicalAddressBits < 32 || physicalAddressBits > 52,
+             "Unsupported x86 physical address width for paging");
     dataSize = 8;
     Addr topAddr;
     if (efer.lma) {
@@ -654,12 +972,24 @@ Walker::WalkerState::setupWalk(Addr vaddr)
     nextState = Ready;
     entry.vaddr = vaddr;
     entry.noExec = false;
+    entry.writable = entry.user = true;
 
     const Addr root = efer.lma ? Addr(cr3.longPdtb) << 12 :
         (cr4.pae ? Addr(cr3.paePdtb) << 5 : Addr(cr3.pdtb) << 12);
     beginFunctionalTranslationWalk(entry.functionalTranslation, root);
 
+    PagingStructureCache::Prefix prefix;
+    if (timing && efer.lma && walker->pagingStructureCache &&
+        walker->pagingStructureCache->lookup(walkCr3, walkCr4, walkEfer,
+                                            entry.pcid, vaddr, prefix)) {
+        prefixHit = true;
+        state = prefix.level == 0 ? LongPML4 : prefix.level == 1 ? LongPDP : LongPD;
+        topAddr = prefix.pteAddress;
+        entry.functionalTranslation = prefix.provenance;
+    }
+
     Request::Flags flags = Request::PHYSICAL;
+    flags.set(Request::PT_WALK);
 
     // PCD can't be used if CR4.PCIDE=1 [sec 2.5
     // of Intel's Software Developer's manual]
@@ -671,6 +1001,8 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     read = new Packet(request, MemCmd::ReadReq);
     read->allocate();
+    if (prefixHit)
+        read->setLE<uint64_t>(prefix.pte);
 }
 
 bool
@@ -683,6 +1015,7 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
     if (squashed) {
         // if were were squashed, return true once inflight is zero and
         // this WalkerState will be freed there.
+        delete pkt;
         return (inflight == 0);
     }
     if (pkt->isRead()) {
@@ -709,7 +1042,24 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
     if (inflight == 0 && read == NULL && writes.size() == 0) {
         state = Ready;
         nextState = Waiting;
-        if (translationGeneration != walker->tlb->generation()) {
+        if (cancelled) {
+            assert(!hasLiveUsers());
+            if (requestMode != BaseMMU::Execute && !req->isPrefetch()) {
+                auto &stats = requestMode == BaseMMU::Read ?
+                    walker->dtlbLoadStats : walker->dtlbStoreStats;
+                ++stats.cancelledStarted;
+            }
+            releaseFollowers(true);
+            translation->finish(std::make_shared<UnimpFault>("Squashed Inst"),
+                                req, tc, mode);
+            return true;
+        }
+        if (translationGeneration != walker->tlb->generation() ||
+            walkCr3 != tc->readMiscRegNoEffect(misc_reg::Cr3) ||
+            walkCr4 != tc->readMiscRegNoEffect(misc_reg::Cr4) ||
+            walkEfer != tc->readMiscRegNoEffect(misc_reg::Efer)) {
+            // A changed context must not keep requests joined to this walk.
+            releaseFollowers(false);
             if (translation->squashed()) {
                 translation->finish(std::make_shared<UnimpFault>("Squashed Inst"),
                                     req, tc, mode);
@@ -722,16 +1072,48 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
             setupWalk(req->getVaddr());
             nextState = state;
             state = Waiting;
-            sendPackets();
+            if (prefixHit)
+                sendPrefixResponse();
+            else
+                sendPackets();
             return false;
         }
-        if (mode == BaseMMU::Execute)
+        if (requestMode == BaseMMU::Execute)
             ++walker->itlbStats.WALK_COMPLETED;
-        if (mode == BaseMMU::Read && timing && !req->isPrefetch())
+        if (requestMode == BaseMMU::Read && timing && !req->isPrefetch()) {
             ++walker->dtlbLoadStats.WALK_COMPLETED;
-        if (timingFault == NoFault) {
-            if (mode == BaseMMU::Execute && entry.logBytes == 12)
+            auto &outcome = walker->dtlbLoadWalkOutcomeStats;
+            if (timingFault != NoFault) {
+                if (translation->squashed()) ++outcome.faultSquashed;
+                else ++outcome.faultNotSquashed;
+            } else {
+                if (translation->squashed()) ++outcome.noFaultSquashed;
+                else ++outcome.noFaultNotSquashed;
+            }
+        }
+        if (requestMode == BaseMMU::Write && timing && !req->isPrefetch())
+            ++walker->dtlbStoreStats.WALK_COMPLETED;
+        {
+            if (requestMode == BaseMMU::Execute && observedLeafLogBytes == 12)
                 ++walker->itlbStats.WALK_COMPLETED_4K;
+            if (requestMode == BaseMMU::Execute &&
+                (observedLeafLogBytes == 21 || observedLeafLogBytes == 22))
+                ++walker->itlbStats.WALK_COMPLETED_2M_4M;
+            if (requestMode == BaseMMU::Execute && observedLeafLogBytes == 30)
+                ++walker->itlbStats.WALK_COMPLETED_1G;
+            if (requestMode == BaseMMU::Execute && !observedLeafLogBytes)
+                ++walker->itlbStats.unclassifiedCompleted;
+            if (requestMode != BaseMMU::Execute && timing && !req->isPrefetch()) {
+                auto &stats = requestMode == BaseMMU::Read ?
+                    walker->dtlbLoadStats : walker->dtlbStoreStats;
+                if (observedLeafLogBytes == 12) ++stats.WALK_COMPLETED_4K;
+                if (observedLeafLogBytes == 21 || observedLeafLogBytes == 22)
+                    ++stats.WALK_COMPLETED_2M_4M;
+                if (observedLeafLogBytes == 30) ++stats.WALK_COMPLETED_1G;
+                if (!observedLeafLogBytes) ++stats.unclassifiedCompleted;
+            }
+        }
+        if (timingFault == NoFault) {
             /*
              * Finish the translation. Now that we know the right entry is
              * in the TLB, this should work with no memory accesses.
@@ -741,19 +1123,19 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
              */
             // Install only once all walk packets have completed, then perform
             // the permission check before another walk can evict this leaf.
-            CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
-            CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
-            walker->tlb->insert(entry.vaddr, entry,
-                                cr4.pcide ? uint64_t(cr3.pcid) : uint64_t(0));
+            walker->tlb->insert(entry.vaddr, entry, entry.pcid,
+                                true, requestMode);
             bool delayedResponse;
             Fault fault = walker->tlb->translate(req, tc, NULL, mode,
                                                  delayedResponse, true);
             assert(!delayedResponse);
-            if (mode == BaseMMU::Execute && fault == NoFault && entry.logBytes == 12)
-                ++walker->itlbStats.WALK_COMPLETED_4K;
+            releaseFollowers(true);
             // Let the CPU continue.
             translation->finish(fault, req, tc, mode);
         } else {
+            // Share the checked page-table result, constructing a fault for
+            // each follower's own address and access mode.
+            releaseFollowers(false, walker->coalesceFaultResults);
             // There was a fault during the walk. Let the CPU know.
             translation->finish(timingFault, req, tc, mode);
         }
@@ -764,8 +1146,63 @@ Walker::WalkerState::recvPacket(PacketPtr pkt)
 }
 
 void
+Walker::WalkerState::releaseFollowers(bool completed, bool shared_fault)
+{
+    auto waiting = std::move(followers);
+    followers.clear();
+    if (!completed && !shared_fault) {
+        for (auto *follower : waiting)
+            follower->leader = nullptr;
+        return;
+    }
+
+    // Perform all TLB lookups before callbacks can initiate another walk and
+    // evict the newly installed leaf.  Each request retains its own privilege,
+    // fault, address and squash handling.
+    struct Completion {
+        WalkerState *state;
+        Fault fault;
+    };
+    std::vector<Completion> ready;
+    ready.reserve(waiting.size());
+    for (auto *follower : waiting) {
+        walker->currStates.remove(follower);
+        Fault fault;
+        if (follower->translation->squashed()) {
+            fault = std::make_shared<UnimpFault>("Squashed Inst");
+        } else if (shared_fault) {
+            HandyM5Reg m5reg = follower->tc->readMiscRegNoEffect(misc_reg::M5Reg);
+            auto fault_mode = follower->mode;
+            if (fault_mode == BaseMMU::Execute && !enableNX)
+                fault_mode = BaseMMU::Read;
+            fault = std::make_shared<PageFault>(follower->req->getVaddr(),
+                faultPresent, fault_mode, m5reg.cpl == 3, faultReserved);
+            if (requestMode != BaseMMU::Execute && !req->isPrefetch()) {
+                auto &stats = requestMode == BaseMMU::Read ?
+                    walker->dtlbLoadStats : walker->dtlbStoreStats;
+                ++stats.sharedFaultRequests;
+            }
+        } else {
+            bool delayed = false;
+            fault = walker->tlb->translate(follower->req, follower->tc,
+                nullptr, follower->mode, delayed, true);
+            assert(!delayed);
+        }
+        ready.push_back({follower, fault});
+    }
+    for (auto &completion : ready) {
+        auto *follower = completion.state;
+        follower->translation->finish(completion.fault, follower->req,
+                                      follower->tc, follower->mode);
+        delete follower;
+    }
+}
+
+void
 Walker::WalkerState::sendPackets()
 {
+    if (walker->cancelSquashedWalks && !hasLiveUsers()) abandoned = true;
+    if (abandoned) stopPendingRead();
     //If we're already waiting for the port to become available, just return.
     if (retrying)
         return;
@@ -794,6 +1231,8 @@ Walker::WalkerState::sendPackets()
             return;
         }
     }
+    if (cancelled && !inflight && !walker->startWalkWrapperEvent.scheduled())
+        walker->schedule(walker->startWalkWrapperEvent, walker->clockEdge());
 }
 
 unsigned
@@ -826,6 +1265,27 @@ Walker::WalkerState::squash()
     squashed = true;
 }
 
+bool
+Walker::WalkerState::hasLiveUsers() const
+{
+    if (!translation->squashed()) return true;
+    for (auto *follower : followers)
+        if (!follower->translation->squashed()) return true;
+    return false;
+}
+
+void
+Walker::WalkerState::stopPendingRead()
+{
+    if (!read) return;
+    delete read;
+    read = nullptr;
+    cancelled = true;
+    // A read rejected by the port owns no transaction. Keep retry state only
+    // if an already determined Accessed-bit write still needs to be sent.
+    if (writes.empty()) retrying = false;
+}
+
 void
 Walker::WalkerState::retry()
 {
@@ -834,14 +1294,19 @@ Walker::WalkerState::retry()
 }
 
 Fault
-Walker::WalkerState::pageFault(bool present)
+Walker::WalkerState::pageFault(bool present, bool reserved)
 {
+    faultPresent = present;
+    faultReserved = reserved;
     DPRINTF(PageTableWalker, "Raising page fault.\n");
     HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+    // Adjust the fault classification without changing the request mode
+    // required by the translation completion and any later rewalk.
+    auto faultMode = mode;
     if (mode == BaseMMU::Execute && !enableNX)
-        mode = BaseMMU::Read;
-    return std::make_shared<PageFault>(entry.vaddr, present, mode,
-                                       m5reg.cpl == 3, false);
+        faultMode = BaseMMU::Read;
+    return std::make_shared<PageFault>(entry.vaddr, present, faultMode,
+                                       m5reg.cpl == 3, reserved);
 }
 
 } // namespace X86ISA

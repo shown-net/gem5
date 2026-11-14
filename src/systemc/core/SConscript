@@ -74,6 +74,9 @@ if env['CONF']['USE_SYSTEMC']:
         Source('sc_time_python.cc', append=append)
 
     # Disable the false positive warning for the event members of the scheduler.
-    with gem5_scons.Configure(env) as conf:
+    # This is a compiler flag check, so do not pull the simulator's external
+    # libraries into its configure test or mark their targets as failed.
+    with gem5_scons.Configure(env.Clone(LIBS=[])) as conf:
         flag = '-Wno-free-nonheap-object'
-        conf.CheckLinkFlag(flag)
+        if conf.CheckLinkFlag(flag, autoadd=False, set_for_shared=False):
+            env.Append(LINKFLAGS=[flag], SHLINKFLAGS=[flag])

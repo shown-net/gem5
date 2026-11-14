@@ -175,7 +175,7 @@ class MultiLevelBTB(BranchTargetBuffer):
     levels = VectorParam.BTBLevel(
         [BTBLevel(numEntries=128, associativity=4, latency=0, inclusive=True),
          BTBLevel(numEntries=6144, associativity=6, latency=1, inclusive=True),
-         BTBLevel(numEntries=12288, associativity=12, latency=2, inclusive=False)],
+         BTBLevel(numEntries=12288, associativity=12, latency=2, inclusive=True)],
         "Levels ordered from the uppermost to the lowermost",
     )
 
@@ -229,6 +229,22 @@ class SimpleIndirectPredictor(IndirectPredictor):
     instShiftAmt = Param.Unsigned(
         Parent.instShiftAmt, "Number of bits to shift instructions by"
     )
+
+
+class GoldenCoveBP(ConditionalPredictor):
+    type = "GoldenCoveBP"
+    cxx_class = "gem5::branch_prediction::GoldenCoveBP"
+    cxx_header = "cpu/pred/golden_cove.hh"
+    historyLengths = VectorParam.Unsigned(
+        [22, 58, 388],
+        "Three PHT spans: 388 measured; short spans are explicit engineering defaults",
+    )
+
+
+class GoldenCoveIndirectPredictor(IndirectPredictor):
+    type = "GoldenCoveIndirectPredictor"
+    cxx_class = "gem5::branch_prediction::GoldenCoveIndirectPredictor"
+    cxx_header = "cpu/pred/golden_cove.hh"
 
 
 class BranchPredictor(SimObject):

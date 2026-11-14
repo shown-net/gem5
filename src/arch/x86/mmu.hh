@@ -41,6 +41,7 @@
 #include "mem/functional_mmu_controls.hh"
 #include "arch/generic/mmu.hh"
 #include "arch/x86/page_size.hh"
+#include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/tlb.hh"
 
 #include "params/X86MMU.hh"
@@ -57,17 +58,45 @@ class MMU : public BaseMMU
       : BaseMMU(p)
     {}
 
+    TLB *dataTlb() const { return static_cast<TLB *>(dtb); }
+
+    void squashTiming(ThreadContext *tc) override
+    { dataTlb()->getWalker()->squashTiming(tc); }
+
     void onInstructionCodeInvalidation(std::function<void()> callback)
     { static_cast<TLB *>(itb)->onCodeInvalidation(std::move(callback)); }
 
     void
-    flushNonGlobal()
+    flushNonGlobal(int pcid = -1)
     {
         functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal);
         { functional_mmu::EdgeScope mmu_edge(mmu_command, this, itb);
-          static_cast<TLB*>(itb)->flushNonGlobal(); }
+          static_cast<TLB*>(itb)->flushNonGlobal(pcid); }
         { functional_mmu::EdgeScope mmu_edge(mmu_command, this, dtb);
-          static_cast<TLB*>(dtb)->flushNonGlobal(); }
+          static_cast<TLB*>(dtb)->flushNonGlobal(pcid); }
+    }
+
+    void
+    contextChanged()
+    {
+        static_cast<TLB *>(itb)->contextChanged();
+        static_cast<TLB *>(dtb)->contextChanged();
+    }
+
+    void
+    invalidatePage(Addr va, uint16_t pcid, bool include_global)
+    {
+        functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, va, pcid, true);
+        { functional_mmu::EdgeScope mmu_edge(mmu_command, this, itb);
+          static_cast<TLB *>(itb)->invalidatePage(va, pcid, include_global); }
+        { functional_mmu::EdgeScope mmu_edge(mmu_command, this, dtb);
+          static_cast<TLB *>(dtb)->invalidatePage(va, pcid, include_global); }
+    }
+
+    Walker*
+    getInstructionWalker()
+    {
+        return static_cast<TLB*>(itb)->getWalker();
     }
 
     Walker*

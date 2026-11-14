@@ -54,6 +54,7 @@ structure(MessageBuffer, buffer="yes", inport="yes", outport="yes",
   // These functions are mostly for including resource utilization info
   // in debug traces dumped by the protocol.
   bool areNSlotsAvailable(int n, Tick curTime);
+  bool isReady(Tick current_time);
   int getSize(Tick curTime);
 }
 
@@ -127,7 +128,12 @@ structure (NetDest, external = "yes", non_obj="yes", implicit_ctor="m_ruby_syste
 
 structure (Sequencer, external = "yes") {
   bool isBlockedLine(Addr);
+  bool hasPendingDemandRead(Addr);
   void readCallbackStale(Addr, DataBlock);
+  void readRequestCallback(Addr, DataBlock, RequestPtr);
+  void registerReadFill(RequestPtr, bool, bool);
+  void readFillCallback(Addr, DataBlock, int, int, int);
+  void readFillCallbackStale(Addr, DataBlock);
   void readCallback(Addr, DataBlock);
   void readCallback(Addr, DataBlock, bool);
   void readCallback(Addr, DataBlock, bool, MachineType);
@@ -135,6 +141,7 @@ structure (Sequencer, external = "yes") {
                     Cycles, Cycles, Cycles);
 
   bool writeCallback(Addr, DataBlock);
+  bool writeCallbackData(Addr, DataBlock);
   bool writeCallback(Addr, DataBlock, bool);
   bool writeCallback(Addr, DataBlock, bool, MachineType);
   bool writeCallback(Addr, DataBlock, bool, MachineType,
@@ -159,6 +166,7 @@ structure (Sequencer, external = "yes") {
   void llscClearLocalMonitor();
 
   void evictionCallback(Addr);
+  void evictionCallback(Addr, bool);
   void storePrepareComplete();
 
   void invL1Callback();
@@ -217,6 +225,9 @@ structure (DirectoryMemory, external = "yes") {
 }
 
 structure (CacheMemory, external = "yes") {
+  AbstractCacheEntry lookupDirectory(Addr);
+  AbstractCacheEntry allocateDirectory(Addr, AbstractCacheEntry);
+  void deallocateDirectory(Addr);
   bool cacheAvail(Addr);
   Addr cacheProbe(Addr);
   AbstractCacheEntry getNullEntry();
@@ -229,14 +240,36 @@ structure (CacheMemory, external = "yes") {
   Cycles getTagLatency();
   Cycles getDataLatency();
   void setMRU(Addr);
+  void setMRUOnFill(Addr);
   void setMRU(Addr, int);
   void setMRU(AbstractCacheEntry);
   void recordRequestType(CacheRequestType, Addr);
+  void profileNativeRequest(int, bool, bool);
+  void profileNativeReadAccess(int);
+    void beginOffcoreOwnership(Addr, int);
+    void endOffcoreOwnership(Addr);
+    void profileDataReplacement(Addr);
+    void markSoftwarePrefetchFill(Addr);
+    void observeSoftwarePrefetchHit(Addr);
+  void profileDataLineFill();
   bool checkResourceAvailable(CacheResourceType, Addr);
   bool canAllocateFill();
   void allocateFill();
   void releaseFill();
   void recordFillBlocked();
+  bool canAllocateDataFill(bool);
+  void allocateDataFill(Addr, bool, bool);
+  void markDataFillReady(Addr);
+  void releaseDataFill(Addr);
+  void finishDataFill(Addr);
+  void recordDemandFillBlocked();
+  void beginDemandFillWait(PacketPtr, bool);
+  void endDemandFillWait(PacketPtr);
+  void observeDataFillDemandRead(Addr);
+  bool dataFillPresent(Addr);
+  bool dataFillReady(Addr);
+  bool advanceDataFillInstall(Addr);
+  void installDataFill(Addr);
 
   // hardware transactional memory
   void htmCommitTransaction();
@@ -267,6 +300,7 @@ structure (TimerTable, inport="yes", external = "yes") {
   bool isReady(Tick);
   Addr nextAddress();
   void set(Addr, Tick);
+  void setReady(Addr, Tick);
   void unset(Addr);
   bool isSet(Addr);
 }
@@ -277,6 +311,7 @@ structure (RubyPrefetcher, external = "yes") {
     void observeDataAccess(RequestPtr);
     void observeAdjacent(Addr);
     void prefetchDequeued(Addr);
+    void prefetchDropped(Addr);
     void observePfHit(Addr);
     void observePfMiss(Addr);
 }

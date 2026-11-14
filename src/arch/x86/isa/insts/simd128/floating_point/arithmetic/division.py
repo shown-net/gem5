@@ -35,55 +35,51 @@
 
 microcode = """
 def macroop DIVSS_XMM_XMM {
-    mdivf xmml, xmml, xmmlm, size=4, ext=Scalar
+    mxmmdivs xmml, xmmh, xmml, xmmh, xmmlm, size=4
 };
 
 def macroop DIVSS_XMM_M {
     .microfused_load
     ldfp ufp1, seg, sib, disp, dataSize=4
-    mdivf xmml, xmml, ufp1, size=4, ext=Scalar
+    mxmmdivs xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop DIVSS_XMM_P {
     .microfused_load
     ldfprip ufp1, seg, riprel, disp, dataSize=4
-    mdivf xmml, xmml, ufp1, size=4, ext=Scalar
+    mxmmdivs xmml, xmmh, xmml, xmmh, ufp1, size=4
 };
 
 def macroop DIVSD_XMM_XMM {
-    mdivf xmml, xmml, xmmlm, size=8, ext=Scalar
+    mxmmdivs xmml, xmmh, xmml, xmmh, xmmlm, size=8
 };
 
 def macroop DIVSD_XMM_M {
     .microfused_load
     ldfp ufp1, seg, sib, disp, dataSize=8
-    mdivf xmml, xmml, ufp1, size=8, ext=Scalar
+    mxmmdivs xmml, xmmh, xmml, xmmh, ufp1, size=8
 };
 
 def macroop DIVSD_XMM_P {
     .microfused_load
     ldfprip ufp1, seg, riprel, disp, dataSize=8
-    mdivf xmml, xmml, ufp1, size=8, ext=Scalar
+    mxmmdivs xmml, xmmh, xmml, xmmh, ufp1, size=8
 };
 
 def macroop DIVPS_XMM_XMM {
-    mdivf xmml, xmml, xmmlm, size=4, ext=0
-    mdivf xmmh, xmmh, xmmhm, size=4, ext=0
+    mxmmdivf xmml, xmmh, xmml, xmmh, xmmlm, xmmhm, size=4
 };
 
 def macroop DIVPS_XMM_M {
-    ldfp ufp1, seg, sib, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, sib, "DISPLACEMENT + 8", dataSize=8
-    mdivf xmml, xmml, ufp1, size=4, ext=0
-    mdivf xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmm (ufp1, ufp2), seg, sib, disp
+    mxmmdivf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop DIVPS_XMM_P {
-    rdip t7
-    ldfp ufp1, seg, riprel, "DISPLACEMENT", dataSize=8
-    ldfp ufp2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
-    mdivf xmml, xmml, ufp1, size=4, ext=0
-    mdivf xmmh, xmmh, ufp2, size=4, ext=0
+    .microfused_load
+    ldfpxmmrip (ufp1, ufp2), seg, riprel, disp
+    mxmmdivf xmml, xmmh, xmml, xmmh, ufp1, ufp2, size=4
 };
 
 def macroop DIVPD_XMM_XMM {

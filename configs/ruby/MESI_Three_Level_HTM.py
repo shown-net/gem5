@@ -182,7 +182,7 @@ def create_system(
             l1_cntrl = MESI_Three_Level_HTM_L1Cache_Controller(
                 version=i * num_cpus_per_cluster + j,
                 cache=l1_cache,
-                l2_select_num_bits=l2_bits,
+                l2_select_num_banks=num_l2caches_per_cluster,
                 cluster_id=i,
                 transitions_per_cycle=options.l1_transitions_per_cycle,
                 ruby_system=ruby_system,

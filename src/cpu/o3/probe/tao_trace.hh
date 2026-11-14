@@ -291,7 +291,7 @@ class TaoTrace : public ProbeListenerObject
                          uint64_t exposed_cyc, uint64_t macro_cyc,
                          uint64_t branch_pen_cyc,
                          uint64_t fetch_lat_cyc, uint64_t exec_lat_cyc,
-                         uint8_t branch_mispred);
+                         uint8_t branch_mispred, bool latency_valid);
     void writeDiagLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
                        uint64_t fetch_tick, uint64_t commit_tick,
                        uint64_t prev_commit_tick, uint64_t last_squash_tick);
@@ -743,7 +743,7 @@ private:
     static std::unordered_map<uint64_t, uint64_t> thread_state_runtime_tasks_;
     static std::unordered_map<int32_t, StateRequest> thread_state_waits_;
     static std::unordered_map<int32_t, StateRequest> thread_state_wakes_;
-    bool isThreadStateHook(uint64_t pc) const;
+    bool isThreadStateHook(uint64_t pc, uint64_t micro_pc) const;
     void openThreadState();
     void emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
     void ensureThreadStateOwner(const DynInstPtr &inst, uint64_t ordinal, bool measurement);
@@ -760,6 +760,8 @@ private:
     bool perf_retirement_finalized_ = false;
     std::map<uint32_t, retirement::NativeMemberDiagnostic> perf_retirement_previous_;
     std::vector<std::string> perf_retirement_boundary_samples_;
+    std::vector<std::string> perf_retirement_unsupported_samples_;
+    uint64_t perf_retirement_unsupported_samples_omitted_ = 0;
     uint64_t perf_retirement_boundary_samples_omitted_ = 0;
     uint64_t perf_retirement_known_rom_samples_ = 0;
     uint64_t perf_retirement_missing_first_samples_ = 0;

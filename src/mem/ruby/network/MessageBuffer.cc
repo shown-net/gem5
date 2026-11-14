@@ -64,6 +64,7 @@ MessageBuffer::MessageBuffer(const Params &p)
     m_last_arrival_time(0), m_last_message_strict_fifo_bypassed(false),
     m_strict_fifo(p.ordered),
     m_delay_to_preserve_order(p.delay_to_preserve_order),
+    m_data_transfer_clock(p.data_transfer_clock),
     m_randomization(p.randomization),
     m_allow_zero_latency(p.allow_zero_latency),
     m_routing_priority(p.routing_priority),
@@ -260,6 +261,21 @@ MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
         }
     }
 
+    // Serialize actual data lines on the selected private-cache return link.
+    // Control messages and other buffers retain their existing service path.
+    bool data_transfer = false;
+    if (m_data_transfer_clock) {
+        const auto kind = message->getMessageSize();
+        if (kind == MessageSizeType_Data ||
+            kind == MessageSizeType_Response_Data ||
+            kind == MessageSizeType_ResponseL2hit_Data ||
+            kind == MessageSizeType_ResponseLocal_Data ||
+            kind == MessageSizeType_Writeback_Data) {
+            data_transfer = true;
+            arrival_time = std::max(arrival_time, m_next_data_arrival);
+        }
+    }
+
     // Check the arrival time
     assert(arrival_time >= current_time);
     if (m_strict_fifo &&
@@ -276,6 +292,10 @@ MessageBuffer::enqueue(MsgPtr message, Tick current_time, Tick delta,
                       m_last_arrival_time);
             }
         }
+    }
+
+    if (data_transfer) {
+        m_next_data_arrival = arrival_time + m_data_transfer_clock->clockPeriod();
     }
 
     // If running a cache trace, don't worry about the last arrival checks
@@ -373,6 +393,7 @@ void
 MessageBuffer::clear()
 {
     m_prio_heap.clear();
+    m_next_data_arrival = 0;
 
     m_msg_counter = 0;
     m_time_last_time_enqueue = 0;

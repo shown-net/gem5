@@ -104,11 +104,12 @@ X86CPUID::doCpuid(ThreadContext * tc, uint32_t function, uint32_t index,
         return true;
     }
 
-    // Ignore anything not in the map of supported CPUID functions.
-    // This is checked after the string-related functions as those are not
-    // in the capabilities map.
+    // Reserved leaves within the advertised ranges return zeros on both
+    // simulated CPUs and KVM. String leaves are handled above.
     if (!capabilities.count(function)) {
-        return false;
+        result = CpuidResult();
+        return function < NumStandardCpuidFuncs ||
+            (function >= ext && function < ext + NumExtendedCpuidFuncs);
     }
 
     int cap_offset = 0;

@@ -90,15 +90,25 @@ FUPool::~FUPool()
 FUPool::PoolStats::PoolStats(FUPool *pool)
     : statistics::Group(pool),
       ADD_STAT(issuedByUnit, statistics::units::Count::get(),
-               "Model FU reservations, including paired store-data slots")
+               "Model FU reservations, including paired store-data slots"),
+      ADD_STAT(fpDividerCrossClassBlocked, statistics::units::Count::get(),
+               "FP divide grants blocked by the shared divider after their own op-class interval"),
+      ADD_STAT(fpDividerClassSwitches, statistics::units::Count::get(),
+               "Admitted shared FP divider operations changing the previous op class"),
+      ADD_STAT(fpDiv64PowerOfTwoIssued, statistics::units::Count::get(),
+               "Admitted normal SSE double divides using the power-of-two timing candidate"),
+      ADD_STAT(fpDiv64AssistIssued, statistics::units::Count::get(),
+               "Admitted masked SSE double divide assist candidates; includes speculative work, not retired ASSISTS.FP")
 {}
 void
 FUPool::bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
                               IntExecutionResource *alu, IntExecutionResource *shift,
                               IntExecutionResource *slow, IntExecutionResource *bm,
                               IntExecutionResource *branch,
+                              IntegerDivider *divider,
                               const std::vector<IntegerALU *> &alus)
 {
+    integerDivider = divider;
     fatal_if(ports && (!results || (!alu && alus.empty())),
              "Integer execution requires ports, ALUs and result forwarding");
     fatal_if(alu && !alus.empty(), "ALU family and individual ALUs duplicate resources");
@@ -122,16 +132,106 @@ FUPool::bindIntegerResources(ExecutionPorts *ports, ResultForwarding *results,
 bool
 FUPool::usesIntegerResources(const DynInstPtr &inst) const
 {
+    if (inst->repFunctional()) return false;
+    if (inst->staticInst->intDivide().bytes && integerDivider)
+        return true;
+    if (inst->staticInst->intExecution().family == IntExecutionFamily::Divider)
+        return false;
+    // x86's branch lowering may have no integer-family tag. A macro-fused
+    // follower is still the functional branch half of its producer's grant;
+    // sending it through the generic FU path would consume a second port.
+    if (executionPorts && inst->fusedFollower())
+        return integerResources.at(unsigned(IntExecutionFamily::Branch));
     const auto family = inst->staticInst->intExecution().family;
     return executionPorts && family != IntExecutionFamily::None &&
         (integerResources.at(unsigned(family)) ||
          (family == IntExecutionFamily::ALU && individualALUs));
 }
 
+uint16_t
+FUPool::portMask(const DynInstPtr &inst) const
+{
+    if (!executionPorts || !inst->issueSlots())
+        return 0;
+    if (usesIntegerResources(inst)) {
+        const auto mask = inst->staticInst->intExecution().ports;
+        return inst->fusedLeader() ? mask & 0x41 : mask;
+    }
+    uint16_t mask = capablePorts[inst->opClass()];
+    if (const auto ports = inst->staticInst->vectorExecutionPorts())
+        mask &= ports;
+    if (inst->fusedLeader() ||
+        (inst->isControl() && inst->opClass() == IntAluOp))
+        mask &= 0x41;
+    return mask;
+}
+
+void
+FUPool::startAllocationCycle(Cycles cycle)
+{
+    if (!haveBindingCycle || bindingCycle != cycle) {
+        // Dispatches in the preceding cycle have already removed their load.
+        // Keep this snapshot unchanged throughout the current admission batch.
+        allocationLoadSnapshot = pendingPortLoads;
+        batchMaskUses.clear();
+        bindingCycle = cycle;
+        haveBindingCycle = true;
+    }
+}
+
+void
+FUPool::bindPort(const DynInstPtr &inst, Cycles cycle)
+{
+    assert(inst->boundExecutionPort == -1);
+    if (inst->repFunctional()) return;
+    const uint16_t mask = portMask(inst);
+    if (!mask)
+        return;
+    startAllocationCycle(cycle);
+    std::array<unsigned, 12> candidates;
+    auto candidates_end = candidates.begin();
+    for (unsigned port = 0; port < 12; ++port)
+        if (mask & (1u << port)) *candidates_end++ = port;
+    std::sort(candidates.begin(), candidates_end, [this](auto a, auto b) {
+        return allocationLoadSnapshot[a] != allocationLoadSnapshot[b] ?
+            allocationLoadSnapshot[a] < allocationLoadSnapshot[b] : a > b;
+    });
+    const unsigned minimum = allocationLoadSnapshot[candidates.front()];
+    candidates_end = std::remove_if(candidates.begin(), candidates_end,
+        [this, minimum](auto p) {
+            return allocationLoadSnapshot[p] >= minimum + 5;
+        });
+    auto uses = std::find_if(batchMaskUses.begin(), batchMaskUses.end(),
+        [mask](const auto &entry) { return entry.first == mask; });
+    if (uses == batchMaskUses.end()) {
+        batchMaskUses.emplace_back(mask, 0);
+        uses = batchMaskUses.end() - 1;
+    }
+    const unsigned port =
+        candidates[uses->second++ % (candidates_end - candidates.begin())];
+    inst->boundExecutionPort = port;
+    ++pendingPortLoads[port];
+}
+
+void
+FUPool::releasePortBinding(const DynInstPtr &inst)
+{
+    if (inst->boundExecutionPort < 0)
+        return;
+    const unsigned port = inst->boundExecutionPort;
+    assert(port < pendingPortLoads.size() && pendingPortLoads[port]);
+    --pendingPortLoads[port];
+    inst->boundExecutionPort = -1;
+}
+
 bool
 FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
-                     std::function<void()> available, std::function<void()> complete)
+                     std::function<void()> available, std::function<void()> complete,
+                     std::function<void()> issued_action)
 {
+    if (inst->staticInst->intDivide().bytes && integerDivider)
+        return integerDivider->issue(cpu, forwarding, this, inst,
+                                     available, complete, issued_action);
     const auto &info = inst->staticInst->intExecution();
     if (inst->fusedFollower()) {
         const Tick ready = forwarding->availableAt(inst, 12);
@@ -144,7 +244,8 @@ FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
             cpu, forwarding, inst, 12, available, complete);
         return true;
     }
-    const uint16_t candidates = inst->fusedLeader() ? info.ports & 0x41 : info.ports;
+    const uint16_t candidates = inst->boundExecutionPort >= 0 ?
+        1u << inst->boundExecutionPort : portMask(inst);
     const auto grant_family = inst->fusedLeader() ? IntExecutionFamily::Branch : info.family;
     const auto resourceAt = [this, &info](unsigned port) -> IntExecutionResource * {
         return info.family == IntExecutionFamily::ALU && individualALUs
@@ -174,18 +275,32 @@ FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
     forwarding->clearWait(inst);
     executionPorts->commit(grant_family, candidates, port, curTick());
     resourceAt(port)->admit(cpu, forwarding, inst, port, available, complete);
+    cpu->recordExecutionAction(inst, port);
     return true;
 }
 
 void
 FUPool::takeOverFrom()
 {
+    pendingPortLoads.fill(0);
+    allocationLoadSnapshot.fill(0);
+    batchMaskUses.clear();
+    haveBindingCycle = false;
+    std::fill(fpDividerLastClass.begin(), fpDividerLastClass.end(), No_OpClass);
     if (forwarding)
         forwarding->reset();
 }
 
 FUPool::FUPool(const Params &p)
-    : SimObject(p), storeDataPorts(p.storeDataPorts), branchPorts(p.branchPorts),
+    : SimObject(p), fpDividerSwitchCycles(p.fpDividerSwitchCycles),
+      fpDiv64ActiveCycles(p.fpDiv64ActiveCycles),
+      fpDiv32ActiveCycles(p.fpDiv32ActiveCycles),
+      fpDiv64PowerOfTwoLatency(p.fpDiv64PowerOfTwoLatency),
+      fpDiv64PowerOfTwoActiveCycles(p.fpDiv64PowerOfTwoActiveCycles),
+      fpDiv64AssistLatency(p.fpDiv64AssistLatency),
+      fpDiv64AssistInterval(p.fpDiv64AssistInterval),
+      fpDiv64AssistActiveCycles(p.fpDiv64AssistActiveCycles),
+      storeDataPorts(p.storeDataPorts), branchPorts(p.branchPorts),
       stats(this)
 {
     numFU = 0;
@@ -223,8 +338,11 @@ FUPool::FUPool(const Params &p)
 
                 // Add each of the FU's that will have this capability to the
                 // appropriate queue.
-                for (int k = 0; k < i->number; ++k)
+                for (int k = 0; k < i->number; ++k) {
                     fuPerCapList[j->opClass].addFU(numFU + k);
+                    if (numFU + k < 12)
+                        capablePorts[j->opClass] |= 1u << (numFU + k);
+                }
 
                 // indicate that this FU has the capability
                 fu->addCapability(j->opClass, j->opLat, j->pipelined);
@@ -258,6 +376,8 @@ FUPool::FUPool(const Params &p)
 
     unitBusy.resize(numFU);
     nextIssue.resize(numFU);
+    fpDividerNextIssue.resize(numFU, Cycles(0));
+    fpDividerLastClass.resize(numFU, No_OpClass);
     for (auto &ready : nextIssue)
         ready.fill(Cycles(0));
     pairedUnit.resize(numFU, -1);
@@ -282,8 +402,69 @@ FUPool::isCapable(OpClass capability)
     return capabilityList[capability];
 }
 
+bool
+FUPool::fpDividerReady(OpClass capability, Cycles cycle)
+{
+    const bool divide = capability == FloatDivOp ||
+        capability == SimdFloatDivOp || capability == X86FloatSqrt32Op ||
+        capability == X86FloatSqrt64Op;
+    if (!divide || !capabilityList[capability]) return true;
+    bool shared_blocked = false;
+    for (int unit = 0; unit < numFU; ++unit) {
+        if (!funcUnits[unit]->provides(capability) || unitBusy[unit] ||
+            cycle < nextIssue[unit][capability] ||
+            (executionPorts && !executionPorts->get(unit)->available(curTick())))
+            continue;
+        if (cycle >= fpDividerReadyAt(unit, capability)) return true;
+        shared_blocked = true;
+    }
+    // One class-head admission probe replaces identical probes of all younger
+    // operations. This remains an attempt count, not blocked cycles.
+    if (shared_blocked) ++stats.fpDividerCrossClassBlocked;
+    return false;
+}
+
+bool
+FUPool::normalPowerOfTwoDivide64(const DynInstPtr &inst) const
+{
+    const auto *si = inst->staticInst.get();
+    const unsigned kind = si->sseArithmeticKind();
+    if ((kind != 1 || si->numSrcRegs() != 3) &&
+        (kind != 3 || si->numSrcRegs() != 4))
+        return false;
+
+    // Legacy scalar/packed SSE divide operands are old-low, old-high,
+    // divisor-low[, divisor-high]. Read ready functional values through
+    // DynInst so unpublished producer results retain their forwarding owner.
+    const auto normal_lane = [](uint64_t numerator, uint64_t divisor) {
+        const unsigned n_exp = (numerator >> 52) & 0x7ff;
+        const unsigned d_exp = (divisor >> 52) & 0x7ff;
+        if (!n_exp || n_exp == 0x7ff || !d_exp || d_exp == 0x7ff ||
+            (divisor & ((uint64_t(1) << 52) - 1)))
+            return false;
+        const int result_exp = int(n_exp) - int(d_exp) + 1023;
+        return result_exp > 0 && result_exp < 0x7ff;
+    };
+    if (!normal_lane(inst->getRegOperand(si, 0),
+                     inst->getRegOperand(si, 2)))
+        return false;
+    return kind == 1 || normal_lane(inst->getRegOperand(si, 1),
+                                   inst->getRegOperand(si, 3));
+}
+
+Cycles
+FUPool::getOpLatency(const DynInstPtr &inst)
+{
+    const unsigned latency = inst->staticInst->vectorExecutionLatency();
+    return executionPorts && latency ? Cycles(latency) :
+        getOpLatency(inst->opClass());
+}
+
 int
-FUPool::getUnit(OpClass capability, Cycles cycle, bool store, bool branch)
+FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
+               Cycles &op_latency,
+               bool store, bool branch,
+               int bound_port)
 {
     //  If this pool doesn't have the specified capability,
     //  return this information to the caller
@@ -302,17 +483,31 @@ FUPool::getUnit(OpClass capability, Cycles cycle, bool store, bool branch)
         if (data_idx < 0) return NoFreeFU;
     }
 
-    int fu_idx = fuPerCapList[capability].getFU();
+    int fu_idx = bound_port >= 0 ? bound_port : fuPerCapList[capability].getFU();
     int start_idx = fu_idx;
+    const bool fp_divide = capability == FloatDivOp ||
+        capability == SimdFloatDivOp || capability == X86FloatSqrt32Op ||
+        capability == X86FloatSqrt64Op;
+    const auto dividerAvailable = [&](int unit) {
+        if (!fp_divide || cycle >= fpDividerReadyAt(unit, capability)) return true;
+        ++stats.fpDividerCrossClassBlocked;
+        return false;
+    };
+    const uint16_t vector_ports = executionPorts ?
+        inst->staticInst->vectorExecutionPorts() : 0;
 
     // Iterate through the circular queue if needed, stopping if we've reached
     // the first element again.
-    while (unitBusy[fu_idx] || cycle < nextIssue[fu_idx][capability] ||
+    while ((vector_ports && !(vector_ports & (1u << fu_idx))) ||
+           unitBusy[fu_idx] || cycle < nextIssue[fu_idx][capability] ||
+           !dividerAvailable(fu_idx) ||
            fu_idx == data_idx ||
            (executionPorts && !executionPorts->get(fu_idx)->available(curTick())) ||
            (branch && !branchPorts.empty() &&
             std::find(branchPorts.begin(), branchPorts.end(), fu_idx) ==
                 branchPorts.end())) {
+        if (bound_port >= 0)
+            return NoFreeFU;
         fu_idx = fuPerCapList[capability].getFU();
         if (fu_idx == start_idx) {
             // No FU available
@@ -323,7 +518,48 @@ FUPool::getUnit(OpClass capability, Cycles cycle, bool store, bool branch)
     assert(fu_idx < numFU);
 
     unitBusy[fu_idx] = true;
+    op_latency = getOpLatency(inst);
+    const bool power_of_two = capability == FloatDivOp &&
+        fpDiv64PowerOfTwoLatency && normalPowerOfTwoDivide64(inst);
+    if (power_of_two) {
+        op_latency = fpDiv64PowerOfTwoLatency;
+        ++stats.fpDiv64PowerOfTwoIssued;
+    }
+    const bool assist = capability == FloatDivOp &&
+        fpDiv64AssistLatency &&
+        inst->staticInst->maskedSSEDivideAssist64(inst.get());
+    if (assist) {
+        op_latency = fpDiv64AssistLatency;
+        ++stats.fpDiv64AssistIssued;
+    }
     nextIssue[fu_idx][capability] = cycle + issueIntervals[fu_idx][capability];
+    if (fp_divide) {
+        if (fpDividerLastClass[fu_idx] != No_OpClass &&
+            fpDividerLastClass[fu_idx] != capability)
+            ++stats.fpDividerClassSwitches;
+        fpDividerLastClass[fu_idx] = capability;
+        fpDividerNextIssue[fu_idx] = nextIssue[fu_idx][capability];
+        if (assist)
+            fpDividerNextIssue[fu_idx] = cycle + fpDiv64AssistInterval;
+    }
+    if (fp_divide) {
+        const Cycles configured_active =
+            assist && fpDiv64AssistActiveCycles ?
+            fpDiv64AssistActiveCycles :
+            power_of_two && fpDiv64PowerOfTwoActiveCycles ?
+            fpDiv64PowerOfTwoActiveCycles : capability == FloatDivOp ?
+            fpDiv64ActiveCycles : capability == SimdFloatDivOp ?
+                fpDiv32ActiveCycles : Cycles(0);
+        const Cycles active = configured_active ?
+            configured_active : op_latency;
+        cpu->dividerStats.start(true);
+        // Arithmetic activity can end before result publication. This event
+        // only accounts admitted work; it does not release the FU or wake IQ.
+        cpu->schedule(new EventFunctionWrapper([cpu] {
+            cpu->dividerStats.finish(true);
+        }, name() + ".dividerArithmeticComplete", true),
+            cpu->clockEdge(active));
+    }
     if (executionPorts)
         executionPorts->commit(IntExecutionFamily::None, 1 << fu_idx,
                                fu_idx, curTick());
@@ -336,6 +572,10 @@ FUPool::getUnit(OpClass capability, Cycles cycle, bool store, bool branch)
         ++stats.issuedByUnit[data_idx];
         pairedUnit[fu_idx] = data_idx;
     }
+
+    cpu->recordExecutionAction(inst, executionPorts ? fu_idx : -1);
+    if (data_idx >= 0)
+        cpu->recordExecutionAction(inst, executionPorts ? data_idx : -1);
 
     return fu_idx;
 }
@@ -401,6 +641,9 @@ FUPool::dump()
 bool
 FUPool::isDrained() const
 {
+    if (std::any_of(pendingPortLoads.begin(), pendingPortLoads.end(),
+                    [](unsigned load) { return load != 0; }))
+        return false;
     for (auto unit : integerALUs)
         if (unit && !unit->empty())
             return false;

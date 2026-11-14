@@ -72,6 +72,31 @@ let {{
                 prefix + "quot" + str(width), (WrRegOp,),
                 {"code": body, "op_class": "IntDivOp"})
 
+    # Full architectural results are formed once by the divider service.
+    # O3 publishes them independently after the corresponding output action.
+    for width in (32, 64):
+        for prefix, body in (("Div", unsigned_quotient),
+                             ("Idiv", signed_quotient)):
+            pair = body.replace('ProdHi', 'dividend_high').replace(
+                'ProdLow', 'dividend_low').replace('op2', 'PSrcReg1')
+            pair = pair.replace('Quotient =', 'result_quotient =')
+            pair = pair.replace('Divisor = divisor;', '').replace(
+                'Divisor = divisor_bits;', '')
+            pair = '''
+                const uint64_t dividend_low = Rax & mask(dataSize * 8);
+                const uint64_t dividend_high = Rdx & mask(dataSize * 8);
+                uint64_t result_quotient = 0;
+            ''' + pair + '''
+                if (fault == NoFault) {
+                    Rax = result_quotient;
+                    Rdx = (dividend_low - result_quotient *
+                           (PSrcReg1 & mask(dataSize * 8))) & mask(dataSize * 8);
+                }
+            '''
+            globals()[prefix + "result" + str(width)] = type(
+                prefix + "result" + str(width), (WrRegOp,),
+                {"code": pair, "op_class": "IntDivOp"})
+
     class Divremainder(RegOp):
         operand_types = ()
         code = """

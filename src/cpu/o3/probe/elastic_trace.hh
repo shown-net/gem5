@@ -241,7 +241,7 @@ class ElasticTrace : public ProbeListenerObject
      * After Write dependencies. The key is the renamed physical register and
      * the value is the instruction sequence number of its last producer.
      */
-    std::unordered_map<RegIndex, InstSeqNum> physRegDepMap;
+    std::unordered_map<PhysRegIndex, InstSeqNum> physRegDepMap;
 
     /**
      * @defgroup TraceInfo Struct for a record in the instruction dependency

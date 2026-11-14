@@ -44,7 +44,12 @@ output header {{
             X86ISA::X86StaticInst(_mnemonic, _machInst, __opClass)
         {
             flags[IsSerializing] = 1;
+            // CPUID may not execute until older instructions and committed
+            // stores have completed. Refetch younger instructions afterward:
+            // they may have been fetched before code publication finished.
+            flags[IsNonSpeculative] = 1;
             flags[IsSerializeAfter] = 1;
+            flags[IsSquashAfter] = 1;
         }
 
         std::string generateDisassembly(Addr pc,

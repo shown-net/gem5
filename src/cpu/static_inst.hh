@@ -63,6 +63,16 @@
 namespace gem5
 {
 
+enum class MacroopKind : uint8_t {
+    None, RepCopy, RepStore, CallImmediate, CallRegister, CallMemory,
+    CallPcRelative, Return, ReturnImmediate, PushRegister, PushImmediate,
+    PopRegister, AddImmediate, SubImmediate, Lea, RegisterMove, MemoryMove
+};
+
+enum class NearStackControl : uint8_t {
+    None, DirectCall, RegisterCall, MemoryCall, Return, ReturnImmediate
+};
+
 // forward declarations
 class Packet;
 
@@ -92,11 +102,32 @@ class StaticInst : public RefCounted, public StaticInstFlags
   protected:
     IntExecutionInfo intExecutionInfo;
     ZeroIdiomKind zeroIdiomInfo = ZeroIdiomKind::None;
+    MacroopKind macroopInfo = MacroopKind::None;
+    NearStackControl nearStackInfo = NearStackControl::None;
 
   public:
+    MacroopKind macroopKind() const { return macroopInfo; }
+    NearStackControl nearStackControl() const { return nearStackInfo; }
     const IntExecutionInfo &intExecution() const { return intExecutionInfo; }
+    virtual IntDivideInfo intDivide() const { return {}; }
     void clearIntExecution() { intExecutionInfo = {}; }
     virtual bool usesMicrocodeService() const { return false; }
+    // Evidence-backed identity is distinct from the supplying frontend.
+    virtual bool hasKnownMicrocodeIdentity() const { return false; }
+    virtual unsigned microcodePrefixOps() const { return 0; }
+    virtual bool hasLengthChangingPrefix() const { return false; }
+    // 0=none, 1=NTA, 2=T0, 3=T1/T2, 4=PREFETCHW.
+    virtual unsigned softwarePrefetchKind() const { return 0; }
+    // 0=none, 1=scalar double, 2=scalar single, 3=packed double,
+    // 4=packed single. Only supported original SSE arithmetic qualifies.
+    virtual unsigned sseArithmeticKind() const { return 0; }
+    // Timing-only query on ready functional operands; does not publish state.
+    virtual bool maskedSSEDivideAssist64(ExecContext *) const { return false; }
+    // Nonzero only when completeAcc can produce the entire load result
+    // without reading an unresolved address or a merge destination.
+    virtual unsigned earlyForwardingSize() const { return 0; }
+    // Address eligibility applies independently to the load and its producer.
+    virtual bool hasFastForwardingAddress() const { return false; }
     virtual bool canMacroFuseWith(const StaticInst &next) const { return false; }
     // Observer-only decoded predicates. Native acceptance does not call these.
     virtual bool coreFusionFactsKnown() const { return false; }
@@ -192,6 +223,13 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual bool isRasReturn() const { return isReturn(); }
     virtual bool isArchitecturalBranch() const { return isControl(); }
     virtual bool isArchitecturalConditionalBranch() const { return isCondCtrl(); }
+    virtual bool isArchitecturalNearCall() const { return isCall(); }
+    virtual bool isArchitecturalNearReturn() const { return isReturn(); }
+    virtual bool isArchitecturalNearIndirectBranch() const
+    { return isIndirectCtrl() && !isReturn(); }
+    virtual bool isArchitecturalFarBranch() const { return false; }
+    virtual bool isArchitecturalNop() const { return isNop(); }
+    virtual bool isArchitecturalX87() const { return false; }
     virtual bool isNearIndirectBranch() const
     { return isIndirectCtrl() && !isReturn(); }
 
@@ -222,7 +260,19 @@ class StaticInst : public RefCounted, public StaticInstFlags
     virtual bool isArchitecturalPortIO() const { return false; }
     virtual bool isArchitecturalLockedMemory() const { return isAtomic(); }
     virtual bool isFullGprMove() const { return false; }
+    virtual bool isZeroExtendingGprMove() const { return false; }
     virtual bool isFullXmmMove() const { return false; }
+    /// Two FP data fragments produced as one XMM value, including temporaries.
+    virtual bool isFullXmmWrite() const { return false; }
+    /// Instruction-specific costs in the shared SPR execution-port pool.
+    /// Zero keeps the configured OpClass ports or latency.
+    virtual uint16_t vectorExecutionPorts() const { return 0; }
+    virtual unsigned vectorExecutionLatency() const { return 0; }
+    unsigned
+    numFloatDestEntries() const
+    {
+        return isFullXmmWrite() ? 1 : numDestRegs(FloatRegClass);
+    }
     bool isDelayedCommit() const { return flags[IsDelayedCommit]; }
     bool isLastMicroop() const { return flags[IsLastMicroop]; }
     bool isFirstMicroop() const { return flags[IsFirstMicroop]; }
@@ -407,7 +457,7 @@ class StaticInst : public RefCounted, public StaticInstFlags
     void printFlags(std::ostream &outs, const std::string &separator) const;
 
     /// Return name of machine instruction
-    std::string getName() { return mnemonic; }
+    std::string getName() const { return mnemonic; }
 
   protected:
     template<typename T>

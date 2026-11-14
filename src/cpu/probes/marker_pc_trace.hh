@@ -26,7 +26,7 @@ class MarkerPcTrace
     void initializeTrace();
     void append(Addr pc, Tick commitTick, int64_t fetchTick,
                 int32_t dispatchTick, int32_t issueTick,
-                int32_t completeTick);
+                int32_t completeTick, int64_t dataReturnTick, int64_t wakeTick);
     void finalizeTrace();
 
   private:
@@ -42,7 +42,7 @@ class MarkerPcTrace
   public:
     explicit MarkerPcTrace(const std::string &) { fatal("Marker PC trace requires protobuf"); }
     void initializeTrace() {}
-    void append(Addr, Tick, int64_t, int32_t, int32_t, int32_t) {}
+    void append(Addr, Tick, int64_t, int32_t, int32_t, int32_t, int64_t, int64_t) {}
     void finalizeTrace() {}
 };
 #endif

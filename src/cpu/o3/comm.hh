@@ -58,6 +58,11 @@ namespace gem5
 namespace o3
 {
 
+enum class RecoveryCause {
+    None, Branch, MemoryOrdering, FastForward, Snoop, Code, OtherMachine,
+    FrontendBranch, UnknownBranch, Microcode
+};
+
 /** Struct that defines the information passed from fetch to decode. */
 struct FetchStruct
 {
@@ -90,7 +95,16 @@ struct IEWStruct
 {
     int size;
 
-    DynInstPtr insts[MaxWidth];
+    struct BranchResolution {
+        DynInstPtr instruction;
+        std::unique_ptr<PCStateBase> target;
+        uint64_t predictionVersion;
+        bool taken;
+    };
+    std::vector<BranchResolution> branchResolutions;
+
+    // Completion notifications are not a shared physical writeback port.
+    std::vector<DynInstPtr> insts;
     DynInstPtr mispredictInst[MaxThreads];
     Addr mispredPC[MaxThreads];
     InstSeqNum squashedSeqNum[MaxThreads];
@@ -100,6 +114,7 @@ struct IEWStruct
     bool branchMispredict[MaxThreads];
     bool branchTaken[MaxThreads];
     bool includeSquashInst[MaxThreads];
+    RecoveryCause recoveryCause[MaxThreads]{};
 };
 
 struct IssueStruct
@@ -122,6 +137,20 @@ struct TimeStruct
 
     FetchComm fetchInfo[MaxThreads];
 
+    struct BacComm
+    {
+        InstSeqNum resolvedNoTarget = 0;
+        bool holdFetch = false;
+        bool holdDecodeOnly = false;
+        bool frontendRedirect = false;
+        InstSeqNum redirectSequence = 0;
+        std::unique_ptr<PCStateBase> redirectTarget;
+        DynInstPtr correctionInst;
+        std::unique_ptr<PCStateBase> correctionTarget;
+        uint64_t correctionVersion = 0;
+    };
+    BacComm bacInfo[MaxThreads];
+
     struct DecodeComm
     {
         std::unique_ptr<PCStateBase> nextPC;
@@ -139,7 +168,15 @@ struct TimeStruct
 
     DecodeComm decodeInfo[MaxThreads];
 
-    struct RenameComm {};
+    struct RenameComm
+    {
+        // Receiver state travels with the existing Rename-to-Fetch delay.
+        // It classifies IDQ output; it is not a second resource reservation.
+        bool receiverValid = false;
+        unsigned receiverCapacity = 0;
+        unsigned receiverBlocks = 0;
+        unsigned freeSQEntries = 0;
+    };
 
     RenameComm renameInfo[MaxThreads];
 
@@ -157,8 +194,6 @@ struct TimeStruct
 
         // Allocation units forwarded by IEW; fused followers cost zero.
         unsigned dispatched = 0;
-        unsigned noIQDispatched = 0;
-        unsigned extraIQDispatched = 0;
         bool usedIQ = false;
         bool usedLSQ = false;
     };
@@ -190,6 +225,13 @@ struct TimeStruct
 
         /// Instruction that caused the a non-mispredict squash
         DynInstPtr squashInst; // *F
+        bool replayBranch = false;
+        Addr replayBranchPC = 0;
+        bool replayBranchTaken = false;
+        std::unique_ptr<PCStateBase> replayBranchTarget;
+        bool predictionCorrection = false;
+        bool lateActualCorrection = false;
+        std::vector<InstSeqNum> releaseLateSequences;
 
         /// Hack for now to send back a strictly ordered access to the
         /// IEW stage.
@@ -259,6 +301,8 @@ removeCommThreadInsts(ThreadID tid, CommStruct& comm_struct)
     std::fill(last, comm_struct.insts + comm_struct.size, nullptr);
     comm_struct.size = last - comm_struct.insts;
 }
+
+void removeCommThreadInsts(ThreadID tid, IEWStruct &comm);
 
 } // namespace o3
 } // namespace gem5

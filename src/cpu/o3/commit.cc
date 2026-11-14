@@ -53,12 +53,14 @@
 #include "cpu/exetrace.hh"
 #include "cpu/o3/cpu.hh"
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/stack_engine.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/probe/tao_trace.hh"
 #include "cpu/o3/thread_state.hh"
 #include "cpu/timebuf.hh"
 #include "debug/Activity.hh"
 #include "debug/Commit.hh"
+#include "debug/Fetch.hh"
 #include "debug/CommitRate.hh"
 #include "debug/Drain.hh"
 #include "debug/ExecFaulting.hh"
@@ -111,6 +113,7 @@ Commit::Commit(CPU *_cpu, const BaseO3CPUParams &params)
       fetchToCommitDelay(params.commitToFetchDelay),
       renameWidth(params.renameWidth),
       commitWidth(params.commitWidth),
+      fullFenceServiceCycles(params.sprFullFenceServiceCycles),
       numThreads(params.numThreads),
       drainPending(false),
       drainImminent(false),
@@ -241,6 +244,7 @@ Commit::setTimeBuffer(TimeBuffer<TimeStruct> *tb_ptr)
 
     // Setup wire to read data from IEW (for the ROB).
     robInfoFromIEW = timeBuffer->getWire(-iewToCommitDelay);
+    fromBAC = timeBuffer->getWire(-1);
 }
 
 void
@@ -268,6 +272,7 @@ Commit::setIEWQueue(TimeBuffer<IEWStruct> *iq_ptr)
 
     // Setup wire to get instructions from IEW.
     fromIEW = iewQueue->getWire(-iewToCommitDelay);
+    fromIEWResolution = iewQueue->getWire(-1);
 }
 
 void
@@ -314,6 +319,7 @@ Commit::startupStage()
 void
 Commit::clearStates(ThreadID tid)
 {
+    lateCorrections[tid].clear();
     commitStatus[tid] = Idle;
     changedROBNumEntries[tid] = false;
     checkEmptyROB[tid] = false;
@@ -369,6 +375,7 @@ Commit::isDrained() const
      *   address mappings. This can happen on for example x86.
      */
     for (ThreadID tid = 0; tid < numThreads; tid++) {
+        if (!lateCorrections[tid].empty()) return false;
         if (pc[tid]->microPC() != 0)
             return false;
     }
@@ -511,6 +518,8 @@ void
 Commit::squashAll(ThreadID tid)
 {
     cpu->discardMemoryRetirement(tid);
+    cpu->discardBranchRetirement(tid);
+    cpu->discardRetirement(tid);
     // If we want to include the squashing instruction in the squash,
     // then use one older sequence number.
     // Hopefully this doesn't mess things up.  Basically I want to squash
@@ -613,8 +622,14 @@ Commit::tick()
     wroteToTimeBuffer = false;
     _nextStatus = Inactive;
 
-    if (activeThreads->empty())
+    if (activeThreads->empty()) {
+        // A context can quiesce while older execution completions are still
+        // in the IEW-to-commit transport. The time buffer advances even on
+        // this tick; retain their ready state before it advances, without
+        // retiring work from an inactive thread.
+        markCompletedInsts();
         return;
+    }
 
     // Check if any of the threads are done squashing.  Change the
     // status if they are done.
@@ -778,6 +793,8 @@ Commit::commit()
     int num_squashing_threads = 0;
     for (ThreadID tid : *activeThreads) {
         stats.status[commitStatus[tid]]++;
+        const bool architectureSquash = trapSquash[tid] || tcSquash[tid] ||
+            commitStatus[tid] == SquashAfterPending;
         // Not sure which one takes priority.  I think if we have
         // both, that's a bad sign.
         if (trapSquash[tid]) {
@@ -800,69 +817,188 @@ Commit::commit()
             squashFromSquashAfter(tid);
         }
 
+        const auto &bac = fromBAC->bacInfo[tid];
+        auto &pending = lateCorrections[tid];
+        if (bac.correctionInst && bac.correctionTarget) {
+            LateCorrection correction{bac.correctionInst,
+                std::unique_ptr<PCStateBase>(bac.correctionTarget->clone()),
+                bac.correctionVersion};
+            auto position = std::upper_bound(pending.begin(), pending.end(), correction,
+                [](const LateCorrection &a, const LateCorrection &b) {
+                    return a.inst->seqNum < b.inst->seqNum;
+                });
+            pending.insert(position, std::move(correction));
+        }
+        while (!pending.empty()) {
+            auto history = pending.front().inst->predictionTransaction.lock();
+            if (!pending.front().inst->isSquashed() && !pending.front().inst->staleCode &&
+                history && history->valid &&
+                history->predictionVersion == pending.front().version)
+                break;
+            toIEW->commitInfo[tid].releaseLateSequences.push_back(pending.front().inst->seqNum);
+            pending.pop_front();
+        }
+        if (architectureSquash) pending.clear();
+        if (!pending.empty()) wroteToTimeBuffer = true;
+
+        bool recovery = fromIEW->squash[tid];
+        InstSeqNum recoverySeq = fromIEW->squashedSeqNum[tid];
+        DynInstPtr recoveryInst = fromIEW->mispredictInst[tid];
+        const PCStateBase *recoveryTarget = fromIEW->pc[tid].get();
+        bool recoveryTaken = fromIEW->branchTaken[tid];
+        bool includeRecovery = fromIEW->includeSquashInst[tid];
+        RecoveryCause recoveryCause = fromIEW->recoveryCause[tid];
+        bool predictionCorrection = false;
+        uint64_t correctionVersion = 0;
+
+        for (const auto &resolution : fromIEWResolution->branchResolutions) {
+            const auto &inst = resolution.instruction;
+            if (!inst || inst->threadNumber != tid || inst->isSquashed()) continue;
+            inst->commitResolutionObserved = true;
+            inst->commitResolutionTaken = resolution.taken;
+            inst->commitResolutionVersion = resolution.predictionVersion;
+            set(inst->commitResolutionTarget, *resolution.target);
+        }
+
+        // IEW may have compared an older visible prediction. If that old
+        // comparison reported a miss but the now-visible prediction equals
+        // the actual target, its squash is superseded.
+        if (recovery && recoveryInst && recoveryInst->commitResolutionObserved &&
+            recoveryInst->commitResolutionVersion != recoveryInst->predictionVersion &&
+            *recoveryInst->commitResolutionTarget == recoveryInst->readPredTarg() &&
+            recoveryInst->commitResolutionTaken == recoveryInst->readPredTaken())
+            recovery = false;
+
+        if (!pending.empty() && rob->findInst(tid, pending.front().inst->seqNum) &&
+            (!recovery || pending.front().inst->seqNum < recoverySeq)) {
+            auto &candidate = pending.front();
+            recovery = true;
+            recoverySeq = candidate.inst->seqNum;
+            recoveryInst = candidate.inst;
+            recoveryTarget = candidate.target.get();
+            recoveryTaken = true;
+            includeRecovery = false;
+            recoveryCause = RecoveryCause::FrontendBranch;
+            predictionCorrection = true;
+            correctionVersion = candidate.version;
+            if (candidate.inst->commitResolutionObserved) {
+                recoveryTarget = candidate.inst->commitResolutionTarget.get();
+                recoveryTaken = candidate.inst->commitResolutionTaken;
+                recoveryCause = RecoveryCause::Branch;
+                predictionCorrection = false;
+            }
+        }
+        // Real resolution for the same branch wins over its late prediction.
+        // A later notice can also reveal that IEW executed the older version.
+        for (const auto &resolution : fromIEWResolution->branchResolutions) {
+            const auto &inst = resolution.instruction;
+            if (!inst || inst->threadNumber != tid || inst->isSquashed()) continue;
+            const bool sameCorrection = predictionCorrection && inst->seqNum == recoverySeq;
+            auto history = inst->predictionTransaction.lock();
+            const bool noTargetMismatch = history && history->valid &&
+                history->noTargetTaken &&
+                (*resolution.target != inst->readPredTarg() ||
+                 resolution.taken != inst->readPredTaken());
+            const bool changedSinceExecution =
+                resolution.predictionVersion != inst->predictionVersion &&
+                (*resolution.target != inst->readPredTarg() ||
+                 resolution.taken != inst->readPredTaken());
+            if (!sameCorrection && !changedSinceExecution && !noTargetMismatch) continue;
+            if (recovery && recoverySeq < inst->seqNum) continue;
+            recovery = true;
+            recoverySeq = inst->seqNum;
+            recoveryInst = inst;
+            recoveryTarget = resolution.target.get();
+            recoveryTaken = resolution.taken;
+            includeRecovery = false;
+            recoveryCause = RecoveryCause::Branch;
+            predictionCorrection = false;
+        }
+
         // Squashed sequence number must be older than youngest valid
         // instruction in the ROB. This prevents squashes from younger
         // instructions overriding squashes from older instructions.
-        if (fromIEW->squash[tid] &&
+        if (recovery && recoveryTarget && !architectureSquash &&
             commitStatus[tid] != TrapPending &&
-            fromIEW->squashedSeqNum[tid] <= youngestSeqNum[tid]) {
+            recoverySeq <= youngestSeqNum[tid]) {
 
-            if (fromIEW->mispredictInst[tid]) {
+            if (recoveryInst) {
                 DPRINTF(Commit,
                     "[tid:%i] Squashing due to branch mispred "
                     "PC:%#x [sn:%llu]\n",
                     tid,
-                    fromIEW->mispredictInst[tid]->pcState().instAddr(),
-                    fromIEW->squashedSeqNum[tid]);
+                    recoveryInst->pcState().instAddr(), recoverySeq);
             } else {
                 DPRINTF(Commit,
                     "[tid:%i] Squashing due to order violation [sn:%llu]\n",
-                    tid, fromIEW->squashedSeqNum[tid]);
+                    tid, recoverySeq);
             }
 
             DPRINTF(Commit, "[tid:%i] Redirecting to PC %#x\n",
-                    tid, *fromIEW->pc[tid]);
+                    tid, *recoveryTarget);
 
             commitStatus[tid] = ROBSquashing;
 
             // If we want to include the squashing instruction in the squash,
             // then use one older sequence number.
-            const InstSeqNum cause_seq = fromIEW->squashedSeqNum[tid];
+            const InstSeqNum cause_seq = recoverySeq;
             const InstSeqNum rob_youngest_seq = youngestSeqNum[tid];
-            DynInstPtr oracle_cause_inst = fromIEW->mispredictInst[tid];
+            DynInstPtr oracle_cause_inst = recoveryInst;
             if (!oracle_cause_inst) {
                 oracle_cause_inst = rob->findInst(tid, cause_seq);
             }
             InstSeqNum squashed_inst = cause_seq;
-            std::unique_ptr<PCStateBase> redirect_pc(fromIEW->pc[tid]->clone());
+            std::unique_ptr<PCStateBase> redirect_pc(recoveryTarget->clone());
 
-            if (fromIEW->includeSquashInst[tid]) {
+            if (includeRecovery) {
                 squashed_inst--;
+                auto preceding = rob->findInst(tid, squashed_inst);
+                if (preceding && preceding->stackSync) --squashed_inst;
             }
 
             if (oracle_cause_inst && oracle_cause_inst->allocationGroup &&
-                (fromIEW->includeSquashInst[tid] ||
+                (includeRecovery ||
                  squashed_inst < oracle_cause_inst->allocationGroup->end)) {
                 // Recovery cannot preserve half of a shared allocation unit.
                 // Re-fetch the architectural instruction from its first op.
                 const auto group = oracle_cause_inst->allocationGroup;
+                if (recoveryInst && recoveryInst->isControl()) {
+                    auto &info = toIEW->commitInfo[tid];
+                    info.replayBranch = true;
+                    info.replayBranchPC = oracle_cause_inst->pcState().instAddr();
+                    info.replayBranchTaken = recoveryTaken ||
+                        oracle_cause_inst->isUncondCtrl();
+                    set(info.replayBranchTarget, *recoveryTarget);
+                }
                 auto leader = rob->findInst(tid, group->leader);
                 squashed_inst = group->leader - 1;
+                auto preceding = rob->findInst(tid, squashed_inst);
+                if (preceding && preceding->stackSync) --squashed_inst;
                 redirect_pc->set(leader ? leader->pcState().instAddr() :
                                          oracle_cause_inst->pcState().instAddr());
             }
 
-            if (tid == 0) cpu->tmaStats.squashAfter(squashed_inst, true);
+            auto resolvedHistory = recoveryInst ?
+                recoveryInst->predictionTransaction.lock() :
+                branch_prediction::BPredUnit::HistoryHandle{}.lock();
+            const bool lateActualCorrection = !predictionCorrection && recoveryInst &&
+                recoveryInst->commitResolutionObserved && resolvedHistory &&
+                resolvedHistory->predictionVersion != recoveryInst->commitResolutionVersion;
+            const auto cause = (predictionCorrection ||
+                (lateActualCorrection && !recoveryInst->executionBranchMispredicted)) ?
+                RecoveryCause::FrontendBranch :
+                recoveryInst ? RecoveryCause::Branch : recoveryCause;
+            cpu->recoveryStats.accept(tid, cause_seq, cause);
+            if (tid == 0) cpu->tmaStats.squashAfter(
+                squashed_inst, true, cause == RecoveryCause::Branch);
 
             TaoTrace::traceSquashEpisode(
                 cpu, uint32_t(tid),
-                bool(fromIEW->mispredictInst[tid]),
-                fromIEW->includeSquashInst[tid], uint64_t(cause_seq),
+                bool(recoveryInst), includeRecovery, uint64_t(cause_seq),
                 uint64_t(squashed_inst), uint64_t(rob_youngest_seq),
                 oracle_cause_inst
                     ? uint64_t(oracle_cause_inst->pcState().instAddr()) : 0,
-                fromIEW->pc[tid]
-                    ? uint64_t(fromIEW->pc[tid]->instAddr()) : 0);
+                uint64_t(recoveryTarget->instAddr()));
 
             // All younger instructions will be squashed. Set the sequence
             // number as the youngest instruction in the ROB.
@@ -879,18 +1015,30 @@ Commit::commit()
             // the ROB is in the process of squashing.
             toIEW->commitInfo[tid].robSquashing = true;
 
-            toIEW->commitInfo[tid].mispredictInst =
-                fromIEW->mispredictInst[tid];
-            toIEW->commitInfo[tid].branchTaken =
-                fromIEW->branchTaken[tid];
+            toIEW->commitInfo[tid].mispredictInst = recoveryInst;
+            toIEW->commitInfo[tid].branchTaken = recoveryTaken;
+            toIEW->commitInfo[tid].predictionCorrection = predictionCorrection;
+            toIEW->commitInfo[tid].lateActualCorrection = lateActualCorrection;
             toIEW->commitInfo[tid].squashInst =
                                     rob->findInst(tid, squashed_inst);
             if (toIEW->commitInfo[tid].mispredictInst) {
                 if (toIEW->commitInfo[tid].mispredictInst->isUncondCtrl()) {
                      toIEW->commitInfo[tid].branchTaken = true;
                 }
-                ++stats.branchMispredicts;
+                if (!predictionCorrection &&
+                    (!toIEW->commitInfo[tid].lateActualCorrection ||
+                     recoveryInst->executionBranchMispredicted))
+                    ++stats.branchMispredicts;
             }
+
+            if (predictionCorrection && recoveryInst &&
+                squashed_inst >= recoveryInst->seqNum) {
+                recoveryInst->setPredTarg(*recoveryTarget);
+                recoveryInst->setPredTaken(recoveryTaken);
+                recoveryInst->predictionVersion = correctionVersion;
+            }
+            if (!pending.empty() && pending.front().inst->seqNum == cause_seq)
+                pending.pop_front();
 
             set(toIEW->commitInfo[tid].pc, *redirect_pc);
         }
@@ -906,10 +1054,12 @@ Commit::commit()
         _nextStatus = Active;
     }
 
-    if (num_squashing_threads != numThreads) {
-        // If we're not currently squashing, then get instructions.
-        getInsts();
+    // Rename may restart after restoring its mappings while the ROB continues
+    // visiting invalid old-path records. Receive every bounded message here;
+    // otherwise it expires in the time buffer and leaks its reservations.
+    getInsts();
 
+    if (num_squashing_threads != numThreads) {
         // Try to commit any instructions.
         commitInsts();
     }
@@ -962,6 +1112,7 @@ Commit::commitInsts()
 
     unsigned num_committed = 0;
     ThreadID follow_thread = InvalidThreadID;
+    InstSeqNum following_retirement = 0;
 
     DynInstPtr head_inst;
 
@@ -972,7 +1123,8 @@ Commit::commitInsts()
         // If executing within a transaction,
         // need to handle interrupts specially
 
-        ThreadID commit_thread = num_committed == commitWidth ? follow_thread : getCommittingThread();
+        ThreadID commit_thread = follow_thread != InvalidThreadID ?
+            follow_thread : getCommittingThread();
 
         // Check for any interrupt that we've already squashed for
         // and start processing it.
@@ -994,21 +1146,37 @@ Commit::commitInsts()
             break;
 
         head_inst = rob->readHeadInst(commit_thread);
-        if (num_committed == commitWidth && head_inst->allocationSlots()) break;
-        if (head_inst->allocationLeader() && !head_inst->isSquashed() && head_inst->getFault() == NoFault) {
-            auto follower = rob->findInst(commit_thread, head_inst->allocationGroup->end);
-            if (!follower || !follower->readyToCommit()) {
-                // A fault in a middle memory record must reach the trap path
-                // even when its dependent final record cannot complete.
-                bool fault_ready = false;
-                for (InstSeqNum sn = head_inst->seqNum;
-                     sn <= head_inst->allocationGroup->end; ++sn) {
-                    auto member = rob->findInst(commit_thread, sn);
-                    if (member && member->readyToCommit() && member->getFault() != NoFault)
-                        fault_ready = true;
-                }
-                if (!fault_ready) break;
-            }
+        if (!lateCorrections[commit_thread].empty()) {
+            const auto cause = lateCorrections[commit_thread].front().inst->seqNum;
+            const auto group = head_inst->allocationGroup;
+            if (head_inst->seqNum == cause ||
+                (group && group->leader <= cause && cause <= group->end))
+                break;
+        }
+        if (follow_thread != InvalidThreadID &&
+            head_inst->retirementKey() != following_retirement) {
+            follow_thread = InvalidThreadID;
+            following_retirement = 0;
+        }
+        // A retirement slot is charged once, when its final functional member
+        // retires. Reserve this cycle's bandwidth before starting the group.
+        if (!head_inst->isSquashed() && num_committed +
+                head_inst->retirementGroupSlots() > commitWidth)
+            break;
+        // A commit-gated head (for example a strictly ordered fused load)
+        // must reach commitHead to receive execution permission. That path
+        // returns without retiring it; require the whole group to be ready
+        // only once the head has executed, before any member can retire.
+        if (!head_inst->retirementGroupEnd() && !head_inst->isSquashed() &&
+            !head_inst->staleCode &&
+            head_inst->isExecuted() && head_inst->getFault() == NoFault) {
+            bool fault_ready = false;
+            const bool group_ready =
+                rob->retirementGroupReady(head_inst, fault_ready);
+            // A faulting interior member must still reach the trap path when
+            // a dependent final member cannot produce a result.
+            if (!group_ready && !fault_ready)
+                break;
         }
 
         ThreadID tid = head_inst->threadNumber;
@@ -1027,6 +1195,8 @@ Commit::commitInsts()
                     "ROB.\n");
 
             rob->retireHead(commit_thread);
+            follow_thread = InvalidThreadID;
+            following_retirement = 0;
 
             ++stats.commitSquashedInsts;
             // Notify potential listeners that this instruction is squashed
@@ -1066,15 +1236,19 @@ Commit::commitInsts()
                     head_inst->prepareResultValues(12, curTick());
                     head_inst->evaluateResultValues(curTick());
                     ++cpu->moveEliminationStats.retired;
+                } else if ((head_inst->renameComputed ||
+                            head_inst->moveProjection) &&
+                           head_inst->staticInst->isZeroExtendingGprMove()) {
+                    ++cpu->moveEliminationStats.retired;
                 }
-                num_committed += head_inst->allocationSlots();
-                follow_thread = head_inst->allocationGroup &&
-                    head_inst->seqNum != head_inst->allocationGroup->end ?
+                const unsigned retired_slots = head_inst->retirementSlots();
+                num_committed += retired_slots;
+                follow_thread = !head_inst->retirementGroupEnd() ?
                     commit_thread : InvalidThreadID;
+                following_retirement = follow_thread != InvalidThreadID ?
+                    head_inst->retirementKey() : 0;
                 cpu->tmaStats.onRetire(head_inst);
-                if (!head_inst->allocationGroup ||
-                    head_inst->seqNum == head_inst->allocationGroup->end)
-                    ++cpu->uopsRetiredStats.SLOTS;
+                cpu->recordRetiredUops(head_inst);
                 cpu->recordBranchRetirement(head_inst);
                 cpu->recordMemoryRetirement(head_inst);
                 cpu->commitStats[tid]
@@ -1106,7 +1280,8 @@ Commit::commitInsts()
                 toIEW->commitInfo[tid].doneSeqNum = head_inst->seqNum;
 
                 if (tid == 0)
-                    canHandleInterrupts = !head_inst->isDelayedCommit() && !head_inst->fusedLeader();
+                    canHandleInterrupts = !head_inst->isDelayedCommit() &&
+                        head_inst->retirementGroupEnd();
 
                 // at this point store conditionals should either have
                 // been completed or predicated false
@@ -1120,7 +1295,7 @@ Commit::commitInsts()
 
                 // Check instruction execution if it successfully commits and
                 // is not carrying a fault.
-                if (cpu->checker) {
+                if (cpu->checker && !head_inst->stackSync) {
                     cpu->checker->verify(head_inst);
                 }
 
@@ -1211,7 +1386,7 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
 
     // If the instruction is not executed yet, then it will need extra
     // handling.  Signal backwards that it should be executed.
-    if (!head_inst->isExecuted()) {
+    if (!head_inst->isExecuted() && !head_inst->staleCode) {
         // Make sure we are only trying to commit un-executed instructions we
         // think are possible.
         assert(head_inst->isNonSpeculative() || head_inst->isStoreConditional()
@@ -1231,6 +1406,22 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
                     "Waiting for all stores to writeback.\n",
                     tid, head_inst->seqNum);
             return false;
+        }
+
+        if (fullFenceServiceCycles > Cycles(0) &&
+            head_inst->isFullMemBarrier() &&
+            !head_inst->staticInst->isMicroop() &&
+            head_inst->staticInst->getName() == "MFENCE") {
+            // This form-specific service begins only after ordinary store
+            // completion. Embedded fences in locked operations retain their
+            // own execution service.
+            if (!head_inst->completionNotBefore)
+                head_inst->completionNotBefore =
+                    cpu->clockEdge(fullFenceServiceCycles);
+            if (curTick() < head_inst->completionNotBefore) {
+                cpu->activityThisCycle();
+                return false;
+            }
         }
 
         toIEW->commitInfo[tid].nonSpecSeqNum = head_inst->seqNum;
@@ -1253,7 +1444,12 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
     }
 
     // Check if the instruction caused a fault.  If so, trap.
-    Fault inst_fault = head_inst->getFault();
+    if (head_inst->staleCode) {
+        DPRINTF(Fetch, "[tid:%i] Replaying stale code [sn:%llu] PC %s\n",
+                tid, head_inst->seqNum, head_inst->pcState());
+    }
+    Fault inst_fault = head_inst->staleCode ?
+        std::make_shared<ReExec>() : head_inst->getFault();
 
     // hardware transactional memory
     // if a fault occurred within a HTM transaction
@@ -1279,6 +1475,8 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
 
     if (inst_fault != NoFault) {
         cpu->discardMemoryRetirement(tid);
+        cpu->discardBranchRetirement(tid);
+        cpu->discardRetirement(tid, true);
         DPRINTF(Commit, "Inst [tid:%i] [sn:%llu] PC %s has a fault\n",
                 tid, head_inst->seqNum, head_inst->pcState());
 
@@ -1311,12 +1509,24 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         // needed to update the state as soon as possible.  This
         // prevents external agents from changing any specific state
         // that the trap need.
+        const bool is_reexecution = dynamic_cast<ReExec *>(inst_fault.get());
+        if (is_reexecution) {
+            const auto cause = head_inst->staleCode ? RecoveryCause::Code :
+                                                      head_inst->replayCause;
+            cpu->recoveryStats.accept(tid, head_inst->seqNum, cause);
+            if (tid == 0) cpu->tmaStats.squashAfter(
+                head_inst->seqNum - 1, true, false);
+        }
         ppKernelEntry->notify(KernelEntryEvent{
             uint32_t(cpu->cpuId()), tid, inst_fault,
             KernelEntrySource::SynchronousFault, curTick(),
             cpu->clockPeriod(), cpu->inUserMode(tid),
             uint32_t(cpu->tcBase(tid)->contextId()),head_inst->pcState().instAddr()});
-        auto* arch_observer=functional_arch::observer(cpu->tcBase(tid));
+        // ReExec is an internal replay signal, not an architectural entry;
+        // its invoke() only retries the current PC. Keep the pipeline recovery
+        // and its statistics, but do not serialize a fictitious fault boundary.
+        auto* arch_observer = is_reexecution ? nullptr :
+            functional_arch::observer(cpu->tcBase(tid));
         auto arch_facts=arch_observer&&arch_observer->accepting()?inst_fault->functionalBoundaryFacts(cpu->tcBase(tid)):functional_arch::AcceptedFacts{};
         arch_facts.pc_known=true;arch_facts.pc=head_inst->pcState().instAddr();arch_facts.micro_pc=head_inst->pcState().microPC();
         arch_facts.carrier=head_inst->notAnInst()?1:0;
@@ -1371,6 +1581,11 @@ Commit::commitHead(const DynInstPtr &head_inst, unsigned inst_num)
         renameMap[tid]->setEntry(head_inst->flattenedDestIdx(i),
                                  head_inst->renamedDestIdx(i));
     }
+    if (cpu->stackEngine && cpu->stackEngine->enabled()) {
+        cpu->stackEngine->retire(tid, head_inst->seqNum,
+            head_inst->stackStateChanged, head_inst->stackDeltaAfter);
+        if (head_inst->stackSync) cpu->stackEngine->noteSyncRetired();
+    }
 
     // hardware transactional memory
     // the HTM UID is purely for correctness and debugging purposes
@@ -1412,9 +1627,7 @@ Commit::getInsts()
         const DynInstPtr &inst = fromRename->insts[inst_num];
         ThreadID tid = inst->threadNumber;
 
-        if (!inst->isSquashed() &&
-            commitStatus[tid] != ROBSquashing &&
-            commitStatus[tid] != TrapPending) {
+        if (!inst->isSquashed() && commitStatus[tid] != TrapPending) {
             changedROBNumEntries[tid] = true;
 
             DPRINTF(Commit, "[tid:%i] [sn:%llu] Inserting PC %s into ROB.\n",
@@ -1426,6 +1639,8 @@ Commit::getInsts()
 
             youngestSeqNum[tid] = inst->seqNum;
         } else {
+            rob->cancelReservation(inst->seqNum);
+            iewStage->instQueue.cancelReservation(inst->seqNum);
             DPRINTF(Commit, "[tid:%i] [sn:%llu] "
                     "Instruction PC %s was squashed, skipping.\n",
                     tid, inst->seqNum, inst->pcState());
@@ -1461,9 +1676,13 @@ Commit::updateComInstStats(const DynInstPtr &inst)
 
     // Count number of instructions, ensure we don't
     // double count Microops as insts.
-    if (!inst->isMicroop() || inst->isLastMicroop()) {
+    if (!inst->notAnInst() &&
+        (!inst->isMicroop() || inst->isLastMicroop())) {
         cpu->commitStats[tid]->numInsts++;
         ++cpu->instRetiredStats.ANY;
+        const auto &architecture = inst->macroop ? inst->macroop : inst->staticInst;
+        if (architecture->isArchitecturalNop())
+            ++cpu->instRetiredStats.NOP;
         cpu->baseStats.numInsts++;
         if (in_user_mode) {
             cpu->commitStats[tid]->numUserInsts++;

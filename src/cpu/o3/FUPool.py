@@ -49,6 +49,30 @@ class FUPool(SimObject):
     FUList = VectorParam.FUDesc("list of FU's for this pool")
     storeDataPorts = VectorParam.Unsigned([], "FU indices reserved with a store address")
     branchPorts = VectorParam.Unsigned([], "FU indices eligible for control operations")
+    fpDividerSwitchCycles = Param.Cycles(
+        0, "Additional admission delay when a shared FP divider changes op class"
+    )
+    fpDiv64ActiveCycles = Param.Cycles(
+        0, "Double FP divide arithmetic-active interval; zero uses result latency"
+    )
+    fpDiv32ActiveCycles = Param.Cycles(
+        0, "Single FP divide arithmetic-active interval; zero uses result latency"
+    )
+    fpDiv64PowerOfTwoLatency = Param.Cycles(
+        0, "Normal SSE double divide by a power of two; zero disables the timing candidate"
+    )
+    fpDiv64PowerOfTwoActiveCycles = Param.Cycles(
+        0, "Arithmetic-active interval for the normal double power-of-two candidate"
+    )
+    fpDiv64AssistLatency = Param.Cycles(
+        0, "Masked legacy SSE double divide assist result delay; zero disables"
+    )
+    fpDiv64AssistInterval = Param.Cycles(
+        0, "Shared divider admission interval for the masked double assist candidate"
+    )
+    fpDiv64AssistActiveCycles = Param.Cycles(
+        0, "Admitted arithmetic activity for the masked double assist candidate"
+    )
 
 
 class DefaultFUPool(FUPool):

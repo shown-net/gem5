@@ -122,7 +122,7 @@ def template MacroConstructor {{
             %(adjust_disp)s;
             %(init_env)s;
             %(constructor)s;
-            const char *macrocodeBlock = "%(class_name)s";
+            setMicrocodeBlock("%(class_name)s", MacroopKind::%(macroop_kind)s);
             //alloc_microops is the code that sets up the microops
             //array in the parent class.
             %(alloc_microops)s;
@@ -161,6 +161,12 @@ let {{
         def splitShift(self):
             self.split_shift = True
 
+        def ripLea(self):
+            self.rip_lea = True
+
+        def stackPopDirect(self):
+            self.stack_pop_direct = True
+
         def function_call(self):
             self.function_call = True
         def function_return(self):
@@ -184,6 +190,8 @@ let {{
                 "stack_reg_allocation" : self.stackRegAllocation,
                 "low_result_mul" : self.lowResultMultiply,
                 "split_shift" : self.splitShift,
+                "rip_lea" : self.ripLea,
+                "stack_pop_direct" : self.stackPopDirect,
                 "function_call" : self.function_call,
                 "function_return" : self.function_return,
                 "control_direct" : self.control_direct,
@@ -210,6 +218,8 @@ let {{
             self.stack_reg_allocation = False
             self.low_result_multiply = False
             self.split_shift = False
+            self.rip_lea = False
+            self.stack_pop_direct = False
             self.function_call = False
             self.function_return = False
             self.control_direct = False
@@ -273,10 +283,44 @@ let {{
                     "microops[%d] = %s;\n" % \
                     (micropc, op.getAllocator(flags))
                 micropc += 1
+            if self.stack_pop_direct:
+                import copy
+                if (numMicroops != 3 or self.microops[0].mnemonic != 'ld'
+                        or self.microops[1].mnemonic != 'addi'):
+                    raise ValueError('stack_pop_direct requires ld + addi + mov')
+                load = copy.copy(self.microops[0])
+                load.data = self.microops[2].ops[0]
+                increment = self.microops[1].getAllocator(
+                    ['IsMicroop', 'IsLastMicroop'])
+                direct = load.getAllocator(
+                    ['IsMicroop', 'IsFirstMicroop', 'IsDelayedCommit'])
+                stack_load = self.microops[0].getAllocator(
+                    ['IsMicroop', 'IsFirstMicroop', 'IsDelayedCommit'])
+                stack_result = self.microops[2].getAllocator(
+                    ['IsMicroop', 'IsLastMicroop'])
+                allocMicroops = ('if (env.dataSize == 8 && env.stackSize == 8) {\n'
+                    'if (env.reg == int_reg::Rsp) {\n'
+                    'microops[0] = %s;\nmicroops[1] = %s;\n} else {\n'
+                    'microops[0] = %s;\nmicroops[1] = %s;\n}\n} else {\n%s}\n' %
+                    (stack_load, stack_result, direct, increment, allocMicroops))
+                numMicroops = ('(_env.stackSize == 8 && (_env.dataSize == 8 || '
+                    '(machInst.mode.submode == SixtyFourBitMode && _env.dataSize == 4)) ? 2 : 3)')
+            if self.rip_lea:
+                import copy
+                if numMicroops != 2 or self.microops[0].mnemonic != 'rdip':
+                    raise ValueError('rip_lea requires rdip + lea')
+                op = copy.copy(self.microops[1])
+                op.className = 'Learip'
+                op.mnemonic = 'learip'
+                direct = op.getAllocator(
+                    ['IsMicroop', 'IsFirstMicroop', 'IsLastMicroop'])
+                allocMicroops = ('if (env.dataSize >= 4) {\n'
+                    'microops[0] = %s;\n} else {\n%s}\n' %
+                    (direct, allocMicroops))
+                numMicroops = '(_env.dataSize >= 4 ? 1 : 2)'
             if self.direct_immediate:
-                # Keep narrow register merge work on its existing path.
-                # Wide register/immediate ALU work consumes the decoded
-                # immediate directly, without an independently issued limm.
+                # Register/immediate ALU work consumes the decoded immediate
+                # directly, without an independently issued limm.
                 import copy
                 if numMicroops != 2 or self.microops[0].mnemonic != 'limm':
                     raise ValueError('direct_imm requires limm + ALU')
@@ -286,10 +330,8 @@ let {{
                 op.mnemonic += 'i'
                 direct = op.getAllocator(
                     ['IsMicroop', 'IsFirstMicroop', 'IsLastMicroop'])
-                allocMicroops = ('if (env.dataSize >= 4) {\n'
-                    'microops[0] = %s;\n} else {\n%s}\n' %
-                    (direct, allocMicroops))
-                numMicroops = '(_env.dataSize >= 4 ? 1 : 2)'
+                allocMicroops = 'microops[0] = %s;\n' % direct
+                numMicroops = '1'
             if self.low_result_multiply:
                 # Collapse only the selected wide low-result forms. Keep
                 # narrow merges and the full-product forms unchanged.
@@ -331,9 +373,9 @@ let {{
                 wide = 'microops[0] = %s;\nmicroops[1] = %s;\n' % (
                     flags.getAllocator(['IsMicroop', 'IsFirstMicroop', 'IsDelayedCommit']),
                     value.getAllocator(['IsMicroop', 'IsLastMicroop']))
-                allocMicroops = 'if (env.dataSize >= 4) {\n%s} else {\n%s}\n' % (
+                allocMicroops = 'if (env.dataSize >= 2) {\n%s} else {\n%s}\n' % (
                     wide, allocMicroops)
-                numMicroops = '(_env.dataSize >= 4 ? 2 : 1)'
+                numMicroops = '(_env.dataSize >= 2 ? 2 : 1)'
             if self.microfused_load:
                 if len(self.microops) > 3 and not self.low_result_multiply:
                     raise ValueError('microfused_load supports at most three functional records')
@@ -361,6 +403,25 @@ let {{
             regSize = '''(%s || (env.base == int_reg::Rsp && %s) ?
                          env.stackSize :
                          env.dataSize)''' % (useStackSize, memoryInst)
+            # Exact immutable block identities used by timing consumers.
+            macroopKind = {
+                "MOVS_E_M_M": "RepCopy",
+                "STOS_E_M": "RepStore",
+                "CALL_NEAR_I": "CallImmediate",
+                "CALL_NEAR_R": "CallRegister",
+                "CALL_NEAR_M": "CallMemory",
+                "CALL_NEAR_P": "CallPcRelative",
+                "RET_NEAR": "Return",
+                "RET_NEAR_I": "ReturnImmediate",
+                "PUSH_R": "PushRegister",
+                "PUSH_I": "PushImmediate",
+                "POP_R": "PopRegister",
+                "ADD_R_I": "AddImmediate",
+                "SUB_R_I": "SubImmediate",
+                "LEA_R_M": "Lea",
+                "MOV_R_R": "RegisterMove",
+                "MOV_R_M": "MemoryMove",
+            }.get(self.name, "None")
             iop = InstObjParams(self.getMnemonic(), self.name, "Macroop",
                                 {"code" : "", "num_microops" : numMicroops,
                                  "alloc_microops" : allocMicroops,
@@ -369,7 +430,8 @@ let {{
                                  "adjust_disp" : self.adjust_disp,
                                  "disassembly" : env.disassembly,
                                  "regSize" : regSize,
-                                 "init_env" : self.initEnv})
+                                 "init_env" : self.initEnv,
+                                 "macroop_kind" : macroopKind})
             return MacroConstructor.subst(iop) + \
                    MacroDisassembly.subst(iop);
 }};

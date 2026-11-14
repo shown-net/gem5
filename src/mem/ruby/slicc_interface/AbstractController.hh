@@ -163,6 +163,9 @@ class AbstractController : public ClockedObject, public Consumer
     { fatal("Prefetches not implemented!");}
 
     //! Notifies controller of a request coalesced at the sequencer.
+    virtual void notifyCoalescedAdmission(const Addr& addr,
+        const RubyRequestType& type, const RequestPtr& req) {}
+
     //! By default, it does nothing. Behavior is protocol-specific
     virtual void notifyCoalesced(const Addr& addr,
                                  const RubyRequestType& type,

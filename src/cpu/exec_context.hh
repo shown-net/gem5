@@ -106,6 +106,10 @@ class ExecContext
      */
     virtual void setMiscReg(int misc_reg, RegVal val) = 0;
 
+    /** Merge sticky architectural status bits at this operation's commit. */
+    virtual void orMiscReg(int misc_reg, RegVal bits)
+    { setMiscReg(misc_reg, readMiscReg(misc_reg) | bits); }
+
     /** @} */
 
     /**
@@ -252,9 +256,8 @@ class ExecContext
      * Invalidate a page in the DTLB <i>and</i> ITLB.
      */
     virtual void demapPage(Addr vaddr, uint64_t asn) = 0;
-    virtual void armMonitor(Addr address) = 0;
-    virtual bool mwait(PacketPtr pkt) = 0;
-    virtual void mwaitAtomic(ThreadContext *tc) = 0;
+    virtual void armMonitor(Addr address, Addr paddr) = 0;
+    virtual bool mwait(bool break_on_interrupt) = 0;
     virtual AddressMonitor *getAddrMonitor() = 0;
 
     /** @} */

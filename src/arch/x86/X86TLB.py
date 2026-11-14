@@ -35,8 +35,16 @@
 
 from m5.objects.BaseTLB import BaseTLB
 from m5.objects.ClockedObject import ClockedObject
+from m5.SimObject import SimObject
 from m5.params import *
 from m5.proxy import *
+
+
+class X86PagingStructureCache(SimObject):
+    type = "X86PagingStructureCache"
+    cxx_class = "gem5::X86ISA::PagingStructureCache"
+    cxx_header = "arch/x86/paging_structure_cache.hh"
+    entriesPerLevel = Param.Unsigned(16, "Shared entries per upper paging level; engineering prior")
 
 
 class X86PagetableWalker(ClockedObject):
@@ -50,6 +58,17 @@ class X86PagetableWalker(ClockedObject):
         4, "Number of outstanding walks that can be squashed per cycle"
     )
     max_active_walks = Param.Unsigned(1, "Concurrent timing page walks")
+    coalesce_fault_results = Param.Bool(
+        False, "Complete joined translations from the same page-walk fault result"
+    )
+    cancel_squashed_walks = Param.Bool(
+        False, "Stop further PTE reads when all walk users have been squashed"
+    )
+    paging_structure_cache = Param.X86PagingStructureCache(NULL, "Optional shared virtual-prefix cache")
+    prefix_hit_latency = Param.Cycles(1, "Upper-prefix hit service latency")
+    pte_response_latency = Param.Cycles(
+        0, "PTE read response processing before the next walk step"
+    )
 
 
 class X86TLB(BaseTLB):
@@ -61,6 +80,10 @@ class X86TLB(BaseTLB):
     itlb_4k_ways = Param.Unsigned(0, "4K instruction TLB ways; zero uses fully associative replacement")
     dtlb_4k_ways = Param.Unsigned(0, "4K data TLB ways; zero uses fully associative replacement")
     spr_shared_domains = Param.Bool(False, "Two 1024-entry page-size support domains")
+    spr_shared_index_shift = Param.Unsigned(
+        0, "4K VPN XOR fold: 8 folds every byte; other nonzero values fold once"
+    )
+    spr_split_l1 = Param.Bool(False, "SPR first-level page-size and data-access replacement domains")
     next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
     system = Param.System(Parent.any, "system object")
     walker = Param.X86PagetableWalker(

@@ -39,12 +39,24 @@ class RubyCache(SimObject):
     assoc = Param.Int("")
     replacement_policy = Param.BaseReplacementPolicy(TreePLRURP(), "")
     start_index_bit = Param.Int(6, "index start, default 6 for 64-byte line")
+    index_divisor = Param.Unsigned(
+        1, "Divide the line address by the slice count; 52 banks use the SPR XOR proxy"
+    )
     is_icache = Param.Bool(False, "is instruction only cache")
     block_size = Param.MemorySize(
         "0B", "block size in bytes. 0 means default RubyBlockSize"
     )
     fill_capacity = Param.Unsigned(
         0, "Maximum tracked line fills; zero leaves the fill budget unlimited"
+    )
+    write_fill_capacity = Param.Unsigned(
+        0, "Candidate bound on write-initiated L0 fills; zero disables it"
+    )
+    fill_stats_clock = Param.ClockDomain(
+        NULL, "Optional core clock domain for data-fill occupancy statistics"
+    )
+    fill_install_bytes_per_cycle = Param.Unsigned(
+        64, "L1 data refill bytes accepted per fill_stats_clock cycle"
     )
 
     # Atomic parameters only applicable to GPU atomics

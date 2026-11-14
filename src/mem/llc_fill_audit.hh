@@ -6,7 +6,13 @@
 #include <set>
 
 namespace gem5 { namespace llc_fill_audit {
-struct Native { unsigned source=1025;std::uint64_t admission=0,response=0;bool resolved=false; };
+struct Native {
+    unsigned source=1025;
+    std::uint64_t admission=0,response=0;
+    bool resolved=false;
+    // Diagnostic copies of the current SPR reducer, not legacy source bits.
+    unsigned spr_miss_mask=0,spr_unknown_mask=7,spr_estimated_mask=0,spr_path_mask=0;
+};
 class Audit {
     fastsim::llcaudit::Writer writer_;
     std::map<std::pair<int,std::uint64_t>,Native> pending_;
@@ -63,7 +69,11 @@ class Audit {
              <<",\"line\":"<<line<<",\"split\":"<<(((address>>6)!=last)?"true":"false")<<",\"flags\":"<<flags<<",\"measurement\":"<<(measurement?"true":"false")
              <<",\"tick\":"<<tick<<",\"source\":"<<n.source
              <<",\"admission_tick\":"<<n.admission<<",\"response_tick\":"<<n.response
-             <<",\"resolved\":"<<(n.resolved?"true":"false")<<'}';writer_.row(s.str());
+             <<",\"resolved\":"<<(n.resolved?"true":"false")
+             <<",\"spr_miss_mask\":"<<n.spr_miss_mask
+             <<",\"spr_unknown_mask\":"<<n.spr_unknown_mask
+             <<",\"spr_estimated_mask\":"<<n.spr_estimated_mask
+             <<",\"spr_path_mask\":"<<n.spr_path_mask<<'}';writer_.row(s.str());
         }
     }
     void squash(int core,std::uint64_t cutoff,std::uint64_t youngest,std::uint64_t tick) {

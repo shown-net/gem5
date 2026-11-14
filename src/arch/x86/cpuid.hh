@@ -53,6 +53,7 @@ enum StandardCpuidFunction
     ThermalPowerMgmt,
     ExtendedFeatures,
     ExtendedState = 0xD,
+    TscFrequency = 0x15,
     NumStandardCpuidFuncs
 };
 
@@ -86,8 +87,7 @@ struct CpuidResult
         rax(_rax), rbx(_rbx), rcx(_rcx), rdx(_rdx)
     {}
 
-    CpuidResult()
-    {}
+    CpuidResult() : rax(0), rbx(0), rcx(0), rdx(0) {}
 };
 
 class X86CPUID

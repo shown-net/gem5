@@ -42,7 +42,9 @@
 #ifndef __CPU_O3_FETCH_HH__
 #define __CPU_O3_FETCH_HH__
 
+#include <array>
 #include <optional>
+#include <set>
 #include "arch/generic/decoder.hh"
 #include "arch/generic/mmu.hh"
 #include "base/random.hh"
@@ -113,11 +115,14 @@ class Fetch
     {
       protected:
         Fetch *fetch;
+        RequestPtr request;
 
       public:
-        FetchTranslation(Fetch *_fetch) : fetch(_fetch) {}
+        FetchTranslation(Fetch *_fetch, const RequestPtr &_request)
+            : fetch(_fetch), request(_request) {}
 
         void markDelayed() {}
+        bool squashed() const override;
 
         void
         finish(const Fault &fault, const RequestPtr &req,
@@ -225,6 +230,8 @@ class Fetch
 
     /** Sets the main backwards communication time buffer pointer. */
     void setTimeBuffer(TimeBuffer<TimeStruct> *time_buffer);
+    void refreshWake();
+    void cancelWake();
 
     /** Sets pointer to list of active threads. */
     void setActiveThreads(std::list<ThreadID> *at_ptr);
@@ -234,8 +241,12 @@ class Fetch
     void setRenameQueue(TimeBuffer<DecodeStruct> *queue)
     { toRename = queue->getWire(0); }
     void invalidateTranslations();
+    void accountIcacheStalls();
     void invalidateCode(Addr physical_block);
-    void resolveMicrocodeControl(const DynInstPtr &inst, const PCStateBase &next);
+
+    bool markCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block);
+
+    bool pendingCodeWrite(ThreadID tid, Addr physical_block);
 
     /** Sets pointer to branch address calculation stage and FTQ */
     void setBACandFTQPtr(BAC *bac_ptr, FTQ *ftq_ptr);
@@ -278,6 +289,9 @@ class Fetch
     /** Tells fetch to wake up from a quiesce instruction. */
     void wakeFromQuiesce();
 
+    /** Read-only state for the explicitly enabled CPU progress diagnostic. */
+    void dumpProgressState() const;
+
     /** For priority-based fetch policies, need to keep update priorityList */
     void deactivateThread(ThreadID tid);
   private:
@@ -305,8 +319,17 @@ class Fetch
      * @param pc The actual PC of the current instruction.
      * @return Any fault that occured.
      */
-    bool fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc);
+    bool fetchCacheLine(Addr vaddr, ThreadID tid, Addr pc,
+                        bool lookahead = false);
     void finishTranslation(const Fault &fault, const RequestPtr &mem_req);
+    bool startByteLookahead(Addr address, ThreadID tid);
+    void finishByteTranslation(const Fault &fault, const RequestPtr &request);
+    void sendReadyByteRequests();
+    bool completeByteLookahead(PacketPtr packet);
+    void fetchPredictedBytes(ThreadID tid, FetchTargetPtr target);
+    bool byteRequestPending(Addr address, ThreadID tid) const;
+    void discardByteLookahead(ThreadID tid);
+    void revokeDemandRequest(ThreadID tid);
 
 
     /** Check if an interrupt is pending and that we need to handle
@@ -364,7 +387,7 @@ class Fetch
     void fetch(bool &status_change);
 
     /** Align a PC to the start of a fetch buffer block. */
-    Addr fetchBufferAlignPC(Addr addr)
+    Addr fetchBufferAlignPC(Addr addr) const
     {
         return (addr & ~(fetchBufferMask));
     }
@@ -379,6 +402,7 @@ class Fetch
     bool emitFrontendRecord(FrontendRecordPtr record);
     FrontendSource expansionSource = FrontendSource::Mite;
     std::optional<FrontendTemplate> expansionTemplate;
+    InstSeqNum expansionFirstSequence = 0;
     AllocationGroupPtr memoryExpansionGroup;
     std::vector<FrontendRecordPtr> pendingMemoryExpansion;
     bool decodeCanReuse = true;
@@ -413,6 +437,7 @@ class Fetch
   private:
     /** Pointer to the O3CPU. */
     CPU *cpu;
+    EventFunctionWrapper wakeEvent;
     FrontendCoordinator *frontend;
 
     /** Time buffer interface. */
@@ -432,6 +457,7 @@ class Fetch
 
     /** Wire used to write any information backward to BAC. */
     TimeBuffer<TimeStruct>::wire toBAC;
+    TimeBuffer<TimeStruct>::wire fromBAC;
 
     //Might be annoying how this name is different than the queue.
     /** Wire used to write any information heading to decode. */
@@ -447,6 +473,17 @@ class Fetch
     std::unique_ptr<PCStateBase> pc[MaxThreads];
 
     Addr fetchOffset[MaxThreads];
+    std::array<Addr, 2> decodedCodeBlocks[MaxThreads]{};
+    unsigned decodedCodeBlockCount[MaxThreads]{};
+    bool codeDecodeInProgress[MaxThreads]{};
+    bool expansionCodeStale[MaxThreads]{};
+
+    void clearCodeDecode(ThreadID tid)
+    {
+        decodedCodeBlockCount[tid] = 0;
+        codeDecodeInProgress[tid] = false;
+        expansionCodeStale[tid] = false;
+    }
 
     StaticInstPtr macroop[MaxThreads];
 
@@ -472,7 +509,7 @@ class Fetch
     };
 
     /** Tracks which stages are telling fetch to stall. */
-    Stalls stalls[MaxThreads];
+    Stalls stalls[MaxThreads]{};
 
     /** Enables the decoupled front-end */
     const bool decoupledFrontEnd;
@@ -496,7 +533,7 @@ class Fetch
     const unsigned decodeWidth;
 
     /** Is the cache blocked?  If so no threads can access it. */
-    bool cacheBlocked;
+    bool cacheBlocked = false;
 
     /** The packet that is waiting to be retried. */
     PacketPtr retryPkt;
@@ -529,10 +566,30 @@ class Fetch
 
     /** Whether or not the fetch buffer data is valid. */
     bool fetchBufferValid[MaxThreads];
+    bool byteLookahead[MaxThreads]{};
+    bool demandAccepted[MaxThreads]{};
+    struct ByteRequest
+    {
+        uint64_t epoch;
+        uint64_t order;
+        bool response = false;
+        bool cancelled = false;
+        bool translated = false;
+        bool demand = false;
+    };
+    std::map<RequestPtr, ByteRequest> byteRequests;
+    uint64_t nextByteRequestOrder = 0;
+    uint64_t lastByteIssue = ~uint64_t(0);
 
     /** Earliest cycle for the next fetch after a coupled BTB prediction. */
     uint64_t btbReadyCycle[MaxThreads]{};
     InstSeqNum microcodeControl[MaxThreads]{};
+    InstSeqNum noTargetBranch[MaxThreads]{};
+    std::set<InstSeqNum> lateHoldSequences[MaxThreads];
+    StaticInstPtr lcpDecoded[MaxThreads];
+    uint64_t lcpReadyCycle[MaxThreads]{};
+    std::shared_ptr<bool> dsbMissExposed[MaxThreads];
+    uint64_t lastIcacheAccounting = 0;
 
     /** Size of instructions. */
     int instSize;
@@ -569,6 +626,7 @@ class Fetch
     /*Max number of FT added to the FTQ per Cycle*/
     const unsigned maxFTPerCycle;
     const unsigned maxTakenPredPerCycle;
+    const unsigned maxDsbTakenPerCycle;
 
   protected:
     struct FetchStatGroup : public statistics::Group
@@ -585,6 +643,10 @@ class Fetch
         statistics::Scalar predictedBranches;
         /** Frontend batches which consumed more than one taken target. */
         statistics::Scalar multiTakenBatches;
+        /** Selected-thread fetch attempts blocked by an internal control. */
+        statistics::Scalar microcodeControlWaitCycles;
+        /** The subset whose retained parent is REP MOVS/STOS. */
+        statistics::Scalar repControlWaitCycles;
         /** Total number of cycles spent in any other state. */
         statistics::Scalar miscStallCycles;
         /** Total number of cycles spent in waiting for drains. */

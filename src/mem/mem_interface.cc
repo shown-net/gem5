@@ -53,6 +53,7 @@ namespace memory
 
 MemInterface::MemInterface(const MemInterfaceParams &_p)
     : AbstractMemory(_p),
+      channelRanges(_p.channel_ranges),
       addrMapping(_p.addr_mapping),
       burstSize((_p.devices_per_rank * _p.burst_length *
                  _p.device_bus_width) / 8),

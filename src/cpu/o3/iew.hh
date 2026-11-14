@@ -87,6 +87,9 @@ class FUPool;
 class IEW
 {
   public:
+    /** FSFP validation failure recovers without training memory-disambiguation. */
+    void squashFastForwarding(const DynInstPtr &inst);
+
     /** Overall IEW stage status. Used to determine if the CPU can
      * deschedule itself due to a lack of activity.
      */
@@ -229,8 +232,12 @@ class IEW
     /** Returns if the LSQ has any stores to writeback. */
     bool hasStoresToWB(ThreadID tid) { return ldstQueue.hasStoresToWB(tid); }
 
+    bool hasPendingCodeWrite(ThreadID tid, Addr physical_block)
+    { return ldstQueue.hasPendingCodeWrite(tid, physical_block); }
+
     /** Check misprediction  */
     void checkMisprediction(const DynInstPtr &inst);
+    void notifyBranchResolution(const DynInstPtr &inst);
 
     // hardware transactional memory
     // For debugging purposes, it is useful to keep track of the most recent
@@ -251,7 +258,8 @@ class IEW
     /** Sends commit proper information for a squash due to a memory order
      * violation.
      */
-    void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid);
+    void squashDueToMemOrder(const DynInstPtr &inst, ThreadID tid,
+                            RecoveryCause cause = RecoveryCause::MemoryOrdering);
 
     /** Sets Dispatch to blocked, and signals back to other stages to block. */
     void block(ThreadID tid);
@@ -398,18 +406,8 @@ class IEW
     /** Width of issue, in instructions. */
     unsigned issueWidth;
 
-    /** Index into queue of instructions being written back. */
-    unsigned wbNumInst;
-
-    /** Cycle number within the queue of instructions being written back.
-     * Used in case there are too many instructions writing back at the current
-     * cycle and writesbacks need to be scheduled for the future. See comments
-     * in instToCommit().
-     */
-    unsigned wbCycle;
-
-    /** Writeback width. */
-    unsigned wbWidth;
+    /** Result values already produced, awaiting their completion notification. */
+    unsigned pendingResultCompletions = 0;
 
     /** Number of active threads. */
     ThreadID numThreads;

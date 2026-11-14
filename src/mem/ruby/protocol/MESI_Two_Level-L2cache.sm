@@ -72,6 +72,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     SS, AccessPermission:Read_Only, desc="L2 cache entry Shared, also present in one or more L1s";
     M, AccessPermission:Read_Write, desc="L2 cache entry Modified, not present in any L1s", format="!b";
     MT, AccessPermission:Maybe_Stale, desc="L2 cache entry Modified in a local L1, assume L2 copy stale", format="!b";
+    DS, AccessPermission:NotPresent, desc="Directory-only shared line; memory is current";
+    DT, AccessPermission:NotPresent, desc="Directory-only line with a private exclusive owner";
+    S_WB, AccessPermission:Read_Only, desc="Data eviction writes current shared TBE data to memory, retaining sharers";
 
     // L2 replacement
     M_I, AccessPermission:Busy, desc="L2 cache replacing, have all acks, sent dirty data to memory, waiting for ACK from memory";
@@ -88,6 +91,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     // Blocking states
     SS_MB, AccessPermission:Busy, desc="Blocked for L1_GETX from SS";
     MT_MB, AccessPermission:Busy, desc="Blocked for L1_GETX from MT";
+    DT_MB, AccessPermission:Busy, desc="Directory-only ownership handoff, waiting for exclusive unblock";
 
     MT_IIB, AccessPermission:Busy, desc="Blocked for L1_GETS from MT, waiting for unblock and data";
     MT_IB, AccessPermission:Busy, desc="Blocked for L1_GETS from MT, got unblock, waiting for data";
@@ -118,6 +122,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     // events from memory controller
     Mem_Data,     desc="data from memory", format="!r";
     Mem_Ack,     desc="ack from memory", format="!r";
+    Mem_Ack_NoSharers, desc="Flush memory ack when no sharer ack is outstanding";
 
     // M->S data writeback
     WB_Data,  desc="data from L1";
@@ -145,8 +150,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     State CacheState,          desc="cache state";
     NetDest Sharers,               desc="tracks the L1 shares on-chip";
     MachineID Exclusive,          desc="Exclusive holder of block";
-    DataBlock DataBlk,       desc="data for the block";
     bool Dirty, default="false", desc="data is dirty";
+  }
+
+  // Only these entries occupy the configured data ways. The logical directory
+  // above has no DataBlock and cannot satisfy a data hit after eviction.
+  structure(DataEntry, desc="Bounded LLC data storage", interface="AbstractCacheEntry", main="false") {
+    DataBlock DataBlk, desc="data for the block";
+    bool DataValid, default="false", desc="the data way has received data";
   }
 
   // TBE fields
@@ -154,6 +165,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     Addr addr,            desc="Physical address for this TBE";
     State TBEState,             desc="Transient state";
     DataBlock DataBlk,          desc="Buffer for the data block";
+    bool DataValid, default="false", desc="TBE contains received or copied data";
     bool Dirty, default="false", desc="Data is Dirty";
     MachineID Requestor,        desc="Who allocated this TBE";
 
@@ -188,9 +200,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   void profileMsgDelay(int virtualNetworkType, Cycles c);
   MachineID mapAddressToMachine(Addr addr, MachineType mtype);
 
-  // inclusive cache, returns L2 entries only
+  // Metadata is independent of the bounded data cache. Its capacity is a
+  // logical-directory model proxy, not an inferred hardware directory size.
   Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
-    return static_cast(Entry, "pointer", L2cache[addr]);
+    return static_cast(Entry, "pointer", L2cache.lookupDirectory(addr));
+  }
+
+  DataEntry getDataEntry(Addr addr), return_by_pointer="yes" {
+    return static_cast(DataEntry, "pointer", L2cache[addr]);
   }
 
   bool isSharer(Addr addr, MachineID requestor, Entry cache_entry) {
@@ -230,13 +247,19 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   AccessPermission getAccessPermission(Addr addr) {
     TBE tbe := TBEs[addr];
-    if(is_valid(tbe)) {
+    if(is_valid(tbe) && tbe.DataValid) {
+      // Current data retained for a flush remains functionally readable while
+      // timing-side ownership release waits for acknowledgements.
+      if (tbe.TBEState == State:I_FF || tbe.TBEState == State:I_F) {
+        return AccessPermission:Read_Only;
+      }
       DPRINTF(RubySlicc, "%s\n", L2Cache_State_to_permission(tbe.TBEState));
       return L2Cache_State_to_permission(tbe.TBEState);
     }
 
     Entry cache_entry := getCacheEntry(addr);
-    if(is_valid(cache_entry)) {
+    DataEntry data_entry := getDataEntry(addr);
+    if(is_valid(cache_entry) && is_valid(data_entry) && data_entry.DataValid) {
       DPRINTF(RubySlicc, "%s\n", L2Cache_State_to_permission(cache_entry.CacheState));
       return L2Cache_State_to_permission(cache_entry.CacheState);
     }
@@ -247,10 +270,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   void functionalRead(Addr addr, Packet *pkt) {
     TBE tbe := TBEs[addr];
-    if(is_valid(tbe)) {
+    if(is_valid(tbe) && tbe.DataValid) {
       testAndRead(addr, tbe.DataBlk, pkt);
     } else {
-      testAndRead(addr, getCacheEntry(addr).DataBlk, pkt);
+      DataEntry data_entry := getDataEntry(addr);
+      if (is_valid(data_entry) && data_entry.DataValid) {
+        testAndRead(addr, data_entry.DataBlk, pkt);
+      }
     }
   }
 
@@ -262,20 +288,25 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     int num_functional_writes := 0;
 
     TBE tbe := TBEs[addr];
-    if(is_valid(tbe)) {
+    if(is_valid(tbe) && tbe.DataValid) {
       num_functional_writes := num_functional_writes +
         testAndWrite(addr, tbe.DataBlk, pkt);
-      return num_functional_writes;
     }
-
-    num_functional_writes := num_functional_writes +
-        testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+    DataEntry data_entry := getDataEntry(addr);
+    if (is_valid(data_entry) && data_entry.DataValid) {
+      num_functional_writes := num_functional_writes +
+          testAndWrite(addr, data_entry.DataBlk, pkt);
+    }
     return num_functional_writes;
   }
 
   void setAccessPermission(Entry cache_entry, Addr addr, State state) {
     if (is_valid(cache_entry)) {
       cache_entry.changePermission(L2Cache_State_to_permission(state));
+    }
+    DataEntry data_entry := getDataEntry(addr);
+    if (is_valid(data_entry)) {
+      data_entry.changePermission(L2Cache_State_to_permission(state));
     }
   }
 
@@ -378,7 +409,12 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
           if(in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
               trigger(Event:Mem_Data, in_msg.addr, cache_entry, tbe);
           } else if(in_msg.Type == CoherenceResponseType:MEMORY_ACK) {
-              trigger(Event:Mem_Ack, in_msg.addr, cache_entry, tbe);
+              if (is_valid(tbe) && tbe.TBEState == State:I_FF &&
+                  tbe.pendingAcks == 0) {
+                trigger(Event:Mem_Ack_NoSharers, in_msg.addr, cache_entry, tbe);
+              } else {
+                trigger(Event:Mem_Ack, in_msg.addr, cache_entry, tbe);
+              }
           } else if(in_msg.Type == CoherenceResponseType:INV) {
               trigger(Event:MEM_Inv, in_msg.addr, cache_entry, tbe);
           } else {
@@ -404,7 +440,12 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         assert(in_msg.Destination.isElement(machineID));
 
         if (in_msg.Type == CoherenceRequestType:FLUSH) {
-          if (in_msg.Dirty || (is_valid(cache_entry) && cache_entry.Dirty)) {
+          if (is_valid(cache_entry) &&
+              (getState(tbe, cache_entry, in_msg.addr) == State:MT ||
+               getState(tbe, cache_entry, in_msg.addr) == State:DT) &&
+              cache_entry.Exclusive != in_msg.Requestor) {
+            trigger(Event:Flush_NP, in_msg.addr, cache_entry, tbe);
+          } else if (in_msg.Dirty || (is_valid(cache_entry) && cache_entry.Dirty)) {
             trigger(Event:Flush, in_msg.addr, cache_entry, tbe);
           } else {
             trigger(Event:Flush_Clean, in_msg.addr, cache_entry, tbe);
@@ -421,8 +462,20 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
           } else {
             trigger(Event:Flush_Data_Clean, in_msg.addr, cache_entry, tbe);
           }
-        } else if (is_valid(cache_entry)) {
-          // The L2 contains the block, so proceeded with handling the request
+        } else if (is_valid(cache_entry) &&
+                   ((cache_entry.CacheState != State:DS &&
+                     cache_entry.CacheState != State:DT) ||
+                    (cache_entry.CacheState == State:DT &&
+                     (in_msg.Type == CoherenceRequestType:GETX ||
+                      in_msg.Type == CoherenceRequestType:UPGRADE)) ||
+                    (cache_entry.CacheState == State:DS &&
+                     in_msg.Type == CoherenceRequestType:UPGRADE &&
+                     cache_entry.Sharers.isElement(in_msg.Requestor)) ||
+                    (in_msg.Type == CoherenceRequestType:PUTX &&
+                     (cache_entry.CacheState == State:DS ||
+                      !cache_entry.Sharers.isElement(in_msg.Requestor))))) {
+          // Directory-only forwarding, upgrade and stale writeback handling
+          // do not reserve data ways. A returning owner or GETS fill does.
           trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
                                                 in_msg.Requestor, cache_entry),
                   in_msg.addr, cache_entry, tbe);
@@ -484,19 +537,21 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(c_exclusiveReplacement, "c", desc="Send data to memory") {
+    perfCacheNativeWritebackGlobal(2, true);
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       assert(is_valid(cache_entry));
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:MEMORY_DATA;
       out_msg.Sender := machineID;
       out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.DataBlk := getDataEntry(address).DataBlk;
       out_msg.Dirty := cache_entry.Dirty;
       out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
 
   action(c_exclusiveCleanReplacement, "cc", desc="Send ack to memory for clean replacement") {
+    perfCacheNativeWritebackGlobal(2, false);
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:ACK;
@@ -507,8 +562,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(ct_exclusiveReplacementFromTBE, "ct", desc="Send data to memory") {
+    perfCacheNativeWritebackGlobal(2, true);
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
-      assert(is_valid(tbe));
+      assert(is_valid(tbe) && tbe.DataValid);
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:MEMORY_DATA;
       out_msg.Sender := machineID;
@@ -527,7 +583,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         out_msg.Type := CoherenceResponseType:DATA;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
-        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.DataBlk := getDataEntry(address).DataBlk;
+        out_msg.ServiceSource := 2;
+        out_msg.ServiceL3Outcome := 1;
         out_msg.MessageSize := MessageSizeType:Response_Data;
 
         out_msg.AckCount := 0 - cache_entry.Sharers.count();
@@ -546,7 +604,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         out_msg.Type := CoherenceResponseType:DATA_EXCLUSIVE;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
-        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.DataBlk := getDataEntry(address).DataBlk;
+        out_msg.ServiceSource := 2;
+        out_msg.ServiceL3Outcome := 1;
         out_msg.MessageSize := MessageSizeType:Response_Data;
 
         out_msg.AckCount := 0 - cache_entry.Sharers.count();
@@ -565,7 +625,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         out_msg.Type := CoherenceResponseType:DATA;
         out_msg.Sender := machineID;
         out_msg.Destination.add(in_msg.Requestor);
-        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.DataBlk := getDataEntry(address).DataBlk;
+        out_msg.ServiceSource := 2;
+        out_msg.ServiceL3Outcome := 1;
         out_msg.MessageSize := MessageSizeType:Response_Data;
         out_msg.AckCount := 0;
       }
@@ -581,7 +643,10 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       out_msg.Type := CoherenceResponseType:DATA;
       out_msg.Sender := machineID;
       out_msg.Destination := tbe.L1_GetS_IDs;  // internal nodes
-      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.DataBlk := getDataEntry(address).DataBlk;
+      // This action is reached for an LLC miss returning memory data.
+      out_msg.ServiceSource := 3;
+      out_msg.ServiceL3Outcome := 2;
       out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
@@ -595,7 +660,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       out_msg.Type := CoherenceResponseType:DATA_EXCLUSIVE;
       out_msg.Sender := machineID;
       out_msg.Destination := tbe.L1_GetS_IDs;  // internal nodes
-      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.DataBlk := getDataEntry(address).DataBlk;
+      out_msg.ServiceSource := 3;
+      out_msg.ServiceL3Outcome := 2;
       out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
@@ -608,8 +675,15 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
       out_msg.Type := CoherenceResponseType:DATA;
       out_msg.Sender := machineID;
       out_msg.Destination.add(tbe.L1_GetX_ID);
+      // A directory-only shared miss retains old sharers until invalidated.
+      out_msg.AckCount := 0 - cache_entry.Sharers.count();
+      if (cache_entry.Sharers.isElement(tbe.L1_GetX_ID)) {
+        out_msg.AckCount := out_msg.AckCount + 1;
+      }
       DPRINTF(RubySlicc, "%s\n", out_msg.Destination);
-      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.DataBlk := getDataEntry(address).DataBlk;
+      out_msg.ServiceSource := 3;
+      out_msg.ServiceL3Outcome := 2;
       DPRINTF(RubySlicc, "Address: %#x, Destination: %s, DataBlock: %s\n",
               out_msg.addr, out_msg.Destination, out_msg.DataBlk);
       out_msg.MessageSize := MessageSizeType:Response_Data;
@@ -661,7 +735,12 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     TBEs.allocate(address);
     set_tbe(TBEs[address]);
     tbe.L1_GetS_IDs.clear();
-    tbe.DataBlk := cache_entry.DataBlk;
+    if (cache_entry.CacheState != State:MT &&
+        cache_entry.CacheState != State:DT &&
+        is_valid(getDataEntry(address)) && getDataEntry(address).DataValid) {
+      tbe.DataBlk := getDataEntry(address).DataBlk;
+      tbe.DataValid := true;
+    }
     tbe.Dirty := cache_entry.Dirty;
     tbe.pendingAcks := cache_entry.Sharers.count();
   }
@@ -706,7 +785,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(m_writeDataToCache, "m", desc="Write data from response queue to cache") {
     peek(responseL2Network_in, ResponseMsg) {
       assert(is_valid(cache_entry));
-      cache_entry.DataBlk := in_msg.DataBlk;
+      getDataEntry(address).DataBlk := in_msg.DataBlk;
+      getDataEntry(address).DataValid := true;
       if (in_msg.Dirty) {
         cache_entry.Dirty := in_msg.Dirty;
       }
@@ -716,10 +796,10 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(mr_writeDataToCacheFromRequest, "mr", desc="Write data from response queue to cache") {
     peek(L1RequestL2Network_in, RequestMsg) {
       assert(is_valid(cache_entry));
-      if (in_msg.Dirty) {
-        cache_entry.DataBlk := in_msg.DataBlk;
-        cache_entry.Dirty := in_msg.Dirty;
-      }
+      // A clean exclusive owner also returns data: LLC may have no backup.
+      getDataEntry(address).DataBlk := in_msg.DataBlk;
+      getDataEntry(address).DataValid := true;
+      if (in_msg.Dirty) { cache_entry.Dirty := true; }
     }
   }
 
@@ -737,7 +817,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     peek(responseL2Network_in, ResponseMsg) {
       assert(is_valid(tbe));
       tbe.DataBlk := in_msg.DataBlk;
-      tbe.Dirty := in_msg.Dirty;
+      tbe.DataValid := true;
+      if (in_msg.Dirty) { tbe.Dirty := true; }
     }
   }
 
@@ -761,13 +842,42 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   action(qq_allocateL2CacheBlock, "\q", desc="Set L2 cache tag equal to tag of block B.") {
     if (is_invalid(cache_entry)) {
-      set_cache_entry(L2cache.allocate(address, new Entry));
+      set_cache_entry(L2cache.allocateDirectory(address, new Entry));
+    }
+    if (is_invalid(getDataEntry(address))) {
+      L2cache.allocateVoid(address, new DataEntry);
+    }
+  }
+
+  action(rd_dropDataOnly, "rd", desc="Release bounded data way, preserve directory") {
+    assert(is_valid(getDataEntry(address)));
+    llcFillAuditEvict(address);
+    L2cache.deallocate(address);
+  }
+
+  action(cd_markMemoryClean, "cd", desc="Retained writeback made memory current") {
+    cache_entry.Dirty := false;
+  }
+
+  action(cr_writebackRetainDirectory, "cr", desc="Write dirty data without releasing directory ownership") {
+    assert(is_valid(tbe) && tbe.DataValid);
+    enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:MEMORY_DATA_RETAIN;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Dirty := true;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
     }
   }
 
   action(rr_deallocateL2CacheBlock, "\r", desc="Deallocate L2 cache block.  Sets the cache to not present, allowing a replacement in parallel with a fetch.") {
-    llcFillAuditEvict(address);
-    L2cache.deallocate(address);
+    if (is_valid(getDataEntry(address))) {
+      llcFillAuditEvict(address);
+      L2cache.deallocate(address);
+    }
+    L2cache.deallocateDirectory(address);
     unset_cache_entry();
   }
 
@@ -841,20 +951,52 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     }
   }
 
+  action(tf_captureFlushData, "tf", desc="Preserve dirty flush data in the finite transaction buffer") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      if (in_msg.Type == CoherenceRequestType:FLUSH ||
+          in_msg.Type == CoherenceRequestType:FLUSH_DATA) {
+        tbe.DataBlk := in_msg.DataBlk;
+        tbe.DataValid := true;
+        if (in_msg.Dirty) { tbe.Dirty := true; }
+      }
+    }
+  }
+
+  action(qa_clearPendingAcks, "qa", desc="Last sharer has acknowledged invalidation") {
+    tbe.pendingAcks := 0;
+  }
+
+  action(cf_releaseFlushedDirectory, "cf", desc="Release ownership only after every sharer is invalidated") {
+    if (tbe.pendingAcks == 0) {
+      enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        if (tbe.Dirty) {
+          assert(tbe.DataValid);
+          out_msg.Type := CoherenceResponseType:MEMORY_DATA;
+          out_msg.DataBlk := tbe.DataBlk;
+          out_msg.Dirty := true;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+        } else {
+          out_msg.Type := CoherenceResponseType:ACK;
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+      }
+    }
+  }
+
   action(c_exclusiveFlushReplacement, "cef", desc="Send flushed data to memory") {
     peek(L1RequestL2Network_in, RequestMsg) {
+      perfCacheNativeWritebackGlobal(2, cache_entry.Dirty);
       enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
-        assert(is_valid(cache_entry));
+        assert(is_valid(tbe) && tbe.DataValid);
         out_msg.addr := address;
         out_msg.Type := CoherenceResponseType:MEMORY_DATA;
         out_msg.Sender := machineID;
         out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
-        out_msg.DataBlk := cache_entry.DataBlk;
-        out_msg.Dirty := cache_entry.Dirty;
-        if (in_msg.Dirty) {
-          out_msg.DataBlk := in_msg.DataBlk;
-          out_msg.Dirty := in_msg.Dirty;
-        }
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Dirty := tbe.Dirty;
         out_msg.MessageSize := MessageSizeType:Response_Data;
       }
     }
@@ -878,50 +1020,75 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
     L2cache.profileDemandMiss();
     peek(L1RequestL2Network_in, RequestMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 1);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 1);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 1);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 1);
     }
   }
 
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
     L2cache.profileDemandHit();
     peek(L1RequestL2Network_in, RequestMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 0);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 0);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 0);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 0);
     }
   }
 
   action(uu_profileUpgrade, "\uuu", desc="Profile permission upgrade") {
     L2cache.profileDemandHit();
     peek(L1RequestL2Network_in, RequestMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 2);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 2);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 2);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 2);
     }
   }
 
   action(uu_profileMergedMiss, "\umm", desc="Profile TBE-merged miss") {
     L2cache.profileDemandMiss();
     peek(L1RequestL2Network_in, RequestMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 3);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 3);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 3);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 3);
     }
   }
 
   action(uu_profileRemoteSupply, "\urs", desc="Profile remote-owner supply") {
     L2cache.profileDemandMiss();
     peek(L1RequestL2Network_in, RequestMsg) {
-      taotraceCacheOutcomeByIdentity(in_msg.TraceValid,
+      nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 4);
+      taotraceAttemptCacheOutcome(in_msg.TraceValid,
+          in_msg.TraceContextId, in_msg.TraceInstSeqNum,
+          in_msg.PerfTransactionId, 2, 4);
       perfCacheNativeLookupFromRequestor(in_msg.PerfTransactionId, in_msg.Requestor,
           in_msg.Prefetch, 2, 4);
+      prefetchOracleLookup(in_msg.PrefetchOracleGeneration, in_msg.Requestor,
+          in_msg.addr, in_msg.Prefetch, 4);
     }
   }
 
@@ -993,21 +1160,21 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   // BASE STATE - I
 
   // Transitions from I (Idle)
-  transition({NP, IS, ISS, IM, SS, M, M_I, I_I, S_I, MT_IB, MT_SB}, L1_PUTX) {
+  transition({NP, IS, ISS, IM, SS, DS, M, M_I, I_I, S_I, MT_IB, MT_SB}, L1_PUTX) {
     t_sendWBAck;
     jj_popL1RequestQueue;
   }
 
-  transition({NP, SS, M, MT, M_I, I_I, S_I, IS, ISS, IM, MT_IB, MT_SB}, L1_PUTX_old) {
+  transition({NP, SS, DS, DT, M, MT, M_I, I_I, S_I, IS, ISS, IM, MT_IB, MT_SB}, L1_PUTX_old) {
     t_sendWBAck;
     jj_popL1RequestQueue;
   }
 
-  transition({IM, IS, ISS, SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB}, {L2_Replacement, L2_Replacement_clean, Flush, Flush_Data, Flush_NP, Flush_Clean, Flush_NP_Clean, Flush_Data_Clean}) {
+  transition({IM, IS, ISS, SS_MB, MT_MB, DT_MB, MT_IIB, MT_IB, MT_SB}, {L2_Replacement, L2_Replacement_clean, Flush, Flush_Data, Flush_NP, Flush_Clean, Flush_NP_Clean, Flush_Data_Clean}) {
     zz_stallAndWaitL1RequestQueue;
   }
 
-  transition({IM, IS, ISS, SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB}, MEM_Inv) {
+  transition({IM, IS, ISS, SS_MB, MT_MB, DT_MB, MT_IIB, MT_IB, MT_SB}, MEM_Inv) {
     zn_recycleResponseNetwork;
   }
 
@@ -1016,12 +1183,16 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
 
-  transition({SS_MB, MT_MB, MT_IIB, MT_IB, MT_SB}, {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE}) {
+  transition({SS_MB, MT_MB, DT_MB, MT_IIB, MT_IB, MT_SB}, {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE}) {
     zz_stallAndWaitL1RequestQueue;
   }
 
-  transition({I_F, MT_F, I_FF}, {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE, L1_PUTX, L1_PUTX_old, L2_Replacement, L2_Replacement_clean, WB_Data, WB_Data_clean, MEM_Inv, Unblock, Exclusive_Unblock}) {
+  transition({I_F, MT_F, I_FF}, {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE, L1_PUTX, L1_PUTX_old, L2_Replacement, L2_Replacement_clean, WB_Data, WB_Data_clean, Unblock, Exclusive_Unblock}) {
     zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition({I_F, MT_F, I_FF}, MEM_Inv) {
+    zn_recycleResponseNetwork;
   }
 
   transition(NP, L1_GETS,  ISS) {
@@ -1095,11 +1266,11 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     jj_popL1RequestQueue;
   }
 
-  transition({IS, ISS}, L1_GETX) {
+  transition({IS, ISS}, {L1_GETX, L1_UPGRADE}) {
     zz_stallAndWaitL1RequestQueue;
   }
 
-  transition(IM, {L1_GETX, L1_GETS, L1_GET_INSTR}) {
+  transition(IM, {L1_GETX, L1_GETS, L1_GET_INSTR, L1_UPGRADE}) {
     zz_stallAndWaitL1RequestQueue;
   }
 
@@ -1130,16 +1301,74 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     jj_popL1RequestQueue;
   }
 
-  transition(SS, L2_Replacement_clean, I_I) {
-    i_allocateTBE;
-    f_sendInvToSharers;
-    rr_deallocateL2CacheBlock;
+  // Data capacity replacement does not invalidate private sharers.
+  transition(SS, L2_Replacement_clean, DS) {
+    rd_dropDataOnly;
   }
 
-  transition(SS, {L2_Replacement, MEM_Inv}, S_I) {
+  transition(SS, L2_Replacement, S_WB) {
+    i_allocateTBE;
+    cr_writebackRetainDirectory;
+    rd_dropDataOnly;
+  }
+
+  transition(S_WB, Mem_Ack, DS) {
+    cd_markMemoryClean;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(S_WB, {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE, L1_PUTX, L1_PUTX_old, Flush, Flush_NP, Flush_Clean, Flush_NP_Clean, Flush_Data, Flush_Data_Clean}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  transition(S_WB, MEM_Inv) {
+    zn_recycleResponseNetwork;
+  }
+
+  // A metadata hit is a real data miss and uses the same finite data ways.
+  transition(DS, {L1_GETS, L1_GET_INSTR}, IS) {
+    qq_allocateL2CacheBlock;
+    nn_addSharer;
+    i_allocateTBE;
+    ti_recordTraceRequest;
+    ss_recordGetSL1ID;
+    a_issueFetchToMemory;
+    uu_profileMiss;
+    jj_popL1RequestQueue;
+  }
+
+  transition(DS, L1_GETX, IM) {
+    qq_allocateL2CacheBlock;
+    i_allocateTBE;
+    ti_recordTraceRequest;
+    xx_recordGetXL1ID;
+    fwm_sendFwdInvToSharersMinusRequestor;
+    a_issueFetchToMemory;
+    uu_profileMiss;
+    jj_popL1RequestQueue;
+  }
+
+  transition(DS, L1_UPGRADE, DT_MB) {
+    fwm_sendFwdInvToSharersMinusRequestor;
+    ts_sendInvAckToUpgrader;
+    uu_profileUpgrade;
+    jj_popL1RequestQueue;
+  }
+
+  transition(DS, MEM_Inv, I_I) {
     i_allocateTBE;
     f_sendInvToSharers;
     rr_deallocateL2CacheBlock;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(SS, MEM_Inv, S_I) {
+    i_allocateTBE;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+    o_popIncomingResponseQueue;
   }
 
 
@@ -1165,7 +1394,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     jj_popL1RequestQueue;
   }
 
-  transition(M, {L2_Replacement, MEM_Inv}, M_I) {
+  transition(M, L2_Replacement, M_I) {
     i_allocateTBE;
     c_exclusiveReplacement;
     rr_deallocateL2CacheBlock;
@@ -1175,6 +1404,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     i_allocateTBE;
     c_exclusiveCleanReplacement;
     rr_deallocateL2CacheBlock;
+  }
+
+  transition(M, MEM_Inv, M_I) {
+    i_allocateTBE;
+    c_exclusiveReplacement;
+    rr_deallocateL2CacheBlock;
+    o_popIncomingResponseQueue;
   }
 
 
@@ -1187,27 +1423,34 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     jj_popL1RequestQueue;
   }
 
+  transition(DT, L1_GETX, DT_MB) {
+    b_forwardRequestToExclusive;
+    uu_profileRemoteSupply;
+    jj_popL1RequestQueue;
+  }
 
-  transition(MT, {L1_GETS, L1_GET_INSTR}, MT_IIB) {
+
+  transition({MT, DT}, {L1_GETS, L1_GET_INSTR}, MT_IIB) {
+    qq_allocateL2CacheBlock;
     b_forwardRequestToExclusive;
     uu_profileRemoteSupply;
     set_setMRU;
     jj_popL1RequestQueue;
   }
 
-  transition(MT, {L2_Replacement, MEM_Inv}, MT_I) {
+  transition({MT, DT}, MEM_Inv, MT_I) {
     i_allocateTBE;
     f_sendInvToSharers;
     rr_deallocateL2CacheBlock;
+    o_popIncomingResponseQueue;
   }
 
-  transition(MT, L2_Replacement_clean, MCT_I) {
-    i_allocateTBE;
-    f_sendInvToSharers;
-    rr_deallocateL2CacheBlock;
+  transition(MT, {L2_Replacement, L2_Replacement_clean}, DT) {
+    rd_dropDataOnly;
   }
 
-  transition(MT, L1_PUTX, M) {
+  transition({MT, DT}, L1_PUTX, M) {
+    qq_allocateL2CacheBlock;
     ll_clearSharers;
     mr_writeDataToCacheFromRequest;
     t_sendWBAck;
@@ -1216,6 +1459,12 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   transition({SS_MB,MT_MB}, Exclusive_Unblock, MT) {
     // update actual directory
+    mmu_markExclusiveFromUnblock;
+    k_popUnblockQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(DT_MB, Exclusive_Unblock, DT) {
     mmu_markExclusiveFromUnblock;
     k_popUnblockQueue;
     kd_wakeUpDependents;
@@ -1252,6 +1501,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     zz_stallAndWaitL1RequestQueue;
   }
 
+  // A flush racing a replacement waits for its writeback transaction and
+  // is retried when Mem_Ack releases the line and wakes its dependents.
+  transition({I_I, S_I, MT_I, MCT_I, M_I},
+             {Flush, Flush_NP, Flush_Clean, Flush_NP_Clean}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
   transition(I_I, Ack) {
     q_updateAck;
     o_popIncomingResponseQueue;
@@ -1262,13 +1518,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     o_popIncomingResponseQueue;
   }
 
-  transition({MT_I, MCT_I}, WB_Data, M_I) {
+  transition({MT_I, MCT_I}, {WB_Data, WB_Data_clean}, M_I) {
     qq_writeDataToTBE;
     ct_exclusiveReplacementFromTBE;
     o_popIncomingResponseQueue;
   }
 
-  transition(MCT_I, {WB_Data_clean, Ack_all}, M_I) {
+  transition(MCT_I, Ack_all, M_I) {
     c_exclusiveCleanReplacement;
     o_popIncomingResponseQueue;
   }
@@ -1279,19 +1535,20 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     jj_popL1RequestQueue;
   }
 
-  transition(SS, {Flush, Flush_NP}, I_FF) {
+  transition({SS, DS}, {Flush, Flush_NP}, I_FF) {
     i_allocateTBE;
     t_setTbeRequestor;
+    tf_captureFlushData;
     fwn_sendInvToSharersMinusRequestorFlush;
-    c_exclusiveFlushReplacement;
+    cf_releaseFlushedDirectory;
     jj_popL1RequestQueue;
   }
 
-  transition(SS, {Flush_Clean, Flush_NP_Clean}, I_FF) {
+  transition({SS, DS}, {Flush_Clean, Flush_NP_Clean}, I_FF) {
     i_allocateTBE;
     t_setTbeRequestor;
     fwn_sendInvToSharersMinusRequestorFlush;
-    c_exclusiveCleanReplacement;
+    cf_releaseFlushedDirectory;
     jj_popL1RequestQueue;
   }
 
@@ -1309,21 +1566,23 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     jj_popL1RequestQueue;
   }
 
-  transition(MT, Flush, I_F) {
+  transition({MT, DT}, Flush, I_F) {
     i_allocateTBE;
     t_setTbeRequestor;
+    tf_captureFlushData;
     c_exclusiveFlushReplacement;
     jj_popL1RequestQueue;
   }
 
-  transition(MT, Flush_Clean, I_F) {
+  transition({MT, DT}, Flush_Clean, I_F) {
     i_allocateTBE;
     t_setTbeRequestor;
+    tf_captureFlushData;
     c_exclusiveCleanReplacement;
     jj_popL1RequestQueue;
   }
 
-  transition(MT, {Flush_NP, Flush_NP_Clean}, MT_F) {
+  transition({MT, DT}, {Flush_NP, Flush_NP_Clean}, MT_F) {
     i_allocateTBE;
     t_setTbeRequestor;
     f_flushGetDataFromOwner;
@@ -1331,15 +1590,24 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   transition(MT_F, Flush_Data, I_F) {
+    tf_captureFlushData;
     c_exclusiveFlushReplacement;
     jj_popL1RequestQueue;
   }
 
-  transition(MT_F, Flush_Data_Clean, NP) {
+  transition(MT_F, Flush_Data_Clean, I_F) {
+    // Even a clean flush must release the backing directory's owner.
+    tf_captureFlushData;
+    c_exclusiveCleanReplacement;
+    jj_popL1RequestQueue;
+  }
+
+  transition(I_FF, Mem_Ack_NoSharers, NP) {
     f_sendFlushAckToL1;
     s_deallocateTBE;
     rr_deallocateL2CacheBlock;
-    jj_popL1RequestQueue;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
   }
 
   transition(I_FF, Mem_Ack, I_F) {
@@ -1357,6 +1625,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   transition(I_FF, Ack_all, I_F) {
+    qa_clearPendingAcks;
+    cf_releaseFlushedDirectory;
     o_popIncomingResponseQueue;
   }
 
@@ -1365,6 +1635,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     s_deallocateTBE;
     rr_deallocateL2CacheBlock;
     o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
   }
 
   transition(MCT_I,  {L1_PUTX, L1_PUTX_old}){
@@ -1372,7 +1643,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   // L1 never changed Dirty data
-  transition(MT_I, {WB_Data_clean, Ack_all}, M_I) {
+  transition(MT_I, Ack_all, M_I) {
     ct_exclusiveReplacementFromTBE;
     o_popIncomingResponseQueue;
   }
@@ -1382,7 +1653,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   // possible race between unblock and immediate replacement
-  transition({MT_MB,SS_MB}, {L1_PUTX, L1_PUTX_old}) {
+  transition({MT_MB,SS_MB,DT_MB}, {L1_PUTX, L1_PUTX_old}) {
     zz_stallAndWaitL1RequestQueue;
   }
 

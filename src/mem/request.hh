@@ -264,6 +264,8 @@ class Request : public Extensible<Request>
         HAS_NO_ADDR                = 0x0001000000000000,
         /** Internal O3 TSO store-buffer permission preparation. */
         STORE_PREPARE              = 0x0002000000000000,
+        /** Bounded x86 REP access requiring normal cacheable RAM. */
+        REP_BULK                   = 0x0004000000000000,
         // clang-format on
     };
     static const FlagsType STORE_NO_DATA = CACHE_BLOCK_ZERO |

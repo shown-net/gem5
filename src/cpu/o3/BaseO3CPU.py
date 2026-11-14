@@ -45,8 +45,9 @@ from m5.objects.BaseCPU import BaseCPU
 from m5.objects.BranchPredictor import *
 from m5.objects.FUPool import *
 from m5.objects.Frontend import FrontendCoordinator
-from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, ResultForwarding
+from m5.objects.IntExecution import ExecutionPorts, IntExecutionResource, IntegerALU, IntegerDivider, ResultForwarding
 from m5.objects.ZeroIdiom import ZeroIdiom
+from m5.objects.StackEngine import StackEngine
 from m5.objects.IndexingPolicies import *
 from m5.objects.IQUnit import *
 from m5.objects.ReplacementPolicies import *
@@ -63,6 +64,7 @@ class BaseO3CPU(BaseCPU):
     executionPorts = Param.ExecutionPorts(NULL, "Shared integer execution ports")
     resultForwarding = Param.ResultForwarding(NULL, "Versioned result paths")
     zeroIdiom = Param.ZeroIdiom(NULL, "Rename-time constant result formation")
+    stackEngine = Param.StackEngine(NULL, "Speculative x86 stack-pointer tracking")
     frontend = Param.FrontendCoordinator(NULL, "Component-owned frontend supply")
     intALU = Param.IntExecutionResource(NULL, "ALU execution family")
     intALUs = VectorParam.IntegerALU([], "Individual integer ALU instances")
@@ -70,6 +72,7 @@ class BaseO3CPU(BaseCPU):
     intSlow = Param.IntExecutionResource(NULL, "Slow integer execution family")
     intBM = Param.IntExecutionResource(NULL, "Bit-manipulation execution family")
     intBranch = Param.IntExecutionResource(NULL, "Branch resolution execution family")
+    intDivider = Param.IntegerDivider(NULL, "Shared integer divider and output actions")
 
     @classmethod
     def memory_mode(cls):
@@ -89,14 +92,23 @@ class BaseO3CPU(BaseCPU):
         200, "Cache Ports. Constrains stores only."
     )
     cacheLoadPorts = Param.Unsigned(200, "Cache Ports. Constrains loads only.")
-    sprL1LoadBankConflicts = Param.Bool(
-        False, "Limit a third same-bank L1 data load in one cycle"
-    )
     sprStoreBuffer = Param.Bool(
         False, "Use a shared-credit committed store buffer for x86 TSO"
     )
+    sprStoreDrainLineCredits = Param.Unsigned(
+        4, "Distinct in-flight committed write lines; zero removes this limit"
+    )
     sprEarlyStorePrepare = Param.Bool(
         False, "Speculatively prepare translated ordinary stores before retirement"
+    )
+    sprRetiredStorePrepare = Param.Bool(
+        True, "Allow prepare hints for stores eligible for post-retirement writeback"
+    )
+    sprFullFenceServiceCycles = Param.Cycles(
+        0, "Additional service for an architectural x86 MFENCE after stores drain"
+    )
+    sprClflushMinCycles = Param.Cycles(
+        0, "Minimum architectural CLFLUSH issue-to-completion service"
     )
 
     # Backward pipeline delays
@@ -140,7 +152,6 @@ class BaseO3CPU(BaseCPU):
     )
     dispatchWidth = Param.Unsigned(8, "Dispatch width")
     issueWidth = Param.Unsigned(8, "Issue width")
-    wbWidth = Param.Unsigned(8, "Writeback width")
 
     iewToCommitDelay = Param.Cycles(
         1, "Issue/Execute/Writeback to commit delay"
@@ -196,8 +207,19 @@ class BaseO3CPU(BaseCPU):
     numPhysIntRegs = Param.Unsigned(
         256, "Number of physical integer registers"
     )
+    numPhysIntRegEntries = Param.Unsigned(
+        0, "Integer value allocation entries, separate from functional storage; zero uses storage count"
+    )
     numPhysFloatRegs = Param.Unsigned(
         256, "Number of physical floating point registers"
+    )
+    numPhysFloatRegEntries = Param.Unsigned(
+        0, "FP allocation entries shared by data fragments; 0 uses only the "
+        "physical data-register limit"
+    )
+    numPhysFloatWideEntries = Param.Unsigned(
+        0, "512-bit capable subset of shared FP entries; zero disables this "
+        "additional limit. Requires explicit ISA width demand."
     )
     numPhysVecRegs = Param.Unsigned(256, "Number of physical vector registers")
     numPhysVecPredRegs = Param.Unsigned(
@@ -228,12 +250,27 @@ class BaseO3CPU(BaseCPU):
         "Branch Predictor",
     )
     needsTSO = Param.Bool(False, "Enable TSO Memory model")
-    tsoOrderedStoreLineWindow = Param.Unsigned(
-        4, "Maximum distinct cache lines awaiting ordered TSO store completion"
-    )
 
     recvRespThrottling = Param.Bool(
         False, "Enable load receive response throttling in the LSQ"
+    )
+    loadCompletionWidth = Param.Unsigned(
+        0, "Shared load result deliveries per cycle; zero disables the limit"
+    )
+
+    sprMemoryDependence = Param.Bool(False, "Use SPR load/store ordering semantics")
+    sprFastStoreForwarding = Param.Bool(False, "Use the tagged load/store-PC forwarding proxy")
+    sprStoreForwardingLatency = Param.Cycles(
+        0, "Service delay for complete ordinary store-to-load forwarding"
+    )
+    sprMultiStoreForwarding = Param.Bool(
+        True, "Allow several older stores to supply one load"
+    )
+    sprContainedForwardingExtraLatency = Param.Cycles(
+        0, "Additional service delay for a contained load at a different offset"
+    )
+    sprL1WidthService = Param.Bool(
+        False, "Use SPR L1 load/store width and load-bank service budgets"
     )
     recvRespMaxCachelines = Param.Unsigned(
         1,
@@ -263,6 +300,9 @@ class BaseO3CPU(BaseCPU):
     maxFTPerCycle = Param.Unsigned(4, "Max number of FT created per cycle")
     maxTakenPredPerCycle = Param.Unsigned(
         1, "Max number of taken predictions per cycle"
+    )
+    maxDsbTakenPerCycle = Param.Unsigned(
+        1, "Max number of taken targets consumed by DSB per cycle"
     )
 
 

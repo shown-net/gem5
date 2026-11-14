@@ -47,4 +47,25 @@ def macroop INVLPG_P {
     rdip t7
     tia seg, riprel, disp
 };
+
+def macroop INVPCID_R_M {
+    .adjust_env maxOsz
+    .serialize_before
+    .serialize_after
+    invpcidcheck
+    ld t1, seg, sib, disp, dataSize=8
+    ld t2, seg, sib, "DISPLACEMENT + 8", dataSize=8
+    invpcid reg, t1, t2
+};
+
+def macroop INVPCID_R_P {
+    .adjust_env maxOsz
+    .serialize_before
+    .serialize_after
+    invpcidcheck
+    rdip t7
+    ld t1, seg, riprel, disp, dataSize=8
+    ld t2, seg, riprel, "DISPLACEMENT + 8", dataSize=8
+    invpcid reg, t1, t2
+};
 """

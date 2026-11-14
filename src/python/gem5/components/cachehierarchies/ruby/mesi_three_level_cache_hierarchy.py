@@ -30,6 +30,7 @@ from m5.objects import (
     RubyPortProxy,
     RubySequencer,
     RubySystem,
+    SrcClockDomain,
 )
 
 from ....coherence_protocol import CoherenceProtocol
@@ -50,7 +51,10 @@ from .caches.mesi_three_level.dma_controller import DMAController
 from .caches.mesi_three_level.l1_cache import L1Cache
 from .caches.mesi_three_level.l2_cache import L2Cache
 from .caches.mesi_three_level.l3_cache import L3Cache
-from .topologies.simple_pt2pt import SimplePt2Pt
+from .topologies.simple_pt2pt import SimplePt2Pt, SimpleUncore
+
+
+from .topologies.spr_mesh import SPRMesh
 
 
 class MESIThreeLevelCacheHierarchy(
@@ -72,6 +76,7 @@ class MESIThreeLevelCacheHierarchy(
         l3_size: str,
         l3_assoc: int,
         num_l3_banks: int,
+        uncore_clock: str = None,
     ):
         AbstractRubyCacheHierarchy.__init__(self=self)
         AbstractThreeLevelCacheHierarchy.__init__(
@@ -87,6 +92,7 @@ class MESIThreeLevelCacheHierarchy(
         )
 
         self._num_l3_banks = num_l3_banks
+        self._uncore_clock = uncore_clock
 
     @overrides(AbstractCacheHierarchy)
     def get_coherence_protocol(self):
@@ -97,11 +103,24 @@ class MESIThreeLevelCacheHierarchy(
         cache_line_size = board.get_cache_line_size()
 
         self.ruby_system = RubySystem()
+        # TODO(SPR-MSR): Validate native ROI core/uncore frequencies before
+        # considering HWP, power limits or idle-state timing in this baseline.
+        self.ruby_system.clk_domain = (
+            SrcClockDomain(clock=self._uncore_clock,
+                           voltage_domain=board.get_clock_domain().voltage_domain)
+            if self._uncore_clock else board.get_clock_domain()
+        )
 
         # MESI_Three_Level needs 3 virtual networks
         self.ruby_system.number_of_virtual_networks = 3
 
-        self.ruby_system.network = SimplePt2Pt(self.ruby_system)
+        self.ruby_system.network = (
+            SPRMesh(self.ruby_system, self._spr_network_parameters)
+            if hasattr(self, "_spr_network_parameters") else
+            (SimpleUncore(self.ruby_system) if self._uncore_clock
+             else SimplePt2Pt(self.ruby_system))
+        )
+        self.ruby_system.network.clk_domain = self.ruby_system.clk_domain
         self.ruby_system.network.number_of_virtual_networks = 3
 
         self._l1_controllers = []
@@ -124,6 +143,7 @@ class MESIThreeLevelCacheHierarchy(
             l1_cache.sequencer = RubySequencer(
                 version=core_idx,
                 dcache=l1_cache.Dcache,
+                max_outstanding_requests=128,
                 clk_domain=l1_cache.clk_domain,
                 ruby_system=self.ruby_system,
             )
@@ -183,6 +203,7 @@ class MESIThreeLevelCacheHierarchy(
                 cluster_id=0,  # cluster_id is ignored in point-to-point topology
             )
             l3_cache.ruby_system = self.ruby_system
+            l3_cache.clk_domain = self.ruby_system.clk_domain
             self._l3_controllers.append(l3_cache)
 
         # TODO: Make this prettier: The problem is not being able to proxy
@@ -190,14 +211,22 @@ class MESIThreeLevelCacheHierarchy(
         for cache in self._l3_controllers:
             cache.ruby_system = self.ruby_system
 
-        self._directory_controllers = [
-            Directory(self.ruby_system.network, cache_line_size, range, port)
-            for range, port in board.get_mem_ports()
-        ]
+        # Multiple physical RAM ranges can share one subchannel timing port.
+        # One directory per port retains the same controller/queue ownership.
+        directories = {}
+        for mem_range, port in board.get_mem_ports():
+            key = id(port)
+            if key in directories:
+                directories[key].addr_ranges = [*directories[key].addr_ranges, mem_range]
+            else:
+                directories[key] = Directory(self.ruby_system.network,
+                                              cache_line_size, mem_range, port)
+        self._directory_controllers = list(directories.values())
         # TODO: Make this prettier: The problem is not being able to proxy
         # the ruby system correctly
         for dir in self._directory_controllers:
             dir.ruby_system = self.ruby_system
+            dir.clk_domain = self.ruby_system.clk_domain
 
         self._dma_controllers = []
         if board.has_dma_ports():
@@ -211,6 +240,7 @@ class MESIThreeLevelCacheHierarchy(
                     ),
                     self.ruby_system,
                 )
+                ctrl.clk_domain = self.ruby_system.clk_domain
                 self._dma_controllers.append(ctrl)
 
         self.ruby_system.num_of_sequencers = len(self._l1_controllers) + len(
@@ -225,13 +255,17 @@ class MESIThreeLevelCacheHierarchy(
             self.ruby_system.dma_controllers = self._dma_controllers
 
         # Create the network and connect the controllers.
-        self.ruby_system.network.connectControllers(
-            self._l1_controllers
-            + self._l2_controllers
-            + self._l3_controllers
-            + self._directory_controllers
-            + self._dma_controllers
-        )
+        controllers = (self._l1_controllers + self._l2_controllers +
+                       self._l3_controllers + self._directory_controllers +
+                       self._dma_controllers)
+        if hasattr(self, "_spr_network_parameters"):
+            self.ruby_system.network.connectControllers(
+                controllers, core_count=len(self._l1_controllers),
+                bank_count=len(self._l3_controllers),
+                directory_count=len(self._directory_controllers),
+                channels=board.get_memory()._num_channels)
+        else:
+            self.ruby_system.network.connectControllers(controllers)
         self.ruby_system.network.setup_buffers()
 
         # Set up a proxy port for the system_port. Used for load binaries and
@@ -253,10 +287,44 @@ class MESIThreeLevelCacheHierarchy(
 class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
     """Selected SPR private caches with system-supplied LLC geometry."""
 
-    def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int):
-        super().__init__(
-            l1i_size="32KiB", l1i_assoc=8,
-            l1d_size="48KiB", l1d_assoc=12,
-            l2_size="2MiB", l2_assoc=16,
-            l3_size=l3_size, l3_assoc=l3_assoc, num_l3_banks=num_l3_banks,
-        )
+    def __init__(self, *, l3_size: str, l3_assoc: int, num_l3_banks: int,
+                 l1i_size: str, l1i_assoc: int, l1d_size: str, l1d_assoc: int,
+                 l2_size: str, l2_assoc: int, uncore_clock: str,
+                 l1_refill_bytes_per_cycle: int, l1_fill_response_width: int,
+                 l1_fill_capacity: int, l1_write_fill_capacity: int,
+                 l1d_data_access_cycles: int, l2_fill_capacity: int,
+                 sequencer_max_outstanding_requests: int,
+                 l1_tbe_capacity: int, l2_tbe_capacity: int,
+                 network_parameters: dict):
+        super().__init__(l1i_size=l1i_size, l1i_assoc=l1i_assoc,
+                         l1d_size=l1d_size, l1d_assoc=l1d_assoc,
+                         l2_size=l2_size, l2_assoc=l2_assoc,
+                         l3_size=l3_size, l3_assoc=l3_assoc,
+                         num_l3_banks=num_l3_banks, uncore_clock=uncore_clock)
+        self._spr_network_parameters = dict(network_parameters)
+        self._l1_refill_bytes_per_cycle = l1_refill_bytes_per_cycle
+        self._l1_fill_capacity = l1_fill_capacity
+        self._l1_write_fill_capacity = l1_write_fill_capacity
+        self._l1_fill_response_width = l1_fill_response_width
+        self._l1d_data_access_cycles = l1d_data_access_cycles
+        self._l2_fill_capacity = l2_fill_capacity
+        self._sequencer_max_outstanding_requests = sequencer_max_outstanding_requests
+        self._l1_tbe_capacity = l1_tbe_capacity
+        self._l2_tbe_capacity = l2_tbe_capacity
+
+    def incorporate_cache(self, board: AbstractBoard) -> None:
+        super().incorporate_cache(board)
+        for controller in self._l1_controllers:
+            # Native dependent L1 loads take five issue-to-issue cycles.
+            # Three Ruby service cycles plus the AGU/LSU handoffs reproduce
+            # that interval; independent three-load throughput is unchanged.
+            controller.Dcache.dataAccessLatency = self._l1d_data_access_cycles
+            controller.Dcache.fill_install_bytes_per_cycle = self._l1_refill_bytes_per_cycle
+            controller.Dcache.fill_capacity = self._l1_fill_capacity
+            controller.Dcache.write_fill_capacity = self._l1_write_fill_capacity
+            controller.sequencer.data_fill_response_width = self._l1_fill_response_width
+            controller.sequencer.max_outstanding_requests = self._sequencer_max_outstanding_requests
+            controller.number_of_TBEs = self._l1_tbe_capacity
+        for controller in self._l2_controllers:
+            controller.cache.fill_capacity = self._l2_fill_capacity
+            controller.number_of_TBEs = self._l2_tbe_capacity

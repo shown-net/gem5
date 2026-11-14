@@ -117,6 +117,14 @@ CPUProgressEvent::process()
             "committed: %lli\n", curTick(), cpu->name(), temp,
             temp - lastNumInst);
 #endif
+    if (temp == lastNumInst) {
+        if (!noProgressReported) {
+            cpu->dumpProgressState();
+            noProgressReported = true;
+        }
+    } else {
+        noProgressReported = false;
+    }
     lastNumInst = temp;
 }
 
@@ -254,87 +262,58 @@ BaseCPU::postInterrupt(ThreadID tid, int int_num, int index)
     // For RISC-V, the WFI sleep wake up is implementation defined.
     // The SiFive WFI wake up the hart only if mip & mie != 0
     if ((FullSystem && interrupts[tid]->isWakeUp()) ||
-        (!FullSystem && !system->futexMap.is_waiting(threadContexts[tid])))
+        (!FullSystem && !system->futexMap.is_waiting(threadContexts[tid]))) {
+        AddressMonitor &monitor = addressMonitor[tid];
+        if (monitor.waiting) {
+            monitor.armed = false;
+            monitor.waiting = false;
+            monitor.gotWakeup = false;
+        }
         wakeup(tid);
+    }
 }
 
 void
-BaseCPU::armMonitor(ThreadID tid, Addr address)
+BaseCPU::armMonitor(ThreadID tid, Addr address, Addr paddr)
 {
     assert(tid < numThreads);
     AddressMonitor &monitor = addressMonitor[tid];
 
     monitor.armed = true;
     monitor.vAddr = address;
-    monitor.pAddr = 0x0;
-    DPRINTF(Mwait, "[tid:%d] Armed monitor (vAddr=0x%lx)\n", tid, address);
+    monitor.blockMask = ~(cacheLineSize() - 1);
+    monitor.pAddr = paddr & monitor.blockMask;
+    monitor.waiting = false;
+    monitor.gotWakeup = false;
+    DPRINTF(Mwait, "[tid:%d] Armed monitor (vAddr=0x%lx, pAddr=0x%lx)\n",
+            tid, address, monitor.pAddr);
 }
 
 bool
-BaseCPU::mwait(ThreadID tid, PacketPtr pkt)
+BaseCPU::mwait(ThreadID tid, bool break_on_interrupt)
 {
     assert(tid < numThreads);
     AddressMonitor &monitor = addressMonitor[tid];
 
-    if (!monitor.gotWakeup) {
-        Addr block_size = cacheLineSize();
-        Addr mask = ~(block_size - 1);
-
-        assert(pkt->req->hasPaddr());
-        monitor.pAddr = pkt->getAddr() & mask;
-        monitor.waiting = true;
-
-        DPRINTF(Mwait, "[tid:%d] mwait called (vAddr=0x%lx, "
-                "line's paddr=0x%lx)\n", tid, monitor.vAddr, monitor.pAddr);
-        return true;
-    } else {
+    // An interrupt can arrive while a non-speculative MWAIT is still in
+    // flight. O3 cannot accept it until that instruction retires, and its
+    // earlier wakeup saw an active thread. Do not suspend with a deliverable
+    // interrupt already pending: no second interrupt is required to wake it.
+    const bool pending = checkInterrupts(tid) ||
+        (break_on_interrupt && interrupts[tid]->isWakeUp());
+    if (pending || !monitor.armed || monitor.gotWakeup) {
+        DPRINTF(Mwait, "[tid:%d] mwait skipped: pending=%u armed=%u triggered=%u\n",
+                tid, pending, monitor.armed, monitor.gotWakeup);
+        monitor.armed = false;
+        monitor.waiting = false;
         monitor.gotWakeup = false;
         return false;
     }
-}
 
-void
-BaseCPU::mwaitAtomic(ThreadID tid, ThreadContext *tc, BaseMMU *mmu)
-{
-    assert(tid < numThreads);
-    AddressMonitor &monitor = addressMonitor[tid];
-
-    // Mirror of gem5 PR #2259 (which patched Timing/O3's MwaitInitiateAcc):
-    // if the address monitor was not previously armed by MONITOR, MWAIT is a
-    // NOP per Intel SDM Vol 2B. Without this guard, restoring an x86 FS
-    // checkpoint on AtomicSimpleCPU asserts on the very first tick because
-    // Linux's mwait_idle path executes MWAIT with monitor.vAddr=0, and the
-    // atomic MMU walk raises a page fault that this function's
-    // "assert(fault == NoFault)" cannot handle.
-    if (!monitor.armed) {
-        return;
-    }
-
-    RequestPtr req = std::make_shared<Request>();
-
-    Addr addr = monitor.vAddr;
-    Addr block_size = cacheLineSize();
-    Addr mask = ~(block_size - 1);
-    int size = block_size;
-
-    //The address of the next line if it crosses a cache line boundary.
-    Addr secondAddr = roundDown(addr + size - 1, block_size);
-
-    if (secondAddr > addr)
-        size = secondAddr - addr;
-
-    req->setVirt(addr, size, 0x0, dataRequestorId(),
-            tc->pcState().instAddr());
-
-    // translate to physical address
-    Fault fault = mmu->translateAtomic(req, tc, BaseMMU::Read);
-    assert(fault == NoFault);
-
-    monitor.pAddr = req->getPaddr() & mask;
     monitor.waiting = true;
-
     DPRINTF(Mwait, "[tid:%d] mwait called (vAddr=0x%lx, line's paddr=0x%lx)\n",
             tid, monitor.vAddr, monitor.pAddr);
+    return true;
 }
 
 void
@@ -799,6 +778,7 @@ BaseCPU::getCurrentInstCount(ThreadID tid)
 AddressMonitor::AddressMonitor()
 {
     armed = false;
+    vAddr = pAddr = val = blockMask = 0;
     waiting = false;
     gotWakeup = false;
 }
@@ -807,12 +787,15 @@ bool
 AddressMonitor::doMonitor(PacketPtr pkt)
 {
     assert(pkt->req->hasPaddr());
-    if (armed && waiting) {
-        if (pAddr == pkt->getAddr()) {
-            DPRINTF(Mwait, "pAddr=0x%lx invalidated: waking up core\n",
-                    pkt->getAddr());
+    if (armed && (pkt->isWrite() || pkt->isInvalidate())) {
+        if (pAddr == (pkt->getAddr() & blockMask)) {
+            const bool sleeping = waiting;
+            DPRINTF(Mwait, "pAddr=0x%lx triggered monitor: waiting=%u\n",
+                    pkt->getAddr(), sleeping);
             waiting = false;
-            return true;
+            gotWakeup = true;
+            armed = false;
+            return sleeping;
         }
     }
     return false;

@@ -16,6 +16,7 @@
 #include "params/ExecutionPort.hh"
 #include "params/IntExecutionResource.hh"
 #include "params/IntegerALU.hh"
+#include "params/IntegerDivider.hh"
 #include "params/ResultForwarding.hh"
 #include "params/ResultPathRule.hh"
 #include "sim/eventq.hh"
@@ -25,6 +26,7 @@ namespace gem5::o3
 {
 
 class CPU;
+class FUPool;
 
 class ResultPathRule : public SimObject
 {
@@ -79,17 +81,21 @@ class ExecutionPorts : public SimObject
 class ResultForwarding : public SimObject
 {
   public:
-    struct FastAdderState
+    enum class VectorDomain { None, Simd01, Fma, Mul, FastAdder,
+                              Simd5, Shuffle, V2I, I2V };
+    struct VectorResultState
     {
         bool ready = false;
         bool cancelled = false;
         Tick readyAt = 0;
+        Tick nominalAt = 0;
+        VectorDomain domain = VectorDomain::None;
     };
 
     struct Reference
     {
         DynInstPtr producer;
-        std::shared_ptr<FastAdderState> fastAdder;
+        std::shared_ptr<VectorResultState> vectorResult;
         RegIndex destination = 0;
         IntExecutionFamily family = IntExecutionFamily::None;
         unsigned port = 12;
@@ -100,12 +106,14 @@ class ResultForwarding : public SimObject
     };
 
   private:
-    std::unordered_map<RegIndex, Reference> producers;
+    std::vector<Reference> producers;
     struct Waiter { DynInstPtr inst; Tick when; };
     std::unordered_map<uint64_t, Waiter> waiters;
     const std::vector<ResultPathRule *> paths;
     CPU *cpu = nullptr;
     EventFunctionWrapper wakeEvent;
+    bool inIssuePass = false;
+    bool issueWaitersClean = false;
     struct Stats : statistics::Group
     {
         statistics::Scalar deferred, wakeups, cancelled, unissuedCancelled;
@@ -114,17 +122,21 @@ class ResultForwarding : public SimObject
     };
     mutable Stats stats;
     void armWake();
+    void updateWake(Tick old_when, Tick new_when);
     void wakeConsumers();
     void checkDrain();
 
   public:
     ResultForwarding(const ResultForwardingParams &p);
-    void bindCPU(CPU *owner);
+    void bindCPU(CPU *owner, unsigned num_registers);
     void track(const DynInstPtr &inst, bool managed);
+    void dispatched(const DynInstPtr &inst, unsigned port, Cycles latency);
     Reference source(PhysRegIdPtr reg) const;
     bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
     Tick availableAt(const DynInstPtr &inst, unsigned consumer_port) const;
     int earliestAdjustment(const DynInstPtr &inst, unsigned producer_port) const;
+    void beginIssuePass();
+    void endIssuePass();
     void defer(const DynInstPtr &inst, Tick when);
     void clearWait(const DynInstPtr &inst);
     void release(const DynInstPtr &inst);
@@ -144,6 +156,7 @@ class IntExecutionResource : public SimObject
     struct Operation
     {
         DynInstPtr inst;
+        std::list<std::shared_ptr<Operation>>::iterator position;
         bool completed = false;
         bool written = false;
         bool sent = false;
@@ -175,6 +188,46 @@ class IntegerALU : public IntExecutionResource
     IntegerALU(const IntegerALUParams &p);
     ExecutionPort *connection() const { return port; }
     bool accepts(IntExecutionFamily requested, unsigned number, Tick now) const override;
+};
+
+class IntegerDivider : public SimObject
+{
+    struct Operation
+    {
+        DynInstPtr inst;
+        FUPool *pool;
+        ResultForwarding *forwarding;
+        std::function<void()> available, complete, issuedAction;
+        Tick admitted;
+        std::array<Tick, 3> inputs;
+        std::array<Tick, 2> outputs{};
+        bool launched = false;
+        Tick arithmeticEnd = 0;
+        bool arithmeticActive = false;
+        unsigned internalStages = 0, transferred = 0, written = 0;
+    };
+    CPU *cpu = nullptr;
+    Tick nextLaunch = 0;
+    std::array<std::array<unsigned, 3>, 2> latency32, latency64;
+    std::list<std::shared_ptr<Operation>> operations;
+    EventFunctionWrapper serviceEvent;
+    struct Stats : statistics::Group
+    {
+        statistics::Scalar admitted, evaluated, cancelled;
+        statistics::Vector actions;
+        Stats(statistics::Group *parent);
+    } stats;
+    void service();
+    void arm();
+    void finish(const std::shared_ptr<Operation> &operation);
+    void releaseAction(const DynInstPtr &inst);
+
+  public:
+    IntegerDivider(const IntegerDividerParams &p);
+    bool issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
+        const DynInstPtr &inst, std::function<void()> available,
+        std::function<void()> complete, std::function<void()> issued_action);
+    DrainState drain() override;
 };
 
 } // namespace gem5::o3

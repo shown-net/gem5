@@ -126,6 +126,7 @@ class RubyPrefetcher : public SimObject
         void observeDataAccess(RequestPtr request);
         void observeAdjacent(Addr address);
         void prefetchDequeued(Addr address);
+        void prefetchDropped(Addr address);
 
         /**
          * Print out some statistics
@@ -285,6 +286,7 @@ class RubyPrefetcher : public SimObject
             //! Count of prefetch requests made
             statistics::Scalar numPrefetchRequested;
             statistics::Scalar numDuplicateCandidates;
+            statistics::Scalar numDroppedCandidates;
             statistics::Scalar numStreamCandidates;
             statistics::Scalar numIpCandidates;
             statistics::Scalar numIpPageStops;

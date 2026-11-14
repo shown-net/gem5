@@ -171,6 +171,14 @@ class RegClassOps
     virtual ~RegClassOps() = default;
     /** Print the name of the register specified in id. */
     virtual std::string regName(const RegId &id) const;
+    /** Resource group for the initial architectural rename mapping. */
+    virtual RegIndex
+    regAllocationGroup(const RegId &id) const
+    {
+        return id.index();
+    }
+    /** ISA functional temporaries have storage but no hardware value entry. */
+    virtual bool isFunctional(const RegId &id) const { return false; }
     /** Print the value of a register pointed to by val of size size. */
     virtual std::string valString(const void *val, const size_t& size) const;
     /** Flatten register id id using information in the ISA object isa. */
@@ -258,6 +266,12 @@ class RegClass
     }
 
     std::string regName(const RegId &id) const { return _ops->regName(id); }
+    RegIndex
+    regAllocationGroup(const RegId &id) const
+    {
+        return _ops->regAllocationGroup(id);
+    }
+    bool isFunctional(const RegId &id) const { return _ops->isFunctional(id); }
     std::string
     valString(const void *val) const
     {
@@ -430,10 +444,11 @@ class VecElemRegClassOps : public TypedRegClassOps<ValueType>
 class PhysRegId : private RegId
 {
   private:
-    RegIndex flatIdx;
+    PhysRegIndex flatIdx;
     int numPinnedWritesToComplete;
     bool pinned;
     unsigned renameReferences = 0;
+    Tick valueReadyTick = 0;
 
   public:
     explicit PhysRegId() : RegId(invalidRegClass, -1), flatIdx(-1),
@@ -442,7 +457,7 @@ class PhysRegId : private RegId
 
     /** Scalar PhysRegId constructor. */
     explicit PhysRegId(const RegClass &reg_class, RegIndex _regIdx,
-              RegIndex _flatIdx)
+              PhysRegIndex _flatIdx)
         : RegId(reg_class, _regIdx), flatIdx(_flatIdx),
           numPinnedWritesToComplete(0), pinned(false)
     {}
@@ -492,11 +507,14 @@ class PhysRegId : private RegId
     }
 
     /** Flat index accessor */
-    const RegIndex& flatIndex() const { return flatIdx; }
+    const PhysRegIndex& flatIndex() const { return flatIdx; }
 
     unsigned numRenameReferences() const { return renameReferences; }
     void allocateRenameReference()
-    { assert(!renameReferences); renameReferences = 1; }
+    { assert(!renameReferences); renameReferences = 1; valueReadyTick = MaxTick; }
+    Tick valueReadyAt() const { return valueReadyTick; }
+    void recordValueReady(Tick at)
+    { if (valueReadyTick == MaxTick) valueReadyTick = at; }
     void retainRenameReference()
     { assert(renameReferences); ++renameReferences; }
     bool releaseRenameReference()

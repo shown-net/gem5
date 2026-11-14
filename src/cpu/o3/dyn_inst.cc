@@ -39,8 +39,12 @@
  */
 
 #include "cpu/o3/dyn_inst.hh"
+#include "cpu/o3/frontend_record.hh"
+#include "cpu/o3/stack_engine.hh"
 
 #include <algorithm>
+#include <set>
+#include "arch/x86/regs/int.hh"
 
 #include "base/intmath.hh"
 #include "debug/DynInst.hh"
@@ -52,6 +56,61 @@ namespace gem5
 
 namespace o3
 {
+
+bool
+DynInst::repFunctional() const
+{
+    return repStringKind(macroop.get()) != RepStringKind::None &&
+        !staticInst->isMemRef() && !staticInst->isFirstMicroop() &&
+        !staticInst->isLastMicroop();
+}
+
+bool
+DynInst::isDelayedCommit() const
+{
+    // The ordinary loop has updated count and both pointers by its final ADD.
+    // It is an architectural progress boundary, including unsupported fast
+    // directions/forms. No speculative progress is committed here.
+    if (repFunctional() && staticInst->getName() == "add" && numDestRegs() == 1) {
+        const auto dest = destRegIdx(0);
+        const auto kind = repStringKind(macroop.get());
+        if (dest.is(IntRegClass) &&
+            ((kind == RepStringKind::Copy && dest == X86ISA::int_reg::Rsi) ||
+             (kind == RepStringKind::Store && dest == X86ISA::int_reg::Rdi)))
+            return false;
+    }
+    return staticInst->isDelayedCommit();
+}
+
+unsigned
+DynInst::hardwareDestEntries(RegClassType type) const
+{
+    if (eliminatedMove)
+        return 0;
+    auto *isa = tcBase()->getIsaPtr();
+    unsigned groups = 0;
+    for (unsigned i = 0; i < numDestRegs(); ++i) {
+        const auto reg = destRegIdx(i).flatten(*isa);
+        if (!reg.is(type) || reg.regClass().isFunctional(reg) ||
+            (stackTrackedWrite && reg == X86ISA::int_reg::Rsp.flatten(*isa)))
+            continue;
+        const auto group = reg.regClass().regAllocationGroup(reg);
+        bool seen = false;
+        for (unsigned j = 0; j < i; ++j) {
+            const auto prior = destRegIdx(j).flatten(*isa);
+            if (prior.is(type) && !prior.regClass().isFunctional(prior) &&
+                !(stackTrackedWrite &&
+                  prior == X86ISA::int_reg::Rsp.flatten(*isa)) &&
+                prior.regClass().regAllocationGroup(prior) == group) {
+                seen = true;
+                break;
+            }
+        }
+        groups += !seen;
+    }
+    return type == FloatRegClass && groups && stageDemand.floatWideEntries ?
+        stageDemand.floatWideEntries : groups;
+}
 
 DynInst::DynInst(const Arrays &arrays, const StaticInstPtr &static_inst,
         const StaticInstPtr &_macroop, InstSeqNum seq_num, CPU *_cpu)
@@ -72,14 +131,9 @@ DynInst::DynInst(const Arrays &arrays, const StaticInstPtr &static_inst,
 
 #ifndef NDEBUG
     ++cpu->instcount;
-
-    if (cpu->instcount > 1500) {
-#ifdef GEM5_DEBUG
-        cpu->dumpInsts();
-        dumpSNList();
-#endif
-        assert(cpu->instcount <= 1500);
-    }
+    // ROB/IDQ capacity counts hardware units. REP functional followers and
+    // squashed members awaiting normal cleanup have no one-to-one relation
+    // to those units, so a fixed DynInst population limit is not valid.
 
     DPRINTF(DynInst,
         "DynInst: [sn:%lli] Instruction created. Instcount for %s = %i\n",
@@ -199,6 +253,8 @@ DynInst::operator delete(void *ptr)
 DynInst::~DynInst()
 {
     if (thread) functional_mmu::destroy(tcBase(), seqNum, mmuControlGeneration);
+    if (stackSync && isSquashed() && cpu && cpu->stackEngine)
+        cpu->stackEngine->noteSyncSquashed();
     /*
      * The buffer this DynInst occupies also holds some of the structures it
      * points to. We need to call their destructors manually to make sure that
@@ -392,6 +448,8 @@ DynInst::writeResultValues()
 Fault
 DynInst::execute()
 {
+    if (stackSync && cpu->stackEngine)
+        cpu->stackEngine->noteSyncExecuted();
     // @todo: Pretty convoluted way to avoid squashing from happening
     // when using the TC during an instruction's execution
     // (specifically for instructions that have side-effects that use

@@ -49,15 +49,21 @@
 #include "cpu/checker/thread_context.hh"
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/zero_idiom.hh"
+#include "cpu/o3/stack_engine.hh"
+#include "arch/x86/regs/int.hh"
 #include "arch/x86/mmu.hh"
+#include "arch/x86/pagetable_walker.hh"
+#include "arch/x86/regs/misc.hh"
 #include "cpu/o3/limits.hh"
 #include "cpu/o3/thread_context.hh"
 #include "cpu/simple_thread.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Activity.hh"
+#include "debug/Fetch.hh"
 #include "debug/Drain.hh"
 #include "debug/O3CPU.hh"
 #include "debug/Quiesce.hh"
+#include "debug/StackEngine.hh"
 #include "enums/MemoryMode.hh"
 #include "sim/cur_tick.hh"
 #include "sim/full_system.hh"
@@ -72,6 +78,17 @@ struct BaseCPUParams;
 
 namespace o3
 {
+
+void
+removeCommThreadInsts(ThreadID tid, IEWStruct &comm)
+{
+    auto last = std::remove_if(comm.insts.begin(), comm.insts.end(),
+        [tid](const auto &inst) {
+            return inst && inst->threadNumber == tid;
+        });
+    comm.insts.erase(last, comm.insts.end());
+    comm.size = comm.insts.size();
+}
 
 CPU::CPU(const BaseO3CPUParams &params)
     : BaseCPU(params), tmaEnabled(params.numThreads == 1),
@@ -96,7 +113,8 @@ CPU::CPU(const BaseO3CPUParams &params)
               params.numPhysMatRegs, params.numPhysCCRegs,
               params.isa[0]->regClasses()),
 
-      freeList(name() + ".freelist", &regFile),
+      freeList(name() + ".freelist", &regFile, params.numPhysFloatRegEntries,
+               params.numPhysFloatWideEntries, params.numPhysIntRegEntries),
 
       rob(this, params),
 
@@ -112,24 +130,49 @@ CPU::CPU(const BaseO3CPUParams &params)
       activityRec(name(), NumStages,
                   params.backComSize + params.forwardComSize, params.activity),
 
-      globalSeqNum(1),
+      globalSeqNum(params.stackEngine ? 2 : 1),
+      stackRspShadow(numThreads, 0), stackRspPending(numThreads, false),
       globalFTSeqNum(1),
       system(params.system),
       lastRunningCycle(curCycle()),
       cpuStats(this),
       unhaltedClockStats(this),
+      machineClearStats(this), recoveryStats(this),
       tmaStats(this, params.renameWidth),
       branchInstStats(this), branchMispStats(this), instRetiredStats(this),
-      uopsRetiredStats(this), moveEliminationStats(this),
-      memoryInstRetiredStats(this), memoryLoadRetiredStats(this)
+      frontendRetiredStats(this), decodeStats(this),
+      icacheDataStats(this, "ICACHE_DATA"), icacheTagStats(this, "ICACHE_TAG"),
+      baClearStats(this),
+      softwarePrefetchStats(this), fpArithmeticStats(this),
+      uopsRetiredStats(this), idqStats(this), lsdStats(this),
+      uopsIssuedStats(this), uopsExecutedStats(this),
+      uopsDispatchedStats(this), rsStats(this), executionActivityStats(this),
+      dividerStats(this), moveEliminationStats(this),
+      memoryInstRetiredStats(this), memoryLoadRetiredStats(this),
+      memoryLoadCompletedStats(this)
 {
     fatal_if(FullSystem && params.numThreads > 1,
             "SMT is not supported in O3 in full system mode currently.");
     resultForwarding = params.resultForwarding;
     zeroIdiom = params.zeroIdiom;
+    stackEngine = params.stackEngine;
+    if (stackEngine) stackEngine->configure(params.numThreads);
     frontend = params.frontend;
+    if (frontend) frontend->attachCPU(this);
     if (frontend) {
         frontend->configure(params.numThreads, params.renameWidth, cacheLineSize());
+        frontend->setDeliveryObserver(
+            [this](const FrontendRecord &record, uint64_t cycle) {
+                recordFrontendDelivery(record.source, record.demand.idqUnits, cycle);
+                const auto &architecture = record.macroop ?
+                    record.macroop : record.instruction;
+                if (architecture->usesMicrocodeService()) {
+                    if (architecture->hasKnownMicrocodeIdentity())
+                        idqStats.knownMicrocodeUnits += record.demand.idqUnits;
+                    else
+                        idqStats.inferredMicrocodeUnits += record.demand.idqUnits;
+                }
+            });
         auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu);
         fatal_if(!x86_mmu, "Component frontend requires an x86 MMU");
         x86_mmu->onInstructionCodeInvalidation(
@@ -192,6 +235,7 @@ CPU::CPU(const BaseO3CPUParams &params)
     rename.setRenameQueue(&renameQueue);
     iew.setRenameQueue(&renameQueue);
     iew.setIEWQueue(&iewQueue);
+    bac.setIEWQueue(&iewQueue);
     commit.setIEWQueue(&iewQueue);
     commit.setRenameQueue(&renameQueue);
 
@@ -268,12 +312,23 @@ CPU::CPU(const BaseO3CPUParams &params)
     for (ThreadID tid = 0; tid < active_threads; tid++) {
         for (auto type = (RegClassType)0; type <= CCRegClass;
                 type = (RegClassType)(type + 1)) {
+            PhysRegIdPtr previous = nullptr;
+            RegIndex previous_group = 0;
             for (auto &id: *regClasses.at(type)) {
                 // Note that we can't use the rename() method because we don't
                 // want special treatment for the zero register at this point
-                PhysRegIdPtr phys_reg = freeList.getReg(type);
+                const auto group = id.regClass().regAllocationGroup(id);
+                auto peer = type == FloatRegClass && group == previous_group ?
+                    previous : nullptr;
+                PhysRegIdPtr phys_reg = freeList.getReg(
+                    type, peer, !id.regClass().isFunctional(id));
                 renameMap[tid].setEntry(id, phys_reg);
                 commitRenameMap[tid].setEntry(id, phys_reg);
+                // Initial architectural values are ready before execution,
+                // just like mappings installed by insertThread().
+                scoreboard.setReg(phys_reg);
+                previous = phys_reg;
+                previous_group = group;
             }
         }
     }
@@ -360,6 +415,34 @@ CPU::regProbePoints()
     commit.regProbePoints();
 }
 
+bool
+CPU::hasPendingCodeWrite(ThreadID tid, Addr physical_block)
+{
+    return iew.hasPendingCodeWrite(tid, physical_block);
+}
+
+void
+CPU::noteCodeWrite(ThreadID tid, InstSeqNum after, Addr physical_block)
+{
+    bool matched = fetch.markCodeWrite(tid, after, physical_block);
+    // Fetch appends in sequence order; StackSync is inserted immediately
+    // before its following instruction. Older records cannot be marked.
+    for (auto it = instList.rbegin(); it != instList.rend(); ++it) {
+        const auto &inst = *it;
+        if (inst->seqNum <= after)
+            break;
+        matched |= inst->markCodeWrite(tid, after, physical_block);
+    }
+    if (matched) {
+        DPRINTF(Fetch, "[tid:%i] Code write line %#x after [sn:%llu] "
+                "marked younger fetched instructions for replay\n",
+                tid, physical_block, after);
+        fetch.invalidateCode(physical_block);
+        wakeCPU();
+        activityThisCycle();
+    }
+}
+
 CPU::CPUStats::CPUStats(CPU *cpu)
     : statistics::Group(cpu),
       ADD_STAT(timesIdled, statistics::units::Count::get(),
@@ -390,6 +473,11 @@ CPU::tick()
     DPRINTF(O3CPU, "\n\nO3CPU: Ticking main, O3CPU.\n");
     assert(!switchedOut());
     assert(drainState() != DrainState::Drained);
+    assert(!tickInProgress);
+    tickInProgress = true;
+
+    for (ThreadID tid = 0; tid < numThreads; ++tid)
+        flushStackRsp(tid);
 
     ++baseStats.numCycles;
     updateCycleCounters(BaseCPU::CPU_STATE_ON);
@@ -442,6 +530,7 @@ CPU::tick()
         updateThreadPriority();
 
     tryDrain();
+    tickInProgress = false;
 }
 
 void
@@ -594,6 +683,9 @@ CPU::suspendContext(ThreadID tid)
     // If this was the last thread then unschedule the tick event.
     if (activeThreads.size() == 0) {
         unscheduleTickEvent();
+        bac.cancelWake();
+        fetch.cancelWake();
+        if (frontend) frontend->cancelWake();
         lastRunningCycle = curCycle();
         _status = Idle;
     }
@@ -615,6 +707,9 @@ CPU::haltContext(ThreadID tid)
 
     // If this was the last thread then unschedule the tick event.
     if (activeThreads.size() == 0) {
+        bac.cancelWake();
+        fetch.cancelWake();
+        if (frontend) frontend->cancelWake();
         if (tickEvent.scheduled())
         {
             unscheduleTickEvent();
@@ -642,10 +737,17 @@ CPU::insertThread(ThreadID tid)
 
     for (auto type = (RegClassType)0; type <= CCRegClass;
             type = (RegClassType)(type + 1)) {
+        PhysRegIdPtr previous = nullptr;
+        RegIndex previous_group = 0;
         for (auto &id: *regClasses.at(type)) {
-            PhysRegIdPtr phys_reg = freeList.getReg(type);
+            const auto group = id.regClass().regAllocationGroup(id);
+            auto peer = type == FloatRegClass && group == previous_group ?
+                previous : nullptr;
+            PhysRegIdPtr phys_reg = freeList.getReg(type, peer);
             renameMap[tid].setEntry(id, phys_reg);
             scoreboard.setReg(phys_reg);
+            previous = phys_reg;
+            previous_group = group;
         }
     }
 
@@ -734,6 +836,12 @@ CPU::processInterrupts(const Fault &interrupt)
 void
 CPU::trap(const Fault &fault, ThreadID tid, const StaticInstPtr &inst)
 {
+    if (stackEngine) {
+        DPRINTF(StackEngine,
+                "[tid:%u] trap=%s logical-rsp=%#llx committed-delta=%lld\n",
+                tid, fault->name(), getArchReg(X86ISA::int_reg::Rsp, tid),
+                stackEngine->enabled() ? stackEngine->committedOffset(tid) : 0);
+    }
     // Pass the thread's TC into the invoke method.
     fault->invoke(threadContexts[tid], inst);
 }
@@ -747,6 +855,7 @@ CPU::serializeThread(CheckpointOut &cp, ThreadID tid) const
 void
 CPU::unserializeThread(CheckpointIn &cp, ThreadID tid)
 {
+    if (stackEngine) stackEngine->reset(tid);
     thread[tid]->unserialize(cp);
 }
 
@@ -792,6 +901,9 @@ CPU::drain()
         return DrainState::Draining;
     } else {
         DPRINTF(Drain, "CPU is already drained\n");
+        bac.cancelWake();
+        fetch.cancelWake();
+        if (frontend) frontend->cancelWake();
         if (tickEvent.scheduled())
             deschedule(tickEvent);
 
@@ -820,6 +932,10 @@ CPU::tryDrain()
 
     if (tickEvent.scheduled())
         deschedule(tickEvent);
+
+    bac.cancelWake();
+    fetch.cancelWake();
+    if (frontend) frontend->cancelWake();
 
     DPRINTF(Drain, "CPU done draining, processing drain event\n");
     signalDrainDone();
@@ -928,6 +1044,9 @@ CPU::switchOut()
     for (ThreadID tid = 0; tid < numThreads; ++tid)
         unhaltedClockStats.setActive(tid, false);
     tmaStats.setActive(false);
+    bac.cancelWake();
+    fetch.cancelWake();
+    if (frontend) frontend->cancelWake();
     BaseCPU::switchOut();
 
     activityRec.reset();
@@ -942,6 +1061,9 @@ void
 CPU::takeOverFrom(BaseCPU *oldCPU)
 {
     for (auto *tc : threadContexts) {functional_mmu::lifecycle(tc);if(auto* o=functional_arch::observer(tc))o->lifecycle();}
+    if (stackEngine)
+        for (ThreadID tid = 0; tid < numThreads; ++tid)
+            stackEngine->reset(tid);
     BaseCPU::takeOverFrom(oldCPU);
 
     bac.takeOverFrom();
@@ -957,6 +1079,7 @@ CPU::takeOverFrom(BaseCPU *oldCPU)
     auto *oldO3CPU = dynamic_cast<CPU *>(oldCPU);
     if (oldO3CPU)
         globalSeqNum = oldO3CPU->globalSeqNum;
+    if (stackEngine && (globalSeqNum & 1)) ++globalSeqNum;
 
     lastRunningCycle = curCycle();
     _status = Idle;
@@ -995,6 +1118,10 @@ void
 CPU::setMiscReg(int misc_reg, RegVal val, ThreadID tid)
 {
     executeStats[tid]->numMiscRegWrites++;
+    // TODO(SPR-MSR): IBPB currently clears FSFP state only. Characterize
+    // guest/native barrier use and BPU isolation before modeling its cost.
+    if (misc_reg == X86ISA::misc_reg::PredCmd && (val & 1))
+        iew.ldstQueue.clearFastForwarding(tid);
     isa[tid]->setMiscReg(misc_reg, val);
 }
 
@@ -1118,43 +1245,84 @@ CPU::setReg(PhysRegIdPtr phys_reg, const void *val, ThreadID tid)
     regFile.setReg(phys_reg, val);
 }
 
+void
+CPU::flushStackRsp(ThreadID tid)
+{
+    if (!stackRspPending[tid]) return;
+    const auto rsp = X86ISA::int_reg::Rsp.flatten(*isa[tid]);
+    const auto physical = commitRenameMap[tid].lookup(rsp);
+    regFile.setReg(physical, stackRspShadow[tid] -
+                   uint64_t(stackEngine->committedOffset(tid)));
+    stackRspPending[tid] = false;
+}
+
 RegVal
 CPU::getArchReg(const RegId &reg, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
-    return regFile.getReg(phys_reg);
+    auto value = regFile.getReg(phys_reg);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid]))
+        value += uint64_t(stackEngine->committedOffset(tid));
+    return value;
 }
 
 void
 CPU::getArchReg(const RegId &reg, void *val, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
     regFile.getReg(phys_reg, val);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid]))
+        *static_cast<RegVal *>(val) += uint64_t(stackEngine->committedOffset(tid));
 }
 
 void *
 CPU::getWritableArchReg(const RegId &reg, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid])) {
+        stackRspShadow[tid] = regFile.getReg(phys_reg) +
+            uint64_t(stackEngine->committedOffset(tid));
+        stackRspPending[tid] = true;
+        if (!thread[tid]->trapPending && !thread[tid]->noSquashFromTC)
+            squashFromTC(tid);
+        return &stackRspShadow[tid];
+    }
     return regFile.getWritableReg(phys_reg);
 }
 
 void
 CPU::setArchReg(const RegId &reg, RegVal val, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid]))
+        val -= uint64_t(stackEngine->committedOffset(tid));
     regFile.setReg(phys_reg, val);
 }
 
 void
 CPU::setArchReg(const RegId &reg, const void *val, ThreadID tid)
 {
+    flushStackRsp(tid);
     const RegId flat = reg.flatten(*isa[tid]);
     PhysRegIdPtr phys_reg = commitRenameMap[tid].lookup(flat);
+    if (stackEngine && stackEngine->enabled() &&
+        flat == X86ISA::int_reg::Rsp.flatten(*isa[tid])) {
+        regFile.setReg(phys_reg, *static_cast<const RegVal *>(val) -
+                       uint64_t(stackEngine->committedOffset(tid)));
+        return;
+    }
     regFile.setReg(phys_reg, val);
 }
 
@@ -1183,6 +1351,12 @@ CPU::addInst(const DynInstPtr &inst)
     instList.push_back(inst);
 
     return --(instList.end());
+}
+
+CPU::ListIt
+CPU::insertInstBefore(const DynInstPtr &inst, const DynInstPtr &before)
+{
+    return instList.insert(before->getInstListIt(), inst);
 }
 
 void
@@ -1270,7 +1444,8 @@ CPU::removeInstsNotInROB(ThreadID tid)
 void
 CPU::removeInstsUntil(const InstSeqNum &seq_num, ThreadID tid)
 {
-    assert(!instList.empty());
+    // A frontend-only redirect can occur before any record materializes.
+    if (instList.empty()) return;
 
     removeInstsThisCycle = true;
 
@@ -1288,10 +1463,9 @@ CPU::removeInstsUntil(const InstSeqNum &seq_num, ThreadID tid)
 
         squashInstIt(inst_iter, tid);
 
-        inst_iter--;
-
         if (break_loop)
             break;
+        inst_iter--;
     }
 }
 
@@ -1342,6 +1516,48 @@ CPU::removeAllInsts()
 }
 */
 void
+CPU::dumpProgressState()
+{
+    cprintf("%llu: %s no-progress state status:%d tick_scheduled:%d "
+            "active_threads:%u\n", curTick(), name(), _status,
+            tickEvent.scheduled(), activeThreads.size());
+    fetch.dumpProgressState();
+    if (auto *x86_mmu = dynamic_cast<X86ISA::MMU *>(mmu)) {
+        x86_mmu->getInstructionWalker()->dumpProgressState();
+        x86_mmu->getDataWalker()->dumpProgressState();
+    }
+    for (ThreadID tid = 0; tid < numThreads; ++tid) {
+        const auto *context = tcBase(tid);
+        cprintf("Thread:%u status:%d committed_PC:%s ROB_empty:%d\n",
+                tid, context->status(), context->pcState(), rob.isEmpty(tid));
+        const auto &monitor = *getCpuAddrMonitor(tid);
+        cprintf("Thread:%u monitor_armed:%d monitor_waiting:%d "
+                "monitor_got_wakeup:%d monitor_vaddr:%#x "
+                "monitor_paddr:%#x interrupt_deliverable:%d\n",
+                tid, monitor.armed, monitor.waiting, monitor.gotWakeup,
+                monitor.armed ? monitor.vAddr : 0,
+                monitor.waiting ? monitor.pAddr : 0, checkInterrupts(tid));
+        if (rob.isEmpty(tid))
+            continue;
+        const auto &head = rob.readHeadInst(tid);
+        cprintf("ROB head PC:%s [sn:%llu] op:%s issued:%d executed:%d "
+                "can_commit:%d mem_done:%d in_IQ:%d in_LSQ:%d "
+                "translation_started:%d translation_complete:%d "
+                "effective_address_valid:%d fault:%s\n",
+                head->pcState(), head->seqNum, head->staticInst->getName(),
+                head->isIssued(), head->isExecuted(), head->readyToCommit(),
+                head->memOpDone(), head->isInIQ(), head->isInLSQ(),
+                head->translationStarted(), head->translationCompleted(),
+                head->effAddrValid(), head->getFault() == NoFault ?
+                    "none" : head->getFault()->name());
+        for (unsigned source = 0; source < head->numSrcRegs(); ++source)
+            cprintf("ROB head source:%u ready:%d\n",
+                    source, head->readySrcIdx(source));
+        iew.ldstQueue.dumpInsts(tid);
+    }
+}
+
+void
 CPU::dumpInsts()
 {
     int num = 0;
@@ -1371,6 +1587,10 @@ CPU::wakeDependents(const DynInstPtr &inst)
 void
 CPU::wakeCPU()
 {
+    if (tickInProgress) {
+        activityRec.activity();
+        return;
+    }
     if (activityRec.active() || tickEvent.scheduled()) {
         DPRINTF(Activity, "CPU already running.\n");
         return;
@@ -1387,6 +1607,33 @@ CPU::wakeCPU()
     }
 
     schedule(tickEvent, clockEdge());
+}
+
+void
+CPU::wakeFrontend()
+{
+    if (_status != Running || switchedOut() || activeThreads.empty() ||
+        drainState() == DrainState::Drained || tickEvent.scheduled())
+        return;
+    if (tickInProgress) {
+        activityRec.activity();
+        return;
+    }
+    Cycles cycles(curCycle() - lastRunningCycle);
+    if (cycles > 1) {
+        --cycles;
+        cpuStats.idleCycles += cycles;
+        baseStats.numCycles += cycles;
+    }
+    schedule(tickEvent, clockEdge());
+}
+
+void
+CPU::clockPeriodUpdated()
+{
+    bac.refreshWake();
+    fetch.refreshWake();
+    if (frontend) frontend->refreshWake();
 }
 
 void

@@ -66,6 +66,7 @@ MemCtrl::MemCtrl(const MemCtrlParams &p) :
     respondEvent([this] {processRespondEvent(dram, respQueue,
                          respondEvent, retryRdReq); }, name()),
     dram(p.dram),
+    rangeBackings(p.range_backings),
     readBufferSize(dram->readBufferSize),
     writeBufferSize(dram->writeBufferSize),
     writeHighThreshold(writeBufferSize * p.write_high_thresh_perc / 100.0),
@@ -121,10 +122,20 @@ MemCtrl::startup()
     }
 }
 
+AbstractMemory *
+MemCtrl::dataBacking(Addr addr, MemInterface *interface) const
+{
+    if (interface->getAddrRange().contains(addr)) return interface;
+    if (interface == dram)
+        for (auto *backing : rangeBackings)
+            if (backing->getAddrRange().contains(addr)) return backing;
+    return nullptr;
+}
+
 Tick
 MemCtrl::recvAtomic(PacketPtr pkt)
 {
-    if (!dram->getAddrRange().contains(pkt->getAddr())) {
+    if (!dataBacking(pkt->getAddr(), dram)) {
         panic("Can't handle address range for packet %s\n", pkt->print());
     }
 
@@ -142,7 +153,7 @@ MemCtrl::recvAtomicLogic(PacketPtr pkt, MemInterface* mem_intr)
              "is responding");
 
     // do the actual memory access and turn the packet into a response
-    mem_intr->access(pkt);
+    dataBacking(pkt->getAddr(), mem_intr)->access(pkt);
 
     if (pkt->hasData()) {
         // this value is not supposed to be accurate, just enough to
@@ -158,7 +169,7 @@ Tick
 MemCtrl::recvAtomicBackdoor(PacketPtr pkt, MemBackdoorPtr &backdoor)
 {
     Tick latency = recvAtomic(pkt);
-    dram->getBackdoor(backdoor);
+    dataBacking(pkt->getAddr(), dram)->getBackdoor(backdoor);
     return latency;
 }
 
@@ -422,7 +433,7 @@ MemCtrl::recvTimingReq(PacketPtr pkt)
     }
     prevArrival = curTick();
 
-    panic_if(!(dram->getAddrRange().contains(pkt->getAddr())),
+    panic_if(!dataBacking(pkt->getAddr(), dram),
              "Can't handle address range for packet %s\n", pkt->print());
 
     // Find out how many memory packets a pkt translates to
@@ -627,9 +638,9 @@ MemCtrl::accessAndRespond(PacketPtr pkt, Tick static_latency,
     bool needsResponse = pkt->needsResponse();
     // do the actual memory access which also turns the packet into a
     // response
-    panic_if(!mem_intr->getAddrRange().contains(pkt->getAddr()),
+    panic_if(!dataBacking(pkt->getAddr(), mem_intr),
              "Can't handle address range for packet %s\n", pkt->print());
-    mem_intr->access(pkt);
+    dataBacking(pkt->getAddr(), mem_intr)->access(pkt);
 
     // turn packet around to go back to requestor if response expected
     if (needsResponse) {
@@ -1384,19 +1395,19 @@ void
 MemCtrl::recvMemBackdoorReq(const MemBackdoorReq &req,
         MemBackdoorPtr &backdoor)
 {
-    panic_if(!dram->getAddrRange().contains(req.range().start()),
+    panic_if(!dataBacking(req.range().start(), dram),
             "Can't handle address range for backdoor %s.",
             req.range().to_string());
 
-    dram->getBackdoor(backdoor);
+    dataBacking(req.range().start(), dram)->getBackdoor(backdoor);
 }
 
 bool
 MemCtrl::recvFunctionalLogic(PacketPtr pkt, MemInterface* mem_intr)
 {
-    if (mem_intr->getAddrRange().contains(pkt->getAddr())) {
+    if (auto *backing = dataBacking(pkt->getAddr(), mem_intr)) {
         // rely on the abstract memory
-        mem_intr->functionalAccess(pkt);
+        backing->functionalAccess(pkt);
         return true;
     } else {
         return false;
@@ -1471,6 +1482,7 @@ MemCtrl::getAddrRanges()
 {
     AddrRangeList range;
     range.push_back(dram->getAddrRange());
+    for (const auto *backing : rangeBackings) range.push_back(backing->getAddrRange());
     return range;
 }
 

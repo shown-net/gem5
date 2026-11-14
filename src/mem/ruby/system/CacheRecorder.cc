@@ -31,6 +31,7 @@
 
 #include "debug/RubyCacheTrace.hh"
 #include "mem/packet.hh"
+#include "mem/ruby/slicc_interface/AbstractController.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "mem/ruby/system/Sequencer.hh"
 #include "sim/sim_exit.hh"
@@ -79,6 +80,31 @@ CacheRecorder::~CacheRecorder()
         m_uncompressed_trace = NULL;
     }
     m_ruby_port_map.clear();
+}
+
+void
+CacheRecorder::functionalWriteback(RubySystem &system,
+    const std::vector<AbstractController *> &controllers)
+{
+    // Recorded lower-level copies may be stale while a private cache owns
+    // modified data. Read the current authoritative copy through Ruby's
+    // functional permission rules, then update backing memory and all
+    // buffered/cached copies through the same network's functional path.
+    for (auto *record : m_records) {
+        const auto requestor =
+            controllers.at(record->m_cntrl_id)->getRequestorId();
+        auto request = std::make_shared<Request>(record->m_data_address,
+            m_block_size_bytes, 0, requestor);
+        Packet read_packet(request, MemCmd::ReadReq);
+        read_packet.allocate();
+        fatal_if(!system.functionalRead(&read_packet),
+                 "Cannot snapshot Ruby cache line %#x", record->m_data_address);
+        Packet write_packet(request, MemCmd::WriteReq);
+        write_packet.dataStatic(read_packet.getPtr<uint8_t>());
+        system.functionalWrite(&write_packet);
+        memcpy(record->m_data, read_packet.getConstPtr<uint8_t>(),
+               m_block_size_bytes);
+    }
 }
 
 void

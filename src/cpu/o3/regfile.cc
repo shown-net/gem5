@@ -40,6 +40,7 @@
  */
 
 #include "cpu/o3/regfile.hh"
+#include <limits>
 
 #include "cpu/o3/free_list.hh"
 
@@ -82,8 +83,13 @@ PhysRegFile::PhysRegFile(unsigned _numPhysicalIntRegs,
                    _numPhysicalCCRegs +
                    reg_classes.at(MiscRegClass)->numRegs())
 {
+    const auto max_index = std::numeric_limits<RegIndex>::max();
+    panic_if(numPhysicalIntRegs > max_index || numPhysicalFloatRegs > max_index ||
+             numPhysicalVecRegs > max_index || numPhysicalVecPredRegs > max_index ||
+             numPhysicalMatRegs > max_index || numPhysicalCCRegs > max_index,
+             "Per-class physical storage exceeds register index range");
     RegIndex phys_reg;
-    RegIndex flat_reg_idx = 0;
+    PhysRegIndex flat_reg_idx = 0;
 
     // The initial batch of registers are the integer ones
     for (phys_reg = 0; phys_reg < numPhysicalIntRegs; phys_reg++) {

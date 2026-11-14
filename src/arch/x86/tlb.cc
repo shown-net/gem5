@@ -39,6 +39,7 @@
 #include "arch/x86/tlb.hh"
 
 #include <cstring>
+#include <algorithm>
 #include <memory>
 
 #include "arch/x86/faults.hh"
@@ -66,9 +67,13 @@ namespace gem5
 namespace X86ISA {
 
 TLB::TLB(const Params &p)
-    : BaseTLB(p), configAddress(0), size(p.size),
+    : BaseTLB(p), configAddress(0),
+      size(p.size + (p.spr_split_l1 ?
+           (p.dtlb_4k_ways ? 56 : 32) : 0)), baseSize(p.size),
       smallPageWays(p.dtlb_4k_ways ? p.dtlb_4k_ways : p.itlb_4k_ways),
       sprSharedDomains(p.spr_shared_domains),
+      sprSharedIndexShift(p.spr_shared_index_shift),
+      sprSplitL1(p.spr_split_l1),
       nextLevelHitLatency(p.next_level_hit_latency),
       tlb(size), lruSeq(0), m5opRange(p.system->m5opRange()), stats(this)
 {
@@ -78,14 +83,18 @@ TLB::TLB(const Params &p)
              "Select either instruction or data 4K TLB ways");
     fatal_if(p.dtlb_4k_ways && type() != TypeTLB::data,
              "Data 4K associativity applies only to a data TLB");
-    fatal_if(smallPageWays && (size % smallPageWays),
+    fatal_if(smallPageWays && (baseSize % smallPageWays),
              "TLB size must be divisible by its number of 4K ways");
     fatal_if(sprSharedDomains && size != 2048,
              "SPR shared TLB proxy requires 2048 entries");
+    fatal_if(sprSharedIndexShift >= 64,
+             "Shared TLB index fold must be less than 64 bits");
     if (nextLevel() && type() == TypeTLB::instruction)
         itlbMissStats = std::make_unique<ItlbMissStats>(this);
-    if (type() == TypeTLB::data)
+    if (type() == TypeTLB::data) {
         dtlbLoadMissStats = std::make_unique<DtlbLoadMissStats>(this);
+        dtlbStoreMissStats = std::make_unique<DtlbStoreMissStats>(this);
+    }
 
     for (int x = 0; x < size; x++) {
         tlb[x].trieHandle = NULL;
@@ -108,6 +117,56 @@ TLB::DtlbLoadMissStats::DtlbLoadMissStats(statistics::Group *parent)
                "Timing demand-read DTLB misses finding a modeled shared TLB entry; includes speculative lookups")
 {}
 
+TLB::DtlbStoreMissStats::DtlbStoreMissStats(statistics::Group *parent)
+    : statistics::Group(parent, "DTLB_STORE_MISSES"),
+      ADD_STAT(STLB_HIT, statistics::units::Count::get(),
+               "Timing demand-write DTLB misses finding the modeled shared TLB")
+{}
+
+void
+TLB::indexSharedEntry(TlbEntry *entry)
+{
+    if (!sprSharedDomains || sprSplitL1)
+        return;
+    auto &members = sharedSets[sharedSet(entry->vaddr, entry->logBytes)];
+    members.insert(std::lower_bound(members.begin(), members.end(), entry), entry);
+}
+
+unsigned
+TLB::sharedSet(Addr vpn, unsigned log_bytes) const
+{
+    Addr page = vpn >> log_bytes;
+    if (log_bytes == 12 && sprSharedIndexShift == 8) {
+        // Fold every byte of the unsigned virtual page number.  The final
+        // low eight bits select the two modeled domains and their sets.
+        page ^= page >> 32;
+        page ^= page >> 16;
+        page ^= page >> 8;
+    } else if (log_bytes == 12 && sprSharedIndexShift) {
+        page ^= page >> sprSharedIndexShift;
+    }
+    const unsigned domain = log_bytes == 12 ? ((page >> 7) & 1) :
+                            log_bytes == 30 ? 1 : 0;
+    return domain * 128 + unsigned(page & 127);
+}
+
+void
+TLB::removeEntry(TlbEntry *entry)
+{
+    assert(entry->trieHandle);
+    if (sprSharedDomains && !sprSplitL1) {
+        auto &members = sharedSets[sharedSet(entry->vaddr, entry->logBytes)];
+        const auto found = std::lower_bound(members.begin(), members.end(), entry);
+        assert(found != members.end() && *found == entry);
+        members.erase(found);
+    }
+    TlbEntryTrie &owner = sprSplitL1 && type() == TypeTLB::data &&
+        unsigned(entry - tlb.data()) >= baseSize + 40 ? storeTrie : trie;
+    owner.remove(entry->trieHandle);
+    entry->trieHandle = nullptr;
+    freeList.push_back(entry);
+}
+
 void
 TLB::evictLRU()
 {
@@ -120,53 +179,113 @@ TLB::evictLRU()
             lru = i;
     }
 
-    assert(tlb[lru].trieHandle);
-    trie.remove(tlb[lru].trieHandle);
-    tlb[lru].trieHandle = NULL;
-    freeList.push_back(&tlb[lru]);
+    removeEntry(&tlb[lru]);
 }
 
 TlbEntry *
-TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel)
+TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
+            BaseMMU::Mode mode)
 {
-    //Adding pcid to the page address so
-    //that multiple processes using the same
-    //tlb do not conflict when using the same
-    //virtual addresses
-    vpn = concAddrPcid(vpn, pcid);
+    const Addr key = entry.global && FullSystem ?
+        (vpn & mask(48)) | (Addr(1) << 60) : concAddrPcid(vpn, pcid);
+
+    if (sprSplitL1) {
+        const bool data = type() == TypeTLB::data;
+        const bool store = data && mode == BaseMMU::Write;
+        TlbEntryTrie &index = store ? storeTrie : trie;
+        if (auto *existing = index.lookup(key)) return existing;
+
+        unsigned first = 0, last = baseSize;
+        const bool large = entry.logBytes == 21 || entry.logBytes == 22;
+        unsigned set = 0, ways = 0;
+        if (store) {
+            first = baseSize + 40;
+            last = first + 16;
+        } else if (large) {
+            ways = data ? 4 : 8;
+            set = data ? ((vpn >> 22) & 7) :
+                         ((vpn >> entry.logBytes) & 3);
+            first = baseSize + set * ways;
+            last = first + ways;
+        } else if (data && entry.logBytes == 30) {
+            first = baseSize + 32;
+            last = first + 8;
+        }
+        if (first == 0 && entry.logBytes == 12) {
+            const unsigned target = (vpn >> 12) % (baseSize / smallPageWays);
+            unsigned used = 0;
+            TlbEntry *victim = nullptr;
+            for (unsigned i = 0; i < baseSize; ++i) {
+                auto &candidate = tlb[i];
+                if (candidate.trieHandle && candidate.logBytes == 12 &&
+                    (candidate.vaddr >> 12) % (baseSize / smallPageWays) == target) {
+                    ++used;
+                    if (!victim || candidate.lruSeq < victim->lruSeq)
+                        victim = &candidate;
+                }
+            }
+            if (used >= smallPageWays) removeEntry(victim);
+        }
+        auto free = std::find_if(freeList.begin(), freeList.end(),
+            [&](TlbEntry *candidate) {
+                const auto position = unsigned(candidate - tlb.data());
+                return position >= first && position < last;
+            });
+        if (free == freeList.end()) {
+            TlbEntry *victim = nullptr;
+            if (data && large) {
+                const unsigned bits = largePageTree[set];
+                const unsigned half = bits & 1;
+                const unsigned leaf = (bits >> (half ? 2 : 1)) & 1;
+                victim = &tlb[first + 2 * half + leaf];
+            } else {
+                for (unsigned i = first; i < last; ++i)
+                    if (!victim || tlb[i].lruSeq < victim->lruSeq)
+                        victim = &tlb[i];
+            }
+            removeEntry(victim);
+            free = std::prev(freeList.end());
+        }
+        TlbEntry *chosen = *free;
+        freeList.erase(free);
+        const unsigned way = unsigned(chosen - tlb.data()) - first;
+        *chosen = entry;
+        chosen->vaddr = vpn;
+        chosen->pcid = pcid;
+        chosen->lruSeq = nextSeq();
+        chosen->trieHandle = index.insert(key, FullSystem ?
+            TlbEntryTrie::MaxBits - entry.logBytes : TlbEntryTrie::MaxBits, chosen);
+        if (data && large) {
+            auto &bits = largePageTree[set];
+            const unsigned half = way / 2, leaf = way % 2;
+            bits = (bits & ~1U) | (1U - half);
+            const unsigned bit = half ? 2 : 1;
+            bits = (bits & ~(1U << bit)) | ((1U - leaf) << bit);
+        }
+        if (fillNextLevel && nextLevel())
+            static_cast<TLB *>(nextLevel())->insert(entry.vaddr, entry, pcid);
+        return chosen;
+    }
 
     // If somebody beat us to it, just use that existing entry.
-    TlbEntry *newEntry = trie.lookup(vpn);
+    TlbEntry *newEntry = trie.lookup(key);
     if (newEntry) {
-        assert(newEntry->vaddr == vpn);
         return newEntry;
     }
 
     if (sprSharedDomains) {
+        // TODO(SPR-MSR): If STLB QoS is used, distinguish CLOS fill masks
+        // from this fixed geometry; first verify native/guest effective masks.
         // Two support domains. A: 4K/2M/4M, B: 4K/1G.
-        // 4K placement uses VPN[7] for the domain and VPN[6:0] for
-        // the set; large-page indexing is an uncalibrated proxy.
-        auto location = [](Addr addr, unsigned log_bytes) {
-            const Addr page = addr >> log_bytes;
-            const unsigned domain = log_bytes == 12 ? ((page >> 7) & 1) :
-                                    log_bytes == 30 ? 1 : 0;
-            return std::make_pair(domain, unsigned(page & 127));
-        };
-        auto target = location(vpn, entry.logBytes);
-        unsigned used = 0;
-        TlbEntry *victim = nullptr;
-        for (auto &candidate : tlb) {
-            if (candidate.trieHandle &&
-                location(candidate.vaddr, candidate.logBytes) == target) {
-                ++used;
-                if (!victim || candidate.lruSeq < victim->lruSeq)
-                    victim = &candidate;
-            }
-        }
-        if (used >= 8) {
-            trie.remove(victim->trieHandle);
-            victim->trieHandle = nullptr;
-            freeList.push_back(victim);
+        // The optional 4K fold controls false conflicts at sparse strides.
+        // Neither this fold nor large-page indexing is a recovered SPR hash.
+        const auto &members = sharedSets[sharedSet(vpn, entry.logBytes)];
+        if (members.size() >= 8) {
+            auto *victim = *std::min_element(members.begin(), members.end(),
+                [](const TlbEntry *a, const TlbEntry *b) {
+                    return a->lruSeq < b->lruSeq;
+                });
+            removeEntry(victim);
         }
     } else if (smallPageWays && entry.logBytes == 12) {
         const auto set = (vpn >> 12) % (size / smallPageWays);
@@ -181,9 +300,7 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel)
             }
         }
         if (used >= smallPageWays) {
-            trie.remove(victim->trieHandle);
-            victim->trieHandle = nullptr;
-            freeList.push_back(victim);
+            removeEntry(victim);
         }
     }
     if (freeList.empty())
@@ -195,25 +312,41 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel)
     *newEntry = entry;
     newEntry->lruSeq = nextSeq();
     newEntry->vaddr = vpn;
+    newEntry->pcid = pcid;
     if (FullSystem) {
         newEntry->trieHandle =
-        trie.insert(vpn, TlbEntryTrie::MaxBits-entry.logBytes, newEntry);
+        trie.insert(key, TlbEntryTrie::MaxBits-entry.logBytes, newEntry);
     }
     else {
         newEntry->trieHandle =
-        trie.insert(vpn, TlbEntryTrie::MaxBits, newEntry);
+        trie.insert(key, TlbEntryTrie::MaxBits, newEntry);
     }
+    indexSharedEntry(newEntry);
     if (fillNextLevel && nextLevel())
         static_cast<TLB *>(nextLevel())->insert(entry.vaddr, entry, pcid);
     return newEntry;
 }
 
 TlbEntry *
-TLB::lookup(Addr va, bool update_lru)
+TLB::lookup(Addr va, bool update_lru, BaseMMU::Mode mode)
 {
-    TlbEntry *entry = trie.lookup(va);
-    if (entry && update_lru)
+    TlbEntryTrie &index = sprSplitL1 && type() == TypeTLB::data &&
+        mode == BaseMMU::Write ? storeTrie : trie;
+    TlbEntry *entry = index.lookup(va);
+    if (!entry && FullSystem)
+        entry = index.lookup((va & mask(48)) | (Addr(1) << 60));
+    if (entry && update_lru) {
         entry->lruSeq = nextSeq();
+        const unsigned pos = unsigned(entry - tlb.data());
+        if (sprSplitL1 && type() == TypeTLB::data &&
+            pos >= baseSize && pos < baseSize + 32) {
+            const unsigned set = (pos - baseSize) / 4, way = (pos - baseSize) % 4;
+            auto &bits = largePageTree[set];
+            const unsigned half = way / 2, bit = half ? 2 : 1;
+            bits = (bits & ~1U) | (1U - half);
+            bits = (bits & ~(1U << bit)) | ((1U - way % 2) << bit);
+        }
+    }
     return entry;
 }
 
@@ -222,6 +355,8 @@ TLB::flushAll()
 {
     functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushAll, 0, 0, true);
     ++invalidationGeneration;
+    if (walker->pagingStructureCache)
+        walker->pagingStructureCache->invalidate();
     if (codeInvalidation) codeInvalidation();
     if (nextLevel()) {
         functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
@@ -230,9 +365,7 @@ TLB::flushAll()
     DPRINTF(TLB, "Invalidating all entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle) {
-            trie.remove(tlb[i].trieHandle);
-            tlb[i].trieHandle = NULL;
-            freeList.push_back(&tlb[i]);
+            removeEntry(&tlb[i]);
         }
     }
 }
@@ -244,21 +377,22 @@ TLB::setConfigAddress(uint32_t addr)
 }
 
 void
-TLB::flushNonGlobal()
+TLB::flushNonGlobal(int pcid)
 {
     functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::FlushNonGlobal, 0, 0, true);
     ++invalidationGeneration;
+    if (walker->pagingStructureCache)
+        walker->pagingStructureCache->invalidate(pcid);
     if (codeInvalidation) codeInvalidation();
     if (nextLevel()) {
         functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
-        static_cast<TLB *>(nextLevel())->flushNonGlobal();
+        static_cast<TLB *>(nextLevel())->flushNonGlobal(pcid);
     }
     DPRINTF(TLB, "Invalidating all non global entries.\n");
     for (unsigned i = 0; i < size; i++) {
-        if (tlb[i].trieHandle && !tlb[i].global) {
-            trie.remove(tlb[i].trieHandle);
-            tlb[i].trieHandle = NULL;
-            freeList.push_back(&tlb[i]);
+        if (tlb[i].trieHandle && !tlb[i].global &&
+            (pcid < 0 || tlb[i].pcid == pcid)) {
+            removeEntry(&tlb[i]);
         }
     }
 }
@@ -266,18 +400,40 @@ TLB::flushNonGlobal()
 void
 TLB::demapPage(Addr va, uint64_t asn)
 {
-    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, va, asn, true);
+    invalidatePage(va, asn, true);
+}
+
+void
+TLB::contextChanged()
+{
     ++invalidationGeneration;
+    if (codeInvalidation) codeInvalidation();
+    if (nextLevel()) static_cast<TLB *>(nextLevel())->contextChanged();
+}
+
+void
+TLB::invalidatePage(Addr va, uint16_t pcid, bool include_global)
+{
+    functional_mmu::CommandScope mmu_command(this, fastsim::fst::mmuctl::CommandKind::DemapPage, va, pcid, true);
+    ++invalidationGeneration;
+    // INVLPG clears all upper-prefix entries for the PCID, independently of
+    // VA. Architectural page faults may conservatively use this same scope.
+    if (walker->pagingStructureCache)
+        walker->pagingStructureCache->invalidate(pcid);
     if (codeInvalidation) codeInvalidation();
     if (nextLevel()) {
         functional_mmu::EdgeScope mmu_edge(mmu_command, this, nextLevel());
-        static_cast<TLB *>(nextLevel())->demapPage(va, asn);
+        static_cast<TLB *>(nextLevel())->invalidatePage(va, pcid, include_global);
     }
-    TlbEntry *entry = trie.lookup(va);
-    if (entry) {
-        trie.remove(entry->trieHandle);
-        entry->trieHandle = NULL;
-        freeList.push_back(entry);
+    // Scan both load and store banks, including overlapping large pages.
+    for (unsigned i = 0; i < size; ++i) {
+        auto &entry = tlb[i];
+        if (entry.trieHandle &&
+            ((entry.global && include_global) ||
+             (!entry.global && entry.pcid == pcid)) &&
+            (va & ~mask(entry.logBytes)) == entry.vaddr) {
+            removeEntry(&entry);
+        }
     }
 }
 
@@ -316,6 +472,9 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
 
         RegIndex regNum;
         if (!msrAddrToIndex(regNum, vaddr))
+            return std::make_shared<GeneralProtection>(0);
+        // IA32_PRED_CMD is a write-only command, not readable MSR state.
+        if (read && regNum == misc_reg::PredCmd)
             return std::make_shared<GeneralProtection>(0);
 
         req->setPaddr(req->getVaddr());
@@ -528,7 +687,7 @@ TLB::translate(const RequestPtr &req,
                 pcid = 0x000;
 
             pageAlignedVaddr = concAddrPcid(pageAlignedVaddr, pcid);
-            TlbEntry *entry = lookup(pageAlignedVaddr);
+            TlbEntry *entry = lookup(pageAlignedVaddr, true, mode);
 
             switch (mode) {
                 case BaseMMU::Read:
@@ -570,6 +729,9 @@ TLB::translate(const RequestPtr &req,
                         if (mode == BaseMMU::Read && timing && translation &&
                             !req->isPrefetch() && dtlbLoadMissStats)
                             ++dtlbLoadMissStats->STLB_HIT;
+                        if (mode == BaseMMU::Write && timing && translation &&
+                            !req->isPrefetch() && dtlbStoreMissStats)
+                            ++dtlbStoreMissStats->STLB_HIT;
                         if (timing && translation && nextLevelHitLatency > Cycles(0)) {
                             auto *cpu = tc->getCpuPtr();
                             const TlbEntry saved = *hit;
@@ -593,7 +755,7 @@ TLB::translate(const RequestPtr &req,
                                             savedCr3 == tc->readMiscRegNoEffect(misc_reg::Cr3) &&
                                             savedCr4 == tc->readMiscRegNoEffect(misc_reg::Cr4) &&
                                             savedEfer == tc->readMiscRegNoEffect(misc_reg::Efer)) {
-                                            insert(saved.vaddr, saved, pcid, false);
+                                            insert(saved.vaddr, saved, pcid, false, mode);
                                             if (mode == BaseMMU::Execute)
                                                 ++stats.stlbResponses;
                                         } else if (mode == BaseMMU::Execute) {
@@ -606,17 +768,25 @@ TLB::translate(const RequestPtr &req,
                             delayedResponse = true;
                             return NoFault;
                         }
-                        entry = insert(hit->vaddr, *hit, pcid, false);
+                        entry = insert(hit->vaddr, *hit, pcid, false, mode);
                     }
                 }
                 if (!entry && FullSystem) {
+                    if (timing && translation && mode != BaseMMU::Execute &&
+                        !req->isPrefetch() && nextLevel()) {
+                        auto facts = req->getExtension<TranslationMissExtension>();
+                        if (!facts)
+                            facts = std::make_shared<TranslationMissExtension>();
+                        facts->stlbMiss = true;
+                        req->setExtension(facts);
+                    }
                     Fault fault = walker->start(tc, translation, req, mode);
                     if (timing || fault != NoFault) {
                         // This gets ignored in atomic mode.
                         delayedResponse = true;
                         return fault;
                     }
-                    entry = lookup(pageAlignedVaddr);
+                    entry = lookup(pageAlignedVaddr, true, mode);
                     assert(entry);
                 } else if (!entry) {
                     Process *p = tc->getProcessPtr();
@@ -633,7 +803,7 @@ TLB::translate(const RequestPtr &req,
                                 p->pTable->pid(), alignedVaddr, pte->paddr,
                                 pte->flags & EmulationPageTable::Uncacheable,
                                 pte->flags & EmulationPageTable::ReadOnly),
-                                pcid);
+                                pcid, true, mode);
                     }
                     DPRINTF(TLB, "Miss was serviced.\n");
                 }
@@ -681,6 +851,13 @@ TLB::translate(const RequestPtr &req,
             }
             if (entry->uncacheable)
                 req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+            if (req->getFlags() & Request::REP_BULK) {
+                const unsigned pat_index = (unsigned(entry->patBit) << 2) |
+                    (unsigned(entry->uncacheable) << 1) | unsigned(entry->pwt);
+                const RegVal pat = tc->readMiscRegNoEffect(misc_reg::Pat);
+                if (((pat >> (8 * pat_index)) & 0xff) != 6)
+                    return std::make_shared<RepRestart>();
+            }
         } else {
             //Use the address which already has segmentation applied.
             DPRINTF(TLB, "Paging disabled.\n");
@@ -703,6 +880,13 @@ TLB::translate(const RequestPtr &req,
         req->setExtension(extension);
     }
     Fault finalFault = finalizePhysical(req, tc, mode);
+    if (finalFault == NoFault && (req->getFlags() & Request::REP_BULK)) {
+        const Addr paddr = req->getPaddr();
+        if (req->isUncacheable() || req->isStrictlyOrdered() ||
+            req->isLocalAccess() || !tc->getSystemPtr()->isMemAddr(paddr) ||
+            !tc->getSystemPtr()->isMemAddr(paddr + req->getSize() - 1))
+            finalFault = std::make_shared<RepRestart>();
+    }
     if (finalFault != NoFault)
         req->removeExtension<FunctionalTranslationExtension>();
     return finalFault;
@@ -814,9 +998,14 @@ TLB::serialize(CheckpointOut &cp) const
 
     uint32_t _count = 0;
     for (uint32_t x = 0; x < size; x++) {
-        if (tlb[x].trieHandle != NULL)
+        if (tlb[x].trieHandle != NULL) {
+            if (sprSplitL1) paramOut(cp, csprintf("slot%d", _count), x);
             tlb[x].serializeSection(cp, csprintf("Entry%d", _count++));
+        }
     }
+    if (sprSplitL1)
+        for (unsigned i = 0; i < largePageTree.size(); ++i)
+            paramOut(cp, csprintf("largePageTree%d", i), largePageTree[i]);
 }
 
 void
@@ -831,15 +1020,27 @@ TLB::unserialize(CheckpointIn &cp)
     }
 
     UNSERIALIZE_SCALAR(lruSeq);
-
     for (uint32_t x = 0; x < _size; x++) {
-        TlbEntry *newEntry = freeList.front();
-        freeList.pop_front();
-
-        newEntry->unserializeSection(cp, csprintf("Entry%d", x));
-        newEntry->trieHandle = trie.insert(newEntry->vaddr,
-            TlbEntryTrie::MaxBits - newEntry->logBytes, newEntry);
+        TlbEntry restored;
+        restored.unserializeSection(cp, csprintf("Entry%d", x));
+        unsigned slot = 0;
+        if (sprSplitL1) paramIn(cp, csprintf("slot%d", x), slot);
+        TlbEntry *newEntry = sprSplitL1 ? &tlb.at(slot) : freeList.front();
+        freeList.remove(newEntry);
+        *newEntry = restored;
+        TlbEntryTrie &index = sprSplitL1 && type() == TypeTLB::data &&
+            slot >= baseSize + 40 ? storeTrie : trie;
+        const Addr key = newEntry->global && FullSystem ?
+            (newEntry->vaddr & mask(48)) | (Addr(1) << 60) :
+            concAddrPcid(newEntry->vaddr, newEntry->pcid);
+        newEntry->trieHandle = index.insert(key, FullSystem ?
+            TlbEntryTrie::MaxBits - newEntry->logBytes :
+            TlbEntryTrie::MaxBits, newEntry);
+        indexSharedEntry(newEntry);
     }
+    if (sprSplitL1)
+        for (unsigned i = 0; i < largePageTree.size(); ++i)
+            paramIn(cp, csprintf("largePageTree%d", i), largePageTree[i]);
 }
 
 Port *

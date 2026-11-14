@@ -184,7 +184,7 @@ def create_system(
                 cache=l1_cache,
                 prefetcher=RubyPrefetcher(block_size=options.cacheline_size),
                 enable_prefetch=options.enable_prefetch,
-                l2_select_num_bits=l2_bits,
+                l2_select_num_banks=num_l2caches_per_cluster,
                 cluster_id=i,
                 transitions_per_cycle=options.l1_transitions_per_cycle,
                 ruby_system=ruby_system,
@@ -232,7 +232,8 @@ def create_system(
             l2_cache = L2Cache(
                 size=options.l2_size,
                 assoc=options.l2_assoc,
-                start_index_bit=l2_index_start,
+                start_index_bit=block_size_bits,
+                index_divisor=num_l2caches_per_cluster,
             )
 
             l2_cntrl = MESI_Three_Level_L2Cache_Controller(

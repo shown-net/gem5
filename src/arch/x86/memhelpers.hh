@@ -52,6 +52,58 @@ initiateMemRead(ExecContext *xc, trace::InstRecord *traceData, Addr addr,
     return xc->initiateMemRead(addr, dataSize, flags, byte_enable);
 }
 
+// REP carries at most one cache line. The active prefix is the exact access
+// width, not eight independent reads or an instantaneous buffer copy.
+static Fault
+readRepMemAtomic(ExecContext *xc, trace::InstRecord *traceData, Addr addr,
+                 std::array<uint64_t, 8> &mem, unsigned bytes,
+                 Request::Flags flags)
+{
+    assert(bytes <= sizeof(mem));
+    mem.fill(0);
+    if (!bytes) return NoFault;
+    std::array<uint8_t, 64> data{};
+    const std::vector<bool> enabled(bytes, true);
+    Fault fault = xc->readMem(addr, data.data(), bytes, flags, enabled);
+    if (fault == NoFault) {
+        for (unsigned i = 0; i < bytes; ++i)
+            mem[i / 8] |= uint64_t(data[i]) << (8 * (i % 8));
+        if (traceData) traceData->setData(mem[0]);
+    }
+    return fault;
+}
+
+static void
+getRepMem(PacketPtr pkt, std::array<uint64_t, 8> &mem, unsigned bytes,
+          trace::InstRecord *traceData)
+{
+    assert(bytes <= sizeof(mem));
+    mem.fill(0);
+    // A statically predicted REP control path may reach a zero-count
+    // load. The LSQ completes its suppressed access without a packet.
+    if (!bytes) return;
+    assert(pkt && pkt->getSize() == bytes);
+    const auto *data = pkt->getConstPtr<uint8_t>();
+    for (unsigned i = 0; i < bytes; ++i)
+        mem[i / 8] |= uint64_t(data[i]) << (8 * (i % 8));
+    if (traceData) traceData->setData(mem[0]);
+}
+
+static Fault
+writeRepMem(ExecContext *xc, trace::InstRecord *traceData,
+            const std::array<uint64_t, 8> &mem, unsigned bytes, Addr addr,
+            Request::Flags flags, uint64_t *res)
+{
+    assert(bytes <= sizeof(mem));
+    if (!bytes) return NoFault;
+    std::array<uint8_t, 64> data{};
+    for (unsigned i = 0; i < bytes; ++i)
+        data[i] = mem[i / 8] >> (8 * (i % 8));
+    if (traceData) traceData->setData(mem[0]);
+    const std::vector<bool> enabled(bytes, true);
+    return xc->writeMem(data.data(), bytes, addr, flags, res, enabled);
+}
+
 static void
 getMem(PacketPtr pkt, uint64_t &mem, unsigned dataSize,
        trace::InstRecord *traceData)

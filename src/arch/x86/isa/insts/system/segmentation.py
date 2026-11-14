@@ -365,3 +365,43 @@ def macroop SWAPGS
     wrval kernel_gs_base, t2, dataSize=8
 };
 """
+
+# VERW checks the descriptor without loading the segment. Invalid selectors
+# clear ZF, whereas an operand memory access still has its ordinary faults.
+_verw_body = """
+    zexti t1, t1, 15, dataSize=8
+    srli t2, t1, 2, flags=(EZF,), dataSize=8
+    br label("invalid"), flags=(CEZF,)
+    srli t2, t1, 3, dataSize=8
+    slli t2, t2, 3, dataSize=8
+    andi t0, t1, 4, flags=(EZF,), dataSize=8
+    br label("global"), flags=(CEZF,)
+    rdattr t4, tsl, dataSize=8
+    andi t0, t4, 4, flags=(EZF,), dataSize=8
+    br label("invalid"), flags=(nCEZF,)
+    rdlimit t4, tsl, dataSize=8
+    addi t5, t2, 7, dataSize=8
+    sub t0, t4, t5, flags=(ECF,), dataSize=8
+    br label("invalid"), flags=(CECF,)
+    ld t3, tsl, [1, t0, t2], dataSize=8, addressSize=8, atCPL0=True
+    br label("verify")
+global:
+    rdlimit t4, tsg, dataSize=8
+    addi t5, t2, 7, dataSize=8
+    sub t0, t4, t5, flags=(ECF,), dataSize=8
+    br label("invalid"), flags=(CECF,)
+    ld t3, tsg, [1, t0, t2], dataSize=8, addressSize=8, atCPL0=True
+    br label("verify")
+invalid:
+    limm t3, 0, dataSize=8
+verify:
+    verwcheck t1, t3, dataSize=8
+"""
+
+for _suffix, _operand in (
+    ("R", "mov t1, t0, reg, dataSize=2"),
+    ("M", "ld t1, seg, sib, disp, dataSize=2"),
+    ("P", "rdip t7\n    ld t1, seg, riprel, disp, dataSize=2"),
+):
+    microcode += "\ndef macroop VERW_%s {\n    %s\n%s};\n" % (
+        _suffix, _operand, _verw_body)

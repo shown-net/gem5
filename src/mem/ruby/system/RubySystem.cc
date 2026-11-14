@@ -223,81 +223,15 @@ RubySystem::makeCacheRecorder(uint8_t *uncompressed_trace,
 void
 RubySystem::memWriteback()
 {
-    m_cooldown_enabled = true;
-
-    // Make the trace so we know what to write back.
-    DPRINTF(RubyCacheTrace, "Recording Cache Trace\n");
+    // Checkpointing must preserve the live scheduling state. Running a
+    // separate timing cooldown and rewinding curTick changes Consumer tick
+    // sets and component timestamps while restoring old Event objects.
     makeCacheRecorder(NULL, 0, getBlockSizeBytes());
-    for (int cntrl = 0; cntrl < m_abs_cntrl_vec.size(); cntrl++) {
+    for (int cntrl = 0; cntrl < m_abs_cntrl_vec.size(); ++cntrl)
         m_abs_cntrl_vec[cntrl]->recordCacheTrace(cntrl, m_cache_recorder);
-    }
-    DPRINTF(RubyCacheTrace, "Cache Trace Complete\n");
-
-    // If there is no dirty block, we don't need to flush the cache
-    if (m_cache_recorder->getNumRecords() == 0)
-    {
-        m_cooldown_enabled = false;
-        return;
-    }
-
-    // save the current tick value
-    Tick curtick_original = curTick();
-    DPRINTF(RubyCacheTrace, "Recording current tick %ld\n", curtick_original);
-
-    // Deschedule all prior events on the event queue, but record the tick they
-    // were scheduled at so they can be restored correctly later.
-    std::list<std::pair<Event*, Tick> > original_events;
-    while (!eventq->empty()) {
-        Event *curr_head = eventq->getHead();
-        if (curr_head->isAutoDelete()) {
-            DPRINTF(RubyCacheTrace, "Event %s auto-deletes when descheduled,"
-                    " not recording\n", curr_head->name());
-        } else {
-            original_events.push_back(
-                    std::make_pair(curr_head, curr_head->when()));
-        }
-        eventq->deschedule(curr_head);
-    }
-
-    // Schedule an event to start cache cooldown
-    DPRINTF(RubyCacheTrace, "Starting cache flush\n");
-    enqueueRubyEvent(curTick());
-    simulate();
-    DPRINTF(RubyCacheTrace, "Cache flush complete\n");
-
-    // Deschedule any events left on the event queue.
-    while (!eventq->empty()) {
-        eventq->deschedule(eventq->getHead());
-    }
-
-    // Restore curTick
-    setCurTick(curtick_original);
-
-    // Restore all events that were originally on the event queue.  This is
-    // done after setting curTick back to its original value so that events do
-    // not seem to be scheduled in the past.
-    while (!original_events.empty()) {
-        std::pair<Event*, Tick> event = original_events.back();
-        eventq->schedule(event.first, event.second);
-        original_events.pop_back();
-    }
-
-    // No longer flushing back to memory.
-    m_cooldown_enabled = false;
-
-    // There are several issues with continuing simulation after calling
-    // memWriteback() at the moment, that stem from taking events off the
-    // queue, simulating again, and then putting them back on, whilst
-    // pretending that no time has passed.  One is that some events will have
-    // been deleted, so can't be put back.  Another is that any object
-    // recording the tick something happens may end up storing a tick in the
-    // future.  A simple warning here alerts the user that things may not work
-    // as expected.
-    warn_once("Ruby memory writeback is experimental.  Continuing simulation "
-              "afterwards may not always work as intended.");
-
-    // Keep the cache recorder around so that we can dump the trace if a
-    // checkpoint is immediately taken.
+    m_cache_recorder->functionalWriteback(*this, m_abs_cntrl_vec);
+    // Retain the current cache record for the immediately following
+    // serialize(), without flushing permissions or switching event queues.
 }
 
 void
@@ -438,7 +372,8 @@ RubySystem::startup()
     // an empty trace would rewind this queue to zero while KVM queues retain
     // their checkpoint ticks; the resulting global event is in their past.
     // Skip only the empty replay, preserving nonempty checkpoint behavior.
-    if (m_warmup_enabled && m_cache_recorder->getNumRecords() == 0) {
+    // Restored data lives in the trace buffer, not the recording vector.
+    if (m_warmup_enabled && m_cache_recorder->getTraceSize() == 0) {
         delete m_cache_recorder;
         m_cache_recorder = NULL;
         m_warmup_enabled = false;

@@ -307,6 +307,7 @@ using FoldedSrc2Op = FoldedOp<Src2Op>;
 using FloatSrc2Op = FloatOp<Src2Op>;
 using IntSrc2Op = IntOp<Src2Op>;
 
+using IntSrc3Op = IntOp<Src3Op>;
 using FloatSrc3Op = FloatOp<Src3Op>;
 using FloatSrc4Op = FloatOp<Src4Op>;
 

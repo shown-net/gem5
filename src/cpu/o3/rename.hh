@@ -377,8 +377,6 @@ class Rename
      * and ROB, but are not yet included in their occupancy counts.
      */
     int instsInProgress[MaxThreads];
-    int noIQInstsInProgress[MaxThreads];
-    int extraIQInstsInProgress[MaxThreads];
 
     /** Count of Load instructions in progress that have been sent off to the
      * IQ and ROB, but are not yet included in their occupancy counts.
@@ -486,6 +484,17 @@ class Rename
      */
     void incrFullStat(const FullSource &source);
 
+    /** Inspect the oldest complete allocation group without changing it. */
+    unsigned storeStallReasons(ThreadID tid);
+
+    struct ResourceStallStats : public statistics::Group
+    {
+        explicit ResourceStallStats(statistics::Group *parent);
+        statistics::Scalar SB, SB_ROB_OVERLAP, SB_IQ_OVERLAP;
+        statistics::Scalar SB_FRONTEND_BLOCKED;
+        statistics::Scalar SCOREBOARD;
+    } resourceStallStats;
+
     struct RenameStats : public statistics::Group
     {
         static std::string statusStrings[ThreadStatusMax];
@@ -497,6 +506,10 @@ class Rename
         statistics::Vector status;
         /** Stat for total number of renamed instructions. */
         statistics::Scalar renamedInsts;
+        statistics::Scalar recoveryAllocationSlots;
+        /** Implicit PUSH updates, including wrong-path operations. */
+        statistics::Scalar pushUpdatesComputed;
+        statistics::Scalar pushUpdatesDeferred;
         /** Stat for total number of squashed instructions that rename
          * discards. */
         statistics::Scalar squashedInsts;

@@ -39,6 +39,7 @@
 #define __ARCH_X86_TLB_HH__
 
 #include <functional>
+#include <array>
 #include <list>
 #include <functional>
 #include <memory>
@@ -50,6 +51,7 @@
 #include "mem/request.hh"
 #include "params/X86TLB.hh"
 #include "sim/stats.hh"
+#include "sim/full_system.hh"
 
 namespace gem5
 {
@@ -76,13 +78,15 @@ namespace X86ISA
 
         void takeOverFrom(BaseTLB *otlb) override { functional_mmu::lifecycle(this); }
 
-        TlbEntry *lookup(Addr va, bool update_lru = true);
+        TlbEntry *lookup(Addr va, bool update_lru = true,
+                         BaseMMU::Mode mode = BaseMMU::Read);
 
         void setConfigAddress(uint32_t addr);
-        //concatenate Page Addr and pcid
-        inline Addr concAddrPcid(Addr vpn, uint64_t pcid)
+        // Put the context above the 48-bit VA, outside every page offset.
+        static Addr concAddrPcid(Addr vpn, uint64_t pcid)
         {
-          return (vpn | pcid);
+            return FullSystem ? (vpn & mask(48)) | ((pcid & mask(12)) << 48)
+                              : vpn;
         }
 
       protected:
@@ -98,7 +102,9 @@ namespace X86ISA
         void onCodeInvalidation(std::function<void()> callback)
         { codeInvalidation = std::move(callback); }
 
-        void flushNonGlobal();
+        void flushNonGlobal(int pcid = -1);
+        void contextChanged();
+        void invalidatePage(Addr va, uint16_t pcid, bool include_global);
 
         void demapPage(Addr va, uint64_t asn) override;
         uint64_t generation() const { return invalidationGeneration; }
@@ -107,15 +113,25 @@ namespace X86ISA
         std::function<void()> codeInvalidation;
         uint64_t invalidationGeneration = 0;
         uint32_t size;
+        uint32_t baseSize;
         uint32_t smallPageWays;
         bool sprSharedDomains;
+        unsigned sprSharedIndexShift;
+        bool sprSplitL1;
+        std::array<unsigned, 8> largePageTree{};
         Cycles nextLevelHitLatency;
 
         std::vector<TlbEntry> tlb;
+        // Members retain physical-slot order, including after restoration.
+        std::array<std::vector<TlbEntry *>, 256> sharedSets;
+        unsigned sharedSet(Addr vpn, unsigned log_bytes) const;
+        void indexSharedEntry(TlbEntry *entry);
+        void removeEntry(TlbEntry *entry);
 
         EntryList freeList;
 
         TlbEntryTrie trie;
+        TlbEntryTrie storeTrie;
         uint64_t lruSeq;
 
         AddrRange m5opRange;
@@ -148,6 +164,12 @@ namespace X86ISA
             statistics::Scalar STLB_HIT;
         };
         std::unique_ptr<DtlbLoadMissStats> dtlbLoadMissStats;
+        struct DtlbStoreMissStats : public statistics::Group
+        {
+            explicit DtlbStoreMissStats(statistics::Group *parent);
+            statistics::Scalar STLB_HIT;
+        };
+        std::unique_ptr<DtlbStoreMissStats> dtlbStoreMissStats;
 
         Fault translateInt(bool read, RequestPtr req, ThreadContext *tc);
 
@@ -192,7 +214,8 @@ namespace X86ISA
                                BaseMMU::Mode mode) const override;
 
         TlbEntry *insert(Addr vpn, const TlbEntry &entry, uint64_t pcid,
-                         bool fillNextLevel = true);
+                         bool fillNextLevel = true,
+                         BaseMMU::Mode mode = BaseMMU::Read);
 
         // Checkpointing
         void serialize(CheckpointOut &cp) const override;

@@ -70,3 +70,47 @@ class SimplePt2Pt(SimpleNetwork):
                     SimpleIntLink(link_id=link_count, src_node=ri, dst_node=rj)
                 )
         self.int_links = int_links
+
+
+class SimpleUncore(SimpleNetwork):
+    """Uniform logical transit, per-destination queues and shared endpoint I/O.
+
+    The central switch represents routing, not a physical mesh coordinate.
+    Every endpoint has one shared injection link and one shared return link.
+    Link width and transit latency are explicit model defaults, not SPR facts.
+    """
+
+    def __init__(self, ruby_system):
+        super().__init__()
+        self.netifs = []
+        self.ruby_system = ruby_system
+        # Finite queue depth is an engineering initial value, not CHA capacity.
+        self.buffer_size = 16
+
+    def setup_buffers(self):
+        super().setup_buffers()
+        # SimpleIntLink's default branch does not inherit network.buffer_size.
+        for link in self.int_links:
+            for buffer in link.buffers:
+                buffer.buffer_size = self.buffer_size
+
+    def connectControllers(self, controllers):
+        self.routers = [
+            Switch(router_id=i, clk_domain=self.clk_domain)
+            for i in range(len(controllers) + 1)
+        ]
+        hub = self.routers[-1]
+        self.ext_links = [
+            SimpleExtLink(link_id=i, ext_node=c, int_node=self.routers[i],
+                          bandwidth_factor=16)
+            for i, c in enumerate(controllers)
+        ]
+        links = []
+        for i, router in enumerate(self.routers[:-1]):
+            for source, destination in ((router, hub), (hub, router)):
+                links.append(SimpleIntLink(
+                    link_id=len(controllers) + len(links),
+                    src_node=source, dst_node=destination,
+                    bandwidth_factor=16, latency=16,
+                ))
+        self.int_links = links

@@ -75,8 +75,11 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         self.Dcache = RubyCache(
             size=l1d_size,
             assoc=l1d_assoc,
-            dataAccessLatency=3,
+            # Generic Ruby service component. The SPR hierarchy calibrates
+            # this separately from the AGU/LSU issue-to-issue handoffs.
+            dataAccessLatency=4,
             fill_capacity=16,
+            fill_stats_clock=clk_domain,
             start_index_bit=self.getBlockSizeBits(cache_line_size),
             is_icache=False,
             replacement_policy=LRURP(),
@@ -87,7 +90,7 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         )
         self.send_evictions = core.requires_send_evicts()
         self.transitions_per_cycle = 32
-        self.enable_prefetch = True
+        self.enable_prefetch = False
         self.request_latency = 2
         self.response_latency = 2
         self.number_of_TBEs = 256
@@ -112,4 +115,7 @@ class L1Cache(MESI_Three_Level_L0Cache_Controller):
         # Later on, we'll need to connect those buffers to L2.
         # Delay overtaking enqueues while preserving the local FIFO contract.
         self.bufferToL1 = MessageBuffer(ordered=True, delay_to_preserve_order=True)
-        self.bufferFromL1 = MessageBuffer(ordered=True, delay_to_preserve_order=True)
+        self.bufferFromL1 = MessageBuffer(
+            ordered=True, delay_to_preserve_order=True,
+            data_transfer_clock=self.clk_domain,
+        )

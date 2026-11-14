@@ -35,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "arch/x86/insts/static_inst.hh"
@@ -3376,9 +3377,9 @@ TaoTrace::finalizePerfCache()
          << ",\"common_cut_id\":\"first-core-target-common-end-v1\",\"task_ids\":[";
     bool first=true;
     for (const auto tid:tids) { if(!first) file << ','; first=false; file << tid; }
-    file << "],\"observer\":{\"schema\":\"native-cache-request-observer-v1\",\"overflow\":" << requests.overflow
+    file << "],\"observer\":{\"schema\":\"native-cache-request-observer-v2\",\"overflow\":" << requests.overflow
          << ",\"unknown_requests\":" << requests.unknown_kind+requests.unknown_identity
-         << "},\"native_observer\":{\"schema\":\"native-cache-request-observer-v1\","
+         << "},\"native_observer\":{\"schema\":\"native-cache-request-observer-v2\","
          << "\"retirement_filter\":false,\"bounded_by\":\"live-Sequencer-transactions\","
          << "\"diagnostic_encoding\":{\"request_kind\":[\"data_read\",\"rfo\",\"code_read\",\"software_prefetch\","
          << "\"hardware_prefetch\",\"hardware_prefetch_l1\",\"hardware_prefetch_l2\",\"hardware_prefetch_l3\",\"writeback\",\"unknown\"],\"lookup_facts\":[\"hit\",\"tag_miss\","
@@ -3386,10 +3387,23 @@ TaoTrace::finalizePerfCache()
          << "\"event_context\":\"physical-event-edge-only-task-and-CPL-unavailable\","
          << "\"l2_miss_rule\":\"local-tag-miss-independent-of-eventual-supplier\","
          << "\"llc_miss_rule\":\"native-tag-miss-hardware-data-state-mapping-unverified\","
-         << "\"hooks\":{\"sequencer_issue\":true,\"private_l2_lookup\":true,\"llc_lookup\":true,"
-         << "\"private_l2_writeback\":true,\"hardware_prefetch_identity\":false},"
+         << "\"hooks\":{\"sequencer_issue\":true,\"l1d_lookup\":true,\"private_l2_lookup\":true,\"llc_lookup\":true,"
+         << "\"l1d_writeback\":true,\"private_l2_writeback\":true,"
+         << "\"llc_writeback\":\"global-unattributed\",\"invalidations_received\":true,"
+         << "\"merged_follower_typed\":true,\"hardware_prefetch_identity\":false},"
          << "\"inflight\":" << perf_cache_native::observer().inflight(fst_core_id_)
-         << ",\"unassigned_origin_hooks_global\":" << perf_cache_native::observer().unassignedOrigins()
+         << ",\"window_conservation\":{\"inflight_begin\":" << requests.inflight_begin
+         << ",\"inflight_end\":" << requests.inflight_end
+         << ",\"released\":" << requests.released
+         << ",\"superseded\":" << requests.superseded
+         << ",\"balance_residual\":" << requests.inflight_balance_residual << "},"
+         << "\"invalidations\":{\"l1d\":" << requests.invalidations[0]
+         << ",\"private_l2\":" << requests.invalidations[1]
+         << ",\"llc\":" << requests.invalidations[2] << "},"
+         << "\"llc_outgoing_writebacks_global\":{"
+         << "\"total\":" << perf_cache_native::observer().globalWritebacks(2)
+         << ",\"dirty\":" << perf_cache_native::observer().globalDirtyWritebacks(2) << "},"
+         << "\"unassigned_origin_hooks_global\":" << perf_cache_native::observer().unassignedOrigins()
          << ",\"model_trials\":0,\"hardware_validated\":false,\"diagnostics_omitted\":"
          << perf_cache_native::observer().samplesOmitted(fst_core_id_)
          << ",\"diagnostics\":";
@@ -3416,16 +3430,18 @@ TaoTrace::finalizePerfCache()
              << "},\"private_l2_outgoing_writebacks\":" << req.writebacks
              << ",\"request_primitives\":";
         perf_cache_native::writeCounts(file,req);
-        file << ",\"retired_cache\":{\"schema\":\"retired-load-cache-v1\",\"events\":{";
+        file << ",\"retired_cache\":{\"schema\":\"retired-load-cache-v1\","
+             << "\"membership_policy\":\"spr-retired-load-miss-v2\","
+             << "\"legacy_membership_policy\":\"retired-load-cache-membership-v1\","
+             << "\"hardware_equivalence\":\"unverified\",\"failures\":[";
+        for(unsigned i=0;i<6;++i) {
+            if(i) file << ',';
+            file << c.membership_failures[i];
+        }
+        file << "],\"events\":{";
         file << "\"retired_loads\":{\"count\":" << c.perf_retired_loads << ",\"unknown\":" << c.independent_retired_loads_unknown << "}";
         file << ",\"retired_stores\":{\"count\":" << c.perf_retired_stores << ",\"unknown\":" << c.independent_retired_stores_unknown << "}";
-        file << ",\"retired_l1_load_hits\":{\"count\":" << c.independent_l1_hits << ",\"unknown\":" << c.independent_l1_hits_unknown << "}";
-        file << ",\"retired_l1_load_misses\":{\"count\":" << c.independent_l1_misses << ",\"unknown\":" << c.independent_l1_misses_unknown << "}";
-        file << ",\"retired_load_fb_hits\":{\"count\":" << c.independent_fb_hits << ",\"unknown\":" << c.independent_fb_hits_unknown << "}";
-        file << ",\"retired_l2_load_hits\":{\"count\":" << c.independent_l2_hits << ",\"unknown\":" << c.independent_l2_hits_unknown << "}";
-        file << ",\"retired_l2_load_misses\":{\"count\":" << c.independent_l2_misses << ",\"unknown\":" << c.independent_l2_misses_unknown << "}";
-        file << ",\"retired_l3_load_hits\":{\"count\":" << c.independent_l3_hits << ",\"unknown\":" << c.independent_l3_hits_unknown << "}";
-        file << ",\"retired_l3_load_misses\":{\"count\":" << c.independent_l3_misses << ",\"unknown\":" << c.independent_l3_misses_unknown << "}";
+        retirement::writeMembershipEvents(file,c);
         file << "}}";
         file << ",\"event_capabilities\":{";
         const auto retired=[&](const char *field,uint64_t unknown,bool service,bool isa) {
@@ -3487,9 +3503,14 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
     facts.admissions = native.admissions;
     facts.responses = native.responses;
     facts.coalesced = native.coalesced;
+    facts.sequencer_shared = native.sequencerShared;
     facts.hierarchy_requests = native.hierarchyRequests;
     facts.external_hits = native.externalHits;
     facts.external_misses = native.externalMisses;
+    // Task 4: diagnosed lifecycle facts copied for every observation, not
+    // only behind the strict parent-witness gate.
+    facts.stale_serviced = native.staleServiced != 0;
+    facts.repeated_response = native.responses > native.admissions;
     facts.accesses = native.hierarchy.accesses[0];
     facts.hits = native.hierarchy.hits[0];
     facts.tag_misses = native.hierarchy.tagMisses[0];
@@ -3508,6 +3529,116 @@ perfRetirementNativeFacts(const Native &native, bool resolved)
     facts.l3_remote_supplies=native.hierarchy.remoteSupplies[2];
     facts.l2_permission_upgrades=native.hierarchy.permissionUpgrades[1];
     facts.l3_permission_upgrades=native.hierarchy.permissionUpgrades[2];
+    facts.l1_late_prefetches=native.hierarchy.latePrefetches[0];
+    facts.l2_late_prefetches=native.hierarchy.latePrefetches[1];
+    facts.sprMiss = native.sprMiss;
+    // A witness is attempt-level. Only expose it as a read-UOP diagnostic
+    // when the complete lifecycle proves exactly one matching issuance.
+    if constexpr (std::is_same_v<Native, TaoTraceNativeAccessRegistry::Snapshot>) {
+        facts.spr_incomplete_completions=native.sprIncompleteCompletions;
+        facts.spr_failed_request=native.sprFailedRequest;
+        facts.spr_failed_address=native.sprFailedAddress;
+        facts.spr_missing_levels=native.sprMissingLevels;
+        facts.spr_failed_alias_category=native.sprFailedAliasCategory;
+        facts.spr_failed_prepare_status=native.sprFailedPrepareStatus;
+        facts.spr_failed_prepare_invalidation=native.sprFailedPrepareInvalidation;
+        facts.spr_failed_levels=native.sprFailedLevels;
+        using retired_membership::FragmentEvidence;
+        if (resolved && facts.store_forward && !facts.other_terminal) {
+            FragmentEvidence f;f.store_forward_full=true;
+            facts.membership_fragments.push_back(f);
+        } else if (resolved && native.bypassAccepted && !native.admissions &&
+                   native.terminalReasonMask==taoTraceNativeReasonMask(
+                       TaoTraceNativeTerminalReason::DeviceBypassComplete) &&
+                   !native.bypassProtocolErrors) {
+            FragmentEvidence f;f.device_bypass=true;
+            facts.membership_fragments.push_back(f);
+        } else if (resolved && !native.squashed && !native.terminalReasonMask &&
+                   !native.bypassAccepted && !native.attemptOverflow &&
+                   native.attempts.size()==native.admissions &&
+                   native.responses==native.admissions && native.issuanceClosed) {
+            for (const auto &a : native.attempts) {
+                FragmentEvidence f;
+                f.identity_known=a.id || a.coalesced;
+                f.attempts=a.coalesced ? 0 : 1;
+                f.completions=a.completions;
+                f.coalesced_follower=a.coalesced;
+                f.coalesced_resident=a.resident;
+                f.coalesced=a.coalesced;
+                f.hierarchy_requests=a.coalesced ? 0 : 1;
+                f.stale=native.staleServiced!=0;
+                for(unsigned l=0;l<3;++l) {
+                    f.accesses[l]=a.hierarchy.accesses[l];
+                    f.hits[l]=a.hierarchy.hits[l];
+                    f.tag_misses[l]=a.hierarchy.tagMisses[l];
+                    f.permission_upgrades[l]=a.hierarchy.permissionUpgrades[l];
+                    f.merged_misses[l]=a.hierarchy.mergedMisses[l];
+                    f.remote_supplies[l]=a.hierarchy.remoteSupplies[l];
+                }
+                const unsigned chain=a.parentCount[0] ? 0 : 1;
+                const bool witness=a.parentCount[chain]!=0;
+                f.late_l1_parent=witness && chain==0;
+                f.late_l2_parent=witness && chain==1;
+                f.parent_llc_outcome=a.parentOutcome[chain];
+                const unsigned reject=chain==0 ? native.l1ParentRejectMask :
+                                                native.l2ParentRejectMask;
+                f.parent_response_ambiguous=a.parentCount[chain]!=1 ||
+                    a.parentOutcome[chain]<0 ||
+                    (a.parentCount[0] && a.parentCount[1]);
+                f.parent_reject_uniqueness=bool(reject&1);
+                f.parent_reject_stale=bool(reject&2);
+                facts.membership_fragments.push_back(f);
+            }
+        }
+        // Registry-only diagnosed facts (the Request extension carries no
+        // attempt uniqueness or oracle reject mask).
+        facts.hierarchy_attempts = native.hierarchyAttemptCount;
+        facts.hierarchy_completions = native.hierarchyCompletionCount;
+        facts.hierarchy_attempt_id = native.hierarchyAttempt;
+        facts.hierarchy_completion_attempt_id = native.hierarchyCompletionAttempt;
+        facts.l1_parent_reject_mask = native.l1ParentRejectMask;
+        facts.l2_parent_reject_mask = native.l2ParentRejectMask;
+        if (resolved && !native.squashed && !native.terminalReasonMask &&
+            !native.bypassAccepted && native.admissions == 1 && native.responses == 1 &&
+            native.hierarchyRequests == 1 && native.coalesced == 0 &&
+            native.hierarchyAttemptCount == 1 && native.hierarchyAttempt &&
+            native.hierarchyCompletionCount == 1 &&
+            native.hierarchyCompletionAttempt == native.hierarchyAttempt &&
+            native.l2ParentWitnessCount == 1 &&
+            native.l2ParentWitnessAttempt == native.hierarchyAttempt)
+        {
+            for (unsigned i=0; i<facts.l2_prefetch_parent_llc.size(); ++i)
+                facts.l2_prefetch_parent_llc[i]=native.hierarchy.l2PrefetchParentLlc[i];
+            for (unsigned i=0; i<facts.l2_prefetch_parent_sender.size(); ++i) {
+                facts.l2_prefetch_parent_sender[i]=native.hierarchy.l2PrefetchParentSender[i];
+                facts.l2_prefetch_parent_response[i]=native.hierarchy.l2PrefetchParentResponse[i];
+            }
+            facts.l2_prefetch_parent_sender_id=native.l2ParentSenderId;
+        }
+        // Independent L1D-begun chain: the follower demand merged into an
+        // outstanding L0 prefetch TBE.  Same attempt-level uniqueness gate.
+        if (resolved && !native.squashed && !native.terminalReasonMask &&
+            !native.bypassAccepted && native.admissions == 1 && native.responses == 1 &&
+            native.hierarchyRequests == 1 && native.coalesced == 0 &&
+            native.hierarchyAttemptCount == 1 && native.hierarchyAttempt &&
+            native.hierarchyCompletionCount == 1 &&
+            native.hierarchyCompletionAttempt == native.hierarchyAttempt &&
+            native.l1ParentWitnessCount == 1 &&
+            native.l1ParentWitnessAttempt == native.hierarchyAttempt)
+        {
+            for (unsigned i=0; i<facts.l1_prefetch_parent_llc.size(); ++i)
+                facts.l1_prefetch_parent_llc[i]=native.hierarchy.l1PrefetchParentLlc[i];
+            for (unsigned i=0; i<facts.l1_prefetch_parent_sender.size(); ++i) {
+                facts.l1_prefetch_parent_sender[i]=native.hierarchy.l1PrefetchParentSender[i];
+                facts.l1_prefetch_parent_response[i]=native.hierarchy.l1PrefetchParentResponse[i];
+            }
+            facts.l1_prefetch_parent_sender_id=native.l1ParentSenderId;
+        }
+    }
+    facts.service_identity_ambiguous=native.serviceFactIdentityAmbiguous;
+    facts.l1_final_mask=native.l1FinalMask;
+    facts.service_expected=native.serviceExpected;
+    retirement::addServiceFacts(facts, native.serviceFacts);
     return facts;
 }
 
@@ -3581,7 +3712,8 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
     member.unsupported =
         containsAny(name, {"gather", "scatter", "maskmov"}) ||
         containsAny(disasm, {"rep ", "repe ", "repne ", "gather", "scatter", "maskmov"}) ||
-        !inst->readPredicate() || !inst->readMemAccPredicate();
+        !inst->readPredicate() ||
+        (!member.software_prefetch && !inst->readMemAccPredicate());
     retirement::NativeMemberDiagnostic diagnostic;
     diagnostic.sequence = member.sequence;
     diagnostic.pc = inst->pcState().instAddr();
@@ -3595,6 +3727,21 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
     diagnostic.name = si->getName();
     diagnostic.macroop_name = inst->macroop ? inst->macroop->getName() : "";
     diagnostic.disasm = disasm;
+    if (measured && (member.unsupported || member.rom)) {
+        if (perf_retirement_unsupported_samples_.size() < 1024) {
+            std::ostringstream sample;
+            sample << "{\"owner\":" << member.owner
+                   << ",\"read\":" << (member.read ? "true" : "false")
+                   << ",\"write\":" << (member.write ? "true" : "false")
+                   << ",\"rom\":" << (member.rom ? "true" : "false")
+                   << ",\"read_predicate\":" << (inst->readPredicate() ? "true" : "false")
+                   << ",\"mem_access_predicate\":" << (inst->readMemAccPredicate() ? "true" : "false")
+                   << ",\"instruction\":";
+            retirement::writeNativeMemberDiagnostic(sample,diagnostic);
+            sample << '}';
+            perf_retirement_unsupported_samples_.push_back(sample.str());
+        } else ++perf_retirement_unsupported_samples_omitted_;
+    }
     const bool open = perf_retirement_.hasOpen(member.context);
     if (!perf_retirement_boundaries_.opened())
         perf_retirement_boundaries_.open(output_dir_,fst_core_id_);
@@ -3635,7 +3782,9 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
             const auto f=perfRetirementNativeFacts(native,native.resolved());
             llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
                 {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
-                 native.firstAdmissionTick,native.lastResponseTick,native.resolved()});
+                 native.firstAdmissionTick,native.lastResponseTick,native.resolved(),
+                 f.sprMiss.miss_mask,f.sprMiss.unknown(),
+                 f.sprMiss.estimated_mask,f.sprMiss.path_mask});
         } else if (inst->savedRequest) {
             const auto request=inst->savedRequest->mainReq();
             const auto ext=request ? request->getExtension<TaoTraceRubyResponseExtension>() : nullptr;
@@ -3644,7 +3793,9 @@ TaoTrace::accountPerfRetirementCommit(const DynInstPtr &inst)
                 const auto f=perfRetirementNativeFacts(*ext,resolved);
                 llc_fill_audit::observer().native(getCoreId(inst),inst->seqNum,
                     {retirement::classifyIndependent(f)|retirement::classifyRetiredCache(f),
-                     ext->firstAdmissionTick,ext->lastResponseTick,resolved});
+                     ext->firstAdmissionTick,ext->lastResponseTick,resolved,
+                     f.sprMiss.miss_mask,f.sprMiss.unknown(),
+                     f.sprMiss.estimated_mask,f.sprMiss.path_mask});
             }
         }
     }
@@ -3796,7 +3947,15 @@ TaoTrace::finalizePerfRetirement()
         if (!first) file << ',';
         first = false; file << sample;
     }
-    file << "],\"coverage\":{\"common_cut_complete\":" << (complete ? "true" : "false")
+    file << "],\"unsupported_member_diagnostics\":[";
+    first = true;
+    for (const auto &sample : perf_retirement_unsupported_samples_) {
+        if (!first) file << ',';
+        first = false; file << sample;
+    }
+    file << "],\"unsupported_member_diagnostics_omitted\":"
+         << perf_retirement_unsupported_samples_omitted_
+         << ",\"coverage\":{\"common_cut_complete\":" << (complete ? "true" : "false")
          << ",\"kernel_stream_complete\":" << (complete ? "true" : "false")
          << ",\"initial_owner\":" << (thread_state_initial_owner_ ? "true" : "false")
          << ",\"read_failures\":" << thread_state_read_failures_
@@ -5296,7 +5455,7 @@ TaoTrace::emitSyscallRecord(const DynInstPtr &inst)
     writeRecordsSyscallLine(core_id, thread_id, seq_id, pc, op_class, st);
     writeLabelsLine(core_id, thread_id, seq_id, exposed_cyc, macro_cyc, 0,
                     /*fetch_lat_cyc*/ 0, /*exec_lat_cyc*/ 0,
-                    /*branch_mispred*/ 0u);
+                    /*branch_mispred*/ 0u, /*latency_valid*/ false);
     writeDiagLine(core_id, thread_id, seq_id,
                   sc.fetch_tick, curTick(), prev, last_squash_tick_[thread_id]);
 
@@ -5761,9 +5920,9 @@ TaoTrace::flushMacro(MacroAccum &acc, const DynInstPtr &lastInst)
         last_squash_tick_.erase(it_sq);
     }
 
-    // V1 多核新增：fetch / execution latency 拆分
-    //   exec_t   = completeTick − issueTick （宽口径，ROB head 到 writeback）
-    //   fetch_t  = macro_t − exec_t （retire 之前的所有暴露时间归 fetch）
+    // Legacy stage decomposition: completeTick is execute accounting, not
+    // the response time of memory instructions. The complement is not a
+    // measurement of fetch latency; retain both as proxies only.
     uint64_t exec_t = 0;
     if (acc.last_issue_tick_delta >= 0 &&
         acc.last_complete_tick_delta >= 0 &&
@@ -5809,7 +5968,8 @@ TaoTrace::flushMacro(MacroAccum &acc, const DynInstPtr &lastInst)
                      acc.branch_history_before, acc.access_distance_bucket);
     writeLabelsLine(acc.core_id, acc.thread_id, acc.first_seq,
                     exposed_cyc, macro_cyc, branch_pen_cyc,
-                    fetch_cyc, exec_cyc, branch_mispred);
+                    fetch_cyc, exec_cyc, branch_mispred,
+                    /* latency_valid: issue/execute accounting is a proxy */ false);
     writeDiagLine(acc.core_id, acc.thread_id, acc.first_seq,
                   acc.first_fetch_tick, acc.last_commit_tick, prev,
                   last_squash_tick_[acc.thread_id]);
@@ -5902,7 +6062,7 @@ TaoTrace::writeLabelsLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
                           uint64_t exposed_cyc, uint64_t macro_cyc,
                           uint64_t branch_pen_cyc,
                           uint64_t fetch_lat_cyc, uint64_t exec_lat_cyc,
-                          uint8_t branch_mispred)
+                          uint8_t branch_mispred, bool latency_valid)
 {
     if (!out_labels_) return;
     if (!emitGateOpen(core_id)) return;  // V28.1 per-core ROI 闸门
@@ -5911,12 +6071,22 @@ TaoTrace::writeLabelsLine(uint32_t core_id, uint32_t thread_id, uint64_t seq_id,
         "\"exposed_stall_cycles\":%" PRIu64 ","
         "\"macro_cycles\":%" PRIu64 ","
         "\"branch_penalty_cycles\":%" PRIu64 ","
-        "\"fetch_latency_cyc\":%" PRIu64 ","
-        "\"execution_latency_cyc\":%" PRIu64 ","
-        "\"branch_mispred\":%u}\n",
+        "\"fetch_latency_proxy_cyc\":%" PRIu64 ","
+        "\"execution_latency_proxy_cyc\":%" PRIu64 ","
+        "\"execution_latency_valid\":%s,",
         core_id, thread_id, seq_id,
         exposed_cyc, macro_cyc, branch_pen_cyc,
-        fetch_lat_cyc, exec_lat_cyc, unsigned(branch_mispred));
+        fetch_lat_cyc, exec_lat_cyc, latency_valid ? "true" : "false");
+    // No measured fetch latency is available from this subtraction. A memory
+    // macro may comprise multiple operations, so its execute-accounting
+    // timestamp cannot be promoted to full load/store completion either.
+    if (latency_valid) {
+        std::fprintf(out_labels_, "\"execution_latency_cyc\":%" PRIu64 ",", exec_lat_cyc);
+    } else {
+        std::fprintf(out_labels_, "\"execution_latency_cyc\":null,");
+    }
+    std::fprintf(out_labels_, "\"fetch_latency_cyc\":null,\"branch_mispred\":%u}\n",
+                 unsigned(branch_mispred));
 }
 
 void
@@ -6253,23 +6423,39 @@ TaoTrace::emitMicroRecord(const DynInstPtr &inst,
     }
 
     if (out_labels_micro_) {
-        // V9.4：新增 ready_tick 绝对时刻
-        //   load/atomic：LSQUnit::writeback 已覆盖 completeTick = cache 数据返回时刻
-        //   ALU/branch/store：iew.cc updateExeInstStats 设置 completeTick = execute 完成
-        //   兜底（completeTick=0/-1）：退化为 commit_tick
-        uint64_t ready_tick = (complete_tick > 0)
-                                ? (fetch_tick + complete_tick)
-                                : commit_tick;
-        int ready_source = (complete_tick > 0) ? 0 : 1; // 0=complete 1=fallback
+        // completeTick is IEW execute accounting, not a load response.
+        // For a load, only publish a ready tick if both a complete value and
+        // a non-earlier dependency wake were observed. A speculative wake or
+        // an unsupported path is left missing rather than guessed.
+        const bool load_value = inst->isLoad() || inst->isAtomic();
+        const bool have_return = inst->dataReturnTick != Tick(-1);
+        const bool have_wake = inst->lastWakeDependents != Tick(-1);
+        const bool valid_load_ready = have_return && have_wake &&
+            inst->lastWakeDependents >= inst->dataReturnTick;
+        uint64_t ready_tick = load_value
+            ? (valid_load_ready ? uint64_t(inst->lastWakeDependents) : 0)
+            : (complete_tick > 0 ? fetch_tick + complete_tick : commit_tick);
+        // 0=execute, 1=commit fallback, 2=missing, 3=observed load wake.
+        int ready_source = load_value ? (valid_load_ready ? 3 : 2)
+                                      : (complete_tick > 0 ? 0 : 1);
+        char ready_json[32];
+        if (load_value && !valid_load_ready)
+            std::snprintf(ready_json, sizeof(ready_json), "null");
+        else
+            std::snprintf(ready_json, sizeof(ready_json), "%" PRIu64, ready_tick);
         std::fprintf(out_labels_micro_,
             "{\"core_id\":%u,\"thread_id\":%u,\"micro_seq\":%" PRIu64 ","
             "\"fetch_tick\":%" PRIu64 ",\"issue_tick\":%" PRIu64 ","
             "\"complete_tick\":%" PRIu64 ",\"commit_tick\":%" PRIu64 ","
-            "\"ready_tick\":%" PRIu64 ",\"ready_source\":%d,"
+            "\"ready_tick\":%s,\"ready_source\":%d,"
+            "\"data_return_tick\":%" PRId64 ",\"wake_tick\":%" PRId64 ","
             "\"mispredicted\":%d}\n",
             core_id, thread_id, micro_seq,
             fetch_tick, issue_tick, complete_tick, commit_tick,
-            ready_tick, ready_source, mispredicted);
+            ready_json, ready_source,
+            have_return ? int64_t(inst->dataReturnTick) : int64_t(-1),
+            have_wake ? int64_t(inst->lastWakeDependents) : int64_t(-1),
+            mispredicted);
     }
 
     if (out_fst_) {
@@ -6534,7 +6720,13 @@ TaoTrace::observeFstFrontend(const DynInstPtr& inst, const void* record, uint64_
              extern_label_initIntHalt,extern_label_realModeInterrupt});
         first=hardware_entry;
     } else if (si->isMicroop() && !inst->macroop) {
-        throw std::runtime_error("retired frontend micro-op has unsupported origin");
+        throw std::runtime_error(csprintf(
+            "retired frontend micro-op has unsupported origin: "
+            "core=%u seq=%llu pc=%#llx microPC=%llu name=%s first=%u last=%u",
+            getCoreId(inst), (unsigned long long)inst->seqNum,
+            (unsigned long long)pc.instAddr(),
+            (unsigned long long)pc.microPC(), si->getName(),
+            si->isFirstMicroop(), si->isLastMicroop()));
     }
     if (fst_frontend_open_ && (first || pc.instAddr()!=fst_frontend_pending_.pc ||
         asid!=fst_frontend_pending_.address_space_id || thread!=fst_frontend_thread_ ||
@@ -8169,6 +8361,7 @@ TaoTrace::onInstAccessComplete(const PacketPtr &pkt)
 void
 TaoTrace::onPreCommit(const DynInstPtr &inst)
 {
+    if (inst->notAnInst()) return;
     // Commit calls this before commitHead changes the architectural rename
     // map. At the first CPL3 instruction after a syscall, RAX is therefore
     // still the kernel return value even when that user instruction writes
@@ -8469,8 +8662,12 @@ TaoTrace::finalizeTaskClock()
 // These internal PCs are byte-proved by the same exact-build profile as the
 // public entries. They never apply to another kernel or guessed layout.
 bool
-TaoTrace::isThreadStateHook(uint64_t pc) const
+TaoTrace::isThreadStateHook(uint64_t pc, uint64_t micro_pc) const
 {
+    // External-entry ROM retains the interrupted PC. Its last micro-op can
+    // therefore alias any audited hook without executing that instruction.
+    // Keep those records/owner accounting, but never interpret their ABI.
+    if (isRomMicroPC(micro_pc)) return false;
     return pc == thread_state_marker_pc_ || pc == scheduler_switch_pc_ ||
         pc == scheduler_wakeup_pc_ || pc == 0xffffffff81517740ULL ||
         pc == 0xffffffff81517803ULL || pc == 0xffffffff81517851ULL ||
@@ -8597,7 +8794,8 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
 {
     if (!out_thread_state_ || !inst || !inst->tcBase()) return;
     const uint64_t pc = inst->pcState().instAddr();
-    if (thread_state_initial_owner_ && !isThreadStateHook(pc)) return;
+    const bool hook = isThreadStateHook(pc, inst->pcState().microPC());
+    if (thread_state_initial_owner_ && !hook) return;
     auto *tc = inst->tcBase();
     const bool user = isUserInstruction(inst);
     const uint64_t asid = tc->readMiscRegNoEffect(X86ISA::misc_reg::Cr3) & ~uint64_t(0xfff);
@@ -8615,6 +8813,7 @@ TaoTrace::emitThreadState(const DynInstPtr &inst, uint64_t ordinal, bool measure
         return "core" + std::to_string(fst_core_id_) + ":e" + std::to_string(thread_state_events_);
     };
     ensureThreadStateOwner(inst, ordinal, measurement);
+    if (!hook) return;
     // All hooks observe the last committed micro-op of the FIRST instruction
     // at the audited entry PC. push %rbp/nop/mov %eax leave ABI args intact.
     if (inst->staticInst->isMicroop() && !inst->staticInst->isLastMicroop()) return;
@@ -8903,6 +9102,7 @@ TaoTrace::finalizeThreadState()
 void
 TaoTrace::onCommitMiscRegsApplied(const DynInstPtr &inst)
 {
+    if (inst->notAnInst()) return;
     if (fst_mmu_controls_) fst_mmu_controls_->seal(inst->seqNum, inst->mmuControlGeneration);
     if(fst_architectural_boundaries_)fst_architectural_boundaries_->postUpdateSeal(inst->seqNum);
 }
@@ -8919,6 +9119,7 @@ TaoTrace::armArchitecturalBoundaryEpoch()
 void
 TaoTrace::onCommitPCAdvanced(const DynInstPtr& inst)
 {
+    if (inst->notAnInst()) return;
     if(!fst_architectural_boundaries_ || fst_architectural_boundaries_->finished())return;
     const auto& pc=task_clock_cpu_->pcState(inst->threadNumber).as<X86ISA::PCState>();
     fst_architectural_boundaries_->postAdvance(inst->seqNum,pc.microPC(),pc.functionalBoundary());
@@ -8927,8 +9128,11 @@ TaoTrace::onCommitPCAdvanced(const DynInstPtr& inst)
 void
 TaoTrace::onCommit(const DynInstPtr &inst)
 {
-    functional_arch::CommitClassification architectural_classification(fst_architectural_boundaries_.get());
     eraseWrongPathCommitted(inst);
+    // Stack-engine synchronization and fault carriers are model operations.
+    // Their timing remains native; they do not enter the functional stream.
+    if (inst->notAnInst()) return;
+    functional_arch::CommitClassification architectural_classification(fst_architectural_boundaries_.get());
     if (functional_warmup_ && !functional_measurement_started_ &&
         premeasurement_page_fault_pending_ && isUserInstruction(inst)) {
         // The first user commit after a precise #PF proves that its handler
@@ -9000,7 +9204,7 @@ TaoTrace::onCommit(const DynInstPtr &inst)
         observeTaskClockRetirement(fst_record_count_);
     if (state_capture && fst_record_count_ == sync_ordinal &&
         (!inst->staticInst->isMicroop() || inst->staticInst->isLastMicroop()) &&
-        isThreadStateHook(inst->pcState().instAddr()))
+        isThreadStateHook(inst->pcState().instAddr(), inst->pcState().microPC()))
         ++thread_state_unretained_hooks_;
     pending_syscalls_.erase(inst->seqNum);
 }

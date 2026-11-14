@@ -84,9 +84,6 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
       issueToExecuteDelay(params.issueToExecuteDelay),
       dispatchWidth(params.dispatchWidth),
       issueWidth(params.issueWidth),
-      wbNumInst(0),
-      wbCycle(0),
-      wbWidth(params.wbWidth),
       numThreads(params.numThreads),
       iewStats(cpu)
 {
@@ -98,10 +95,6 @@ IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
         fatal("issueWidth (%d) is larger than compiled limit (%d),\n"
              "\tincrease MaxWidth in src/cpu/o3/limits.hh\n",
              issueWidth, static_cast<int>(MaxWidth));
-    if (wbWidth > MaxWidth)
-        fatal("wbWidth (%d) is larger than compiled limit (%d),\n"
-             "\tincrease MaxWidth in src/cpu/o3/limits.hh\n",
-             wbWidth, static_cast<int>(MaxWidth));
 
     _status = Active;
     exeStatus = Running;
@@ -293,6 +286,11 @@ IEW::clearStates(ThreadID tid)
          i <= cpu->iewQueue.getFuture(); ++i) {
         IEWStruct& iew_struct = cpu->iewQueue[i];
         removeCommThreadInsts(tid, iew_struct);
+        auto &resolutions = iew_struct.branchResolutions;
+        resolutions.erase(std::remove_if(resolutions.begin(), resolutions.end(),
+            [tid](const auto &entry) {
+                return entry.instruction && entry.instruction->threadNumber == tid;
+            }), resolutions.end());
         iew_struct.mispredictInst[tid] = nullptr;
         iew_struct.mispredPC[tid] = 0;
         iew_struct.squashedSeqNum[tid] = 0;
@@ -372,7 +370,8 @@ IEW::setScoreboard(Scoreboard *sb_ptr)
 bool
 IEW::isDrained() const
 {
-    bool drained = ldstQueue.isDrained() && instQueue.isDrained();
+    bool drained = ldstQueue.isDrained() && instQueue.isDrained() &&
+                   pendingResultCompletions == 0;
 
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         if (!insts[tid].empty()) {
@@ -466,11 +465,6 @@ IEW::squash(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched += skidBuffer[tid].front()->backendSlots();
-        if (!skidBuffer[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].extraIQDispatched +=
-                skidBuffer[tid].front()->iqSlots() - skidBuffer[tid].front()->backendSlots();
-        if (skidBuffer[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].noIQDispatched += skidBuffer[tid].front()->backendSlots();
 
         skidBuffer[tid].pop();
     }
@@ -494,7 +488,10 @@ IEW::squashDueToBranch(const DynInstPtr& inst, ThreadID tid)
         set(toCommit->pc[tid], inst->pcState());
         inst->staticInst->advancePC(*toCommit->pc[tid]);
 
-        toCommit->mispredictInst[tid] = inst;
+        const bool internal = inst->staticInst->isMicrocodeControl();
+        toCommit->mispredictInst[tid] = internal ? nullptr : inst;
+        toCommit->recoveryCause[tid] = internal ?
+            RecoveryCause::Microcode : RecoveryCause::Branch;
         toCommit->includeSquashInst[tid] = false;
 
         wroteToTimeBuffer = true;
@@ -503,7 +500,8 @@ IEW::squashDueToBranch(const DynInstPtr& inst, ThreadID tid)
 }
 
 void
-IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
+IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid,
+                        RecoveryCause cause)
 {
     DPRINTF(IEW, "[tid:%i] Memory violation, squashing violator and younger "
             "insts, PC: %s [sn:%llu].\n", tid, inst->pcState(), inst->seqNum);
@@ -520,6 +518,7 @@ IEW::squashDueToMemOrder(const DynInstPtr& inst, ThreadID tid)
         toCommit->squashedSeqNum[tid] = inst->seqNum;
         set(toCommit->pc[tid], inst->pcState());
         toCommit->mispredictInst[tid] = NULL;
+        toCommit->recoveryCause[tid] = cause;
 
         // Must include the memory violator in the squash.
         toCommit->includeSquashInst[tid] = true;
@@ -605,31 +604,37 @@ IEW::cacheUnblocked()
 }
 
 void
+IEW::squashFastForwarding(const DynInstPtr &inst)
+{
+    squashDueToMemOrder(inst, inst->threadNumber, RecoveryCause::FastForward);
+}
+
+void
 IEW::instToCommit(const DynInstPtr& inst)
 {
+    if (inst->completionNotBefore > curTick()) {
+        ++pendingResultCompletions;
+        cpu->schedule(new EventFunctionWrapper([this, inst] {
+            assert(pendingResultCompletions);
+            --pendingResultCompletions;
+            if (!inst->isSquashed())
+                instToCommit(inst);
+            cpu->wakeCPU();
+            cpu->activityThisCycle();
+        }, cpu->name() + ".result_completion", true), inst->completionNotBefore);
+        return;
+    }
     // This function should not be called after writebackInsts in a
     // single cycle.  That will cause problems with an instruction
     // being added to the queue to commit without being processed by
     // writebackInsts prior to being sent to commit.
 
-    // First check the time slot that this instruction will write
-    // to.  If there are free write ports at the time, then go ahead
-    // and write the instruction to that time.  If there are not,
-    // keep looking back to see where's the first time there's a
-    // free slot.
-    while ((*iewQueue)[wbCycle].insts[wbNumInst]) {
-        ++wbNumInst;
-        if (wbNumInst == wbWidth) {
-            ++wbCycle;
-            wbNumInst = 0;
-        }
-    }
-
-    DPRINTF(IEW, "Current wb cycle: %i, width: %i, numInst: %i\nwbActual:%i\n",
-            wbCycle, wbWidth, wbNumInst, wbCycle * wbWidth + wbNumInst);
-    // Add finished instruction to queue to commit.
-    (*iewQueue)[wbCycle].insts[wbNumInst] = inst;
-    (*iewQueue)[wbCycle].size++;
+    // Functional completion notifications retain the IEW-to-Commit latency.
+    // Execution ports and result paths already own their throughput; this
+    // transport does not add an unrelated shared writeback bottleneck.
+    auto &completed = (*iewQueue)[0];
+    completed.insts.push_back(inst);
+    completed.size = completed.insts.size();
 }
 
 void
@@ -718,13 +723,6 @@ IEW::checkStall(ThreadID tid)
 {
     bool ret_val(false);
 
-    if (fromCommit->commitInfo[tid].robSquashing) {
-        DPRINTF(IEW,"[tid:%i] Stall from Commit stage detected.\n",tid);
-        ret_val = true;
-    } else if (instQueue.isFull(tid)) {
-        DPRINTF(IEW,"[tid:%i] Stall: IQ  is full.\n",tid);
-        ret_val = true;
-    }
 
     return ret_val;
 }
@@ -753,13 +751,6 @@ IEW::checkSignalsAndUpdate(ThreadID tid)
         return;
     }
 
-    if (fromCommit->commitInfo[tid].robSquashing) {
-        DPRINTF(IEW, "[tid:%i] ROB is still squashing.\n", tid);
-
-        dispatchStatus[tid] = Squashing;
-        emptyRenameInsts(tid);
-        wroteToTimeBuffer = true;
-    }
 
     if (checkStall(tid)) {
         block(tid);
@@ -821,11 +812,6 @@ IEW::emptyRenameInsts(ThreadID tid)
         }
 
         toRename->iewInfo[tid].dispatched += insts[tid].front()->backendSlots();
-        if (!insts[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].extraIQDispatched +=
-                insts[tid].front()->iqSlots() - insts[tid].front()->backendSlots();
-        if (insts[tid].front()->bypassesIQ())
-            toRename->iewInfo[tid].noIQDispatched += insts[tid].front()->backendSlots();
 
         insts[tid].pop();
     }
@@ -957,17 +943,13 @@ IEW::dispatchInsts(ThreadID tid)
             }
 
             toRename->iewInfo[tid].dispatched += inst->backendSlots();
-            if (!inst->bypassesIQ())
-                toRename->iewInfo[tid].extraIQDispatched +=
-                    inst->iqSlots() - inst->backendSlots();
-            if (inst->bypassesIQ())
-                toRename->iewInfo[tid].noIQDispatched += inst->backendSlots();
 
             continue;
         }
 
         // Check for full conditions.
         if (!inst->bypassesIQ() && instQueue.isFull(inst)) {
+            instQueue.recordAdmissionBlocked(inst);
             DPRINTF(IEW, "[tid:%i] Issue: IQ has become full.\n", tid);
 
             // Call function to start blocking.
@@ -1078,7 +1060,21 @@ IEW::dispatchInsts(ThreadID tid)
             inst->setCanCommit();
             instQueue.insertBarrier(inst);
             add_to_iq = false;
-        } else if (inst->eliminatedMove) {
+        } else if (inst->moveProjection) {
+            instQueue.insertMoveProjection(inst);
+            add_to_iq = false;
+        } else if (inst->renameComputed) {
+            // Rename produced a new physical register value; publish it to
+            // the IQ scoreboard without occupying an execution resource.
+            inst->setIssued();
+            inst->setExecuted();
+            inst->setCanCommit();
+            if (inst->getFault() == NoFault)
+                instQueue.recordCompletedProducer(inst);
+            if (inst->isControl())
+                checkMisprediction(inst);
+            add_to_iq = false;
+        } else if (inst->eliminatedMove || inst->stackAbsorbed) {
             // The destination names the source producer's physical register.
             // Preserve its scoreboard and result-forwarding identity.
             inst->setIssued();
@@ -1131,14 +1127,14 @@ IEW::dispatchInsts(ThreadID tid)
             instQueue.insert(inst);
         }
 
+        if (inst->bypassesIQ())
+            ++cpu->uopsIssuedStats.iqBypasses;
+        else
+            ++cpu->uopsIssuedStats.iqAdmissions;
+
         insts_to_dispatch.pop();
 
         toRename->iewInfo[tid].dispatched += inst->backendSlots();
-        if (!inst->bypassesIQ())
-            toRename->iewInfo[tid].extraIQDispatched +=
-                inst->iqSlots() - inst->backendSlots();
-        if (inst->bypassesIQ())
-            toRename->iewInfo[tid].noIQDispatched += inst->backendSlots();
 
         ++iewStats.dispatchedInsts;
 
@@ -1187,8 +1183,6 @@ IEW::printAvailableInsts()
 void
 IEW::executeInsts()
 {
-    wbNumInst = 0;
-    wbCycle = 0;
 
     for (ThreadID tid : *activeThreads) {
         fetchRedirect[tid] = false;
@@ -1320,6 +1314,10 @@ IEW::executeInsts()
 
             inst->setExecuted();
 
+            if (inst->completionNotBefore > curTick() &&
+                inst->getFault() == NoFault)
+                instQueue.wakeDependents(inst);
+
             instToCommit(inst);
         }
 
@@ -1335,13 +1333,8 @@ IEW::executeInsts()
         // instruction first, so the branch resolution order will be correct.
         ThreadID tid = inst->threadNumber;
 
-        if (inst->staticInst->isMicrocodeControl() && inst->isExecuted() && inst->getFault() == NoFault) {
-            auto next = inst->pcState().clone();
-            inst->staticInst->advancePC(*next);
-            cpu->resolveMicrocodeControl(inst, *next);
-            inst->setPredTarg(*next);
-        }
-
+        inst->recordExecutionBranch();
+        notifyBranchResolution(inst);
         if (!fetchRedirect[tid] ||
             !toCommit->squash[tid] ||
             toCommit->squashedSeqNum[tid] > inst->seqNum) {
@@ -1350,7 +1343,7 @@ IEW::executeInsts()
             // that have not been executed.
             bool loadNotExecuted = !inst->isExecuted() && inst->isLoad();
 
-            if (!inst->staticInst->isMicrocodeControl() && inst->mispredicted() && !loadNotExecuted) {
+            if (inst->mispredicted() && !loadNotExecuted) {
                 inst->executionBranchMispredicted =
                     inst->mispredictedArchitecturalAddress();
                 inst->setBranchPredMispredicted();
@@ -1394,7 +1387,8 @@ IEW::executeInsts()
                 instQueue.violation(inst, violator);
 
                 // Squash.
-                squashDueToMemOrder(violator, tid);
+                squashDueToMemOrder(violator, tid, inst->isLoad() ?
+                    RecoveryCause::Snoop : RecoveryCause::MemoryOrdering);
 
                 ++iewStats.memOrderViolationEvents;
             }
@@ -1429,11 +1423,6 @@ IEW::executeInsts()
         cpu->activityThisCycle();
     }
 
-    // Need to reset this in case a writeback event needs to write into the
-    // iew queue.  That way the writeback event will write into the correct
-    // spot in the queue.
-    wbNumInst = 0;
-
 }
 
 void
@@ -1444,9 +1433,8 @@ IEW::writebackInsts()
     // mark scoreboard that this instruction is finally complete.
     // Either have IEW have direct access to scoreboard, or have this
     // as part of backwards communication.
-    for (int inst_num = 0; inst_num < wbWidth &&
-             toCommit->insts[inst_num]; inst_num++) {
-        DynInstPtr inst = toCommit->insts[inst_num];
+    for (size_t i = 0; i < toCommit->insts.size(); ++i) {
+        const DynInstPtr inst = toCommit->insts[i];
         ThreadID tid = inst->threadNumber;
 
         DPRINTF(IEW, "Sending instructions to commit, [sn:%lli] PC %s.\n",
@@ -1464,7 +1452,7 @@ IEW::writebackInsts()
         // when it's ready to execute the strictly ordered load.
         if (!inst->isSquashed() && inst->isExecuted() &&
                 inst->getFault() == NoFault) {
-            int dependents = inst->wereResultsWoken() ? 0 : instQueue.wakeDependents(inst);
+            int dependents = instQueue.wakeDependents(inst);
 
             for (int i = 0; i < inst->numDestRegs(); i++) {
                 // Mark register as ready if not pinned
@@ -1489,8 +1477,9 @@ IEW::writebackInsts()
 void
 IEW::tick()
 {
-    wbNumInst = 0;
-    wbCycle = 0;
+
+    for (FUPool *fu_pool : fuPools)
+        fu_pool->startAllocationCycle(cpu->curCycle());
 
     wroteToTimeBuffer = false;
     updatedQueues = false;
@@ -1512,6 +1501,9 @@ IEW::tick()
         dispatch(tid);
     }
 
+    // RS residence is observed after dispatch and before scheduling, including
+    // cycles in which recovery suppresses scheduling.
+    cpu->executionActivityStats.observe();
     if (exeStatus != Squashing) {
         executeInsts();
 
@@ -1601,6 +1593,7 @@ IEW::tick()
             instQueue.numFreeEntries(), instQueue.hasReadyInsts(),
             ldstQueue.numFreeLoadEntries(), ldstQueue.numFreeStoreEntries());
 
+    instQueue.sampleQueueOccupancy();
     updateStatus();
 
     if (wroteToTimeBuffer) {
@@ -1656,16 +1649,8 @@ void
 IEW::checkMisprediction(const DynInstPtr& inst)
 {
     ThreadID tid = inst->threadNumber;
-    if (inst->staticInst->isMicrocodeControl()) {
-        if (inst->getFault() == NoFault) {
-            auto next = inst->pcState().clone();
-            inst->staticInst->advancePC(*next);
-            cpu->resolveMicrocodeControl(inst, *next);
-            inst->setPredTarg(*next);
-        }
-        return;
-    }
-
+    inst->recordExecutionBranch();
+    notifyBranchResolution(inst);
     if (!fetchRedirect[tid] ||
         !toCommit->squash[tid] ||
         toCommit->squashedSeqNum[tid] > inst->seqNum) {
@@ -1694,6 +1679,23 @@ IEW::checkMisprediction(const DynInstPtr& inst)
             }
         }
     }
+}
+
+void
+IEW::notifyBranchResolution(const DynInstPtr &inst)
+{
+    if (!inst->isControl() || !inst->isExecuted() || inst->isSquashed() ||
+        inst->getFault() != NoFault || inst->predictionResolutionSent)
+        return;
+    auto history = inst->predictionTransaction.lock();
+    if (!history || !history->valid || !history->needsResolution) return;
+    auto target = std::unique_ptr<PCStateBase>(inst->pcState().clone());
+    inst->staticInst->advancePC(*target);
+    toCommit->branchResolutions.push_back({inst, std::move(target),
+        inst->predictionVersion,
+        inst->isUncondCtrl() || inst->pcState().branching()});
+    inst->predictionResolutionSent = true;
+    wroteToTimeBuffer = true;
 }
 
 } // namespace o3

@@ -57,6 +57,7 @@
 #include "debug/LSQ.hh"
 #include "debug/Writeback.hh"
 #include "mem/functional_translation.hh"
+#include "mem/l1_data_access.hh"
 #include "mem/taotrace_response.hh"
 #include "params/BaseO3CPU.hh"
 
@@ -94,7 +95,13 @@ LSQ::DcachePort::DcachePortStats::DcachePortStats(CPU* _cpu)
                                        statistics::units::Count>::get(),
                "Average retry rate per received response"),
       ADD_STAT(numSendRetryResp, statistics::units::Count::get(),
-               "Number of retry responses sent")
+               "Number of retry responses sent"),
+      ADD_STAT(loadCompletionQueued, statistics::units::Count::get(),
+               "Load values admitted to the shared completion resource"),
+      ADD_STAT(loadCompletionDelivered, statistics::units::Count::get(),
+               "Load values delivered by the shared completion resource"),
+      ADD_STAT(loadCompletionBlockedCycles, statistics::units::Cycle::get(),
+               "Cycles with ready load values remaining after delivery")
 {
     recvRespAvgBW.precision(2);
     recvRespAvgBW = numRecvRespBytes / _cpu->baseStats.numCycles;
@@ -114,7 +121,8 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       _cacheBlocked(false),
       cacheStorePorts(params.cacheStorePorts), usedStorePorts(0),
       cacheLoadPorts(params.cacheLoadPorts), usedLoadPorts(0),
-      sprL1LoadBankConflicts(params.sprL1LoadBankConflicts),
+      sprL1WidthService(params.sprL1WidthService),
+      loadCompletionWidth(params.loadCompletionWidth),
       waitingForStaleTranslation(false),
       staleTranslationWaitTxnId(0),
       lsqPolicy(params.smtLSQPolicy),
@@ -195,7 +203,7 @@ LSQ::drainSanityCheck() const
 bool
 LSQ::isDrained() const
 {
-    bool drained(true);
+    bool drained(loadCompletions.empty());
 
     if (!lqEmpty()) {
         DPRINTF(Drain, "Not drained, LQ not empty.\n");
@@ -213,7 +221,12 @@ LSQ::isDrained() const
 void
 LSQ::takeOverFrom()
 {
+    assert(loadCompletions.empty());
     usedStorePorts = 0;
+    usedLoadPorts = 0;
+    cachedL1DataResource = nullptr;
+    if (sprL1WidthService)
+        ++widthServiceEpoch;
     _cacheBlocked = false;
 
     for (ThreadID tid = 0; tid < numThreads; tid++) {
@@ -224,15 +237,43 @@ LSQ::takeOverFrom()
 void
 LSQ::tick()
 {
-    for (ThreadID tid : *activeThreads)
+    updateLoadCompletionBudget();
+    while (!loadCompletions.empty() &&
+           usedLoadCompletions < loadCompletionWidth) {
+        auto completion = std::move(loadCompletions.front());
+        loadCompletions.pop_front();
+        const bool live = !completion.inst->isSquashed();
+        if (live) {
+            // Charge before callbacks can deliver another predicted value.
+            ++usedLoadCompletions;
+            ++dcachePort.dcachePortStats.loadCompletionDelivered;
+        }
+        completion.complete();
+    }
+    if (!loadCompletions.empty())
+        ++dcachePort.dcachePortStats.loadCompletionBlockedCycles;
+    for (ThreadID tid : *activeThreads) {
+        if (thread[tid].hasFastForwardingModel())
+            thread[tid].advanceForwarding();
         thread[tid].sampleStoreOccupancy();
+    }
     // Re-issue loads which got blocked on the per-cycle load ports limit.
-    if (usedLoadPorts == cacheLoadPorts && !_cacheBlocked)
+    if ((usedLoadPorts == cacheLoadPorts ||
+         (sprL1WidthService &&
+          l1DataResource()->loadWidthExhausted(widthServiceEpoch))) &&
+        !_cacheBlocked)
         iewStage->cacheUnblocked();
 
     usedLoadPorts = 0;
     usedStorePorts = 0;
-    loadBankUses.fill(0);
+    if (sprL1WidthService)
+        ++widthServiceEpoch;
+}
+
+unsigned
+LSQ::demandLoadStages(ThreadID tid) const
+{
+    return thread.at(tid).demandLoadStages();
 }
 
 bool
@@ -248,7 +289,7 @@ LSQ::cacheBlocked(bool v)
 }
 
 bool
-LSQ::cachePortAvailable(bool is_load) const
+LSQ::cachePortAvailable(bool is_load, unsigned bytes)
 {
     bool ret;
     if (is_load) {
@@ -256,31 +297,91 @@ LSQ::cachePortAvailable(bool is_load) const
     } else {
         ret  = usedStorePorts < cacheStorePorts;
     }
+    if (sprL1WidthService && bytes) {
+        // Mixed-width proxy, not a claim about SRAM bank geometry.
+        ret &= l1DataResource()->widthAvailable(is_load, bytes,
+                                                widthServiceEpoch);
+    }
     return ret;
 }
 
 void
-LSQ::cachePortBusy(bool is_load)
+LSQ::cachePortBusy(bool is_load, unsigned bytes)
 {
-    assert(cachePortAvailable(is_load));
+    assert(cachePortAvailable(is_load, bytes));
     if (is_load) {
         usedLoadPorts++;
     } else {
         usedStorePorts++;
     }
+    if (sprL1WidthService && bytes)
+        l1DataResource()->noteWidthAccess(is_load, bytes, widthServiceEpoch);
+}
+
+std::vector<DynInstPtr>
+LSQ::olderStores(const DynInstPtr &load) const
+{
+    std::vector<DynInstPtr> stores;
+    for (const auto &entry : thread[load->threadNumber].storeQueue) {
+        if (entry.instruction()->seqNum >= load->seqNum)
+            break;
+        stores.push_back(entry.instruction());
+    }
+    return stores;
 }
 
 bool
-LSQ::loadBankAvailable(Addr addr) const
+LSQ::memorySpeculationAllowed(const DynInstPtr &load) const
 {
-    return !sprL1LoadBankConflicts || loadBankUses[(addr >> 2) & 15] < 2;
+    return thread[load->threadNumber].memorySpeculationAllowed();
+}
+
+bool
+LSQ::hasFastForwardingPrediction(const DynInstPtr &load) const
+{
+    const auto &unit = thread[load->threadNumber];
+    return unit.hasFastForwardingModel() &&
+        unit.hasFastForwardingPrediction(load);
+}
+
+void
+LSQ::clearFastForwarding(ThreadID tid)
+{
+    if (thread[tid].hasFastForwardingModel())
+        thread[tid].clearFastForwarding();
+}
+
+L1DataAccessResource *
+LSQ::l1DataResource()
+{
+    if (cachedL1DataResource)
+        return cachedL1DataResource;
+    fatal_if(!dcachePort.isConnected(),
+             "L1 data service limits require a connected cache port");
+    auto *peer = dynamic_cast<L1DataAccessPort *>(&dcachePort.getPeer());
+    cachedL1DataResource = peer ? peer->l1DataAccess() : nullptr;
+    if (!cachedL1DataResource) {
+        // X86O3CPU enables width service by default and can connect through
+        // non-Ruby ports. Preserve its existing local budget in that case.
+        if (!localL1DataResource)
+            localL1DataResource = std::make_unique<L1DataAccessBudget>();
+        cachedL1DataResource = localL1DataResource.get();
+    }
+    return cachedL1DataResource;
+}
+
+bool
+LSQ::loadBankAvailable(Addr addr)
+{
+    return !sprL1WidthService ||
+        l1DataResource()->bankAvailable(addr, widthServiceEpoch);
 }
 
 void
 LSQ::noteLoadBank(Addr addr)
 {
-    if (sprL1LoadBankConflicts)
-        ++loadBankUses[(addr >> 2) & 15];
+    if (sprL1WidthService)
+        l1DataResource()->noteBankAccess(addr, widthServiceEpoch);
 }
 
 void
@@ -465,6 +566,59 @@ LSQ::completeDataAccess(PacketPtr pkt)
     LSQRequest *request = dynamic_cast<LSQRequest*>(pkt->senderState);
     thread[cpu->contextToThread(request->contextId())]
         .completeDataAccess(pkt);
+}
+
+bool
+LSQ::usesLoadCompletion(const DynInstPtr &inst, const RequestPtr &req) const
+{
+    return loadCompletionWidth && inst && req && inst->isLoad() &&
+        !inst->isAtomic() && !inst->isDataPrefetch() &&
+        !inst->isReadBarrier() && !inst->isWriteBarrier() &&
+        !inst->inHtmTransactionalState() && inst->fault == NoFault &&
+        !req->isLLSC() && !req->isReadModifyWrite() && !req->isAcquire() &&
+        !req->isLocalAccess() && !req->isUncacheable() &&
+        !req->isStrictlyOrdered() && !req->isCacheMaintenance() &&
+        !req->isMemMgmt() && !(req->getFlags() & Request::NO_ACCESS);
+}
+
+void
+LSQ::updateLoadCompletionBudget()
+{
+    const auto cycle = cpu->curCycle();
+    if (cycle != loadCompletionCycle) {
+        loadCompletionCycle = cycle;
+        usedLoadCompletions = 0;
+    }
+}
+
+void
+LSQ::enqueueLoadCompletion(const DynInstPtr &inst,
+                           std::function<void()> complete, bool same_cycle)
+{
+    assert(loadCompletionWidth && inst);
+    updateLoadCompletionBudget();
+    ++dcachePort.dcachePortStats.loadCompletionQueued;
+    // A predicted register value has no cache-response handoff. It may use
+    // remaining result slots now, but cannot pass older queued responses.
+    if (same_cycle && loadCompletions.empty() &&
+        usedLoadCompletions < loadCompletionWidth) {
+        if (!inst->isSquashed()) {
+            ++usedLoadCompletions;
+            ++dcachePort.dcachePortStats.loadCompletionDelivered;
+        }
+        complete();
+        return;
+    }
+    LoadCompletion item{curTick(), inst->seqNum, inst, std::move(complete)};
+    auto position = std::upper_bound(loadCompletions.begin(),
+        loadCompletions.end(), item,
+        [](const LoadCompletion &a, const LoadCompletion &b) {
+            return a.ready < b.ready ||
+                (a.ready == b.ready && a.sequence < b.sequence);
+        });
+    loadCompletions.insert(position, std::move(item));
+    cpu->wakeCPU();
+    iewStage->activityThisCycle();
 }
 
 void
@@ -761,6 +915,12 @@ LSQ::hasStoresToWB(ThreadID tid)
     return thread.at(tid).hasStoresToWB();
 }
 
+bool
+LSQ::hasPendingCodeWrite(ThreadID tid, Addr physical_block)
+{
+    return thread.at(tid).hasPendingCodeWrite(physical_block);
+}
+
 int
 LSQ::numStoresToWB(ThreadID tid)
 {
@@ -770,6 +930,8 @@ LSQ::numStoresToWB(ThreadID tid)
 bool
 LSQ::willWB()
 {
+    if (!loadCompletions.empty())
+        return true;
     for (ThreadID tid : *activeThreads) {
         if (willWB(tid))
             return true;
@@ -850,7 +1012,26 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
         // a strictly ordered load
         inst->getFault() = NoFault;
 
+        // The effective virtual address exists before translation starts.
+        // Ordinary LSU retries reuse this request and do not query MDP again.
+        iewStage->instQueue.memoryDependence(tid).addressGenerated(inst);
+        const bool prepare_l1_index = sprL1WidthService && isLoad &&
+            inst->isLoad() && !inst->isDataPrefetch() && !inst->isAtomic() &&
+            !inst->isReadBarrier() && !inst->isWriteBarrier() &&
+            !inst->inHtmTransactionalState();
+        const Tick index_ready = cpu->clockEdge(Cycles(1));
         request->initiateTranslation();
+        if (prepare_l1_index) {
+            // Every split fragment has its own virtual address and request.
+            // Starting this preparation never issues a cache transaction.
+            for (const auto &fragment : request->_reqs) {
+                if (fragment->hasVaddr()) {
+                    const Addr index = (fragment->getVaddr() >> 6) & 0x3f;
+                    fragment->setExtension(std::make_shared<L1IndexPreparation>(
+                        index_ready, index));
+                }
+            }
+        }
     }
 
     /* This is the place were instructions get the effAddr. */
@@ -859,6 +1040,10 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
             inst->effAddr = request->getVaddr();
             inst->effSize = size;
             inst->effAddrValid(true);
+
+            // Preserve physical ranges before forwarding or retirement can
+            // release the request that owns its byte-enable information.
+            iewStage->instQueue.memoryDependence(tid).addressReady(inst);
 
             if (cpu->checker) {
                 inst->reqToVerify = std::make_shared<Request>(*request->req());
@@ -888,6 +1073,31 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
     return inst->getFault();
 }
 
+bool
+LSQ::LSQRequest::physicalBytes(std::vector<Addr> &bytes) const
+{
+    if (!flags.isSet(Flag::TranslationFinished) || _hasStaleTranslation ||
+        _inst->fault != NoFault || _reqs.empty())
+        return false;
+    std::vector<Addr> result;
+    for (const auto &req : _reqs) {
+        if (!req->hasVaddr() || !req->hasPaddr() ||
+            req->getVaddr() < _addr)
+            return false;
+        const Addr offset = req->getVaddr() - _addr;
+        if (offset > _size || req->getSize() > _size - offset)
+            return false;
+        for (unsigned byte = 0; byte < req->getSize(); ++byte) {
+            if (_byteEnable.empty() || _byteEnable.at(offset + byte))
+                result.push_back(req->getPaddr() + byte);
+        }
+    }
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    bytes = std::move(result);
+    return true;
+}
+
 void
 LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
         gem5::ThreadContext* tc, BaseMMU::Mode mode)
@@ -897,7 +1107,7 @@ LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
     numTranslatedFragments = 1;
     /* If the instruction has been squahsed, let the request know
      * as it may have to self-destruct. */
-    if (_inst->isSquashed()) {
+    if (_inst->isSquashed() || _inst->savedRequest != this || isReleased()) {
         squashTranslation();
     } else {
         _inst->strictlyOrdered(request->isStrictlyOrdered());
@@ -937,7 +1147,7 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
         _mainReq->setFlags(req->getFlags());
 
     if (numTranslatedFragments == _reqs.size()) {
-        if (_inst->isSquashed()) {
+        if (_inst->isSquashed() || _inst->savedRequest != this || isReleased()) {
             squashTranslation();
         } else {
             _inst->strictlyOrdered(_mainReq->isStrictlyOrdered());
@@ -959,6 +1169,7 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
                     _mainReq->setExtraData(*_res);
                 }
                 if (i == _fault.size()) {
+                    _port.noteSplitTranslation(_reqs);
                     _inst->fault = NoFault;
                     setState(State::Request);
                 } else {
@@ -1176,7 +1387,8 @@ LSQ::LSQRequest::addReq(Addr addr, unsigned size,
 LSQ::LSQRequest::~LSQRequest()
 {
     assert(!isAnyOutstandingRequest());
-    _inst->savedRequest = nullptr;
+    if (_inst->savedRequest == this)
+        _inst->savedRequest = nullptr;
 
     for (auto r: _packets)
         delete r;
@@ -1569,6 +1781,13 @@ LSQ::DcachePort::throttleReadResp(PacketPtr pkt)
 bool
 LSQ::DcachePort::recvTimingResp(PacketPtr pkt)
 {
+    // A local write need not invalidate our already-owned cache line. Its
+    // completed visibility must still trigger an armed address monitor.
+    if (pkt->isWrite()) {
+        for (ThreadID tid = 0; tid < cpu->numThreads; ++tid)
+            if (cpu->getCpuAddrMonitor(tid)->doMonitor(pkt))
+                cpu->wakeup(tid);
+    }
     if (lsq->recvRespThrottling && pkt->cmd == MemCmd::ReadResp) {
         if (throttleReadResp(pkt)) {
             return false;

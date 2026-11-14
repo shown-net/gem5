@@ -44,6 +44,7 @@
 #include "debug/Config.hh"
 #include "debug/Drain.hh"
 #include "debug/RubyPort.hh"
+#include "mem/cache_eviction.hh"
 #include "mem/ruby/slicc_interface/AbstractController.hh"
 #include "mem/simple_mem.hh"
 #include "mem/taotrace_response.hh"
@@ -759,7 +760,7 @@ RubyPort::MemResponsePort::isPhysMemAddress(PacketPtr pkt) const
 }
 
 void
-RubyPort::ruby_eviction_callback(Addr address)
+RubyPort::ruby_eviction_callback(Addr address, bool local_capacity)
 {
     DPRINTF(RubyPort, "Sending invalidations.\n");
     // Allocate the invalidate request and packet on the stack, as it is
@@ -768,6 +769,11 @@ RubyPort::ruby_eviction_callback(Addr address)
     auto request = std::make_shared<Request>(
         address, m_ruby_system->getBlockSizeBytes(), 0,
         Request::funcRequestorId);
+    if (local_capacity) {
+        auto origin = std::make_shared<CacheEvictionOrigin>();
+        origin->localCapacity = true;
+        request->setExtension(origin);
+    }
 
     // Use a single packet to signal all snooping ports of the invalidation.
     // This assumes that snooping ports do NOT modify the packet/request

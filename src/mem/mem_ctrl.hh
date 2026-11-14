@@ -66,6 +66,7 @@ namespace gem5
 namespace memory
 {
 
+class AbstractMemory;
 class MemInterface;
 class DRAMInterface;
 class NVMInterface;
@@ -502,6 +503,8 @@ class MemCtrl : public qos::MemCtrl
 +    * Create pointer to interface of the actual memory media when connected
 +    */
     MemInterface* dram;
+    const std::vector<AbstractMemory*> rangeBackings;
+    AbstractMemory *dataBacking(Addr addr, MemInterface *interface) const;
 
     virtual AddrRangeList getAddrRanges();
 

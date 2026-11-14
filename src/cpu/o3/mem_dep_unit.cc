@@ -26,6 +26,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <algorithm>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <vector>
@@ -35,7 +37,9 @@
 #include "cpu/o3/dyn_inst.hh"
 #include "cpu/o3/inst_queue.hh"
 #include "cpu/o3/limits.hh"
+#include "cpu/o3/lsq.hh"
 #include "cpu/o3/mem_dep_unit.hh"
+#include "cpu/o3/physical_byte_coverage.hh"
 #include "debug/MemDepUnit.hh"
 #include "params/BaseO3CPU.hh"
 
@@ -55,12 +59,15 @@ MemDepUnit::MemDepUnit() : iqPtr(NULL), stats(nullptr) {}
 
 MemDepUnit::MemDepUnit(const BaseO3CPUParams &params)
     : _name(params.name + ".memdepunit"),
-      depPred(_name + ".storesets", params.store_set_clear_period,
-              params.SSITSize, params.SSITAssoc, params.SSITReplPolicy,
-              params.SSITIndexingPolicy, params.LFSTSize),
       iqPtr(NULL),
       stats(nullptr)
 {
+    sprPredictor = params.sprMemoryDependence;
+    if (!params.sprMemoryDependence)
+        depPred = std::make_unique<StoreSet>(
+            _name + ".storesets", params.store_set_clear_period,
+            params.SSITSize, params.SSITAssoc, params.SSITReplPolicy,
+            params.SSITIndexingPolicy, params.LFSTSize);
     DPRINTF(MemDepUnit, "Creating MemDepUnit object.\n");
 }
 
@@ -96,10 +103,14 @@ MemDepUnit::init(const BaseO3CPUParams &params, ThreadID tid, CPU *cpu)
     DPRINTF(MemDepUnit, "Creating MemDepUnit %i object.\n",tid);
 
     id = tid;
+    sprPredictor = params.sprMemoryDependence;
 
-    depPred.init(params.store_set_clear_period,
-                 params.SSITSize, params.SSITAssoc, params.SSITReplPolicy,
-                 params.SSITIndexingPolicy, params.LFSTSize);
+    if (!sprPredictor) {
+        depPred = std::make_unique<StoreSet>();
+        depPred->init(params.store_set_clear_period,
+                      params.SSITSize, params.SSITAssoc, params.SSITReplPolicy,
+                      params.SSITIndexingPolicy, params.LFSTSize);
+    }
 
     std::string stats_group_name = csprintf("MemDepUnit__%i", tid);
     cpu->addStatGroup(stats_group_name.c_str(), &stats);
@@ -114,7 +125,9 @@ MemDepUnit::MemDepUnitStats::MemDepUnitStats(statistics::Group *parent)
       ADD_STAT(conflictingLoads, statistics::units::Count::get(),
                "Number of conflicting loads."),
       ADD_STAT(conflictingStores, statistics::units::Count::get(),
-               "Number of conflicting stores.")
+               "Number of conflicting stores."),
+      ADD_STAT(addressWaits, statistics::units::Count::get(),
+               "Loads waiting for older store address resolution")
 {
 }
 
@@ -123,7 +136,7 @@ MemDepUnit::isDrained() const
 {
     bool drained = instsToReplay.empty()
                  && memDepHash.empty()
-                 && instsToReplay.empty();
+                 && loadObservations.empty();
     for (int i = 0; i < MaxThreads; ++i)
         drained = drained && instList[i].empty();
 
@@ -135,6 +148,7 @@ MemDepUnit::drainSanityCheck() const
 {
     assert(instsToReplay.empty());
     assert(memDepHash.empty());
+    assert(loadObservations.empty());
     for (int i = 0; i < MaxThreads; ++i)
         assert(instList[i].empty());
     assert(instsToReplay.empty());
@@ -147,7 +161,9 @@ MemDepUnit::takeOverFrom()
     // Be sure to reset all state.
     loadBarrierSNs.clear();
     storeBarrierSNs.clear();
-    depPred.clear();
+    if (depPred)
+        depPred->clear();
+    loadObservations.clear();
 }
 
 void
@@ -221,13 +237,16 @@ MemDepUnit::insert(const DynInstPtr &inst)
         producing_stores.insert(std::end(producing_stores),
                                 std::begin(storeBarrierSNs),
                                 std::end(storeBarrierSNs));
-    } else {
-        InstSeqNum dep = depPred.checkInst(inst->pcState().instAddr());
+    } else if (!sprPredictor) {
+        InstSeqNum dep = depPred->checkInst(inst->pcState().instAddr());
         if (dep != 0)
             producing_stores.push_back(dep);
     }
 
     std::vector<MemDepEntryPtr> store_entries;
+
+    // Ordinary SPR loads reach the AGU when their operands and architectural
+    // barriers are ready. Prediction and store-address waiting belong to LSU.
 
     // If there is a producing store, try to find the entry.
     for (auto producing_store : producing_stores) {
@@ -271,7 +290,6 @@ MemDepUnit::insert(const DynInstPtr &inst)
         // Add this instruction to the list of dependents.
         for (auto store_entry : store_entries)
             store_entry->dependInsts.push_back(inst_entry);
-
         inst_entry->memDeps = store_entries.size();
 
         if (inst->isLoad()) {
@@ -288,8 +306,9 @@ MemDepUnit::insert(const DynInstPtr &inst)
         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
                 inst->pcState(), inst->seqNum);
 
-        depPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
-                inst->threadNumber);
+        if (!sprPredictor)
+            depPred->insertStore(inst->pcState().instAddr(), inst->seqNum,
+                    inst->threadNumber);
 
         ++stats.insertedStores;
     } else if (inst->isLoad()) {
@@ -310,8 +329,9 @@ MemDepUnit::insertNonSpec(const DynInstPtr &inst)
         DPRINTF(MemDepUnit, "Inserting store/atomic PC %s [sn:%lli].\n",
                 inst->pcState(), inst->seqNum);
 
-        depPred.insertStore(inst->pcState().instAddr(), inst->seqNum,
-                inst->threadNumber);
+        if (!sprPredictor)
+            depPred->insertStore(inst->pcState().instAddr(), inst->seqNum,
+                    inst->threadNumber);
 
         ++stats.insertedStores;
     } else if (inst->isLoad()) {
@@ -548,8 +568,8 @@ MemDepUnit::squash(const InstSeqNum &squashed_num, ThreadID tid)
         }
     }
 
-    ListIt squash_it = instList[tid].end();
-    --squash_it;
+    ListIt squash_it = instList[tid].empty() ? instList[tid].end() :
+        std::prev(instList[tid].end());
 
     MemDepHashIt hash_it;
 
@@ -576,23 +596,35 @@ MemDepUnit::squash(const InstSeqNum &squashed_num, ThreadID tid)
         MemDepEntry::memdep_erase++;
 #endif
 
-        instList[tid].erase(squash_it--);
+        auto previous = squash_it == instList[tid].begin() ?
+            instList[tid].end() : std::prev(squash_it);
+        instList[tid].erase(squash_it);
+        squash_it = previous;
     }
 
     // Tell the dependency predictor to squash as well.
-    depPred.squash(squashed_num, tid);
+    if (!sprPredictor)
+        depPred->squash(squashed_num, tid);
+    for (auto it = loadObservations.begin(); it != loadObservations.end();) {
+        if (it->first > squashed_num)
+            it = loadObservations.erase(it);
+        else
+            ++it;
+    }
 }
 
 void
 MemDepUnit::violation(const DynInstPtr &store_inst,
         const DynInstPtr &violating_load)
 {
+    // Actual recovery is handled by IEW independently of predictor training.
+    if (sprPredictor)
+        return;
     DPRINTF(MemDepUnit, "Passing violating PCs to store sets,"
             " load: %#x, store: %#x\n", violating_load->pcState().instAddr(),
             store_inst->pcState().instAddr());
-    // Tell the memory dependence unit of the violation.
-    depPred.violation(store_inst->pcState().instAddr(),
-            violating_load->pcState().instAddr());
+    depPred->violation(store_inst->pcState().instAddr(),
+                       violating_load->pcState().instAddr());
 }
 
 void
@@ -600,8 +632,65 @@ MemDepUnit::issue(const DynInstPtr &inst)
 {
     DPRINTF(MemDepUnit, "Issuing instruction PC %#x [sn:%lli].\n",
             inst->pcState().instAddr(), inst->seqNum);
+    if (!sprPredictor)
+        depPred->issued(inst->pcState().instAddr(), inst->seqNum,
+                        inst->isStore());
+}
 
-    depPred.issued(inst->pcState().instAddr(), inst->seqNum, inst->isStore());
+bool
+MemDepUnit::canSpeculate(const DynInstPtr &)
+{
+    // The SPR profile never admits an unresolved-store bypass. Generic O3
+    // keeps its original StoreSet-based admission.
+    return !sprPredictor;
+}
+
+const std::vector<Addr> *
+MemDepUnit::physicalReadBytes(const DynInstPtr &inst) const
+{
+    auto found = loadObservations.find(inst->seqNum);
+    return found != loadObservations.end() && found->second.physicalReady ?
+        &found->second.bytes : nullptr;
+}
+
+void
+MemDepUnit::addressGenerated(const DynInstPtr &inst)
+{
+    if (sprPredictor && inst->isLoad() && !inst->isDataPrefetch())
+        loadObservations.insert_or_assign(inst->seqNum, LoadObservation{});
+}
+
+void
+MemDepUnit::addressReady(const DynInstPtr &inst)
+{
+    if (!sprPredictor || !inst->isLoad())
+        return;
+    auto found = loadObservations.find(inst->seqNum);
+    if (found != loadObservations.end() && inst->savedRequest)
+        found->second.physicalReady =
+            inst->savedRequest->physicalBytes(found->second.bytes);
+}
+
+void
+MemDepUnit::storeOrderChecked(const DynInstPtr &, InstSeqNum)
+{
+    // Retained as a pipeline hook. No predictor observes or trains on it.
+}
+
+void
+MemDepUnit::noteAddressWait(const DynInstPtr &load)
+{
+    auto found = loadObservations.find(load->seqNum);
+    if (found == loadObservations.end() || found->second.addressWaitObserved)
+        return;
+    found->second.addressWaitObserved = true;
+    ++stats.addressWaits;
+}
+
+void
+MemDepUnit::loadRetired(const DynInstPtr &load)
+{
+    loadObservations.erase(load->seqNum);
 }
 
 MemDepUnit::MemDepEntryPtr &

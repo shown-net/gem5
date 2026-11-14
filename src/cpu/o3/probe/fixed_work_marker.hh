@@ -9,7 +9,7 @@
 #include "params/TaoTrace.hh"
 #include "sim/eventq.hh"
 
-namespace gem5 { class ThreadContext;
+namespace gem5 { class ThreadContext; class SimObject;
 namespace o3 {
 class CPU;
 class TaoTrace;
@@ -39,6 +39,7 @@ class FixedWorkMarker
     std::vector<Addr> begins_, ends_;
     std::vector<unsigned> cores_;
     std::vector<uint64_t> workids_;
+    std::vector<SimObject *> stat_objects_;
     unsigned worker_ = 0;
     int phase_ = 0;
     bool capturing_ = false;

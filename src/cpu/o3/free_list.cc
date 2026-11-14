@@ -39,7 +39,10 @@ namespace o3
 {
 
 UnifiedFreeList::UnifiedFreeList(const std::string &_my_name,
-                                 PhysRegFile *_regFile)
+                                 PhysRegFile *_regFile,
+                                 unsigned float_entries,
+                                 unsigned float_wide_entries,
+                                 unsigned int_entries)
     : _name(_my_name), regFile(_regFile)
 {
     DPRINTF(FreeList, "Creating new free list object.\n");
@@ -47,6 +50,8 @@ UnifiedFreeList::UnifiedFreeList(const std::string &_my_name,
     // Have the register file initialize the free list since it knows
     // about its internal organization
     regFile->initFreeList(this);
+    freeLists[IntRegClass].initEntries(int_entries);
+    freeLists[FloatRegClass].initEntries(float_entries, float_wide_entries);
 }
 
 } // namespace o3

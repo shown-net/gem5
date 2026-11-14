@@ -124,6 +124,9 @@ class BaseMMU : public SimObject
     translateTiming(const RequestPtr &req, ThreadContext *tc,
                     Translation *translation, Mode mode);
 
+    /** Notify timing translators after this thread's requests are squashed. */
+    virtual void squashTiming(ThreadContext *tc) {}
+
     virtual Fault
     translateFunctional(const RequestPtr &req, ThreadContext *tc,
                         Mode mode);

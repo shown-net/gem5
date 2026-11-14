@@ -39,6 +39,7 @@ def macroop LEA_R_M {
 };
 
 def macroop LEA_R_P {
+    .rip_lea
     rdip t7
     lea reg, seg, riprel, disp
 };

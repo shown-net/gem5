@@ -46,6 +46,7 @@
 #include <array>
 #include <iostream>
 #include <queue>
+#include <vector>
 
 #include "base/logging.hh"
 #include "base/trace.hh"
@@ -74,10 +75,32 @@ class SimpleFreeList
 
     /** The actual free list */
     std::queue<PhysRegIdPtr> freeRegs;
+    // An entry remains occupied until all its data fragments are reusable.
+    // Rename aliases are counted by PhysRegId before reaching this layer.
+    std::vector<int> regEntries;
+    std::vector<unsigned> entryUsers;
+    std::queue<unsigned> freeEntries;
+    std::vector<bool> entryWide;
+    unsigned freeWideEntries = 0;
 
   public:
 
     SimpleFreeList() {};
+
+    void
+    initEntries(unsigned entries, unsigned wide_entries = 0)
+    {
+        if (!entries)
+            return;
+        regEntries.assign(freeRegs.size(), -1);
+        entryUsers.assign(entries, 0);
+        panic_if(wide_entries > entries,
+                 "Wide PRF capability exceeds the shared entry budget");
+        entryWide.assign(entries, false);
+        freeWideEntries = wide_entries;
+        for (unsigned i = 0; i < entries; ++i)
+            freeEntries.push(i);
+    }
 
     /** Add a physical register to the free list */
     bool addReg(PhysRegIdPtr reg)
@@ -86,6 +109,20 @@ class SimpleFreeList
         // register is reusable only after every architectural version/alias
         // has left the rename history.
         if (!reg->numRenameReferences() || reg->releaseRenameReference()) {
+            if (!regEntries.empty()) {
+                const int entry = regEntries[reg->index()];
+                if (entry >= 0) {
+                    assert(entryUsers[entry]);
+                    if (--entryUsers[entry] == 0) {
+                        if (entryWide[entry]) {
+                            entryWide[entry] = false;
+                            ++freeWideEntries;
+                        }
+                        freeEntries.push(entry);
+                    }
+                    regEntries[reg->index()] = -1;
+                }
+            }
             freeRegs.push(reg);
             return true;
         }
@@ -102,17 +139,50 @@ class SimpleFreeList
     }
 
     /** Get the next available register from the free list */
-    PhysRegIdPtr getReg()
+    PhysRegIdPtr getReg(PhysRegIdPtr entry_peer = nullptr,
+                       bool allocation_entry = true)
     {
         assert(!freeRegs.empty());
         PhysRegIdPtr free_reg = freeRegs.front();
         freeRegs.pop();
         free_reg->allocateRenameReference();
+        if (!regEntries.empty() && allocation_entry) {
+            unsigned entry;
+            if (entry_peer) {
+                const int peer_entry = regEntries[entry_peer->index()];
+                assert(peer_entry >= 0);
+                entry = peer_entry;
+            } else {
+                assert(!freeEntries.empty());
+                entry = freeEntries.front();
+                freeEntries.pop();
+            }
+            assert(regEntries[free_reg->index()] == -1);
+            regEntries[free_reg->index()] = entry;
+            ++entryUsers[entry];
+        }
         return free_reg;
     }
 
     /** Return the number of free registers on the list. */
     unsigned numFreeRegs() const { return freeRegs.size(); }
+    unsigned numFreeRegEntries() const
+    {
+        return regEntries.empty() ? numFreeRegs() : freeEntries.size();
+    }
+
+    unsigned numFreeWideEntries() const { return freeWideEntries; }
+    void markWide(PhysRegIdPtr reg)
+    {
+        panic_if(regEntries.empty(), "Wide PRF demand needs entry accounting");
+        const int entry = regEntries.at(reg->index());
+        assert(entry >= 0);
+        if (!entryWide[entry]) {
+            panic_if(!freeWideEntries, "Wide PRF entry without reservation");
+            --freeWideEntries;
+            entryWide[entry] = true;
+        }
+    }
 
     /** True iff there are free registers on the list. */
     bool hasFreeRegs() const { return !freeRegs.empty(); }
@@ -164,13 +234,30 @@ class UnifiedFreeList
      *  @param reservedFloatRegs Number of fp registers already
      *                           used by initial mappings.
      */
-    UnifiedFreeList(const std::string &_my_name, PhysRegFile *_regFile);
+    UnifiedFreeList(const std::string &_my_name, PhysRegFile *_regFile,
+                    unsigned float_entries = 0, unsigned float_wide_entries = 0,
+                    unsigned int_entries = 0);
 
     /** Gives the name of the freelist. */
     std::string name() const { return _name; };
 
     /** Gets a free register of type type. */
-    PhysRegIdPtr getReg(RegClassType type) { return freeLists[type].getReg(); }
+    PhysRegIdPtr getReg(RegClassType type, PhysRegIdPtr entry_peer = nullptr,
+                       bool allocation_entry = true)
+    {
+        return freeLists[type].getReg(entry_peer, allocation_entry);
+    }
+    unsigned numFreeIntEntries() const
+    { return freeLists[IntRegClass].numFreeRegEntries(); }
+
+    unsigned numFreeFloatEntries() const
+    {
+        return freeLists[FloatRegClass].numFreeRegEntries();
+    }
+    unsigned numFreeFloatWideEntries() const
+    { return freeLists[FloatRegClass].numFreeWideEntries(); }
+    void markFloatWide(PhysRegIdPtr reg)
+    { freeLists[FloatRegClass].markWide(reg); }
 
     /** Adds a register back to the free list. */
     template<class InputIt>

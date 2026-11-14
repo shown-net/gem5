@@ -28,15 +28,20 @@ from m5.objects.BaseMinorCPU import BaseMinorCPU
 from m5.objects.BaseNonCachingSimpleCPU import BaseNonCachingSimpleCPU
 from m5.objects.BaseO3CPU import BaseO3CPU
 from m5.objects.BaseTimingSimpleCPU import BaseTimingSimpleCPU
-from m5.objects.BranchPredictor import BranchPredictor, MultiLevelBTB, TournamentBP
+from m5.objects.BranchPredictor import (
+    BranchPredictor, MultiLevelBTB, GoldenCoveBP,
+    GoldenCoveIndirectPredictor, ReturnAddrStack,
+)
 from m5.objects.FuncUnit import *
 from m5.objects.FUPool import *
 from m5.objects.IQUnit import IQUnit
 from m5.objects.ZeroIdiom import ZeroIdiom
-from m5.objects.Frontend import FrontendCoordinator
+from m5.objects.StackEngine import StackEngine
+from m5.objects.Frontend import FrontendCoordinator, InstructionBytes
 from m5.objects.IntExecution import (
     ExecutionPorts,
     IntegerALU,
+    IntegerDivider,
     IntExecutionResource,
     ResultForwarding,
 )
@@ -44,7 +49,7 @@ from m5.objects.X86Decoder import X86Decoder
 from m5.objects.X86ISA import X86ISA
 from m5.objects.X86LocalApic import X86LocalApic
 from m5.objects.X86MMU import X86MMU
-from m5.objects.X86TLB import X86TLB
+from m5.objects.X86TLB import X86TLB, X86PagingStructureCache
 from m5.proxy import Self
 
 
@@ -122,10 +127,12 @@ def spr_fu_pool():
     writes = {str(op.opClass) for op in WritePort().opList}
     ports = [[] for _ in range(12)]
     latencies = {
-        "FloatAdd": 2, "FloatMult": 4, "FloatDiv": 14, "FloatMisc": 1,
+        "FloatAdd": 3, "FloatMult": 4, "FloatDiv": 14, "FloatMisc": 1,
+        "FloatMultAcc": 4, "SimdFloatMultAcc": 4,
         "SimdAlu": 1, "SimdAdd": 1, "SimdMisc": 1, "SimdCmp": 1,
-        "SimdShift": 1, "SimdMult": 3, "SimdFloatAdd": 2,
+        "SimdShift": 1, "SimdMult": 3, "SimdMultAcc": 5, "SimdFloatAdd": 3,
         "SimdFloatMult": 4, "SimdFloatDiv": 11,
+        "X86FloatSqrt32": 12, "X86FloatSqrt64": 18,
     }
     for name, op in specs.items():
         if name == "X86StoreAddress":
@@ -142,7 +149,8 @@ def spr_fu_pool():
             indices = (1, 5)
         elif name == "IntDiv":
             indices = (1,)
-        elif name in {"FloatMult", "SimdFloatMult", "SimdCmp", "SimdShift"}:
+        elif name in {"FloatMult", "SimdFloatMult", "SimdMult", "FloatMultAcc",
+                      "SimdFloatMultAcc", "SimdMultAcc", "SimdCmp", "SimdShift"}:
             indices = (0, 1)
         elif name in {"SimdPack", "SimdInsert"}:
             indices = (5,)
@@ -154,15 +162,20 @@ def spr_fu_pool():
         for index in indices:
             desc = OpDesc(
                 opClass=op.opClass, opLat=latencies.get(name, op.opLat),
-                pipelined=True if name in {"FloatDiv", "SimdFloatDiv"}
+                pipelined=True if name in {"FloatDiv", "SimdFloatDiv",
+                                          "X86FloatSqrt32", "X86FloatSqrt64"}
                 else op.pipelined,
             )
             if name in {"FloatDiv", "SimdFloatDiv"}:
                 desc.issueLat = 4 if name == "FloatDiv" else 3
+            if name in {"X86FloatSqrt32", "X86FloatSqrt64"}:
+                desc.issueLat = 6 if name == "X86FloatSqrt64" else 3
             ports[index].append(desc)
     return FUPool(
         FUList=[FUDesc(opList=ops, count=1) for ops in ports],
         storeDataPorts=[4, 9], branchPorts=[0, 6],
+        fpDiv64ActiveCycles=8, fpDiv32ActiveCycles=5,
+        fpDiv64PowerOfTwoLatency=13, fpDiv64PowerOfTwoActiveCycles=7,
     )
 
 
@@ -173,46 +186,51 @@ _spr_mem_classes = sorted(
 )
 
 
-def x86_o3_mmu():
-    """Default O3 instruction translation and shared second-level proxy."""
-    mmu = X86MMU()
-    mmu.stlb = X86TLB(size=2048, entry_type="unified", spr_shared_domains=True)
-    mmu.itb.size = 256
-    mmu.itb.itlb_4k_ways = 8
-    mmu.itb.next_level = mmu.stlb
-    mmu.dtb.size = 96
-    mmu.dtb.dtlb_4k_ways = 6
-    mmu.dtb.next_level_hit_latency = 6
-    mmu.dtb.walker.max_active_walks = 4
-    mmu.dtb.next_level = mmu.stlb
-    return mmu
-
-
 class X86O3CPU(BaseO3CPU, X86CPU):
-    mmu = x86_o3_mmu()
+    mmu = X86MMU()
     needsTSO = True
     fetchWidth = 8
     fetchBufferSize = 64
     fetchQueueSize = 144
-    decodeWidth = 8
+    decodeWidth = 6
     renameWidth = 6
     dispatchWidth = 6
     issueWidth = 12
-    wbWidth = 12
     commitWidth = 8
     numROBEntries = 512
     LQEntries = 240
     SQEntries = 112
     cacheLoadPorts = 3
     cacheStorePorts = 2
-    numPhysIntRegs = 288
-    numPhysFloatRegs = 256
-    sprL1LoadBankConflicts = True
+    loadCompletionWidth = 3
+    # Storage covers the bounded O3 record window and functional results;
+    # hardware allocation credits remain independent of that representation.
+    numPhysIntRegEntries = 288
+    numPhysIntRegs = numPhysIntRegEntries + numROBEntries * 16 * 4
+    numPhysFloatRegEntries = 320
+    numPhysFloatRegs = numPhysFloatRegEntries * 8 + numROBEntries * 16 * 2
+    numPhysFloatWideEntries = 220
+    sprMemoryDependence = True
+    sprFastStoreForwarding = False
+    sprMultiStoreForwarding = False
+    sprL1WidthService = True
     sprStoreBuffer = True
     sprEarlyStorePrepare = True
+    # Native 8457C fence controls distinguish architectural MFENCE service
+    # from SFENCE and from the embedded fences of locked microcode.
+    sprFullFenceServiceCycles = 34
     branchPred = BranchPredictor(
-        conditionalBranchPred=TournamentBP(), btb=MultiLevelBTB(),
+        requiresBTBHit=True,
+        conditionalBranchPred=GoldenCoveBP(), btb=MultiLevelBTB(),
+        indirectBranchPred=GoldenCoveIndirectPredictor(),
+        ras=ReturnAddrStack(numEntries=16),
     )
+    decoupledFrontEnd = True
+    # One target range covers the resident 64-byte refill; MITE still receives
+    # at most 32 bytes per cycle from InstructionBytes.
+    fetchTargetWidth = 64
+    maxTakenPredPerCycle = 2
+    maxDsbTakenPerCycle = 2
 
     # Development measurements always use the implemented integer structure.
     # SimObject cloning preserves shared port references within each core.
@@ -224,11 +242,17 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     ]
     resultForwarding = ResultForwarding()
     zeroIdiom = ZeroIdiom()
-    frontend = FrontendCoordinator()
+    stackEngine = StackEngine(enabled=True)
+    frontend = FrontendCoordinator(
+        enableLsdReplay=False,
+        instructionBytes=InstructionBytes(residentBlocks=16, requestDepth=8),
+    )
     intSHFT = IntExecutionResource(family=2)
     intSlow = IntExecutionResource(family=3)
     intBM = IntExecutionResource(family=4)
     intBranch = IntExecutionResource(family=5)
+    intDivider = IntegerDivider(quotientLatency32=[12, 11, 10],
+                                quotientLatency64=[14, 14, 14])
 
     # For x86, each CC reg is used to hold only a subset of the
     # flags, so we need 4-5 times the number of CC regs as
@@ -236,22 +260,12 @@ class X86O3CPU(BaseO3CPU, X86CPU):
     # typical real machines, CC regs are not explicitly renamed
     # (it's a side effect of int reg renaming), so they should
     # never be the bottleneck here.
-    numPhysCCRegs = Self.numPhysIntRegs * 5
+    numPhysCCRegs = (numPhysIntRegEntries + numROBEntries * 16) * 5
 
-    # EU 128 is the chosen remainder of the 248-entry model budget.
-    # These named children share one pool within a core, never across cores.
+    # Shared scheduler capacity; no hard EU/MEM/STD partition is assumed.
     sprFUPool = spr_fu_pool()
-    executionIQ = IQUnit(
-        numEntries=128, fuPool=sprFUPool,
-        excludedOpClasses=[*_spr_mem_classes, "X86StoreData"],
-    )
-    memoryIQ = IQUnit(
-        numEntries=72, fuPool=sprFUPool, allowedOpClasses=_spr_mem_classes,
-    )
-    storeDataIQ = IQUnit(
-        numEntries=48, fuPool=sprFUPool, allowedOpClasses=["X86StoreData"],
-    )
-    instQueues = [executionIQ, memoryIQ, storeDataIQ]
+    sharedIQ = IQUnit(numEntries=248, fuPool=sprFUPool)
+    instQueues = [sharedIQ]
 
 
 class X86MinorCPU(BaseMinorCPU, X86CPU):

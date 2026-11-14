@@ -43,12 +43,15 @@
 
 #include "base/intmath.hh"
 #include "base/logging.hh"
+#include "mem/ruby/slicc_interface/AbstractController.hh"
+#include "mem/ruby/common/SPRBankHash.hh"
 #include "debug/HtmMem.hh"
 #include "debug/RubyCache.hh"
 #include "debug/RubyCacheTrace.hh"
 #include "debug/RubyResourceStalls.hh"
 #include "debug/RubyStats.hh"
 #include "mem/cache/replacement_policies/weighted_lru_rp.hh"
+#include "mem/cache/replacement_policies/qlru_h00_m1_r0_u1_rp.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/system/RubySystem.hh"
 
@@ -71,16 +74,25 @@ CacheMemory::CacheMemory(const Params &p)
     dataArray(p.dataArrayBanks, p.dataAccessLatency, p.start_index_bit),
     tagArray(p.tagArrayBanks, p.tagAccessLatency, p.start_index_bit),
     atomicALUArray(p.atomicALUs, p.atomicLatency),
+    l1DataService(p.fill_install_bytes_per_cycle),
     cacheMemoryStats(this)
 {
     m_cache_size = p.size;
     m_cache_assoc = p.assoc;
     m_replacementPolicy_ptr = p.replacement_policy;
     m_start_index_bit = p.start_index_bit;
+    m_index_divisor = p.index_divisor;
+    fatal_if(!m_index_divisor, "Cache index divisor must be positive");
     m_is_instruction_only_cache = p.is_icache;
     m_resource_stalls = p.resourceStalls;
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
-    m_fill_capacity = p.fill_capacity;
+    l2CacheService.setFillCapacity(p.fill_capacity);
+    l1DataService.setCapacity(p.fill_capacity);
+    l1DataService.setWriteCapacity(p.write_fill_capacity);
+    fatal_if(p.fill_install_bytes_per_cycle == 0,
+             "L1 refill bandwidth must be positive");
+    if (p.fill_stats_clock)
+        dataFillClock = std::make_unique<DataFillClock>(*p.fill_stats_clock);
     m_use_occupancy = dynamic_cast<replacement_policy::WeightedLRU*>(
                                     m_replacementPolicy_ptr) ? true : false;
 }
@@ -88,31 +100,262 @@ CacheMemory::CacheMemory(const Params &p)
 bool
 CacheMemory::canAllocateFill() const
 {
-    return m_fill_capacity == 0 || m_fill_in_flight < m_fill_capacity;
+    return l2CacheService.canAllocateFill();
 }
 
 void
 CacheMemory::allocateFill()
 {
-    assert(canAllocateFill());
-    ++m_fill_in_flight;
+    const auto occupancy = l2CacheService.allocateFill();
     ++cacheMemoryStats.fillAllocations;
-    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+    cacheMemoryStats.fillOccupancy = occupancy;
 }
 
 void
 CacheMemory::releaseFill()
 {
-    assert(m_fill_in_flight > 0);
-    --m_fill_in_flight;
+    const auto occupancy = l2CacheService.releaseFill();
     ++cacheMemoryStats.fillCompletions;
-    cacheMemoryStats.fillOccupancy = m_fill_in_flight;
+    cacheMemoryStats.fillOccupancy = occupancy;
 }
 
 void
 CacheMemory::recordFillBlocked()
 {
     ++cacheMemoryStats.fillBlockedRequests;
+}
+
+void
+CacheMemory::recordL1DataHitRead()
+{
+    ++cacheMemoryStats.l1DataHitReadRequests;
+}
+
+void
+CacheMemory::recordL1DataFillRead()
+{
+    ++cacheMemoryStats.l1DataFillReadResponses;
+}
+
+void
+CacheMemory::recordL1OrderedStore(unsigned logical_stores, unsigned enabled_bytes)
+{
+    ++cacheMemoryStats.l1OrderedStorePackets;
+    cacheMemoryStats.l1OrderedStoreLogicalStores += logical_stores;
+    cacheMemoryStats.l1OrderedStoreEnabledBytes += enabled_bytes;
+}
+
+void
+CacheMemory::registerDataFillRead(PacketPtr packet, bool follower,
+                                  bool has_service_source)
+{
+    if (l1DataService.registerFillRead(packet, follower, has_service_source)) {
+        ++cacheMemoryStats.l1FillReadRegistrations;
+        if (follower)
+            ++cacheMemoryStats.l1FillFollowerRegistrations;
+    }
+}
+
+void
+CacheMemory::cancelDataFillRead(PacketPtr packet)
+{
+    if (l1DataService.cancelFillRead(packet))
+        ++cacheMemoryStats.l1FillReadCancellations;
+}
+
+std::vector<L1DataService::FillParticipant>
+CacheMemory::selectDataFillReads(Addr line)
+{
+    auto selected = l1DataService.selectFillReads(line);
+    cacheMemoryStats.l1FillReadSelections += selected.size();
+    return selected;
+}
+
+uint64_t
+CacheMemory::currentDataFillCycle() const
+{
+    return dataFillClock ? uint64_t(dataFillClock->curCycle()) :
+                           uint64_t(m_ruby_system->curCycle());
+}
+
+void
+CacheMemory::accountDataFillCycles()
+{
+    if (!m_ruby_system) return;
+    const uint64_t now = currentDataFillCycle();
+    const uint64_t elapsed = now - lastDataFillCycle;
+    cacheMemoryStats.dataFillDemandReadPending +=
+        elapsed * l1DataService.demandReadCount();
+    cacheMemoryStats.dataFillReadyEntryCycles +=
+        elapsed * l1DataService.readyCount();
+    if (l1DataService.demandReadCount())
+        cacheMemoryStats.dataFillDemandReadPendingCycles += elapsed;
+    if ((demandFillReadWaiters && !l1DataService.canAllocate(false)) ||
+        (demandFillWriteWaiters && !l1DataService.canAllocate(true)))
+        cacheMemoryStats.dataFillDemandWaitFullCycles += elapsed;
+    if (offcoreDemandRfos) cacheMemoryStats.offcoreDemandRfoCycles += elapsed;
+    lastDataFillCycle = now;
+}
+
+bool
+CacheMemory::canAllocateDataFill(bool write_initiated) const
+{
+    return l1DataService.canAllocate(write_initiated);
+}
+
+void
+CacheMemory::allocateDataFill(Addr address, bool demand_read, bool write_initiated)
+{
+    assert(canAllocateDataFill(write_initiated));
+    accountDataFillCycles();
+    l1DataService.allocate(makeLineAddress(address), demand_read, write_initiated);
+    ++cacheMemoryStats.fillAllocations;
+    cacheMemoryStats.fillOccupancy = l1DataService.size();
+}
+
+void
+CacheMemory::markDataFillReady(Addr address)
+{
+    accountDataFillCycles();
+    l1DataService.markReady(makeLineAddress(address));
+}
+
+void
+CacheMemory::markSoftwarePrefetchFill(Addr address)
+{
+    l1DataService.markSoftwarePrefetch(makeLineAddress(address));
+}
+
+void
+CacheMemory::observeSoftwarePrefetchHit(Addr address)
+{
+    if (l1DataService.fromSoftwarePrefetch(makeLineAddress(address)))
+        ++cacheMemoryStats.softwarePrefetchFillHits;
+}
+
+void
+CacheMemory::releaseDataFill(Addr address)
+{
+    accountDataFillCycles();
+    l1DataService.release(makeLineAddress(address));
+    ++cacheMemoryStats.fillCompletions;
+    cacheMemoryStats.fillOccupancy = l1DataService.size();
+}
+
+void
+CacheMemory::finishDataFill(Addr address)
+{
+    // Permission-only transactions do not own a data fill. The protocol
+    // calls this after its data action and local callbacks, independently of
+    // deallocating the coherence transaction.
+    if (l1DataService.contains(makeLineAddress(address))) {
+        ++cacheMemoryStats.dataFillCancellations;
+        releaseDataFill(address);
+    }
+}
+
+bool
+CacheMemory::dataFillPresent(Addr address) const
+{
+    return l1DataService.contains(makeLineAddress(address));
+}
+
+bool
+CacheMemory::dataFillReady(Addr address) const
+{
+    return l1DataService.ready(makeLineAddress(address));
+}
+
+bool
+CacheMemory::advanceDataFillInstall(Addr address)
+{
+    // Permission-only responses consume no refill service. Reserve actual
+    // transfer beats, independently of the load issue pipeline latency.
+    const Addr line = makeLineAddress(address);
+    const auto result = l1DataService.advanceInstall(
+        line, currentDataFillCycle(), m_ruby_system->getBlockSizeBytes());
+    if (result == L1DataService::InstallResult::Blocked) {
+        ++cacheMemoryStats.dataFillInstallBlocked;
+        return false;
+    }
+    if (result == L1DataService::InstallResult::InProgress) {
+        ++cacheMemoryStats.dataFillInstallServiceCycles;
+        return false;
+    }
+    return true;
+}
+
+void
+CacheMemory::installDataFill(Addr address)
+{
+    if (!dataFillPresent(address)) return;
+    assert(dataFillReady(address) && l1DataService.installComplete(
+        makeLineAddress(address), currentDataFillCycle()));
+    ++cacheMemoryStats.dataFillInstalls;
+    releaseDataFill(address);
+}
+
+void
+CacheMemory::recordDemandFillBlocked()
+{
+    ++cacheMemoryStats.fillBlockedRequests;
+    const uint64_t now = currentDataFillCycle();
+    if (lastDemandFillBlockedCycle != now) {
+        ++cacheMemoryStats.dataFillDemandBlockedCycles;
+        lastDemandFillBlockedCycle = now;
+    }
+}
+
+void
+CacheMemory::beginDemandFillWait(PacketPtr packet, bool write_initiated)
+{
+    if (!packet) return;
+    accountDataFillCycles();
+    const auto [it, inserted] = demandFillWaiters.emplace(packet, write_initiated);
+    assert(inserted || it->second == write_initiated);
+    if (inserted) {
+        if (write_initiated) ++demandFillWriteWaiters;
+        else ++demandFillReadWaiters;
+    }
+}
+
+void
+CacheMemory::endDemandFillWait(PacketPtr packet)
+{
+    const auto it = demandFillWaiters.find(packet);
+    if (it == demandFillWaiters.end()) return;
+    accountDataFillCycles();
+    if (it->second) {
+        assert(demandFillWriteWaiters);
+        --demandFillWriteWaiters;
+    } else {
+        assert(demandFillReadWaiters);
+        --demandFillReadWaiters;
+    }
+    demandFillWaiters.erase(it);
+}
+
+bool
+CacheMemory::dataFillPending(Addr address) const
+{
+    return l1DataService.pending(makeLineAddress(address));
+}
+
+void
+CacheMemory::observeDataFillDemandRead(Addr address)
+{
+    const Addr line = makeLineAddress(address);
+    if (!l1DataService.needsDemandRead(line)) return;
+    accountDataFillCycles();
+    l1DataService.observeDemandRead(line);
+}
+
+bool
+CacheMemory::hasReadableData(Addr address) const
+{
+    const auto *entry = lookup(makeLineAddress(address));
+    return entry && (entry->m_Permission == AccessPermission_Read_Only ||
+                     entry->m_Permission == AccessPermission_Read_Write);
 }
 
 void
@@ -168,6 +411,12 @@ int64_t
 CacheMemory::addressToCacheSet(Addr address) const
 {
     assert(address == makeLineAddress(address));
+    if (m_index_divisor != 1) {
+        const Addr line = sprL3IndexLine(address >> m_start_index_bit,
+                                       m_index_divisor);
+        return (line / m_index_divisor) %
+               m_cache_num_sets;
+    }
     if (isPowerOf2(m_cache_num_sets)) {
         return bitSelect(address, m_start_index_bit,
                          m_start_index_bit + m_cache_num_set_bits - 1);
@@ -325,6 +574,8 @@ CacheMemory::cacheAvail(Addr address) const
 AbstractCacheEntry*
 CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
 {
+    // TODO(SPR-MSR): If CAT is used, characterize CLOS fill eligibility;
+    // changing cache size does not reproduce dynamic masks or existing lines.
     assert(address == makeLineAddress(address));
     assert(!isTagPresent(address));
     assert(cacheAvail(address));
@@ -364,6 +615,32 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
         }
     }
     panic("Allocate didn't find an available entry");
+}
+
+AbstractCacheEntry*
+CacheMemory::lookupDirectory(Addr address)
+{
+    const auto it = m_directory.find(address);
+    return it == m_directory.end() ? nullptr : it->second.get();
+}
+
+AbstractCacheEntry*
+CacheMemory::allocateDirectory(Addr address, AbstractCacheEntry* entry)
+{
+    assert(address == makeLineAddress(address));
+    assert(entry && !lookupDirectory(address));
+    entry->m_Address = address;
+    entry->m_Permission = AccessPermission_Invalid;
+    entry->setRubySystem(m_ruby_system);
+    m_directory.emplace(address, std::unique_ptr<AbstractCacheEntry>(entry));
+    return entry;
+}
+
+void
+CacheMemory::deallocateDirectory(Addr address)
+{
+    [[maybe_unused]] const auto erased = m_directory.erase(address);
+    assert(erased == 1);
 }
 
 void
@@ -431,6 +708,19 @@ CacheMemory::setMRU(Addr address)
 }
 
 void
+CacheMemory::setMRUOnFill(Addr address)
+{
+    // QLRU inserts when the miss reserves its way; the response completing
+    // that same request is not a second reference to the inserted line.
+    if (dynamic_cast<replacement_policy::QLRUH00M1R0U1*>(m_replacementPolicy_ptr)) {
+        if (auto *entry = lookup(makeLineAddress(address)))
+            entry->setLastAccess(curTick());
+    } else {
+        setMRU(address);
+    }
+}
+
+void
 CacheMemory::setMRU(AbstractCacheEntry *entry)
 {
     assert(entry != nullptr);
@@ -472,7 +762,8 @@ CacheMemory::getReplacementWeight(int64_t set, int64_t loc)
 }
 
 void
-CacheMemory::recordCacheContents(int cntrl, CacheRecorder* tr) const
+CacheMemory::recordCacheContents(int cntrl, CacheRecorder* tr,
+                                 AbstractController *owner) const
 {
     uint64_t warmedUpBlocks = 0;
     [[maybe_unused]] uint64_t totalBlocks = (uint64_t)m_cache_num_sets *
@@ -482,6 +773,12 @@ CacheMemory::recordCacheContents(int cntrl, CacheRecorder* tr) const
         for (int j = 0; j < m_cache_assoc; j++) {
             if (m_cache[i][j] != NULL) {
                 AccessPermission perm = m_cache[i][j]->m_Permission;
+                if (perm != AccessPermission_Invalid &&
+                    perm != AccessPermission_NotPresent) {
+                    // The controller knows whether a Busy tag is already
+                    // data/permission-ready in an FB, or still unavailable.
+                    perm = owner->getAccessPermission(m_cache[i][j]->m_Address);
+                }
                 RubyRequestType request_type = RubyRequestType_NULL;
                 if (perm == AccessPermission_Read_Only) {
                     if (m_is_instruction_only_cache) {
@@ -581,8 +878,9 @@ CacheMemory::isLocked(Addr address, int context)
 }
 
 CacheMemory::
-CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
+CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
     : statistics::Group(parent),
+      owner(parent),
       ADD_STAT(numDataArrayReads, "Number of data array reads"),
       ADD_STAT(numDataArrayWrites, "Number of data array writes"),
       ADD_STAT(numTagArrayReads, "Number of tag array reads"),
@@ -595,6 +893,47 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(fillCompletions, "Cache-line fill transactions released"),
       ADD_STAT(fillBlockedRequests, "Fill admissions retried because the budget was full"),
       ADD_STAT(fillOccupancy, "Average number of live tracked line fills"),
+      ADD_STAT(dataFillDemandBlockedCycles, "Candidate cycles a demand request waits for data fill-buffer capacity"),
+      ADD_STAT(dataFillDemandWaitFullCycles, "Cycles with a previously FB-rejected demand request still waiting while its FB credit is unavailable; model candidate"),
+      ADD_STAT(dataFillDemandReadPending, "Integral of L0 data fill entries containing a demand read"),
+      ADD_STAT(dataFillDemandReadPendingCycles, "Cycles with at least one L0 demand-read data fill"),
+      ADD_STAT(dataFillReadyEntryCycles, "Integral of data-ready fill entries awaiting L1 installation"),
+      ADD_STAT(dataFillInstalls, "Data fill entries released by L1 installation"),
+      ADD_STAT(dataFillCancellations, "Data fill entries released without L1 installation"),
+      ADD_STAT(dataFillInstallBlocked, "L1 installation attempts waiting for refill bandwidth"),
+      ADD_STAT(dataFillInstallServiceCycles, "Data-ready FB line cycles spent transferring into L1"),
+      ADD_STAT(l1DataHitReadRequests, "L1 data-hit read requests completed by the controller"),
+      ADD_STAT(l1DataFillReadResponses, "Read responses supplied by L1 data fill, including prefetch hints"),
+      ADD_STAT(l1OrderedStorePackets, "Committed ordinary store packets published in L1"),
+      ADD_STAT(l1OrderedStoreLogicalStores, "Logical stores represented by published committed store packets"),
+      ADD_STAT(l1OrderedStoreEnabledBytes, "Enabled bytes in published committed store packets"),
+      ADD_STAT(l1FillReadRegistrations, "Read requests newly registered with an L1 data fill"),
+      ADD_STAT(l1FillFollowerRegistrations, "New L1 data fill registrations classified as followers"),
+      ADD_STAT(l1FillReadSelections, "Registered reads selected for L1 data-fill supply"),
+      ADD_STAT(l1FillReadCancellations, "Registered reads completed on a non-fill path"),
+      ADD_STAT(demandDataReadHits, "Candidate cacheable demand data read requests observed hitting the private L2"),
+      ADD_STAT(demandDataReadTrueMisses, "Candidate cacheable demand data read requests observed missing the private L2, excluding merges and upgrades"),
+      ADD_STAT(codeReadHits, "Private L2 instruction read hits"),
+      ADD_STAT(codeReadTrueMisses, "Private L2 instruction read true misses"),
+      ADD_STAT(demandDataReadAccesses, "Private L2 consumed demand data and page-table read requests, including pending prefetch merges"),
+      ADD_STAT(codeReadAccesses, "Private L2 consumed instruction read requests, including pending prefetch merges"),
+      ADD_STAT(rfoHits, "Private L2 demand and prefetch ownership hits, including permission upgrades"),
+      ADD_STAT(rfoTrueMisses, "Private L2 demand and prefetch ownership true misses, excluding pending merges"),
+      ADD_STAT(softwarePrefetchHits, "Private L2 software-prefetch hits"),
+      ADD_STAT(softwarePrefetchTrueMisses, "Private L2 software-prefetch true misses"),
+      ADD_STAT(hardwarePrefetchHits, "Private L2 hardware-prefetch hits"),
+      ADD_STAT(hardwarePrefetchTrueMisses, "Private L2 hardware-prefetch true misses"),
+      ADD_STAT(storePrepareHits, "Private L2 store-prepare ownership hits, also included in RFO hits"),
+      ADD_STAT(storePrepareTrueMisses, "Private L2 early store-prepare true misses"),
+      ADD_STAT(dataLineFills, "Lines installed by private L2 line-fill transactions, including code and data"),
+      ADD_STAT(dataReplacements, "Readable data lines evicted for capacity replacement; excludes empty insertions and invalidations"),
+      ADD_STAT(allRfo, "Private L2 demand and prefetch ownership lookups, including Store_Prepare"),
+      ADD_STAT(softwarePrefetchRfo, "Private L2 PREFETCHW ownership lookups"),
+      ADD_STAT(softwarePrefetchFillHits, "Demand reads accepted while an FB from software prefetch exists"),
+      ADD_STAT(offcoreDemandRfoRequests, "Private L2 ownership transactions sent to the shared hierarchy, including Store_Prepare and PREFETCHW"),
+      ADD_STAT(offcoreDemandRfoCycles, "Core cycles with a private L2 demand ownership transaction pending"),
+      ADD_STAT(offcorePrepareRequests, "Store_Prepare ownership transactions sent to the shared hierarchy"),
+      ADD_STAT(offcoreSoftwareRfoRequests, "Software-prefetch ownership transactions sent to the shared hierarchy"),
       ADD_STAT(htmTransCommitReadSet, "Read set size of a committed "
                                       "transaction"),
       ADD_STAT(htmTransCommitWriteSet, "Write set size of a committed "
@@ -675,6 +1014,20 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
             .flags(statistics::nozero)
             ;
     }
+}
+
+void
+CacheMemory::CacheMemoryStats::preDumpStats()
+{
+    owner->accountDataFillCycles();
+    statistics::Group::preDumpStats();
+}
+
+void
+CacheMemory::CacheMemoryStats::resetStats()
+{
+    owner->accountDataFillCycles();
+    statistics::Group::resetStats();
 }
 
 // assumption: SLICC generated files will only call this function
@@ -843,6 +1196,96 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+void
+CacheMemory::profileNativeReadAccess(int role)
+{
+    if (role == 1 || role == 4)
+        ++cacheMemoryStats.demandDataReadAccesses;
+    else if (role == 3)
+        ++cacheMemoryStats.codeReadAccesses;
+}
+
+void
+CacheMemory::profileNativeRequest(int role, bool miss, bool ownership)
+{
+    switch (role) {
+      case 1:
+      case 4: // Page-table demand reads also access this private L2.
+        if (ownership) break;
+        if (miss) ++cacheMemoryStats.demandDataReadTrueMisses;
+        else ++cacheMemoryStats.demandDataReadHits;
+        break;
+      case 2:
+        ++cacheMemoryStats.allRfo;
+        if (miss) ++cacheMemoryStats.rfoTrueMisses;
+        else ++cacheMemoryStats.rfoHits;
+        break;
+      case 3:
+        if (miss) ++cacheMemoryStats.codeReadTrueMisses;
+        else ++cacheMemoryStats.codeReadHits;
+        break;
+      case 5:
+        if (miss) ++cacheMemoryStats.softwarePrefetchTrueMisses;
+        else ++cacheMemoryStats.softwarePrefetchHits;
+        break;
+      case 6:
+        // Store_Prepare sends a real GetX for an ordinary store. SPR's
+        // L2_RQSTS RFO events include L1D demand RFOs and RFO prefetches.
+        ++cacheMemoryStats.allRfo;
+        if (miss) ++cacheMemoryStats.rfoTrueMisses;
+        else ++cacheMemoryStats.rfoHits;
+        if (miss) ++cacheMemoryStats.storePrepareTrueMisses;
+        else ++cacheMemoryStats.storePrepareHits;
+        break;
+      case 7:
+        if (miss) ++cacheMemoryStats.hardwarePrefetchTrueMisses;
+        else ++cacheMemoryStats.hardwarePrefetchHits;
+        break;
+      case 8:
+        ++cacheMemoryStats.allRfo;
+        if (miss) ++cacheMemoryStats.rfoTrueMisses;
+        else ++cacheMemoryStats.rfoHits;
+        ++cacheMemoryStats.softwarePrefetchRfo;
+        break;
+    }
+}
+
+void
+CacheMemory::profileDataLineFill()
+{
+    ++cacheMemoryStats.dataLineFills;
+}
+
+void
+CacheMemory::beginOffcoreOwnership(Addr address, int role)
+{
+    if (role != 2 && role != 6 && role != 8) return;
+    accountDataFillCycles();
+    const bool inserted = offcoreOwnership.emplace(makeLineAddress(address), role).second;
+    panic_if(!inserted, "Duplicate ownership transaction for the same private L2 line");
+    ++offcoreDemandRfos;
+    ++cacheMemoryStats.offcoreDemandRfoRequests;
+    if (role == 6) ++cacheMemoryStats.offcorePrepareRequests;
+    else if (role == 8) ++cacheMemoryStats.offcoreSoftwareRfoRequests;
+}
+
+void
+CacheMemory::endOffcoreOwnership(Addr address)
+{
+    const auto it = offcoreOwnership.find(makeLineAddress(address));
+    if (it == offcoreOwnership.end()) return;
+    accountDataFillCycles();
+    assert(offcoreDemandRfos);
+    --offcoreDemandRfos;
+    offcoreOwnership.erase(it);
+}
+
+void
+CacheMemory::profileDataReplacement(Addr address)
+{
+    if (hasReadableData(address)) ++cacheMemoryStats.dataReplacements;
 }
 
 void

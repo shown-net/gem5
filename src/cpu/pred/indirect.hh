@@ -44,6 +44,7 @@
 #define __CPU_PRED_INDIRECT_BASE_HH__
 
 #include "arch/generic/pcstate.hh"
+#include <memory>
 #include "cpu/inst_seq.hh"
 #include "cpu/pred/branch_type.hh"
 #include "params/IndirectPredictor.hh"
@@ -70,6 +71,10 @@ class IndirectPredictor : public SimObject
 
     /** Capture the privilege domain at prediction, if the model uses it. */
     virtual void setUserMode(ThreadID tid, bool user) {}
+    virtual void setReturnFallback(void *history) {}
+    virtual std::shared_ptr<const void> pathSnapshot(ThreadID tid) const { return {}; }
+    virtual bool notTakenSnapshot(ThreadID tid, Addr pc,
+        const std::shared_ptr<const void> &snapshot, void *&history) { return false; }
 
     /**
      * Predicts the indirect target of an indirect branch.
