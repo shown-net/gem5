@@ -263,6 +263,15 @@ class BaseO3CPU(BaseCPU):
     sprStoreForwardingLatency = Param.Cycles(
         0, "Service delay for complete ordinary store-to-load forwarding"
     )
+    sprStoreAddressForwardLatency = Param.Cycles(
+        0, "Earliest complete forwarding from an observed store address"
+    )
+    sprReplayBlockedLoads = Param.Bool(
+        False, "Reissue overlapping loads after a committed-store buffer wait"
+    )
+    sprBlockedLoadReturnExtraLatency = Param.Cycles(
+        0, "Additional cache-return service for a load blocked by older overlapping stores"
+    )
     sprMultiStoreForwarding = Param.Bool(
         True, "Allow several older stores to supply one load"
     )
@@ -303,6 +312,9 @@ class BaseO3CPU(BaseCPU):
     )
     maxDsbTakenPerCycle = Param.Unsigned(
         1, "Max number of taken targets consumed by DSB per cycle"
+    )
+    sprBranchCheckpoints = Param.Unsigned(
+        0, "Logical unresolved branch checkpoints; zero disables the limit"
     )
 
 

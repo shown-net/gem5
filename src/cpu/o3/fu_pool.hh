@@ -118,11 +118,6 @@ class FUPool : public SimObject
                 fpDividerSwitchCycles : Cycles(0));
     }
     std::array<uint16_t, Num_OpClasses> capablePorts{};
-    std::array<unsigned, 12> pendingPortLoads{};
-    std::array<unsigned, 12> allocationLoadSnapshot{};
-    std::vector<std::pair<uint16_t, unsigned>> batchMaskUses;
-    Cycles bindingCycle = Cycles(0);
-    bool haveBindingCycle = false;
     const std::vector<unsigned> storeDataPorts;
     const std::vector<unsigned> branchPorts;
 
@@ -198,9 +193,6 @@ class FUPool : public SimObject
     bool portAvailable(unsigned port, Tick now) const
     { return executionPorts && !unitBusy.at(port) && executionPorts->get(port)->available(now); }
     ExecutionPorts *sharedPorts() const { return executionPorts; }
-    void bindPort(const DynInstPtr &inst, Cycles cycle);
-    void startAllocationCycle(Cycles cycle);
-    void releasePortBinding(const DynInstPtr &inst);
     uint16_t portMask(const DynInstPtr &inst) const;
     ~FUPool();
 
@@ -247,7 +239,7 @@ class FUPool : public SimObject
      */
     int getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
                 Cycles &op_latency,
-                bool store = false, bool branch = false, int bound_port = -1);
+                bool store = false, bool branch = false);
 
     /** Frees a FU at the end of this cycle. */
     void freeUnitNextCycle(int fu_idx);

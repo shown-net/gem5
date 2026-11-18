@@ -54,49 +54,35 @@ def macroop CMPS_M_M {
 # unrolling.
 #
 
-def macroop CMPS_E_M_M {
-    and t0, rcx, rcx, flags=(EZF,), dataSize=asz
-    br label("end"), flags=(CEZF,)
+"""
 
-    # Find the constant we need to either add or subtract from rdi
+rep_microcode = """
+def macroop CMPS_REP_MODE_M_M {
+    repstart label("end"), dataSize=asz
+    repselectcompare label("ordinary"), dataSize=asz
+bulk:
+    ldrepcompareleft t0, seg, [1, t0, rsi]
+    ldrepcompareright t0, es, [1, t0, rdi]
+    repprogresscompare label("bulk"), label("ordinary"), dataSize=asz
+    br label("finish")
+ordinary:
     ruflag t0, 10
-    movi t3, t3, dsz, flags=(CEZF,), dataSize=asz
-    subi t4, t0, dsz, dataSize=asz
-    mov t3, t3, t4, flags=(nCEZF,), dataSize=asz
+    movi t4, t4, dsz, flags=(CEZF,), dataSize=asz
+    subi t3, t0, dsz, dataSize=asz
+    mov t4, t4, t3, flags=(nCEZF,), dataSize=asz
 
 topOfLoop:
     ld t1, seg, [1, t0, rsi]
     ld t2, es, [1, t0, rdi]
+    subi rcx, rcx, 1, dataSize=asz
+    add rdi, rdi, t4, dataSize=asz
+    add rsi, rsi, t4, dataSize=asz
+    repcheckcompare label("topOfLoop"), dataSize=asz
+finish:
     sub t0, t1, t2, flags=(OF, SF, ZF, AF, PF, CF)
-
-    subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    add rdi, rdi, t3, dataSize=asz
-    add rsi, rsi, t3, dataSize=asz
-    br label("topOfLoop"), flags=(CSTRZnEZF,)
-end:
-    fault "NoFault"
-};
-
-def macroop CMPS_N_M_M {
-    and t0, rcx, rcx, flags=(EZF,), dataSize=asz
-    br label("end"), flags=(CEZF,)
-
-    # Find the constant we need to either add or subtract from rdi
-    ruflag t0, 10
-    movi t3, t3, dsz, flags=(CEZF,), dataSize=asz
-    subi t4, t0, dsz, dataSize=asz
-    mov t3, t3, t4, flags=(nCEZF,), dataSize=asz
-
-topOfLoop:
-    ld t1, seg, [1, t0, rsi]
-    ld t2, es, [1, t0, rdi]
-    sub t0, t1, t2, flags=(OF, SF, ZF, AF, PF, CF)
-
-    subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    add rdi, rdi, t3, dataSize=asz
-    add rsi, rsi, t3, dataSize=asz
-    br label("topOfLoop"), flags=(CSTRnZnEZF,)
 end:
     fault "NoFault"
 };
 """
+microcode += rep_microcode.replace("REP_MODE", "E")
+microcode += rep_microcode.replace("REP_MODE", "N")

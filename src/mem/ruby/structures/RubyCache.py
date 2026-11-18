@@ -42,6 +42,15 @@ class RubyCache(SimObject):
     index_divisor = Param.Unsigned(
         1, "Divide the line address by the slice count; 52 banks use the SPR XOR proxy"
     )
+    sf_num_sets = Param.Unsigned(
+        0, "Bounded snoop-filter sets; zero disables the optional filter"
+    )
+    sf_assoc = Param.Unsigned(
+        0, "Bounded snoop-filter ways per set; zero disables the optional filter"
+    )
+    llc_requestor_count = Param.Unsigned(
+        0, "Private-cache requestors tracked by shared LLC lookup statistics"
+    )
     is_icache = Param.Bool(False, "is instruction only cache")
     block_size = Param.MemorySize(
         "0B", "block size in bytes. 0 means default RubyBlockSize"

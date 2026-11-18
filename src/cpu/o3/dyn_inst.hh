@@ -400,7 +400,6 @@ class DynInst : public ExecContext, public RefCounted
     AllocationGroupPtr allocationGroup;
     StageDemand stageDemand;
     // Selected on scheduler admission, retained until dispatch or squash.
-    int boundExecutionPort = -1;
     // Earliest completion notification; bypass data may be usable sooner.
     Tick completionNotBefore = 0;
     unsigned hardwareDestEntries(RegClassType type) const;

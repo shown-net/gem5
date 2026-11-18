@@ -61,8 +61,10 @@ class ISA : public BaseISA
 
     std::string vendorString;
     const uint64_t tscFrequency;
+    const bool repFastString;
 
   public:
+    bool repFastStringEnabled() const { return repFastString; }
     void clear() override;
 
     PCStateBase *

@@ -93,6 +93,11 @@ class IQUnit : public SimObject
     bool hasReservation(InstSeqNum sequence) const;
     bool hasGroup(InstSeqNum group) const { return allocations.count(group); }
     unsigned reservationDemand(const DynInstPtr &inst) const;
+    static constexpr unsigned NumCategories = 3;
+    static unsigned categoryMask(const DynInstPtr &inst);
+    unsigned groupCategoryMask(InstSeqNum group) const;
+    unsigned categoryFree(unsigned category) const;
+    bool hasCategoryRoom(const DynInstPtr &inst) const;
     unsigned groupMembers(InstSeqNum group) const { return allocations.at(group).members; }
     void cancelReservations(ThreadID tid, InstSeqNum through);
 
@@ -171,21 +176,25 @@ class IQUnit : public SimObject
     FUPool *_fuPool;
     std::vector<OpClass> allowedOpClasses;
     std::vector<OpClass> excludedOpClasses;
+    std::array<unsigned, NumCategories> categoryCapacity{};
+    std::array<unsigned, NumCategories> categoryUsed{};
     struct SchedulerEntry
     {
         ThreadID thread;
         InstSeqNum allocation;
         bool resident = false;
+        unsigned categories = 0;
     };
     struct SchedulerAllocation
     {
         ThreadID thread;
         unsigned slots;
         unsigned members;
+        std::array<unsigned, NumCategories> categoryMembers{};
     };
     std::map<InstSeqNum, SchedulerEntry> entries;
     std::map<InstSeqNum, SchedulerAllocation> allocations;
-    void releaseAllocation(InstSeqNum key);
+    void releaseAllocation(InstSeqNum key, unsigned categories);
 };
 
 /**

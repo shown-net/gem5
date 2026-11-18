@@ -128,6 +128,7 @@ Rename::Rename(CPU *_cpu, const BaseO3CPUParams &params)
       decodeToRenameDelay(params.frontend ? Cycles(0) : params.decodeToRenameDelay),
       commitToRenameDelay(params.commitToRenameDelay),
       renameWidth(params.renameWidth),
+      branchCheckpointCapacity(params.sprBranchCheckpoints),
       numThreads(params.numThreads),
       resourceStallStats(_cpu),
       stats(_cpu)
@@ -322,6 +323,7 @@ void
 Rename::clearStates(ThreadID tid)
 {
     renameStatus[tid] = Idle;
+    branchCheckpoints[tid].clear();
 
     freeEntries[tid].iqEntries = iew_ptr->instQueue.numFreeEntries(tid);
     freeEntries[tid].lqEntries = iew_ptr->ldstQueue.numFreeLoadEntries(tid);
@@ -366,6 +368,7 @@ Rename::resetStage()
     // Grab the number of free entries directly from the stages.
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         renameStatus[tid] = Idle;
+        branchCheckpoints[tid].clear();
 
         freeEntries[tid].iqEntries = iew_ptr->instQueue.numFreeEntries(tid);
         freeEntries[tid].lqEntries =
@@ -417,6 +420,7 @@ Rename::isDrained() const
 {
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         if (instsInProgress[tid] != 0 || !historyBuffer[tid].empty() ||
+            !branchCheckpoints[tid].empty() ||
             !skidBuffer[tid].empty() ||
             !insts[tid].empty() ||
             (renameStatus[tid] != Idle && renameStatus[tid] != Running))
@@ -436,6 +440,7 @@ Rename::drainSanityCheck() const
 {
     for (ThreadID tid = 0; tid < numThreads; tid++) {
         assert(historyBuffer[tid].empty());
+        assert(branchCheckpoints[tid].empty());
         assert(insts[tid].empty());
         assert(skidBuffer[tid].empty());
         assert(instsInProgress[tid] == 0);
@@ -445,6 +450,9 @@ Rename::drainSanityCheck() const
 void
 Rename::squash(const InstSeqNum &squash_seq_num, ThreadID tid)
 {
+    branchCheckpoints[tid].remove_if([squash_seq_num](const DynInstPtr &inst) {
+        return inst->seqNum > squash_seq_num;
+    });
     if (cpu->stackEngine && cpu->stackEngine->enabled())
         cpu->stackEngine->squash(tid, squash_seq_num);
     commit_ptr->reorderBuffer().cancelReservations(tid, squash_seq_num);
@@ -504,6 +512,21 @@ void
 Rename::tick()
 {
     wroteToTimeBuffer = false;
+
+    // Resolution and squash may occur out of program order. A checkpoint is
+    // only a capacity credit: rename history remains responsible for recovery.
+    // At most branchCheckpointCapacity entries are visited per core tick.
+    if (branchCheckpointCapacity) {
+        for (ThreadID tid = 0; tid < numThreads; ++tid) {
+            branchCheckpoints[tid].remove_if([](const DynInstPtr &inst) {
+                // Some direct calls are functionally evaluated in rename.
+                // They still hold a checkpoint until IEW has observed the
+                // branch result and processed its recovery decision.
+                return inst->executionBranchResolved || inst->isSquashed() ||
+                    (inst->isExecuted() && inst->getFault() != NoFault);
+            });
+        }
+    }
 
     blockThisCycle = false;
 
@@ -781,6 +804,18 @@ Rename::renameInsts(ThreadID tid)
         assert(!insts_to_rename.empty());
 
         DynInstPtr inst = insts_to_rename.front();
+        const bool needs_checkpoint = branchCheckpointCapacity &&
+            !inst->isSquashed() && inst->isControl() &&
+            !inst->staticInst->isMicrocodeControl();
+        if (needs_checkpoint) {
+            unsigned used = 0;
+            for (ThreadID owner = 0; owner < numThreads; ++owner)
+                used += branchCheckpoints[owner].size();
+            if (used >= branchCheckpointCapacity) {
+                blockThisCycle = true;
+                break;
+            }
+        }
         StackEngine::Decision stack_decision;
         if (cpu->stackEngine && !inst->isSquashed()) {
             stack_decision = cpu->stackEngine->classify(inst);
@@ -1074,6 +1109,9 @@ Rename::renameInsts(ThreadID tid)
             rob.reserve(member);
             iew_ptr->instQueue.reserve(member);
         }
+
+        if (needs_checkpoint)
+            branchCheckpoints[tid].push_back(inst);
 
         renameSrcRegs(inst, inst->threadNumber);
 

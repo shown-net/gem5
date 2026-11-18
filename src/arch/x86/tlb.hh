@@ -38,11 +38,12 @@
 #ifndef __ARCH_X86_TLB_HH__
 #define __ARCH_X86_TLB_HH__
 
-#include <functional>
 #include <array>
-#include <list>
 #include <functional>
+#include <list>
+#include <map>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "arch/generic/tlb.hh"
@@ -56,6 +57,7 @@
 namespace gem5
 {
 
+class BaseCPU;
 class ThreadContext;
 
 namespace X86ISA
@@ -117,9 +119,25 @@ namespace X86ISA
         uint32_t smallPageWays;
         bool sprSharedDomains;
         unsigned sprSharedIndexShift;
+        bool sprSharedHighParity;
         bool sprSplitL1;
         std::array<unsigned, 8> largePageTree{};
+        // Candidate inferred from SPR 4K-load replacement probes.  Each
+        // of the 16 sets has three two-entry groups and a next group.
+        bool sprDtlb4kPairReplacement;
+        std::array<unsigned, 16> smallPageNextPair{};
         Cycles nextLevelHitLatency;
+        Cycles nextLevelMissLatency;
+        // One wakeup per TLB serves all responses due at the same edge.
+        // Same-edge responses are LIFO within this component; unlike separate
+        // events they cannot interleave with unrelated same-priority events.
+        std::map<Tick, std::vector<std::function<void()>>> nextLevelResponses;
+        EventFunctionWrapper nextLevelResponseEvent;
+        BaseCPU *nextLevelResponseCpu = nullptr;
+        bool servingNextLevelResponses = false;
+        void queueNextLevelResponse(BaseCPU *cpu, Tick when,
+                                    std::function<void()> response);
+        void serviceNextLevelResponses();
 
         std::vector<TlbEntry> tlb;
         // Members retain physical-slot order, including after restoration.
@@ -175,7 +193,8 @@ namespace X86ISA
 
         Fault translate(const RequestPtr &req, ThreadContext *tc,
                 BaseMMU::Translation *translation, BaseMMU::Mode mode,
-                bool &delayedResponse, bool timing);
+                bool &delayedResponse, bool timing,
+                bool nextLevelLookupCompleted = false);
 
       public:
 

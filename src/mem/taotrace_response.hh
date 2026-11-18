@@ -267,6 +267,9 @@ class TaoTraceRubyResponseExtension
     // Final local L1 observation for this physical request. Bits are
     // unknown, hit, tag miss, fill merge, upgrade, remote supply.
     uint8_t l1FinalMask = 0;
+    // A demand load joined an existing data fill before its data was ready.
+    // This is independent of the eventual fill-service outcome.
+    bool fillHitBeforeReady = false;
     uint32_t serviceExpected = 0;
     bool l1ObservationMissing = false;
     bool serviceFactIdentityAmbiguous = false;
@@ -286,6 +289,7 @@ class TaoTraceRubyResponseExtension
         serviceFactIdentityAmbiguous = admissions > responses;
         l1ObservationMissing = serviceFactIdentityAmbiguous;
         l1FinalMask = 0;
+        fillHitBeforeReady = false;
         serviceExpected = 0;
         serviceFacts.clear();
         admissionAccesses = hierarchy.accesses;
@@ -375,6 +379,7 @@ class TaoTraceRubyResponseExtension
                                 other.l1ObservationPending();
         serviceFactIdentityAmbiguous |= other.serviceFactIdentityAmbiguous;
         l1FinalMask |= other.l1FinalMask;
+        fillHitBeforeReady |= other.fillHitBeforeReady;
         serviceExpected += other.serviceExpected;
         serviceFacts.insert(serviceFacts.end(), other.serviceFacts.begin(),
                             other.serviceFacts.end());
@@ -1175,6 +1180,14 @@ class TaoTraceNativeAccessRegistry
         mutate(context_id, seq_num, [level, outcome](Snapshot &facts) {
             facts.hierarchy.observe(level, outcome);
         });
+    }
+
+    static void
+    noteFillHitBeforeReady(const RequestPtr &req)
+    {
+        auto extension = ensureExtension(req);
+        if (extension && !extension->serviceFactIdentityAmbiguous)
+            extension->fillHitBeforeReady = true;
     }
 
     // Used when the Sequencer directly observes a request-local cache/FB

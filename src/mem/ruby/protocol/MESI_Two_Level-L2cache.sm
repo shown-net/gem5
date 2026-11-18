@@ -43,6 +43,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
    Cycles l2_request_latency := 2;
    Cycles l2_response_latency := 2;
    Cycles to_l1_latency := 1;
+   // The shared controller is also used by MESI_Two_Level, whose private
+   // controller does not implement GETS_CLEAN_PEER.
+   bool enable_clean_peer := "False";
 
   // Message Queues
   // From local bank of L2 cache TO the network
@@ -74,6 +77,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     MT, AccessPermission:Maybe_Stale, desc="L2 cache entry Modified in a local L1, assume L2 copy stale", format="!b";
     DS, AccessPermission:NotPresent, desc="Directory-only shared line; memory is current";
     DT, AccessPermission:NotPresent, desc="Directory-only line with a private exclusive owner";
+    DS_PEER, AccessPermission:Busy, desc="Waiting for one clean peer probe or requester unblock";
+    DS_PEER_MEM, AccessPermission:Busy, desc="Clean peers missed; waiting for current memory data";
     S_WB, AccessPermission:Read_Only, desc="Data eviction writes current shared TBE data to memory, retaining sharers";
 
     // L2 replacement
@@ -109,6 +114,10 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     // events initiated by the local L1s
     L1_GET_INSTR,            desc="a L1I GET INSTR request for a block maped to us";
     L1_GETS,                 desc="a L1D GETS request for a block maped to us";
+    L1_GETS_CLEAN_PEER,      desc="GETS on directory-only line with a candidate sharer";
+    SF_Replacement,          desc="Reclaim one snoop filter entry";
+    SF_Wait,                 desc="Wait for the active snoop filter victim";
+    SF_ReleaseUnused,        desc="Release an SF entry with no private sharer";
     L1_GETX,                 desc="a L1D GETX request for a block maped to us";
     L1_UPGRADE,                 desc="a L1D GETX request for a block maped to us";
 
@@ -127,6 +136,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     // M->S data writeback
     WB_Data,  desc="data from L1";
     WB_Data_clean,  desc="clean data from L1";
+    CleanPeerRetry, desc="Clean peer missed; try another sharer";
+    CleanPeerFallback, desc="Last clean peer missed; fetch current memory";
     Ack,      desc="writeback ack";
     Ack_all,      desc="writeback ack";
 
@@ -168,6 +179,11 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     bool DataValid, default="false", desc="TBE contains received or copied data";
     bool Dirty, default="false", desc="Data is Dirty";
     MachineID Requestor,        desc="Who allocated this TBE";
+    NetDest CleanPeerCandidates, desc="Untried clean sharers";
+    RubyAccessMode CleanPeerAccessMode, desc="Original request access mode";
+    PrefetchBit CleanPeerPrefetch, desc="Original request prefetch flag";
+    bool SFEviction, default="false", desc="TBE owns the active SF eviction";
+    Addr SFWaitingAddress, default="0", desc="Request waiting for SF victim";
 
     NetDest L1_GetS_IDs,            desc="Set of the internal processors that want the block in shared state";
     MachineID L1_GetX_ID,          desc="ID of the L1 cache to forward the block to once we get a response";
@@ -180,6 +196,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   structure(TBETable, external="yes") {
+    bool areNSlotsAvailable(int n, Tick current_time);
     TBE lookup(Addr);
     void allocate(Addr);
     void deallocate(Addr);
@@ -187,6 +204,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   TBETable TBEs, template="<L2Cache_TBE>", constructor="m_number_of_TBEs";
+  bool sfEvictionActive, default="false";
+  Addr sfActiveVictim, default="0";
 
   Tick clockEdge();
   Tick cyclesToTicks(Cycles c);
@@ -197,6 +216,8 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   void set_tbe(TBE a);
   void unset_tbe();
   void wakeUpBuffers(Addr a);
+  void wakeUpAllBuffers(Addr a);
+  void wakeUpAllBuffers();
   void profileMsgDelay(int virtualNetworkType, Cycles c);
   MachineID mapAddressToMachine(Addr addr, MachineType mtype);
 
@@ -395,6 +416,13 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
             } else {
               trigger(Event:WB_Data_clean, in_msg.addr, cache_entry, tbe);
             }
+          } else if (in_msg.Type == CoherenceResponseType:CLEAN_PEER_NACK) {
+            assert(is_valid(tbe));
+            if (tbe.CleanPeerCandidates.isEmpty()) {
+              trigger(Event:CleanPeerFallback, in_msg.addr, cache_entry, tbe);
+            } else {
+              trigger(Event:CleanPeerRetry, in_msg.addr, cache_entry, tbe);
+            }
           } else if (in_msg.Type == CoherenceResponseType:ACK) {
             if ((getPendingAcks(tbe) - in_msg.AckCount) == 0) {
               trigger(Event:Ack_all, in_msg.addr, cache_entry, tbe);
@@ -416,7 +444,21 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
                 trigger(Event:Mem_Ack, in_msg.addr, cache_entry, tbe);
               }
           } else if(in_msg.Type == CoherenceResponseType:INV) {
-              trigger(Event:MEM_Inv, in_msg.addr, cache_entry, tbe);
+              if (L2cache.sfEnabled() && is_invalid(tbe) &&
+                  is_valid(cache_entry) &&
+                  (cache_entry.CacheState == State:SS ||
+                   cache_entry.CacheState == State:DS ||
+                   cache_entry.CacheState == State:M ||
+                   cache_entry.CacheState == State:MT ||
+                   cache_entry.CacheState == State:DT) &&
+                  !TBEs.areNSlotsAvailable(1, clockEdge())) {
+                // Park this request in the existing message buffer. Replies
+                // behind it must still be able to free transaction resources.
+                Addr waiting_address := in_msg.addr;
+                stall_and_wait(responseL2Network_in, waiting_address);
+              } else {
+                trigger(Event:MEM_Inv, in_msg.addr, cache_entry, tbe);
+              }
           } else {
             error("unknown message type");
           }
@@ -439,7 +481,53 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         assert(machineIDToMachineType(in_msg.Requestor) == MachineType:L1Cache);
         assert(in_msg.Destination.isElement(machineID));
 
-        if (in_msg.Type == CoherenceRequestType:FLUSH) {
+        if (L2cache.sfEnabled() && L2cache.sfContains(in_msg.addr) &&
+            (in_msg.Type == CoherenceRequestType:GETS ||
+             in_msg.Type == CoherenceRequestType:GET_INSTR ||
+             in_msg.Type == CoherenceRequestType:GETX ||
+             in_msg.Type == CoherenceRequestType:UPGRADE)) {
+          L2cache.sfTouch(in_msg.addr);
+        }
+
+        if (L2cache.sfEnabled() &&
+            (in_msg.Type == CoherenceRequestType:GETS ||
+             in_msg.Type == CoherenceRequestType:GET_INSTR ||
+             in_msg.Type == CoherenceRequestType:GETX ||
+             in_msg.Type == CoherenceRequestType:UPGRADE) &&
+            !L2cache.sfContains(in_msg.addr) &&
+            (sfEvictionActive || !L2cache.sfHasSpace(in_msg.addr))) {
+          if (sfEvictionActive) {
+            Entry victim_entry := getCacheEntry(sfActiveVictim);
+            trigger(Event:SF_Wait, sfActiveVictim, victim_entry, TBEs[sfActiveVictim]);
+          } else {
+            Addr victim := L2cache.sfVictim(in_msg.addr);
+            Entry victim_entry := getCacheEntry(victim);
+            TBE victim_tbe := TBEs[victim];
+            if (is_invalid(victim_tbe) &&
+                (is_invalid(victim_entry) ||
+                 ((victim_entry.CacheState == State:SS ||
+                   victim_entry.CacheState == State:DS ||
+                   victim_entry.CacheState == State:M) &&
+                  victim_entry.Sharers.isEmpty()))) {
+              trigger(Event:SF_ReleaseUnused, victim, victim_entry, victim_tbe);
+            } else {
+              trigger(Event:SF_Replacement, victim, victim_entry, victim_tbe);
+            }
+          }
+        } else if (L2cache.sfEnabled() && is_invalid(tbe) &&
+                   (in_msg.Type == CoherenceRequestType:GETS ||
+                    in_msg.Type == CoherenceRequestType:GET_INSTR ||
+                    in_msg.Type == CoherenceRequestType:GETX ||
+                    in_msg.Type == CoherenceRequestType:UPGRADE ||
+                    in_msg.Type == CoherenceRequestType:FLUSH ||
+                    in_msg.Type == CoherenceRequestType:FLUSH_NP ||
+                    in_msg.Type == CoherenceRequestType:FLUSH_DATA) &&
+                   !TBEs.areNSlotsAvailable(2, clockEdge())) {
+          // Keep one TBE available for SF reclamation. Completion traffic
+          // uses other input ports and may free ordinary transaction slots.
+          Addr waiting_address := in_msg.addr;
+          stall_and_wait(L1RequestL2Network_in, waiting_address);
+        } else if (in_msg.Type == CoherenceRequestType:FLUSH) {
           if (is_valid(cache_entry) &&
               (getState(tbe, cache_entry, in_msg.addr) == State:MT ||
                getState(tbe, cache_entry, in_msg.addr) == State:DT) &&
@@ -462,6 +550,17 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
           } else {
             trigger(Event:Flush_Data_Clean, in_msg.addr, cache_entry, tbe);
           }
+        } else if (enable_clean_peer && is_valid(cache_entry) && is_invalid(tbe) &&
+                   cache_entry.CacheState == State:DS &&
+                   (in_msg.Type == CoherenceRequestType:GETS ||
+                    in_msg.Type == CoherenceRequestType:GET_INSTR) &&
+                   (cache_entry.Sharers.count() > 1 ||
+                    (cache_entry.Sharers.count() == 1 &&
+                     !cache_entry.Sharers.isElement(in_msg.Requestor)))) {
+          if (L2cache.sfEnabled() && !L2cache.sfContains(in_msg.addr)) {
+            L2cache.sfAllocate(in_msg.addr);
+          }
+          trigger(Event:L1_GETS_CLEAN_PEER, in_msg.addr, cache_entry, tbe);
         } else if (is_valid(cache_entry) &&
                    ((cache_entry.CacheState != State:DS &&
                      cache_entry.CacheState != State:DT) ||
@@ -474,6 +573,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
                     (in_msg.Type == CoherenceRequestType:PUTX &&
                      (cache_entry.CacheState == State:DS ||
                       !cache_entry.Sharers.isElement(in_msg.Requestor))))) {
+          if (L2cache.sfEnabled() &&
+              (in_msg.Type == CoherenceRequestType:GETS ||
+               in_msg.Type == CoherenceRequestType:GET_INSTR ||
+               in_msg.Type == CoherenceRequestType:GETX ||
+               in_msg.Type == CoherenceRequestType:UPGRADE) &&
+              !L2cache.sfContains(in_msg.addr)) {
+            L2cache.sfAllocate(in_msg.addr);
+          }
           // Directory-only forwarding, upgrade and stale writeback handling
           // do not reserve data ways. A returning owner or GETS fill does.
           trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
@@ -481,6 +588,14 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
                   in_msg.addr, cache_entry, tbe);
         } else {
           if (L2cache.cacheAvail(in_msg.addr)) {
+            if (L2cache.sfEnabled() &&
+                (in_msg.Type == CoherenceRequestType:GETS ||
+                 in_msg.Type == CoherenceRequestType:GET_INSTR ||
+                 in_msg.Type == CoherenceRequestType:GETX ||
+                 in_msg.Type == CoherenceRequestType:UPGRADE) &&
+                !L2cache.sfContains(in_msg.addr)) {
+              L2cache.sfAllocate(in_msg.addr);
+            }
             // L2 does't have the line, but we have space for it in the L2
             trigger(L1Cache_request_type_to_event(in_msg.Type, in_msg.addr,
                                                   in_msg.Requestor, cache_entry),
@@ -505,6 +620,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   // ACTIONS
 
   action(a_issueFetchToMemory, "a", desc="fetch data from memory") {
+    L2cache.profileLlcReadRequest();
     peek(L1RequestL2Network_in, RequestMsg) {
       taotraceRubyMemoryFetchByIdentity(in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum);
@@ -536,8 +652,80 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     }
   }
 
+  action(cp_recordPeerRequest, "cpr", desc="Record clean peer candidates and requestor") {
+    peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(tbe) && is_valid(cache_entry) && !cache_entry.Dirty);
+      tbe.Requestor := in_msg.Requestor;
+      tbe.CleanPeerCandidates := cache_entry.Sharers;
+      tbe.CleanPeerCandidates.remove(in_msg.Requestor);
+      tbe.CleanPeerAccessMode := in_msg.AccessMode;
+      tbe.CleanPeerPrefetch := in_msg.Prefetch;
+    }
+  }
+
+  action(cp_probeNextPeer, "cpp", desc="Probe the lowest untried clean sharer") {
+    assert(is_valid(tbe) && !tbe.CleanPeerCandidates.isEmpty());
+    MachineID peer := tbe.CleanPeerCandidates.smallestElement();
+    enqueue(L1RequestL2Network_out, RequestMsg, to_l1_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:GETS_CLEAN_PEER;
+      out_msg.Requestor := tbe.Requestor;
+      out_msg.Destination.add(peer);
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+    }
+    tbe.CleanPeerCandidates.remove(peer);
+  }
+
+  action(cp_fetchMemory, "cpm", desc="All peers missed; fetch current memory") {
+    assert(is_valid(tbe) && is_valid(cache_entry) && !cache_entry.Dirty);
+    L2cache.profileLlcReadRequest();
+    taotraceRubyMemoryFetchByIdentity(tbe.TraceValid, tbe.TraceContextId,
+                                    tbe.TraceInstSeqNum);
+    enqueue(DirRequestL2Network_out, RequestMsg, l2_request_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceRequestType:GETS;
+      out_msg.Requestor := machineID;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.MessageSize := MessageSizeType:Control;
+      out_msg.AccessMode := tbe.CleanPeerAccessMode;
+      out_msg.Prefetch := tbe.CleanPeerPrefetch;
+      out_msg.TraceValid := tbe.TraceValid;
+      out_msg.TraceContextId := tbe.TraceContextId;
+      out_msg.TraceInstSeqNum := tbe.TraceInstSeqNum;
+    }
+  }
+
+  action(cp_returnMemoryData, "cpd", desc="Return fallback data without installing an LLC way") {
+    peek(responseL2Network_in, ResponseMsg) {
+      assert(is_valid(tbe) && is_valid(cache_entry) && !cache_entry.Dirty);
+      enqueue(responseL2Network_out, ResponseMsg, to_l1_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(tbe.Requestor);
+        out_msg.DataBlk := in_msg.DataBlk;
+        out_msg.ServiceSource := 3;
+        out_msg.ServiceL3Outcome := 2;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+      addSharer(address, tbe.Requestor, cache_entry);
+    }
+  }
+
+  action(cp_checkUnblock, "cpu", desc="Validate clean peer requester unblock") {
+    peek(L1unblockNetwork_in, ResponseMsg) {
+      assert(is_valid(tbe) && in_msg.Sender == tbe.Requestor);
+    }
+  }
+
+  action(cp_unsupportedInvalidation, "cpi", desc="Report unsupported peer/invalidation race") {
+    error("Directory invalidation raced an outstanding clean-peer request");
+  }
+
   action(c_exclusiveReplacement, "c", desc="Send data to memory") {
+    assert(is_valid(cache_entry));
     perfCacheNativeWritebackGlobal(2, true);
+    if (cache_entry.Dirty) { L2cache.profileLlcWriteRequest(); }
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       assert(is_valid(cache_entry));
       out_msg.addr := address;
@@ -562,7 +750,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(ct_exclusiveReplacementFromTBE, "ct", desc="Send data to memory") {
+    assert(is_valid(tbe));
     perfCacheNativeWritebackGlobal(2, true);
+    if (tbe.Dirty) { L2cache.profileLlcWriteRequest(); }
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       assert(is_valid(tbe) && tbe.DataValid);
       out_msg.addr := address;
@@ -763,8 +953,25 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(s_deallocateTBE, "s", desc="Deallocate external TBE") {
+    if (tbe.SFEviction) {
+      assert(sfEvictionActive && sfActiveVictim == address);
+      assert(L2cache.sfContains(address));
+      L2cache.sfRelease(address);
+      sfEvictionActive := false;
+      wakeUpBuffers(tbe.SFWaitingAddress);
+    } else if (is_invalid(cache_entry) && L2cache.sfEnabled() &&
+               L2cache.sfContains(address)) {
+      // The associated metadata was removed earlier; keep the SF credit
+      // until all replies and any memory writeback have completed.
+      L2cache.sfRelease(address);
+    }
     TBEs.deallocate(address);
     unset_tbe();
+    if (L2cache.sfEnabled()) {
+      // Resource waiters need not share the completed transaction's address
+      // or input-port rank. Reanalyze each existing stalled buffer once.
+      wakeUpAllBuffers();
+    }
   }
 
   action(jj_popL1RequestQueue, "\j", desc="Pop incoming L1 request queue") {
@@ -861,6 +1068,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   action(cr_writebackRetainDirectory, "cr", desc="Write dirty data without releasing directory ownership") {
     assert(is_valid(tbe) && tbe.DataValid);
+    L2cache.profileLlcWriteRequest();
     enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
       out_msg.addr := address;
       out_msg.Type := CoherenceResponseType:MEMORY_DATA_RETAIN;
@@ -879,6 +1087,41 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     }
     L2cache.deallocateDirectory(address);
     unset_cache_entry();
+    if (is_invalid(tbe) && L2cache.sfEnabled() && L2cache.sfContains(address)) {
+      L2cache.sfRelease(address);
+    }
+  }
+
+  action(sf_recordEviction, "sfr", desc="Bind an SF victim to its waiting request") {
+    assert(is_valid(tbe) && !sfEvictionActive);
+    peek(L1RequestL2Network_in, RequestMsg) {
+      tbe.SFEviction := true;
+      tbe.SFWaitingAddress := in_msg.addr;
+      sfEvictionActive := true;
+      sfActiveVictim := address;
+    }
+  }
+
+  action(sf_stallRequester, "sfs", desc="Park requesting address until SF victim completes") {
+    Addr waiting_address := tbe.SFWaitingAddress;
+    stall_and_wait(L1RequestL2Network_in, waiting_address);
+  }
+
+  action(sf_stallVictim, "sfw", desc="Wait for active or transient SF victim") {
+    stall_and_wait(L1RequestL2Network_in, address);
+  }
+
+  action(sf_releaseUnused, "sfu", desc="Release SF entry with no private responsibility") {
+    assert(L2cache.sfContains(address));
+    L2cache.sfRelease(address);
+  }
+
+  action(sf_releaseOwner, "sfo", desc="Release SF after owner returns the line") {
+    if (L2cache.sfEnabled() && L2cache.sfContains(address)) {
+      L2cache.sfRelease(address);
+      // An SF waiter can have the same input-port rank as this PUTX.
+      wakeUpAllBuffers(address);
+    }
   }
 
   action(t_sendWBAck, "t", desc="Send writeback ACK") {
@@ -974,6 +1217,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
         out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
         if (tbe.Dirty) {
           assert(tbe.DataValid);
+          L2cache.profileLlcWriteRequest();
           out_msg.Type := CoherenceResponseType:MEMORY_DATA;
           out_msg.DataBlk := tbe.DataBlk;
           out_msg.Dirty := true;
@@ -988,7 +1232,9 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
 
   action(c_exclusiveFlushReplacement, "cef", desc="Send flushed data to memory") {
     peek(L1RequestL2Network_in, RequestMsg) {
+      assert(is_valid(tbe));
       perfCacheNativeWritebackGlobal(2, cache_entry.Dirty);
+      if (tbe.Dirty) { L2cache.profileLlcWriteRequest(); }
       enqueue(responseL2Network_out, ResponseMsg, l2_response_latency) {
         assert(is_valid(tbe) && tbe.DataValid);
         out_msg.addr := address;
@@ -1020,6 +1266,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(uu_profileMiss, "\um", desc="Profile the demand miss") {
     L2cache.profileDemandMiss();
     peek(L1RequestL2Network_in, RequestMsg) {
+      L2cache.profileLlcLookup(machineIDToNodeID(in_msg.Requestor), true);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 1);
       taotraceAttemptCacheOutcome(in_msg.TraceValid,
@@ -1035,6 +1282,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(uu_profileHit, "\uh", desc="Profile the demand hit") {
     L2cache.profileDemandHit();
     peek(L1RequestL2Network_in, RequestMsg) {
+      L2cache.profileLlcLookup(machineIDToNodeID(in_msg.Requestor), false);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 0);
       taotraceAttemptCacheOutcome(in_msg.TraceValid,
@@ -1065,6 +1313,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(uu_profileMergedMiss, "\umm", desc="Profile TBE-merged miss") {
     L2cache.profileDemandMiss();
     peek(L1RequestL2Network_in, RequestMsg) {
+      L2cache.profileLlcLookup(machineIDToNodeID(in_msg.Requestor), true);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 3);
       taotraceAttemptCacheOutcome(in_msg.TraceValid,
@@ -1080,6 +1329,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   action(uu_profileRemoteSupply, "\urs", desc="Profile remote-owner supply") {
     L2cache.profileDemandMiss();
     peek(L1RequestL2Network_in, RequestMsg) {
+      L2cache.profileLlcLookup(machineIDToNodeID(in_msg.Requestor), true);
       nativeCacheOutcome(in_msg.NativeRequest, in_msg.TraceValid,
           in_msg.TraceContextId, in_msg.TraceInstSeqNum, 2, 4);
       taotraceAttemptCacheOutcome(in_msg.TraceValid,
@@ -1144,7 +1394,11 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
   }
 
   action(zn_recycleResponseNetwork, "zn", desc="recycle memory request") {
-    responseL2Network_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
+    if (L2cache.sfEnabled()) {
+      stall_and_wait(responseL2Network_in, address);
+    } else {
+      responseL2Network_in.recycle(clockEdge(), cyclesToTicks(recycle_latency));
+    }
   }
 
   action(kd_wakeUpDependents, "kd", desc="wake-up dependents") {
@@ -1327,6 +1581,93 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     zn_recycleResponseNetwork;
   }
 
+  transition(DS, L1_GETS_CLEAN_PEER, DS_PEER) {
+    i_allocateTBE;
+    ti_recordTraceRequest;
+    cp_recordPeerRequest;
+    cp_probeNextPeer;
+    uu_profileRemoteSupply;
+    jj_popL1RequestQueue;
+  }
+
+  transition(DS_PEER, CleanPeerRetry) {
+    cp_probeNextPeer;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(DS_PEER, CleanPeerFallback, DS_PEER_MEM) {
+    cp_fetchMemory;
+    o_popIncomingResponseQueue;
+  }
+
+  transition(DS_PEER, Unblock, DS) {
+    cp_checkUnblock;
+    nnu_addSharerFromUnblock;
+    s_deallocateTBE;
+    k_popUnblockQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(DS_PEER_MEM, Mem_Data, DS) {
+    cp_returnMemoryData;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition({DS_PEER, DS_PEER_MEM},
+             {L1_GETS, L1_GET_INSTR, L1_GETX, L1_UPGRADE, L1_PUTX,
+              L1_PUTX_old, Flush, Flush_NP, Flush_Clean, Flush_NP_Clean,
+              Flush_Data, Flush_Data_Clean}) {
+    zz_stallAndWaitL1RequestQueue;
+  }
+
+  // TODO: park the invalidation on a separate retry path so responses can
+  // pass it; recycling this shared response queue could deadlock the peer.
+  transition({DS_PEER, DS_PEER_MEM}, MEM_Inv) {
+    cp_unsupportedInvalidation;
+  }
+
+  // Retain the SF slot in the TBE until invalidation acknowledgements and
+  // any memory transfer finish. The parked new address is then awakened.
+  transition(DS, SF_Replacement, I_I) {
+    i_allocateTBE;
+    sf_recordEviction;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+    sf_stallRequester;
+  }
+
+  transition(SS, SF_Replacement, S_I) {
+    i_allocateTBE;
+    sf_recordEviction;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+    sf_stallRequester;
+  }
+
+  transition({MT, DT}, SF_Replacement, MT_I) {
+    i_allocateTBE;
+    sf_recordEviction;
+    f_sendInvToSharers;
+    rr_deallocateL2CacheBlock;
+    sf_stallRequester;
+  }
+
+  transition({NP, M, SS, DS}, SF_ReleaseUnused) {
+    sf_releaseUnused;
+  }
+
+  transition({IS, ISS, IM, SS_MB, MT_MB, DT_MB, MT_IIB, MT_IB, MT_SB,
+              S_WB, I_I, S_I, MT_I, MCT_I, M_I, I_F, I_FF, MT_F,
+              DS_PEER, DS_PEER_MEM}, SF_Replacement) {
+    sf_stallVictim;
+  }
+
+  transition({I_I, S_I, MT_I, M_I}, SF_Wait) {
+    sf_stallVictim;
+  }
+
   // A metadata hit is a real data miss and uses the same finite data ways.
   transition(DS, {L1_GETS, L1_GET_INSTR}, IS) {
     qq_allocateL2CacheBlock;
@@ -1454,6 +1795,7 @@ machine(MachineType:L2Cache, "MESI Directory L2 Cache CMP")
     ll_clearSharers;
     mr_writeDataToCacheFromRequest;
     t_sendWBAck;
+    sf_releaseOwner;
     jj_popL1RequestQueue;
   }
 

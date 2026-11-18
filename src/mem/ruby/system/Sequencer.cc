@@ -189,7 +189,9 @@ Sequencer::Sequencer(const Params &p)
       m_IncompleteTimes(MachineType_NUM),
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check"),
       dataFillResponseEvent([this]{ serviceDataFillReads(); },
-                            "Sequencer data-fill return service")
+                            "Sequencer data-fill return service"),
+      dataHitResponseEvent([this]{ serviceDataHits(); },
+                           "Sequencer data-hit return service")
 {
     m_outstanding_count = 0;
     m_store_prepare_outstanding = 0;
@@ -384,6 +386,12 @@ Sequencer::wakeup()
                  "Data-fill return service deadlocked");
         total_outstanding += m_dataCache_ptr->pendingDataFillResponses();
     }
+    for (const auto &entry : pendingDataHits) {
+        const auto &pending = entry.second;
+        panic_if(current_time - pending.request.issue_time >= m_deadlock_threshold,
+                 "Data-hit return service deadlocked");
+        ++total_outstanding;
+    }
     assert(m_outstanding_count == total_outstanding);
 
     if (m_outstanding_count > 0) {
@@ -405,6 +413,19 @@ Sequencer::functionalWrite(Packet *func_pkt)
     }
     if (m_dataCache_ptr)
         num_written += m_dataCache_ptr->functionalWriteDataFillResponses(func_pkt);
+    for (auto &entry : pendingDataHits) {
+        auto &pending = entry.second;
+        const int bytes = pending.data.getBlockSize();
+        assert(bytes > 0 && (bytes & (bytes - 1)) == 0);
+        const Addr line = pending.request.pkt->getAddr() & ~(Addr(bytes) - 1);
+        const bool overlaps = func_pkt->isSecure() ==
+                pending.request.pkt->isSecure() &&
+            func_pkt->getAddr() < line + bytes &&
+            line < func_pkt->getAddr() + func_pkt->getSize();
+        func_pkt->trySatisfyFunctional(nullptr, line,
+            pending.request.pkt->isSecure(), bytes, pending.data.getDataMod(0));
+        num_written += overlaps;
+    }
     // Functional writes to addresses being monitored
     // will fail (remove) the monitor entry.
     llscClearMonitor(makeLineAddress(func_pkt->getAddr()));
@@ -995,6 +1016,13 @@ Sequencer::registerReadFill(const RequestPtr &request, bool follower,
             (entry.m_type == RubyRequestType_LD ||
              entry.m_type == RubyRequestType_Load_Linked)) {
             panic_if(!m_dataCache_ptr, "Data fill registration requires an L1 data cache");
+            const Addr line = makeLineAddress(request->getPaddr());
+            if (follower && !request->isPrefetch() && !request->isPTWalk() &&
+                !entry.pkt->cmd.isSWPrefetch() &&
+                m_dataCache_ptr->dataFillPresent(line) &&
+                !m_dataCache_ptr->dataFillReady(line)) {
+                TaoTraceNativeAccessRegistry::noteFillHitBeforeReady(request);
+            }
             m_dataCache_ptr->registerDataFillRead(entry.pkt, follower,
                                                  has_service_source);
             return;
@@ -1020,6 +1048,17 @@ Sequencer::readRequestCallback(Addr address, DataBlock &data,
              "Request already registered for a data fill hit in L1");
     if (m_dataCache_ptr)
         m_dataCache_ptr->recordL1DataHitRead();
+    const auto delay = dataHitDelay.find(entry->pkt);
+    if (delay != dataHitDelay.end() && delay->second > Cycles(0)) {
+        queueDataHit(*entry, data, delay->second);
+        dataHitDelay.erase(delay);
+        requests.erase(entry);
+        if (requests.empty())
+            m_RequestTable.erase(makeLineAddress(address));
+        else
+            issueReadyLineRequests(address);
+        return;
+    }
     recordMissLatency(&*entry, true, MachineType_NUM, false,
                       Cycles(0), Cycles(0), Cycles(0));
     markRemoved();
@@ -1032,6 +1071,39 @@ Sequencer::readRequestCallback(Addr address, DataBlock &data,
         m_RequestTable.erase(makeLineAddress(address));
     else
         issueReadyLineRequests(address);
+}
+
+void
+Sequencer::queueDataHit(SequencerRequest &request, const DataBlock &data,
+                        Cycles delay)
+{
+    const Tick when = clockEdge(delay);
+    pendingDataHits.emplace(when, PendingDataHit{request, data});
+    if (servicingDataHits)
+        return;
+    if (!dataHitResponseEvent.scheduled())
+        schedule(dataHitResponseEvent, when);
+    else if (when < dataHitResponseEvent.when())
+        reschedule(dataHitResponseEvent, when);
+}
+
+void
+Sequencer::serviceDataHits()
+{
+    servicingDataHits = true;
+    while (!pendingDataHits.empty() && pendingDataHits.begin()->first <= curTick()) {
+        auto it = pendingDataHits.begin();
+        PendingDataHit pending = std::move(it->second);
+        pendingDataHits.erase(it);
+        recordMissLatency(&pending.request, true, MachineType_NUM, false,
+                          Cycles(0), Cycles(0), Cycles(0));
+        markRemoved();
+        hitCallback(&pending.request, pending.data, true, MachineType_NUM, false,
+                    Cycles(0), Cycles(0), Cycles(0), false);
+    }
+    servicingDataHits = false;
+    if (!pendingDataHits.empty())
+        schedule(dataHitResponseEvent, pendingDataHits.begin()->first);
 }
 
 void
@@ -1190,6 +1262,7 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
               "in .sm files!");
 
     PacketPtr pkt = srequest->pkt;
+    dataHitDelay.erase(pkt);
     // A request answered by a non-fill path must not leave an observed
     // participant behind, even if a snoop or special operation diverted it.
     if (m_dataCache_ptr) {
@@ -1203,6 +1276,8 @@ Sequencer::hitCallback(SequencerRequest* srequest, DataBlock& data,
         TaoTraceNativeAccessRegistry::noteHierarchyCompletion(
             pkt->req, perf_cache_native::observer().attemptForPacket(packet_id),
             was_coalesced, !externalHit);
+        if (was_coalesced && srequest->admissionFillNotReady)
+            TaoTraceNativeAccessRegistry::noteFillHitBeforeReady(pkt->req);
         if (was_coalesced && srequest->admissionDataSource)
             TaoTraceNativeAccessRegistry::noteHierarchy(
                 pkt->req, 0, srequest->admissionDataSource == 2 ?
@@ -1515,6 +1590,7 @@ bool
 Sequencer::empty() const
 {
     return m_RequestTable.empty() &&
+           pendingDataHits.empty() &&
            (!m_dataCache_ptr || !m_dataCache_ptr->hasPendingDataFillResponses()) &&
            m_UnaddressedRequestTable.empty() &&
            m_store_prepare_outstanding == 0;
@@ -1763,6 +1839,8 @@ Sequencer::makeRequest(PacketPtr pkt)
             if (joins && status == RequestStatus_Aliased) {
                 m_dataCache_ptr->observeSoftwarePrefetchHit(line);
                 m_RequestTable.at(line).back().admissionDataSource = 2;
+                m_RequestTable.at(line).back().admissionFillNotReady =
+                    !pkt->req->isPTWalk() && !m_dataCache_ptr->dataFillReady(line);
             }
         } else if (status == RequestStatus_Aliased && tailCanFollow(line) &&
                    m_dataCache_ptr->hasReadableData(line)) {
@@ -1783,6 +1861,9 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
                         Cycles overlapped)
 {
     assert(pkt != NULL);
+    // A protocol retry recalculates the remaining array service for this
+    // attempt; it must not inherit a previous attempt's deferred delay.
+    dataHitDelay.erase(pkt);
     if (pkt->req && !pkt->req->isMemMgmt() &&
         pkt->cmd != MemCmd::MemSyncReq) {
         const auto it = m_RequestTable.find(makeLineAddress(pkt->getAddr()));
@@ -1910,6 +1991,31 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type,
         const Cycles saved = std::min(overlapped, service - Cycles(1));
         service = service - saved;
         orderedStoreStats.overlappedCycles += uint64_t(saved);
+    }
+    if (m_ruby_system->getProtocolInfo().getName() == "MESI_Three_Level" &&
+        secondary_type == RubyRequestType_LD &&
+        m_dataCache_ptr->getDataLatency() > Cycles(1) &&
+        service > Cycles(1)) {
+        const auto table = m_RequestTable.find(makeLineAddress(pkt->getAddr()));
+        if (table != m_RequestTable.end()) {
+            const auto entry = std::find_if(table->second.begin(), table->second.end(),
+                [pkt](const auto &item) { return item.pkt == pkt; });
+            if (entry != table->second.end() && isIndependentDataRead(*entry) &&
+                pkt->isRead() && !pkt->needsWritable() && !pkt->isAtomicOp() &&
+                !pkt->isHtmTransactional() && !pkt->req->isPTWalk() &&
+                !pkt->req->isLocalAccess() && !pkt->req->isCacheMaintenance() &&
+                !pkt->req->isMasked()) {
+                // Apply index-preparation and earlier same-line overlap first,
+                // then move the remaining array service to the hit response.
+                // The total hit latency is unchanged and a miss no longer
+                // waits for data-array work before being recognized.
+                const Cycles delay = std::min(
+                    m_dataCache_ptr->getDataLatency() - Cycles(1),
+                    service - Cycles(1));
+                service = service - delay;
+                dataHitDelay.insert_or_assign(pkt, delay);
+            }
+        }
     }
     Tick latency = cyclesToTicks(service);
     assert(latency > 0);

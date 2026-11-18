@@ -20,6 +20,7 @@ struct SequencerRequest
     RubyRequestType m_second_type;
     Cycles issue_time;
     uint8_t admissionDataSource = 0;
+    bool admissionFillNotReady = false;
     bool issuedToL1 = false;
     RequestPtr serviceParent;
     bool serviceParentIsWrite = false;

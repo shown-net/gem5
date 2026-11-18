@@ -295,7 +295,10 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
                  l1d_data_access_cycles: int, l2_fill_capacity: int,
                  sequencer_max_outstanding_requests: int,
                  l1_tbe_capacity: int, l2_tbe_capacity: int,
-                 network_parameters: dict):
+                 l1_only_enabled: bool, sf_num_sets: int, sf_assoc: int,
+                 clean_peer_enabled: bool,
+                 network_parameters: dict, l2_data_response_cycles: int = 11,
+                 l2_other_message_cycles: int = 11):
         super().__init__(l1i_size=l1i_size, l1i_assoc=l1i_assoc,
                          l1d_size=l1d_size, l1d_assoc=l1d_assoc,
                          l2_size=l2_size, l2_assoc=l2_assoc,
@@ -308,13 +311,22 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
         self._l1_fill_response_width = l1_fill_response_width
         self._l1d_data_access_cycles = l1d_data_access_cycles
         self._l2_fill_capacity = l2_fill_capacity
+        self._l2_data_response_cycles = l2_data_response_cycles
+        self._l2_other_message_cycles = l2_other_message_cycles
         self._sequencer_max_outstanding_requests = sequencer_max_outstanding_requests
         self._l1_tbe_capacity = l1_tbe_capacity
         self._l2_tbe_capacity = l2_tbe_capacity
+        self._l1_only_enabled = l1_only_enabled
+        self._sf_num_sets = sf_num_sets
+        self._sf_assoc = sf_assoc
+        self._clean_peer_enabled = clean_peer_enabled
 
     def incorporate_cache(self, board: AbstractBoard) -> None:
         super().incorporate_cache(board)
         for controller in self._l1_controllers:
+            # The opposite direction already has its own data-transfer clock.
+            # Model one data message per cycle independently in this direction.
+            controller.bufferToL1.data_transfer_clock = controller.clk_domain
             # Native dependent L1 loads take five issue-to-issue cycles.
             # Three Ruby service cycles plus the AGU/LSU handoffs reproduce
             # that interval; independent three-load throughput is unchanged.
@@ -325,6 +337,19 @@ class SPRCacheHierarchy(MESIThreeLevelCacheHierarchy):
             controller.sequencer.data_fill_response_width = self._l1_fill_response_width
             controller.sequencer.max_outstanding_requests = self._sequencer_max_outstanding_requests
             controller.number_of_TBEs = self._l1_tbe_capacity
-        for controller in self._l2_controllers:
+        for l1, controller in zip(self._l1_controllers, self._l2_controllers):
             controller.cache.fill_capacity = self._l2_fill_capacity
+            # Local data replies and the controller's remaining messages
+            # use separate service delays, without adding either delay twice.
+            controller.l1_data_response_latency = self._l2_data_response_cycles
+            controller.l1_response_latency = self._l2_other_message_cycles
             controller.number_of_TBEs = self._l2_tbe_capacity
+            if self._l1_only_enabled:
+                controller.l1_only_capacity = (
+                    int(l1.Icache.size) + int(l1.Dcache.size)
+                ) // int(board.get_cache_line_size())
+        for controller in self._l3_controllers:
+            controller.L2cache.sf_num_sets = self._sf_num_sets
+            controller.L2cache.sf_assoc = self._sf_assoc
+            controller.L2cache.llc_requestor_count = len(self._l2_controllers)
+            controller.enable_clean_peer = self._clean_peer_enabled

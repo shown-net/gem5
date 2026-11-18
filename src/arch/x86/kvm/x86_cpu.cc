@@ -1549,7 +1549,20 @@ X86KvmCPU::updateCPUID()
         CpuidResult cpuid;
         uint32_t idx(0);
 
-        if (!isa->cpuid->hasSignificantIndex(function)) {
+        if (function == X86ISA::ExtendedFeatures) {
+            // Leaf 7 advertises its last subleaf in subleaf 0 EAX. An empty
+            // intermediate subleaf is valid and must not end enumeration.
+            isa->cpuid->doCpuid(tc, function, 0, cpuid);
+            const uint32_t last = cpuid.rax;
+            for (;;) {
+                isa->cpuid->doCpuid(tc, function, idx, cpuid);
+                m5_supported.push_back(makeKvmCpuid(
+                    function, idx, cpuid, KVM_CPUID_FLAG_SIGNIFCANT_INDEX));
+                if (idx == last)
+                    break;
+                ++idx;
+            }
+        } else if (!isa->cpuid->hasSignificantIndex(function)) {
             isa->cpuid->doCpuid(tc, function, idx, cpuid);
             m5_supported.push_back(makeKvmCpuid(function, idx, cpuid));
         } else {

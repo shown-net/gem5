@@ -664,7 +664,8 @@ machine(MachineType:L0Cache, "MESI Directory L0 Cache")
           } else {
             Dcache.recordDemandFillBlocked();
             if (in_msg.fillAuditRole() == 1 || in_msg.fillAuditRole() == 2 ||
-                in_msg.fillAuditRole() == 4) {
+                in_msg.fillAuditRole() == 4 || in_msg.fillAuditRole() == 5 ||
+                in_msg.fillAuditRole() == 8) {
               Dcache.beginDemandFillWait(in_msg.pkt,
                   in_msg.Type == RubyRequestType:ST ||
                   in_msg.Type == RubyRequestType:ATOMIC);

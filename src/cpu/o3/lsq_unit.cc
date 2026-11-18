@@ -207,11 +207,14 @@ LSQUnit::completeDataAccess(PacketPtr pkt)
                 // synthetic packet for a split access. Keep it alive until
                 // the shared load-result resource delivers the value.
                 request->writebackScheduled();
+                const Cycles blocked_delay = inst->isLoad() &&
+                    loadQueue[inst->lqIdx].forwardBlockObserved() ?
+                    sprBlockedLoadReturnExtraLatency : Cycles(0);
                 lsq->enqueueLoadCompletion(inst, [this, inst, request] {
                     cpu->recordCompletedLoad(inst);
                     writeback(inst, request->mainPacket());
                     request->writebackDone();
-                });
+                }, false, blocked_delay);
             } else {
                 cpu->recordCompletedLoad(inst);
                 writeback(inst, request->mainPacket());
@@ -270,6 +273,12 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
     if (!sprMemoryDependence && params.sprFastStoreForwarding && !params.checker)
         fsfp = std::make_unique<FastForwardingState>();
     sprStoreForwardingLatency = params.sprStoreForwardingLatency;
+    sprStoreAddressForwardLatency = params.sprStoreAddressForwardLatency;
+    sprReplayBlockedLoads = params.sprReplayBlockedLoads;
+    sprBlockedLoadReturnExtraLatency = params.sprBlockedLoadReturnExtraLatency;
+    fatal_if(sprBlockedLoadReturnExtraLatency > Cycles(0) &&
+             !params.loadCompletionWidth,
+             "Blocked-load return latency requires load completion service");
     sprMultiStoreForwarding = params.sprMultiStoreForwarding;
     sprContainedForwardingExtraLatency = params.sprContainedForwardingExtraLatency;
     iewStage->instQueue.memoryDependence(lsqID).setLSQ(lsq);
@@ -286,6 +295,7 @@ LSQUnit::resetState()
     panic_if(!committedStoreBuffer.empty(),
              "Cannot reset a nonempty committed store buffer");
     assert(committedStores == 0);
+    assert(committedStoreCredits == 0);
     assert(issuedStoreBufferEntries == 0);
     storeBufferLinesInFlight.clear();
     storesToWB = 0;
@@ -386,6 +396,10 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Number of loads that were rescheduled"),
       ADD_STAT(selectivePartialWaits, statistics::units::Count::get(),
                "Partial-overlap loads registered with a blocking store"),
+      ADD_STAT(storeForwardBlockedLoads, statistics::units::Count::get(),
+               "Distinct speculative loads blocked by an overlapping older store; SQ and committed-buffer waits count once"),
+      ADD_STAT(storeAddressForwardDelayed, statistics::units::Count::get(),
+               "SQ forwards whose delivery waited for the modeled store-address timing endpoint"),
       ADD_STAT(selectivePartialWakeups, statistics::units::Count::get(),
                "Tracked loads individually woken after their blocking store"),
       ADD_STAT(selectivePartialSquashedWaits, statistics::units::Count::get(),
@@ -397,7 +411,11 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(splitStoreDataWaits, statistics::units::Count::get(),
                "Loads waiting for an older split store's data"),
       ADD_STAT(retainedStoreDataWaits, statistics::units::Count::get(),
-               "Full-overlap loads waiting with their translated request"),
+               "Overlapping loads waiting for store data with their translated request"),
+      ADD_STAT(retainedStoreDataWaitCycles, statistics::units::Cycle::get(),
+               "Sum of elapsed cycles for retained store-data waits when woken"),
+      ADD_STAT(retainedStoreDataWaitAtLeast4, statistics::units::Count::get(),
+               "Retained store-data waits lasting at least four cycles when woken"),
       ADD_STAT(retainedStoreDataResumes, statistics::units::Count::get(),
                "Retained loads resumed without a new IQ or AGU issue"),
       ADD_STAT(loadBankConflicts, statistics::units::Count::get(),
@@ -423,9 +441,9 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
       ADD_STAT(storeBufferEntryCycles, statistics::units::Count::get(),
                "Committed logical stores sampled each active LSQ cycle"),
       ADD_STAT(storeBufferLineEntryCycles, statistics::units::Count::get(),
-               "Committed store buffer line entries sampled each active LSQ cycle"),
+               "Uncompleted committed store line credits sampled each active LSQ cycle"),
       ADD_STAT(sharedStoreEntryCycles, statistics::units::Count::get(),
-               "SQ entries plus committed logical stores sampled each active LSQ cycle"),
+               "SQ entries plus committed line credits sampled each active LSQ cycle"),
       ADD_STAT(sharedStoreFullCycles, statistics::units::Cycle::get(),
                "Active LSQ cycles with the shared store budget full"),
       ADD_STAT(storeDrainCacheBlocked, statistics::units::Count::get(),
@@ -492,6 +510,7 @@ LSQUnit::drainSanityCheck() const
     assert(tsoLinesInFlight.empty());
     assert(committedStoreBuffer.empty());
     assert(committedStores == 0);
+    assert(committedStoreCredits == 0);
     assert(issuedStoreBufferEntries == 0);
     assert(storeBufferLinesInFlight.empty());
     assert(selectiveBlockedLoads.empty());
@@ -674,7 +693,7 @@ LSQUnit::numFreeStoreEntries()
 {
     DPRINTF(LSQUnit, "SQ size: %d, #stores occupied: %d\n",
             storeQueue.capacity(), storeQueue.size());
-    const size_t used = storeQueue.size() + committedStoreCount();
+    const size_t used = storeQueue.size() + committedStoreCredits;
     assert(used <= storeQueue.capacity());
     return storeQueue.capacity() - used;
 }
@@ -682,10 +701,10 @@ LSQUnit::numFreeStoreEntries()
 void
 LSQUnit::sampleStoreOccupancy()
 {
-    const auto used = storeQueue.size() + committedStoreCount();
+    const auto used = storeQueue.size() + committedStoreCredits;
     assert(used <= storeQueue.capacity());
     stats.storeBufferEntryCycles += committedStoreCount();
-    stats.storeBufferLineEntryCycles += committedStoreBuffer.size();
+    stats.storeBufferLineEntryCycles += committedStoreCredits;
     stats.sharedStoreEntryCycles += used;
     if (used == storeQueue.capacity())
         ++stats.sharedStoreFullCycles;
@@ -1422,6 +1441,7 @@ LSQUnit::offloadCommittedStores()
                 std::vector<InstSeqNum>(line_size, 0),
                 std::vector<Addr>(fsfp ? line_size : 0, 0),
                 std::vector<bool>(fsfp ? line_size : 0, false)});
+            ++committedStoreCredits;
             target = &committedStoreBuffer.back();
         }
         ++committedStores;
@@ -1505,7 +1525,8 @@ LSQUnit::drainCommittedStoreBuffer()
                  "Committed TSO store buffer requires MESI_Three_Level Ruby");
         entry.issued = true;
         ++issuedStoreBufferEntries;
-        ++storeBufferLinesInFlight[entry.line];
+        if (sprStoreDrainLineCredits)
+            ++storeBufferLinesInFlight[entry.line];
         lsq->cachePortBusy(false, service_bytes);
         ++stats.storeBufferSent;
         stats.storeBufferLogicalSent += entry.logicalStores;
@@ -1522,11 +1543,15 @@ LSQUnit::completeStoreBufferWrite(uint64_t entry_id)
     it->completed = true;
     assert(committedStores >= it->logicalStores);
     committedStores -= it->logicalStores;
+    assert(committedStoreCredits > 0);
+    --committedStoreCredits;
     it->staleTranslation = false;
-    auto line_it = storeBufferLinesInFlight.find(it->line);
-    assert(line_it != storeBufferLinesInFlight.end() && line_it->second > 0);
-    if (--line_it->second == 0)
-        storeBufferLinesInFlight.erase(line_it);
+    if (sprStoreDrainLineCredits) {
+        auto line_it = storeBufferLinesInFlight.find(it->line);
+        assert(line_it != storeBufferLinesInFlight.end() && line_it->second > 0);
+        if (--line_it->second == 0)
+            storeBufferLinesInFlight.erase(line_it);
+    }
     std::vector<SelectiveBlockedLoad> ready;
     for (auto wait = selectiveBlockedLoads.begin();
          wait != selectiveBlockedLoads.end();) {
@@ -1553,7 +1578,8 @@ LSQUnit::completeStoreBufferWrite(uint64_t entry_id)
         committedStoreBuffer.pop_front();
     }
     for (const auto &wait : ready)
-        resumeSelectiveBlockedLoad(wait);
+        resumeSelectiveBlockedLoad(wait, sprReplayBlockedLoads &&
+            !wait.waitForData && !wait.waitForAddress);
     iewStage->updateLSQNextCycle = true;
     cpu->wakeCPU();
     cpu->activityThisCycle();
@@ -1575,8 +1601,17 @@ LSQUnit::wakeSelectiveBlockedLoads(InstSeqNum store_seq, bool data_only,
         ready.push_back(it->second);
         it = selectiveBlockedLoads.erase(it);
     }
-    for (const auto &wait : ready)
+    for (const auto &wait : ready) {
+        if (wait.waitForData && wait.retainRequest && !wait.load->isSquashed()) {
+            assert(wait.dataWaitStarted <= curTick());
+            const uint64_t elapsed = uint64_t(cpu->ticksToCycles(
+                curTick() - wait.dataWaitStarted));
+            stats.retainedStoreDataWaitCycles += elapsed;
+            if (elapsed >= 4)
+                ++stats.retainedStoreDataWaitAtLeast4;
+        }
         resumeSelectiveBlockedLoad(wait);
+    }
 }
 
 void
@@ -1611,7 +1646,8 @@ LSQUnit::canRetainLoadRequest(LSQRequest *request) const
 }
 
 void
-LSQUnit::resumeSelectiveBlockedLoad(const SelectiveBlockedLoad &wait)
+LSQUnit::resumeSelectiveBlockedLoad(const SelectiveBlockedLoad &wait,
+                                    bool replay)
 {
     const auto &load = wait.load;
     if (load->isSquashed())
@@ -1624,7 +1660,7 @@ LSQUnit::resumeSelectiveBlockedLoad(const SelectiveBlockedLoad &wait)
     auto &entry = loadQueue[load->lqIdx];
     auto *request = entry.request();
     assert(entry.valid() && entry.instruction() == load && request);
-    if (request->hasStaleTranslation() || !load->effAddrValid()) {
+    if (replay || request->hasStaleTranslation() || !load->effAddrValid()) {
         rescheduleRetainedLoad(load);
         return;
     }
@@ -2541,10 +2577,9 @@ LSQUnit::rememberForwarding(const DynInstPtr &load, const DynInstPtr &store)
 bool
 LSQUnit::collectSameStartForwarding(LSQRequest *request, ssize_t load_idx)
 {
-    // The single-producer policy requires complete coverage by one store;
-    // partial store bytes may not be combined with a cache response either.
-    if (!sprMultiStoreForwarding)
-        return false;
+    // Even with multi-store forwarding disabled, one same-start producer can
+    // supply the covered bytes while the cache supplies the remainder.  The
+    // producer check below rejects mixtures from multiple stores.
     const auto &load = loadQueue[load_idx].instruction();
     if (partialForwarding.count(load->seqNum))
         return true;
@@ -2645,6 +2680,22 @@ LSQUnit::collectSameStartForwarding(LSQRequest *request, ssize_t load_idx)
             found = true;
         }
     }
+    // On the measured SPR profile, the tested 1->2, 2->4, 4->8 and
+    // 8->16-byte same-start cases block rather than taking this immediate
+    // cache-merge path.  Other partial sizes remain model candidates: the
+    // public Golden Cove description permits some same-start partial forwards
+    // but does not establish their full eligibility or timing.
+    const bool tested_half_width = size >= 2 && size <= 16 &&
+        (size & (size - 1)) == 0 && supplied * 2 == size &&
+        std::all_of(bytes.mask.begin(), bytes.mask.begin() + supplied,
+                    [](bool covered) { return covered; }) &&
+        std::all_of(bytes.sourceSequence.begin(),
+                    bytes.sourceSequence.begin() + supplied,
+                    [&](InstSeqNum seq) {
+                        return seq == bytes.sourceSequence.front();
+                    });
+    if (sprMemoryDependence && tested_half_width)
+        return false;
     partialForwarding.emplace(load->seqNum, std::move(bytes));
     ++stats.sameStartPartialLoads;
     ++stats.forwLoads;
@@ -2814,6 +2865,9 @@ LSQUnit::forwardFromStoreBuffer(LSQRequest *request, ssize_t load_idx)
         }
     }
 
+    if ((ordinary || (ordinary_split && overlap)) &&
+        load_entry.noteForwardBlock())
+        ++stats.storeForwardBlockedLoads;
     const bool retain = canRetainLoadRequest(request);
     selectiveBlockedLoads.insert_or_assign(
         load->seqNum, SelectiveBlockedLoad{wait_seq, load, false, false, retain});
@@ -3092,7 +3146,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 selectiveBlockedLoads.insert_or_assign(
                     load_inst->seqNum,
                     SelectiveBlockedLoad{store_it->instruction()->seqNum,
-                                         load_inst, true, false, retain});
+                                         load_inst, true, false, retain,
+                                         curTick()});
                 ++stats.splitStoreDataWaits;
                 if (retain) {
                     ++stats.retainedStoreDataWaits;
@@ -3169,6 +3224,13 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                       load_inst->getHtmTransactionUid());
                 }
 
+                const bool address_timing_eligible =
+                    sprMemoryDependence &&
+                    sprStoreAddressForwardLatency > Cycles(0) &&
+                    !request->isSplit() && canRetainLoadRequest(request) &&
+                    !request->mainReq()->isMasked() &&
+                    isOrdinaryStore(store_it) &&
+                    store_it->addressReadyTick() != MaxTick;
                 if (request->isAnyOutstandingRequest()) {
                     assert(request->_numOutstandingPackets > 0);
                     // There are memory requests packets in flight already.
@@ -3188,8 +3250,17 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                 // physical-byte validation.
                 const Cycles service = sprStoreForwardingLatency +
                     (shift_amt ? sprContainedForwardingExtraLatency : Cycles(0));
-                cpu->schedule(wb, service > Cycles(0) ?
-                    cpu->clockEdge(service) : curTick());
+                Tick ready = service > Cycles(0) ?
+                    cpu->clockEdge(service) : curTick();
+                if (address_timing_eligible) {
+                    const Tick address_ready = store_it->addressReadyTick() +
+                        cpu->cyclesToTicks(sprStoreAddressForwardLatency);
+                    if (address_ready > ready) {
+                        ready = address_ready;
+                        ++stats.storeAddressForwardDelayed;
+                    }
+                }
+                cpu->schedule(wb, ready);
 
                 // Don't need to do anything special for split loads.
                 ++stats.forwLoads;
@@ -3206,6 +3277,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
 
                 // Special accesses retain the conservative oldest-load wakeup.
                 const bool selective = canRetainLoadRequest(request);
+                if (selective && load_entry.noteForwardBlock())
+                    ++stats.storeForwardBlockedLoads;
                 if (selective) {
                     const bool retain = canRetainLoadRequest(request);
                     selectiveBlockedLoads.insert_or_assign(
@@ -3306,6 +3379,8 @@ LSQUnit::write(LSQRequest *request, uint8_t *data, ssize_t store_idx)
     storeQueue[store_idx].setRequest(request);
     unsigned size = request->_size;
     storeQueue[store_idx].size() = size;
+    if (sprStoreAddressForwardLatency > Cycles(0))
+        storeQueue[store_idx].addressReadyTick() = curTick();
     if (storeQueue[store_idx].instruction()->isStoreAddress()) {
         if (!storeQueue[store_idx].addressReady() &&
             !storeQueue[store_idx].dataReady())

@@ -43,9 +43,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
    int l2_select_num_banks;
    Cycles l1_request_latency := 2;
    Cycles l1_response_latency := 2;
+   Cycles l1_data_response_latency := 2;
    Cycles to_l2_latency := 1;
    RubyPrefetcher * prefetcher;
    bool enable_prefetch := "False";
+   // Bounded directory-only entries for clean shared lines still in L0.
+   // Zero disables this partial L1-only implementation.
+   int l1_only_capacity := 0;
    // Optional access-sequence candidate: allocation already inserted the line.
    MessageBuffer * prefetchQueue;
 
@@ -82,6 +86,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     EE, AccessPermission:Read_Write, desc="Line is present in exclusive state in L1 but not L0";
     M, AccessPermission:Maybe_Stale, desc="Line is present in modified state in L1 and present in L0", format="!b";
     MM, AccessPermission:Read_Write, desc="Line is present in modified state in L1 but not present in L0", format="!b";
+    L1_ONLY, AccessPermission:NotPresent, desc="Clean L0 copy, private L2 data way released";
+    L1_ONLY_INV, AccessPermission:Busy, desc="Waiting for clean L0 invalidation before dropping L1-only metadata";
 
     // Transient States
     IS, AccessPermission:Busy, desc="L1 idle, issued GETS, have not seen response yet";
@@ -131,6 +137,8 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     // other requests
     Fwd_GETX,   desc="GETX from other processor";
     Fwd_GETS,   desc="GETS from other processor";
+    CleanPeerHit, desc="A clean shared copy can supply a peer";
+    CleanPeerMiss, desc="A clean peer probe cannot be satisfied";
 
     Data,       desc="Data for processor";
     Data_Exclusive,       desc="Data for processor";
@@ -166,6 +174,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     DataBlock DataBlk,       desc="data for the block";
     bool Dirty, default="false",   desc="data is dirty";
     bool isPrefetched, default="false", desc="Line was brought by an L2 prefetch";
+  }
+
+  // The directory-only entry has no line data. Initially it is used only for
+  // a stable clean shared L0 copy; exclusive and modified lines retain the
+  // original inclusive path until their owner/data races are implemented.
+  structure(ShadowEntry, desc="Clean L0-only metadata", interface="AbstractCacheEntry", main="false") {
+    State CacheState, desc="Shadow coherence state";
   }
 
   // TBE fields
@@ -213,11 +228,17 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     return cache_entry;
   }
 
+  ShadowEntry getShadowEntry(Addr addr), return_by_pointer="yes" {
+    return static_cast(ShadowEntry, "pointer", cache.lookupDirectory(addr));
+  }
+
   State getState(TBE tbe, Entry cache_entry, Addr addr) {
     if(is_valid(tbe)) {
       return tbe.TBEState;
     } else if (is_valid(cache_entry)) {
       return cache_entry.CacheState;
+    } else if (is_valid(getShadowEntry(addr))) {
+      return getShadowEntry(addr).CacheState;
     }
     return State:I;
   }
@@ -230,6 +251,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
     if (is_valid(cache_entry)) {
       cache_entry.CacheState := state;
+    }
+    if (is_valid(getShadowEntry(addr))) {
+      getShadowEntry(addr).CacheState := state;
     }
   }
 
@@ -254,7 +278,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     TBE tbe := TBEs[addr];
     if(is_valid(tbe)) {
       testAndRead(addr, tbe.DataBlk, pkt);
-    } else {
+    } else if (is_valid(getCacheEntry(addr))) {
       testAndRead(addr, getCacheEntry(addr).DataBlk, pkt);
     }
   }
@@ -273,8 +297,10 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       return num_functional_writes;
     }
 
-    num_functional_writes := num_functional_writes +
-        testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+    if (is_valid(getCacheEntry(addr))) {
+      num_functional_writes := num_functional_writes +
+          testAndWrite(addr, getCacheEntry(addr).DataBlk, pkt);
+    }
     return num_functional_writes;
   }
 
@@ -384,12 +410,21 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         TBE tbe := TBEs[in_msg.addr];
 
         if (in_msg.Type == CoherenceRequestType:INV) {
-            if (is_valid(cache_entry) && inL0Cache(cache_entry.CacheState)) {
+            if ((is_valid(cache_entry) && inL0Cache(cache_entry.CacheState)) ||
+                is_valid(getShadowEntry(in_msg.addr))) {
                 trigger(Event:L0_Invalidate_Else, in_msg.addr,
                         cache_entry, tbe);
             }  else {
                 trigger(Event:Inv, in_msg.addr, cache_entry, tbe);
             }
+        } else if (is_valid(getShadowEntry(in_msg.addr)) &&
+                   (in_msg.Type == CoherenceRequestType:GETX ||
+                    in_msg.Type == CoherenceRequestType:UPGRADE ||
+                    in_msg.Type == CoherenceRequestType:GETS ||
+                    in_msg.Type == CoherenceRequestType:FLUSH_DATA)) {
+            // A clean shared shadow is not an owner and has no data to
+            // forward. Do not silently answer an unexpected owner request.
+            error("Unsupported owner/flush request for clean L1-only shadow");
         } else if (in_msg.Type == CoherenceRequestType:GETX ||
                    in_msg.Type == CoherenceRequestType:UPGRADE) {
             if (is_valid(cache_entry) && inL0Cache(cache_entry.CacheState)) {
@@ -397,6 +432,18 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
                         cache_entry, tbe);
             } else {
                 trigger(Event:Fwd_GETX, in_msg.addr, cache_entry, tbe);
+            }
+        } else if (in_msg.Type == CoherenceRequestType:GETS_CLEAN_PEER) {
+            // Directory sharer bits may be stale, and a private transition
+            // can race this probe. Only a stable, clean shared entry is a
+            // safe source; every other state returns an explicit NACK.
+            if (is_valid(cache_entry) && is_invalid(tbe) &&
+                !cache_entry.Dirty &&
+                (cache_entry.CacheState == State:S ||
+                 cache_entry.CacheState == State:SS)) {
+                trigger(Event:CleanPeerHit, in_msg.addr, cache_entry, tbe);
+            } else {
+                trigger(Event:CleanPeerMiss, in_msg.addr, cache_entry, tbe);
             }
         } else if (in_msg.Type == CoherenceRequestType:GETS) {
             if (is_valid(cache_entry) && inL0Cache(cache_entry.CacheState)) {
@@ -429,6 +476,13 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
             cache.recordFillBlocked();
             messageBufferFromL0_in.recycle(clockEdge(),
                                            cyclesToTicks(intToCycles(1)));
+        } else if (is_valid(getShadowEntry(in_msg.addr)) &&
+                   (in_msg.Class == CoherenceClass:PUTX ||
+                    in_msg.Class == CoherenceClass:PUTX_COPY ||
+                    in_msg.Class == CoherenceClass:INV_DATA ||
+                    in_msg.Class == CoherenceClass:NAK ||
+                    in_msg.Class == CoherenceClass:FLUSH_DATA)) {
+            error("Unsupported L0 data/owner message for clean L1-only shadow");
         } else if(in_msg.Class == CoherenceClass:INV_DATA) {
             trigger(Event:L0_DataAck, in_msg.addr, cache_entry, tbe);
         }  else if (in_msg.Class == CoherenceClass:NAK) {
@@ -437,6 +491,15 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
               trigger(Event:L0_DataCopy, in_msg.addr, cache_entry, tbe);
         }  else if (in_msg.Class == CoherenceClass:INV_ACK) {
             trigger(Event:L0_Ack, in_msg.addr, cache_entry, tbe);
+        }  else if (is_valid(getShadowEntry(in_msg.addr)) &&
+                    (in_msg.Class == CoherenceClass:GETS ||
+                     in_msg.Class == CoherenceClass:GETX ||
+                     in_msg.Class == CoherenceClass:UPGRADE ||
+                     in_msg.Class == CoherenceClass:FLUSH ||
+                     in_msg.Class == CoherenceClass:FLUSH_NP)) {
+            // Reclaim the L0 copy first, then retry the original request as
+            // a miss; the shadow does not contain data for local replies.
+            trigger(Event:L0_Invalidate_Own, in_msg.addr, cache_entry, tbe);
         }  else if (in_msg.Class == CoherenceClass:FLUSH) {
             trigger(Event:Flush, in_msg.addr, cache_entry, tbe);
         }  else if (in_msg.Class == CoherenceClass:FLUSH_NP) {
@@ -459,7 +522,11 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
                     Entry victim_entry := getCacheEntry(victim);
                     TBE victim_tbe := TBEs[victim];
 
-                    if (is_valid(victim_entry) && inL0Cache(victim_entry.CacheState)) {
+                    if (is_valid(victim_entry) &&
+                        victim_entry.CacheState == State:S && !victim_entry.Dirty &&
+                        l1_only_capacity > 0 && cache.directorySize() < l1_only_capacity) {
+                        trigger(Event:L1_Replacement, victim, victim_entry, victim_tbe);
+                    } else if (is_valid(victim_entry) && inL0Cache(victim_entry.CacheState)) {
                         trigger(Event:L0_Invalidate_Own,
                                 victim, victim_entry, victim_tbe);
                     }  else {
@@ -508,6 +575,9 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
                victim_state != State:MM)) {
             prefetcher.prefetchDropped(in_msg.LineAddress);
             prefetchQueue_in.dequeue(clockEdge());
+          } else if (victim_state == State:S && !victim_entry.Dirty &&
+                     l1_only_capacity > 0 && cache.directorySize() < l1_only_capacity) {
+            trigger(Event:L1_Replacement, victim, victim_entry, victim_tbe);
           } else if (inL0Cache(victim_state)) {
             trigger(Event:L0_Invalidate_Own, victim, victim_entry, victim_tbe);
           } else {
@@ -682,6 +752,17 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         out_msg.Destination.add(in_msg.Requestor);
         out_msg.MessageSize := MessageSizeType:Response_Data;
       }
+    }
+  }
+
+  action(cp_sendCleanPeerNack, "cpn", desc="NACK a clean peer probe") {
+    enqueue(responseNetwork_out, ResponseMsg, l1_response_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:CLEAN_PEER_NACK;
+      out_msg.Sender := machineID;
+      out_msg.Destination.add(mapAddressToModulo(address, MachineType:L2Cache,
+                          l2_select_low_bit, l2_select_num_banks, clusterID));
+      out_msg.MessageSize := MessageSizeType:Response_Control;
     }
   }
 
@@ -959,7 +1040,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(h_data_to_l0, "h", desc="If not prefetch, send data to the L0 cache.") {
-      enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
+      enqueue(bufferToL0_out, CoherenceMsg, l1_data_response_latency) {
           assert(is_valid(cache_entry));
 
           out_msg.addr := address;
@@ -993,7 +1074,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   action(hh_xdata_to_l0, "\h", desc="If not prefetch, notify sequencer that store completed.") {
-      enqueue(bufferToL0_out, CoherenceMsg, l1_response_latency) {
+      enqueue(bufferToL0_out, CoherenceMsg, l1_data_response_latency) {
           assert(is_valid(cache_entry));
 
           out_msg.addr := address;
@@ -1161,6 +1242,19 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
       cache.deallocate(address);
     }
     unset_cache_entry();
+  }
+
+  action(sh_keepCleanL0Directory, "sh", desc="Release private L2 data and retain bounded L0 metadata") {
+    assert(is_valid(cache_entry) && !cache_entry.Dirty);
+    assert(is_invalid(getShadowEntry(address)));
+    cache.allocateDirectory(address, new ShadowEntry);
+    cache.deallocate(address);
+    unset_cache_entry();
+  }
+
+  action(sd_dropCleanL0Directory, "sd", desc="Drop shadow after L0 invalidation ack") {
+    assert(is_valid(getShadowEntry(address)));
+    cache.deallocateDirectory(address);
   }
 
   action(oo_allocateCacheBlock, "\o", desc="Set cache tag equal to tag of block B.") {
@@ -1379,6 +1473,47 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   transition(I, Inv) {
     fi_sendInvAck;
     l_popL2RequestQueue;
+  }
+
+  // A stable clean shared private-L2 copy can serve without invalidating L0.
+  // Busy/absent states return NACK rather than assuming stale directory bits.
+  transition({S, SS}, CleanPeerHit) {
+    d_sendDataToRequestor;
+    l_popL2RequestQueue;
+  }
+
+  transition({I, S, SS, E, EE, M, MM, L1_ONLY, L1_ONLY_INV,
+              IS, IM, SM, IS_I, PF_IS, PF_IS_I,
+              M_I, SINK_WB_ACK, S_IL0, E_IL0, M_IL0, MM_IL0, SM_IL0,
+              I_F, V_F, D_F}, CleanPeerMiss) {
+    cp_sendCleanPeerNack;
+    l_popL2RequestQueue;
+  }
+
+  transition(S, L1_Replacement, L1_ONLY) {
+    sh_keepCleanL0Directory;
+  }
+
+  transition(L1_ONLY, L0_Invalidate_Own, L1_ONLY_INV) {
+    forward_eviction_to_L0_own;
+  }
+
+  transition(L1_ONLY, L0_Invalidate_Else, L1_ONLY_INV) {
+    forward_eviction_to_L0_else;
+  }
+
+  transition(L1_ONLY_INV, L0_Invalidate_Own) {
+    z0_stallAndWaitL0Queue;
+  }
+
+  transition(L1_ONLY_INV, L0_Invalidate_Else) {
+    z2_stallAndWaitL2Queue;
+  }
+
+  transition(L1_ONLY_INV, L0_Ack, I) {
+    sd_dropCleanL0Directory;
+    k_popL0RequestQueue;
+    kd_wakeUpDependents;
   }
 
   // Transitions from Shared

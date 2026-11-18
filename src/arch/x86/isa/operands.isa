@@ -161,6 +161,8 @@ def operands {{
         'ShiftState': IntReg('X86ISA::intRegMicro(3)', 13),
         'DivisionSign': IntReg('X86ISA::intRegMicro(12)', 13),
         'RepCount':     IntReg('X86ISA::intRegMicro(3)', 13),
+        'RepLeft':      IntReg('X86ISA::intRegMicro(1)', 38),
+        'RepRight':     IntReg('X86ISA::intRegMicro(2)', 39),
         'RepWord0':     IntReg('X86ISA::intRegMicro(5)', 30),
         'RepWord1':     IntReg('X86ISA::intRegMicro(6)', 31),
         'RepWord2':     IntReg('X86ISA::intRegMicro(7)', 32),

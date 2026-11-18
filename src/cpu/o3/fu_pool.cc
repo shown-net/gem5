@@ -39,10 +39,9 @@
  */
 
 #include "cpu/o3/fu_pool.hh"
-#include <algorithm>
-#include <limits>
 
 #include <algorithm>
+#include <limits>
 #include <sstream>
 
 #include "cpu/func_unit.hh"
@@ -166,64 +165,6 @@ FUPool::portMask(const DynInstPtr &inst) const
     return mask;
 }
 
-void
-FUPool::startAllocationCycle(Cycles cycle)
-{
-    if (!haveBindingCycle || bindingCycle != cycle) {
-        // Dispatches in the preceding cycle have already removed their load.
-        // Keep this snapshot unchanged throughout the current admission batch.
-        allocationLoadSnapshot = pendingPortLoads;
-        batchMaskUses.clear();
-        bindingCycle = cycle;
-        haveBindingCycle = true;
-    }
-}
-
-void
-FUPool::bindPort(const DynInstPtr &inst, Cycles cycle)
-{
-    assert(inst->boundExecutionPort == -1);
-    if (inst->repFunctional()) return;
-    const uint16_t mask = portMask(inst);
-    if (!mask)
-        return;
-    startAllocationCycle(cycle);
-    std::array<unsigned, 12> candidates;
-    auto candidates_end = candidates.begin();
-    for (unsigned port = 0; port < 12; ++port)
-        if (mask & (1u << port)) *candidates_end++ = port;
-    std::sort(candidates.begin(), candidates_end, [this](auto a, auto b) {
-        return allocationLoadSnapshot[a] != allocationLoadSnapshot[b] ?
-            allocationLoadSnapshot[a] < allocationLoadSnapshot[b] : a > b;
-    });
-    const unsigned minimum = allocationLoadSnapshot[candidates.front()];
-    candidates_end = std::remove_if(candidates.begin(), candidates_end,
-        [this, minimum](auto p) {
-            return allocationLoadSnapshot[p] >= minimum + 5;
-        });
-    auto uses = std::find_if(batchMaskUses.begin(), batchMaskUses.end(),
-        [mask](const auto &entry) { return entry.first == mask; });
-    if (uses == batchMaskUses.end()) {
-        batchMaskUses.emplace_back(mask, 0);
-        uses = batchMaskUses.end() - 1;
-    }
-    const unsigned port =
-        candidates[uses->second++ % (candidates_end - candidates.begin())];
-    inst->boundExecutionPort = port;
-    ++pendingPortLoads[port];
-}
-
-void
-FUPool::releasePortBinding(const DynInstPtr &inst)
-{
-    if (inst->boundExecutionPort < 0)
-        return;
-    const unsigned port = inst->boundExecutionPort;
-    assert(port < pendingPortLoads.size() && pendingPortLoads[port]);
-    --pendingPortLoads[port];
-    inst->boundExecutionPort = -1;
-}
-
 bool
 FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
                      std::function<void()> available, std::function<void()> complete,
@@ -244,8 +185,7 @@ FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
             cpu, forwarding, inst, 12, available, complete);
         return true;
     }
-    const uint16_t candidates = inst->boundExecutionPort >= 0 ?
-        1u << inst->boundExecutionPort : portMask(inst);
+    const uint16_t candidates = portMask(inst);
     const auto grant_family = inst->fusedLeader() ? IntExecutionFamily::Branch : info.family;
     const auto resourceAt = [this, &info](unsigned port) -> IntExecutionResource * {
         return info.family == IntExecutionFamily::ALU && individualALUs
@@ -282,10 +222,6 @@ FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
 void
 FUPool::takeOverFrom()
 {
-    pendingPortLoads.fill(0);
-    allocationLoadSnapshot.fill(0);
-    batchMaskUses.clear();
-    haveBindingCycle = false;
     std::fill(fpDividerLastClass.begin(), fpDividerLastClass.end(), No_OpClass);
     if (forwarding)
         forwarding->reset();
@@ -463,8 +399,7 @@ FUPool::getOpLatency(const DynInstPtr &inst)
 int
 FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cycle,
                Cycles &op_latency,
-               bool store, bool branch,
-               int bound_port)
+               bool store, bool branch)
 {
     //  If this pool doesn't have the specified capability,
     //  return this information to the caller
@@ -472,18 +407,7 @@ FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cyc
         return NoCapableFU;
 
     int data_idx = -1;
-    if (store && !storeDataPorts.empty()) {
-        for (auto index : storeDataPorts) {
-            if (!unitBusy[index] && (!executionPorts ||
-                executionPorts->get(index)->available(curTick()))) {
-                data_idx = index;
-                break;
-            }
-        }
-        if (data_idx < 0) return NoFreeFU;
-    }
-
-    int fu_idx = bound_port >= 0 ? bound_port : fuPerCapList[capability].getFU();
+    int fu_idx = fuPerCapList[capability].getFU();
     int start_idx = fu_idx;
     const bool fp_divide = capability == FloatDivOp ||
         capability == SimdFloatDivOp || capability == X86FloatSqrt32Op ||
@@ -496,24 +420,46 @@ FUPool::getUnit(CPU *cpu, const DynInstPtr &inst, OpClass capability, Cycles cyc
     const uint16_t vector_ports = executionPorts ?
         inst->staticInst->vectorExecutionPorts() : 0;
 
-    // Iterate through the circular queue if needed, stopping if we've reached
-    // the first element again.
-    while ((vector_ports && !(vector_ports & (1u << fu_idx))) ||
-           unitBusy[fu_idx] || cycle < nextIssue[fu_idx][capability] ||
-           !dividerAvailable(fu_idx) ||
-           fu_idx == data_idx ||
-           (executionPorts && !executionPorts->get(fu_idx)->available(curTick())) ||
-           (branch && !branchPorts.empty() &&
-            std::find(branchPorts.begin(), branchPorts.end(), fu_idx) ==
-                branchPorts.end())) {
-        if (bound_port >= 0)
-            return NoFreeFU;
+    // Port choice occurs at issue: check the forwarding path for each
+    // candidate rather than pinning the instruction during IQ admission.
+    Tick earliest_path = std::numeric_limits<Tick>::max();
+    while (true) {
+        const bool compatible =
+            (!vector_ports || (vector_ports & (1u << fu_idx))) &&
+            (!branch || branchPorts.empty() ||
+             std::find(branchPorts.begin(), branchPorts.end(), fu_idx) !=
+                 branchPorts.end());
+        const Tick ready = compatible && cpu->resultForwarding ?
+            cpu->resultForwarding->availableAt(inst, executionPorts ? fu_idx : 12) :
+            compatible ? curTick() : std::numeric_limits<Tick>::max();
+        earliest_path = std::min(earliest_path, ready);
+        data_idx = -1;
+        if (store && !storeDataPorts.empty()) {
+            for (auto index : storeDataPorts) {
+                if (index != static_cast<unsigned>(fu_idx) && !unitBusy[index] &&
+                    (!executionPorts ||
+                     executionPorts->get(index)->available(curTick()))) {
+                    data_idx = index;
+                    break;
+                }
+            }
+        }
+        if (compatible && ready <= curTick() && !unitBusy[fu_idx] &&
+            cycle >= nextIssue[fu_idx][capability] && dividerAvailable(fu_idx) &&
+            (!store || storeDataPorts.empty() || data_idx >= 0) && (!executionPorts ||
+            executionPorts->get(fu_idx)->available(curTick())))
+            break;
         fu_idx = fuPerCapList[capability].getFU();
         if (fu_idx == start_idx) {
-            // No FU available
+            if (cpu->resultForwarding && earliest_path > curTick() &&
+                earliest_path != std::numeric_limits<Tick>::max())
+                cpu->resultForwarding->defer(inst, earliest_path);
             return NoFreeFU;
         }
     }
+
+    if (cpu->resultForwarding)
+        cpu->resultForwarding->clearWait(inst);
 
     assert(fu_idx < numFU);
 
@@ -641,9 +587,6 @@ FUPool::dump()
 bool
 FUPool::isDrained() const
 {
-    if (std::any_of(pendingPortLoads.begin(), pendingPortLoads.end(),
-                    [](unsigned load) { return load != 0; }))
-        return false;
     for (auto unit : integerALUs)
         if (unit && !unit->empty())
             return false;

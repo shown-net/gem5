@@ -228,6 +228,14 @@ structure (CacheMemory, external = "yes") {
   AbstractCacheEntry lookupDirectory(Addr);
   AbstractCacheEntry allocateDirectory(Addr, AbstractCacheEntry);
   void deallocateDirectory(Addr);
+  int directorySize();
+  bool sfEnabled();
+  bool sfContains(Addr);
+  bool sfHasSpace(Addr);
+  Addr sfVictim(Addr);
+  void sfAllocate(Addr);
+  void sfTouch(Addr);
+  void sfRelease(Addr);
   bool cacheAvail(Addr);
   Addr cacheProbe(Addr);
   AbstractCacheEntry getNullEntry();
@@ -246,6 +254,9 @@ structure (CacheMemory, external = "yes") {
   void recordRequestType(CacheRequestType, Addr);
   void profileNativeRequest(int, bool, bool);
   void profileNativeReadAccess(int);
+  void profileLlcLookup(NodeID, bool);
+  void profileLlcReadRequest();
+  void profileLlcWriteRequest();
     void beginOffcoreOwnership(Addr, int);
     void endOffcoreOwnership(Addr);
     void profileDataReplacement(Addr);

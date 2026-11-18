@@ -1478,9 +1478,6 @@ void
 IEW::tick()
 {
 
-    for (FUPool *fu_pool : fuPools)
-        fu_pool->startAllocationCycle(cpu->curCycle());
-
     wroteToTimeBuffer = false;
     updatedQueues = false;
 

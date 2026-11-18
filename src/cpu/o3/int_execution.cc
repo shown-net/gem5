@@ -724,8 +724,7 @@ IntegerDivider::issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
     cpu = owner;
     const auto info = inst->staticInst->intDivide();
     assert((info.bytes == 4 || info.bytes == 8) && inst->numDestRegs() == 2);
-    const unsigned candidates = inst->boundExecutionPort >= 0 ?
-        1u << inst->boundExecutionPort : inst->staticInst->intExecution().ports;
+    const unsigned candidates = inst->staticInst->intExecution().ports;
     unsigned eligible = 0;
     for (unsigned p = 0; p < 12; ++p)
         if ((candidates & (1u << p)) && pool->portAvailable(p, curTick()) &&
@@ -736,7 +735,6 @@ IntegerDivider::issue(CPU *owner, ResultForwarding *forwarding, FUPool *pool,
     if (port < 0) return false;
     pool->sharedPorts()->commit(IntExecutionFamily::Divider, candidates, port, curTick());
     cpu->recordExecutionAction(inst, port);
-    pool->releasePortBinding(inst);
     inst->divisionManaged = true;
     auto op = std::make_shared<Operation>();
     op->inst = inst;

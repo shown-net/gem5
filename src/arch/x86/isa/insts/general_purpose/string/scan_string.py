@@ -52,46 +52,32 @@ def macroop SCAS_M {
 # unrolling.
 #
 
-def macroop SCAS_E_M {
-    and t0, rcx, rcx, flags=(EZF,), dataSize=asz
-    br label("end"), flags=(CEZF,)
-
-    # Find the constant we need to either add or subtract from rdi
-    ruflag t0, 10
-    movi t2, t2, dsz, flags=(CEZF,), dataSize=asz
-    subi t3, t0, dsz, dataSize=asz
-    mov t2, t2, t3, flags=(nCEZF,), dataSize=asz
-
-topOfLoop:
-    ld t1, es, [1, t0, rdi]
-    sub t0, rax, t1, flags=(OF, SF, ZF, AF, PF, CF)
-
-    subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    add rdi, rdi, t2, dataSize=asz
-    br label("topOfLoop"), flags=(CSTRZnEZF,)
-end:
-    fault "NoFault"
-};
-
-def macroop SCAS_N_M {
-    and t0, rcx, rcx, flags=(EZF,), dataSize=asz
-    br label("end"), flags=(CEZF,)
-
-    # Find the constant we need to either add or subtract from rdi
-    ruflag t0, 10
-    movi t2, t2, dsz, flags=(CEZF,), dataSize=asz
-    subi t3, t0, dsz, dataSize=asz
-    mov t2, t2, t3, flags=(nCEZF,), dataSize=asz
-
-topOfLoop:
-    ld t1, es, [1, t0, rdi]
-    sub t0, rax, t1, flags=(OF, SF, ZF, AF, PF, CF)
-
-    subi rcx, rcx, 1, flags=(EZF,), dataSize=asz
-    add rdi, rdi, t2, dataSize=asz
-    br label("topOfLoop"), flags=(CSTRnZnEZF,)
-end:
-    fault "NoFault"
-};
-
 """
+
+rep_microcode = """
+def macroop SCAS_REP_MODE_M {
+    repstart label("end"), dataSize=asz
+    repselectscan label("ordinary"), dataSize=asz
+bulk:
+    ldrepcompareright t0, es, [1, t0, rdi]
+    repprogressscan label("bulk"), label("ordinary"), dataSize=asz
+    br label("finish")
+ordinary:
+    ruflag t0, 10
+    movi t4, t4, dsz, flags=(CEZF,), dataSize=asz
+    subi t3, t0, dsz, dataSize=asz
+    mov t4, t4, t3, flags=(nCEZF,), dataSize=asz
+
+topOfLoop:
+    ld t2, es, [1, t0, rdi]
+    subi rcx, rcx, 1, dataSize=asz
+    add rdi, rdi, t4, dataSize=asz
+    repcheckscan label("topOfLoop"), dataSize=asz
+finish:
+    sub t0, rax, t2, flags=(OF, SF, ZF, AF, PF, CF)
+end:
+    fault "NoFault"
+};
+"""
+microcode += rep_microcode.replace("REP_MODE", "E")
+microcode += rep_microcode.replace("REP_MODE", "N")

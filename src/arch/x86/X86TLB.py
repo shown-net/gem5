@@ -83,8 +83,17 @@ class X86TLB(BaseTLB):
     spr_shared_index_shift = Param.Unsigned(
         0, "4K VPN XOR fold: 8 folds every byte; other nonzero values fold once"
     )
+    spr_shared_high_parity = Param.Bool(
+        False, "Experimental 4K STLB domain fold using high VPN parity"
+    )
     spr_split_l1 = Param.Bool(False, "SPR first-level page-size and data-access replacement domains")
+    spr_dtlb_4k_pair_replacement = Param.Bool(
+        False, "Use the measured three-pair replacement candidate for the 96-entry 4K DTLB"
+    )
     next_level_hit_latency = Param.Cycles(7, "Modeled next-level TLB hit latency")
+    next_level_miss_latency = Param.Cycles(
+        0, "Modeled next-level TLB miss determination before starting a walk"
+    )
     system = Param.System(Parent.any, "system object")
     walker = Param.X86PagetableWalker(
         X86PagetableWalker(), "page table walker"

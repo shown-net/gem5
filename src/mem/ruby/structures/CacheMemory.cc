@@ -41,6 +41,8 @@
 
 #include "mem/ruby/structures/CacheMemory.hh"
 
+#include <algorithm>
+
 #include "base/intmath.hh"
 #include "base/logging.hh"
 #include "mem/ruby/slicc_interface/AbstractController.hh"
@@ -74,6 +76,7 @@ CacheMemory::CacheMemory(const Params &p)
     dataArray(p.dataArrayBanks, p.dataAccessLatency, p.start_index_bit),
     tagArray(p.tagArrayBanks, p.tagAccessLatency, p.start_index_bit),
     atomicALUArray(p.atomicALUs, p.atomicLatency),
+    llcRequestorCount(p.llc_requestor_count),
     l1DataService(p.fill_install_bytes_per_cycle),
     cacheMemoryStats(this)
 {
@@ -83,6 +86,10 @@ CacheMemory::CacheMemory(const Params &p)
     m_start_index_bit = p.start_index_bit;
     m_index_divisor = p.index_divisor;
     fatal_if(!m_index_divisor, "Cache index divisor must be positive");
+    fatal_if((p.sf_num_sets == 0) != (p.sf_assoc == 0),
+             "Snoop filter sets and associativity must both be zero or positive");
+    sfWays = p.sf_assoc;
+    sfSets.resize(p.sf_num_sets);
     m_is_instruction_only_cache = p.is_icache;
     m_resource_stalls = p.resourceStalls;
     m_block_size = p.block_size;  // may be 0 at this point. Updated in init()
@@ -423,6 +430,86 @@ CacheMemory::addressToCacheSet(Addr address) const
     }
     // Exclude the block offset and any bank-selection bits before indexing.
     return (address >> m_start_index_bit) % m_cache_num_sets;
+}
+
+size_t
+CacheMemory::addressToSfSet(Addr address) const
+{
+    assert(address == makeLineAddress(address));
+    assert(sfEnabled());
+    // Keep the same slice folding/divisor as the data cache, but use the
+    // filter's independent set count rather than the data-way geometry.
+    const Addr line = sprL3IndexLine(address >> m_start_index_bit,
+                                    m_index_divisor);
+    return (line / m_index_divisor) % sfSets.size();
+}
+
+bool
+CacheMemory::sfContains(Addr address) const
+{
+    if (!sfEnabled())
+        return false;
+    const auto &set = sfSets[addressToSfSet(address)];
+    return std::find(set.begin(), set.end(), address) != set.end();
+}
+
+bool
+CacheMemory::sfHasSpace(Addr address) const
+{
+    if (!sfEnabled())
+        return true;
+    const auto &set = sfSets[addressToSfSet(address)];
+    return set.size() < sfWays ||
+        std::find(set.begin(), set.end(), address) != set.end();
+}
+
+Addr
+CacheMemory::sfVictim(Addr address) const
+{
+    panic_if(!sfEnabled(), "Cannot select a victim from a disabled snoop filter");
+    const auto &set = sfSets[addressToSfSet(address)];
+    panic_if(set.size() < sfWays || sfContains(address),
+             "Snoop-filter victim requested for a non-full insertion");
+    return set.front();
+}
+
+void
+CacheMemory::sfAllocate(Addr address)
+{
+    if (!sfEnabled())
+        return;
+    auto &set = sfSets[addressToSfSet(address)];
+    const auto old = std::find(set.begin(), set.end(), address);
+    if (old != set.end()) {
+        set.erase(old);
+    } else {
+        panic_if(set.size() >= sfWays,
+                 "Snoop-filter insertion attempted before victim release");
+    }
+    set.push_back(address);
+}
+
+void
+CacheMemory::sfTouch(Addr address)
+{
+    if (!sfEnabled())
+        return;
+    auto &set = sfSets[addressToSfSet(address)];
+    const auto it = std::find(set.begin(), set.end(), address);
+    panic_if(it == set.end(), "Touch of missing snoop-filter entry %#x", address);
+    set.erase(it);
+    set.push_back(address);
+}
+
+void
+CacheMemory::sfRelease(Addr address)
+{
+    if (!sfEnabled())
+        return;
+    auto &set = sfSets[addressToSfSet(address)];
+    const auto it = std::find(set.begin(), set.end(), address);
+    panic_if(it == set.end(), "Release of missing snoop-filter entry %#x", address);
+    set.erase(it);
 }
 
 // Given a cache index: returns the index of the tag in a set.
@@ -934,6 +1021,10 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
       ADD_STAT(offcoreDemandRfoCycles, "Core cycles with a private L2 demand ownership transaction pending"),
       ADD_STAT(offcorePrepareRequests, "Store_Prepare ownership transactions sent to the shared hierarchy"),
       ADD_STAT(offcoreSoftwareRfoRequests, "Software-prefetch ownership transactions sent to the shared hierarchy"),
+      ADD_STAT(llcCoreReferences, "Accepted shared LLC data lookups by private-cache requestor"),
+      ADD_STAT(llcCoreMisses, "Accepted shared LLC data misses by private-cache requestor"),
+      ADD_STAT(llcLocalMemoryReads, "Shared LLC line fetches issued to the local memory directory"),
+      ADD_STAT(llcLocalMemoryWrites, "Dirty shared LLC lines issued to the local memory directory"),
       ADD_STAT(htmTransCommitReadSet, "Read set size of a committed "
                                       "transaction"),
       ADD_STAT(htmTransCommitWriteSet, "Write set size of a committed "
@@ -951,6 +1042,8 @@ CacheMemoryStats::CacheMemoryStats(CacheMemory *parent)
                m_prefetch_hits + m_prefetch_misses),
       ADD_STAT(m_accessModeType, "")
 {
+    llcCoreReferences.init(std::max(1u, owner->llcRequestorCount));
+    llcCoreMisses.init(std::max(1u, owner->llcRequestorCount));
     numDataArrayReads
         .flags(statistics::nozero);
 
@@ -1196,6 +1289,28 @@ void
 CacheMemory::profileDemandMiss()
 {
     cacheMemoryStats.m_demand_misses++;
+}
+
+void
+CacheMemory::profileLlcLookup(int requestor, bool miss)
+{
+    if (requestor < 0 || unsigned(requestor) >= llcRequestorCount)
+        return;
+    ++cacheMemoryStats.llcCoreReferences[requestor];
+    if (miss)
+        ++cacheMemoryStats.llcCoreMisses[requestor];
+}
+
+void
+CacheMemory::profileLlcReadRequest()
+{
+    ++cacheMemoryStats.llcLocalMemoryReads;
+}
+
+void
+CacheMemory::profileLlcWriteRequest()
+{
+    ++cacheMemoryStats.llcLocalMemoryWrites;
 }
 
 void

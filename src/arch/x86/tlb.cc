@@ -73,8 +73,13 @@ TLB::TLB(const Params &p)
       smallPageWays(p.dtlb_4k_ways ? p.dtlb_4k_ways : p.itlb_4k_ways),
       sprSharedDomains(p.spr_shared_domains),
       sprSharedIndexShift(p.spr_shared_index_shift),
+      sprSharedHighParity(p.spr_shared_high_parity),
       sprSplitL1(p.spr_split_l1),
+      sprDtlb4kPairReplacement(p.spr_dtlb_4k_pair_replacement),
       nextLevelHitLatency(p.next_level_hit_latency),
+      nextLevelMissLatency(p.next_level_miss_latency),
+      nextLevelResponseEvent([this] { serviceNextLevelResponses(); },
+                             name() + ".nextLevelResponses"),
       tlb(size), lruSeq(0), m5opRange(p.system->m5opRange()), stats(this)
 {
     if (!size)
@@ -89,6 +94,12 @@ TLB::TLB(const Params &p)
              "SPR shared TLB proxy requires 2048 entries");
     fatal_if(sprSharedIndexShift >= 64,
              "Shared TLB index fold must be less than 64 bits");
+    fatal_if(sprSharedHighParity && !sprSharedDomains,
+             "Shared TLB high parity requires SPR shared domains");
+    fatal_if(sprDtlb4kPairReplacement &&
+             (!sprSplitL1 || type() != TypeTLB::data ||
+              baseSize != 96 || smallPageWays != 6),
+             "The DTLB pair candidate requires the 96-entry, six-way SPR data TLB");
     if (nextLevel() && type() == TypeTLB::instruction)
         itlbMissStats = std::make_unique<ItlbMissStats>(this);
     if (type() == TypeTLB::data) {
@@ -103,6 +114,47 @@ TLB::TLB(const Params &p)
 
     walker = p.walker;
     walker->setTLB(this);
+}
+
+void
+TLB::queueNextLevelResponse(BaseCPU *cpu, Tick when,
+                            std::function<void()> response)
+{
+    // An L1 TLB belongs to a CPU event queue. Do not silently combine events
+    // from different queues if a configuration shares it across CPUs.
+    panic_if(nextLevelResponseCpu &&
+             nextLevelResponseCpu->eventQueue() != cpu->eventQueue(),
+             "Delayed TLB responses cannot span CPU event queues");
+    nextLevelResponseCpu = cpu;
+    nextLevelResponses[when].push_back(std::move(response));
+    if (servingNextLevelResponses)
+        return;
+    const Tick earliest = nextLevelResponses.begin()->first;
+    if (!nextLevelResponseEvent.scheduled())
+        cpu->schedule(nextLevelResponseEvent, earliest);
+    else if (earliest < nextLevelResponseEvent.when())
+        cpu->reschedule(nextLevelResponseEvent, earliest);
+}
+
+void
+TLB::serviceNextLevelResponses()
+{
+    servingNextLevelResponses = true;
+    while (!nextLevelResponses.empty() &&
+           nextLevelResponses.begin()->first <= curTick()) {
+        auto it = nextLevelResponses.begin();
+        auto response = std::move(it->second.back());
+        it->second.pop_back();
+        if (it->second.empty())
+            nextLevelResponses.erase(it);
+        response();
+    }
+    servingNextLevelResponses = false;
+    if (!nextLevelResponses.empty())
+        nextLevelResponseCpu->schedule(nextLevelResponseEvent,
+                                       nextLevelResponses.begin()->first);
+    else
+        nextLevelResponseCpu = nullptr;
 }
 
 TLB::ItlbMissStats::ItlbMissStats(statistics::Group *parent)
@@ -136,6 +188,15 @@ unsigned
 TLB::sharedSet(Addr vpn, unsigned log_bytes) const
 {
     Addr page = vpn >> log_bytes;
+    if (log_bytes == 12 && sprSharedHighParity) {
+        // Candidate constrained by 32/64 MiB and larger-stride probes:
+        // the set sees VPN[13:0], while all higher bits can select a
+        // support domain. This is not a recovered SPR indexing function.
+        const unsigned set = unsigned((page ^ (page >> 7)) & 127);
+        const unsigned domain = ((page >> 7) ^
+                                 __builtin_parityll(page >> 14)) & 1;
+        return domain * 128 + set;
+    }
     if (log_bytes == 12 && sprSharedIndexShift == 8) {
         // Fold every byte of the unsigned virtual page number.  The final
         // low eight bits select the two modeled domains and their sets.
@@ -194,6 +255,48 @@ TLB::insert(Addr vpn, const TlbEntry &entry, uint64_t pcid, bool fillNextLevel,
         const bool store = data && mode == BaseMMU::Write;
         TlbEntryTrie &index = store ? storeTrie : trie;
         if (auto *existing = index.lookup(key)) return existing;
+
+        if (sprDtlb4kPairReplacement && !store && entry.logBytes == 12) {
+            // Place each set in six fixed slots: two ways per pair.
+            // A hit or insertion selects the following pair for replacement;
+            // within that pair, select the less recently used entry.
+            const unsigned set = (vpn >> 12) % smallPageNextPair.size();
+            const unsigned first_slot = set * 6;
+            unsigned pair = smallPageNextPair[set];
+            auto has_free_way = [&](unsigned p) {
+                return !tlb[first_slot + p].trieHandle ||
+                       !tlb[first_slot + p + 3].trieHandle;
+            };
+            // Keep an empty way before evicting a live entry after invalidation.
+            if (!has_free_way(pair)) {
+                for (unsigned offset = 1; offset < 3; ++offset) {
+                    const unsigned candidate = (pair + offset) % 3;
+                    if (has_free_way(candidate)) {
+                        pair = candidate;
+                        break;
+                    }
+                }
+            }
+            auto *a = &tlb[first_slot + pair];
+            auto *b = &tlb[first_slot + pair + 3];
+            TlbEntry *chosen = !a->trieHandle ? a : !b->trieHandle ? b :
+                a->lruSeq < b->lruSeq ? a : b;
+            if (chosen->trieHandle)
+                removeEntry(chosen);
+            auto free = std::find(freeList.begin(), freeList.end(), chosen);
+            panic_if(free == freeList.end(), "DTLB pair entry missing from free list");
+            freeList.erase(free);
+            *chosen = entry;
+            chosen->vaddr = vpn;
+            chosen->pcid = pcid;
+            chosen->lruSeq = nextSeq();
+            chosen->trieHandle = index.insert(key, FullSystem ?
+                TlbEntryTrie::MaxBits - entry.logBytes : TlbEntryTrie::MaxBits, chosen);
+            smallPageNextPair[set] = (pair + 1) % 3;
+            if (fillNextLevel && nextLevel())
+                static_cast<TLB *>(nextLevel())->insert(entry.vaddr, entry, pcid);
+            return chosen;
+        }
 
         unsigned first = 0, last = baseSize;
         const bool large = entry.logBytes == 21 || entry.logBytes == 22;
@@ -338,6 +441,11 @@ TLB::lookup(Addr va, bool update_lru, BaseMMU::Mode mode)
     if (entry && update_lru) {
         entry->lruSeq = nextSeq();
         const unsigned pos = unsigned(entry - tlb.data());
+        if (sprDtlb4kPairReplacement && entry->logBytes == 12 &&
+            pos < baseSize) {
+            const unsigned set = pos / 6;
+            smallPageNextPair[set] = ((pos % 6) % 3 + 1) % 3;
+        }
         if (sprSplitL1 && type() == TypeTLB::data &&
             pos >= baseSize && pos < baseSize + 32) {
             const unsigned set = (pos - baseSize) / 4, way = (pos - baseSize) % 4;
@@ -588,7 +696,8 @@ TLB::finalizePhysical(const RequestPtr &req,
 Fault
 TLB::translate(const RequestPtr &req,
         ThreadContext *tc, BaseMMU::Translation *translation,
-        BaseMMU::Mode mode, bool &delayedResponse, bool timing)
+        BaseMMU::Mode mode, bool &delayedResponse, bool timing,
+        bool nextLevelLookupCompleted)
 {
     // Retries and failed translations cannot expose an older Request's facts.
     req->removeExtension<FunctionalTranslationExtension>();
@@ -689,37 +798,41 @@ TLB::translate(const RequestPtr &req,
             pageAlignedVaddr = concAddrPcid(pageAlignedVaddr, pcid);
             TlbEntry *entry = lookup(pageAlignedVaddr, true, mode);
 
-            switch (mode) {
-                case BaseMMU::Read:
+            if (!nextLevelLookupCompleted) {
+                switch (mode) {
+                  case BaseMMU::Read:
                     stats.rdAccesses++;
                     break;
-                case BaseMMU::Write:
+                  case BaseMMU::Write:
                     stats.wrAccesses++;
                     break;
-                case BaseMMU::Execute:
+                  case BaseMMU::Execute:
                     stats.exAccesses++;
                     break;
-                default:
+                  default:
                     panic("Invalid mode\n");
                     break;
+                }
             }
             if (!entry) {
                 DPRINTF(TLB, "Handling a TLB miss for "
                         "address %#x at pc %#x.\n",
                         vaddr, tc->pcState().instAddr());
-                switch (mode) {
-                    case BaseMMU::Read:
+                if (!nextLevelLookupCompleted) {
+                    switch (mode) {
+                      case BaseMMU::Read:
                         stats.rdMisses++;
                         break;
-                    case BaseMMU::Write:
+                      case BaseMMU::Write:
                         stats.wrMisses++;
                         break;
-                    case BaseMMU::Execute:
+                      case BaseMMU::Execute:
                         stats.exMisses++;
                         break;
-                    default:
+                      default:
                         panic("Invalid mode\n");
                         break;
+                    }
                 }
                 if (FullSystem && nextLevel()) {
                     auto *shared = static_cast<TLB *>(nextLevel());
@@ -732,7 +845,8 @@ TLB::translate(const RequestPtr &req,
                         if (mode == BaseMMU::Write && timing && translation &&
                             !req->isPrefetch() && dtlbStoreMissStats)
                             ++dtlbStoreMissStats->STLB_HIT;
-                        if (timing && translation && nextLevelHitLatency > Cycles(0)) {
+                        if (timing && translation && !nextLevelLookupCompleted &&
+                            nextLevelHitLatency > Cycles(0)) {
                             auto *cpu = tc->getCpuPtr();
                             const TlbEntry saved = *hit;
                             const auto localGeneration = invalidationGeneration;
@@ -740,7 +854,8 @@ TLB::translate(const RequestPtr &req,
                             const auto savedCr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
                             const auto savedCr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
                             const auto savedEfer = tc->readMiscRegNoEffect(misc_reg::Efer);
-                            cpu->schedule(new EventFunctionWrapper(
+                            queueNextLevelResponse(cpu,
+                                cpu->clockEdge(nextLevelHitLatency),
                                 [this, shared, req, tc, translation, mode, saved,
                                  pcid, localGeneration, sharedGeneration,
                                  savedCr3, savedCr4, savedEfer] {
@@ -763,8 +878,7 @@ TLB::translate(const RequestPtr &req,
                                         }
                                         translateTiming(req, tc, translation, mode);
                                     }
-                                }, name() + ".stlbResponse", true),
-                                cpu->clockEdge(nextLevelHitLatency));
+                                });
                             delayedResponse = true;
                             return NoFault;
                         }
@@ -772,6 +886,47 @@ TLB::translate(const RequestPtr &req,
                     }
                 }
                 if (!entry && FullSystem) {
+                    if (timing && translation && nextLevel() &&
+                        !nextLevelLookupCompleted &&
+                        nextLevelMissLatency > Cycles(0)) {
+                        auto *shared = static_cast<TLB *>(nextLevel());
+                        auto *cpu = tc->getCpuPtr();
+                        const auto localGeneration = invalidationGeneration;
+                        const auto sharedGeneration = shared->invalidationGeneration;
+                        const auto savedCr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+                        const auto savedCr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+                        const auto savedEfer = tc->readMiscRegNoEffect(misc_reg::Efer);
+                        queueNextLevelResponse(cpu,
+                            cpu->clockEdge(nextLevelMissLatency),
+                            [this, shared, req, tc, translation, mode,
+                             localGeneration, sharedGeneration,
+                             savedCr3, savedCr4, savedEfer] {
+                                if (translation->squashed()) {
+                                    if (mode == BaseMMU::Execute)
+                                        ++stats.stlbSquashes;
+                                    translation->finish(std::make_shared<UnimpFault>(
+                                        "Squashed Inst"), req, tc, mode);
+                                    return;
+                                }
+                                if (localGeneration != invalidationGeneration ||
+                                    sharedGeneration != shared->invalidationGeneration ||
+                                    savedCr3 != tc->readMiscRegNoEffect(misc_reg::Cr3) ||
+                                    savedCr4 != tc->readMiscRegNoEffect(misc_reg::Cr4) ||
+                                    savedEfer != tc->readMiscRegNoEffect(misc_reg::Efer)) {
+                                    if (mode == BaseMMU::Execute)
+                                        ++stats.stlbRestarts;
+                                    translateTiming(req, tc, translation, mode);
+                                    return;
+                                }
+                                bool delayed = false;
+                                Fault fault = translate(req, tc, translation, mode,
+                                                        delayed, true, true);
+                                if (!delayed)
+                                    translation->finish(fault, req, tc, mode);
+                            });
+                        delayedResponse = true;
+                        return NoFault;
+                    }
                     if (timing && translation && mode != BaseMMU::Execute &&
                         !req->isPrefetch() && nextLevel()) {
                         auto facts = req->getExtension<TranslationMissExtension>();
@@ -997,15 +1152,25 @@ TLB::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(lruSeq);
 
     uint32_t _count = 0;
-    for (uint32_t x = 0; x < size; x++) {
-        if (tlb[x].trieHandle != NULL) {
-            if (sprSplitL1) paramOut(cp, csprintf("slot%d", _count), x);
-            tlb[x].serializeSection(cp, csprintf("Entry%d", _count++));
-        }
-    }
+    // Parent parameters must precede nested entry sections: popping the
+    // section scope does not emit a new parent header in the checkpoint file.
+    if (sprSplitL1)
+        for (uint32_t x = 0; x < size; x++)
+            if (tlb[x].trieHandle != NULL)
+                paramOut(cp, csprintf("slot%d", _count++), x);
     if (sprSplitL1)
         for (unsigned i = 0; i < largePageTree.size(); ++i)
             paramOut(cp, csprintf("largePageTree%d", i), largePageTree[i]);
+    if (sprDtlb4kPairReplacement) {
+        paramOut(cp, "dtlb4kPairVersion", 1);
+        for (unsigned i = 0; i < smallPageNextPair.size(); ++i)
+            paramOut(cp, csprintf("smallPageNextPair%d", i),
+                     smallPageNextPair[i]);
+    }
+    _count = 0;
+    for (uint32_t x = 0; x < size; x++)
+        if (tlb[x].trieHandle != NULL)
+            tlb[x].serializeSection(cp, csprintf("Entry%d", _count++));
 }
 
 void
@@ -1041,6 +1206,16 @@ TLB::unserialize(CheckpointIn &cp)
     if (sprSplitL1)
         for (unsigned i = 0; i < largePageTree.size(); ++i)
             paramIn(cp, csprintf("largePageTree%d", i), largePageTree[i]);
+    if (sprDtlb4kPairReplacement) {
+        unsigned version = 0;
+        fatal_if(!optParamIn(cp, "dtlb4kPairVersion", version) || version != 1,
+                 "DTLB pair replacement requires a checkpoint made with this policy");
+        for (unsigned i = 0; i < smallPageNextPair.size(); ++i) {
+            paramIn(cp, csprintf("smallPageNextPair%d", i), smallPageNextPair[i]);
+            fatal_if(smallPageNextPair[i] >= 3,
+                     "Invalid DTLB pair replacement checkpoint state");
+        }
+    }
 }
 
 Port *

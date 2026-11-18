@@ -563,15 +563,16 @@ let {{
     # One bounded REP read/write goes through the same dynamic LSQ request,
     # timing translation, cache ports and store buffer as ordinary accesses.
     # Eight functional words carry one line; they are not eight hardware uops.
-    def defineRepAccess(Name, store=False, fill=False):
+    def defineRepAccess(Name, store=False, fill=False, first_word=0, count=8):
         global header_output, exec_output
         name = Name.lower()
-        words = ['RepWord%d' % i for i in range(8)]
+        words = ['RepWord%d' % i for i in range(first_word, first_word + count)]
         if store:
             code = ('\n'.join('Mem_u8qw[%d] = %s;' % (i, word)
                                for i, word in enumerate(words)) if not fill else
-                    '\n'.join('Mem_u8qw[%d] = (Rax & 0xff) * '
-                              '0x0101010101010101ULL;' % i for i in range(8)))
+                    'const uint64_t pattern = machInst.opcode.op == 0xab ? '
+                    'Rax : (Rax & 0xff) * 0x0101010101010101ULL;\n' +
+                    '\n'.join('Mem_u8qw[%d] = pattern;' % i for i in range(8)))
         else:
             code = '\n'.join('%s = Mem_u8qw[%d];' % (word, i)
                               for i, word in enumerate(words))
@@ -601,6 +602,8 @@ let {{
         microopClasses[name] = RepAccess
 
     defineRepAccess('Ldrep')
+    defineRepAccess('Ldrepcompareleft', count=4)
+    defineRepAccess('Ldrepcompareright', first_word=4, count=4)
     defineRepAccess('Strep', store=True)
     defineRepAccess('Stosrep', store=True, fill=True)
     rip_load_ea = (

@@ -45,6 +45,7 @@
 #include <iterator>
 #include <limits>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "base/logging.hh"
@@ -76,7 +77,9 @@ IQUnit::IQUnit(const IQUnitParams &params)
       _numEntries(params.numEntries),
       _fuPool(params.fuPool),
       allowedOpClasses(params.allowedOpClasses),
-      excludedOpClasses(params.excludedOpClasses)
+      excludedOpClasses(params.excludedOpClasses),
+      categoryCapacity{params.sprVectorEntries, params.sprLoadEntries,
+                       params.sprStoreDataEntries}
 {
     assert(_fuPool);
     // Figure out resource sharing policy
@@ -139,8 +142,7 @@ IQUnit::remove(const DynInstPtr &inst)
     assert(it != entries.end() && it->second.resident);
     assert(residentCount[inst->threadNumber]);
     --residentCount[inst->threadNumber];
-    _fuPool->releasePortBinding(inst);
-    releaseAllocation(it->second.allocation);
+    releaseAllocation(it->second.allocation, it->second.categories);
     entries.erase(it);
     assert(_freeEntries <= _numEntries);
 }
@@ -176,9 +178,59 @@ IQUnit::reserve(const DynInstPtr &inst)
         assert(found->second.thread == inst->threadNumber &&
                found->second.slots == inst->iqSlots());
     }
+    const unsigned categories = categoryMask(inst);
+    for (unsigned category = 0; category < NumCategories; ++category) {
+        if (!(categories & (1u << category)))
+            continue;
+        if (!found->second.categoryMembers[category]++) {
+            assert(categoryFree(category));
+            ++categoryUsed[category];
+        }
+    }
     ++found->second.members;
     entries.emplace(inst->seqNum,
-                    SchedulerEntry{inst->threadNumber, key, false});
+                    SchedulerEntry{inst->threadNumber, key, false, categories});
+}
+
+unsigned
+IQUnit::categoryMask(const DynInstPtr &inst)
+{
+    return ((inst->isVector() || inst->isFloating()) ? 1u : 0u) |
+        ((inst->isLoad() && !inst->isDataPrefetch() &&
+          !inst->isInstPrefetch()) ? 2u : 0u) |
+        ((inst->isStoreData() || (inst->isStore() && !inst->isStoreAddress()))
+             ? 4u : 0u);
+}
+
+unsigned
+IQUnit::groupCategoryMask(InstSeqNum group) const
+{
+    const auto it = allocations.find(group);
+    if (it == allocations.end())
+        return 0;
+    unsigned mask = 0;
+    for (unsigned c = 0; c < NumCategories; ++c)
+        if (it->second.categoryMembers[c])
+            mask |= 1u << c;
+    return mask;
+}
+
+unsigned
+IQUnit::categoryFree(unsigned category) const
+{
+    return categoryCapacity[category] ?
+        categoryCapacity[category] - categoryUsed[category] :
+        std::numeric_limits<unsigned>::max();
+}
+
+bool
+IQUnit::hasCategoryRoom(const DynInstPtr &inst) const
+{
+    const unsigned added = categoryMask(inst) & ~groupCategoryMask(inst->schedulerKey());
+    for (unsigned c = 0; c < NumCategories; ++c)
+        if ((added & (1u << c)) && !categoryFree(c))
+            return false;
+    return true;
 }
 
 unsigned
@@ -188,10 +240,19 @@ IQUnit::reservationDemand(const DynInstPtr &inst) const
 }
 
 void
-IQUnit::releaseAllocation(InstSeqNum key)
+IQUnit::releaseAllocation(InstSeqNum key, unsigned categories)
 {
     auto it = allocations.find(key);
     assert(it != allocations.end() && it->second.members);
+    for (unsigned c = 0; c < NumCategories; ++c) {
+        if (!(categories & (1u << c)))
+            continue;
+        assert(it->second.categoryMembers[c]);
+        if (!--it->second.categoryMembers[c]) {
+            assert(categoryUsed[c]);
+            --categoryUsed[c];
+        }
+    }
     if (--it->second.members == 0) {
         _freeEntries += it->second.slots;
         count[it->second.thread] -= it->second.slots;
@@ -214,7 +275,7 @@ IQUnit::cancelReservation(InstSeqNum seq)
     auto it = entries.find(seq);
     if (it == entries.end() || it->second.resident)
         return;
-    releaseAllocation(it->second.allocation);
+    releaseAllocation(it->second.allocation, it->second.categories);
     entries.erase(it);
 }
 
@@ -240,6 +301,7 @@ IQUnit::resetState()
 {
     entries.clear();
     allocations.clear();
+    categoryUsed = {};
     residentCount = {};
     _freeEntries = _numEntries;
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
@@ -280,7 +342,7 @@ IQUnit::numFreeEntries(const DynInstPtr &inst) const
     const ThreadID tid = inst->threadNumber;
     const OpClass op_class = inst->opClass();
     // Return 0 if the IQ cannot accept the specific op class
-    if (!allows(inst) ||
+    if (!allows(inst) || !hasCategoryRoom(inst) ||
         (op_class != No_OpClass && !_fuPool->isCapable(op_class))) {
         return 0;
     } else {
@@ -786,11 +848,13 @@ InstructionQueue::canReserve(const std::vector<DynInstPtr> &batch)
     {
         unsigned total = 0;
         std::array<unsigned, MaxThreads> thread{};
+        std::array<unsigned, IQUnit::NumCategories> categories{};
     };
     struct Group
     {
         InstSeqNum key;
         IQUnit *owner;
+        unsigned categories;
     };
     std::vector<Usage> used(iqs.size());
     std::array<Group, MaxWidth> groups;
@@ -817,15 +881,28 @@ InstructionQueue::canReserve(const std::vector<DynInstPtr> &batch)
                 iqs.begin(), std::find(iqs.begin(), iqs.end(), iq))];
             const unsigned slots = found_group != group_end ?
                 0 : iq->reservationDemand(inst);
+            const unsigned existing = iq->groupCategoryMask(group) |
+                (found_group != group_end ? found_group->categories : 0);
+            const unsigned added = IQUnit::categoryMask(inst) & ~existing;
+            bool category_room = true;
+            for (unsigned c = 0; c < IQUnit::NumCategories; ++c) {
+                if ((added & (1u << c)) &&
+                    iq->categoryFree(c) <= usage.categories[c])
+                    category_room = false;
+            }
             if (iq->numFreeEntries() >= usage.total + slots &&
                 iq->numFreeEntries(inst->threadNumber) >=
-                    usage.thread[inst->threadNumber] + slots) {
+                    usage.thread[inst->threadNumber] + slots && category_room) {
                 usage.total += slots;
                 usage.thread[inst->threadNumber] += slots;
+                for (unsigned c = 0; c < IQUnit::NumCategories; ++c)
+                    usage.categories[c] += !!(added & (1u << c));
                 if (found_group == group_end)
-                    groups[group_count++] = {group, iq};
-                else
+                    groups[group_count++] = {group, iq, added};
+                else {
                     found_group->owner = iq;
+                    found_group->categories |= added;
+                }
                 found = true;
                 break;
             }
@@ -919,10 +996,12 @@ InstructionQueue::findIQ(const DynInstPtr &inst)
             return iq;
     for (auto iq : iqs)
         if (iq->hasGroup(inst->schedulerKey()))
-            return iq->allows(inst) && (inst->opClass() == No_OpClass ||
+            return iq->allows(inst) && iq->hasCategoryRoom(inst) &&
+                (inst->opClass() == No_OpClass ||
                 iq->fuPool()->isCapable(inst->opClass())) ? iq : nullptr;
     for (auto iq : iqs) {
-        if (iq->allows(inst) && (inst->opClass() == No_OpClass ||
+        if (iq->allows(inst) && iq->hasCategoryRoom(inst) &&
+            (inst->opClass() == No_OpClass ||
             iq->fuPool()->isCapable(inst->opClass())) &&
             iq->numFreeEntries(inst) >= iq->reservationDemand(inst)) {
             return iq;
@@ -934,7 +1013,63 @@ InstructionQueue::findIQ(const DynInstPtr &inst)
 IQUnit *
 InstructionQueue::findOrReclaimIQ(const DynInstPtr &inst)
 {
-    if (auto *iq = findIQ(inst))
+    // A suspended group must reacquire all of its categories atomically.
+    // Looking only at the ready action can admit a group whose other member
+    // requires a full category, causing restoreAllocation() to overcommit it.
+    std::vector<DynInstPtr> restoring;
+    if (!inst->stageDemand.schedulerGroup) {
+        restoring.push_back(inst);
+    } else {
+        for (const auto &member : instList[inst->threadNumber]) {
+            if (member->schedulerKey() == inst->schedulerKey() &&
+                !member->isInIQ() && !member->isIssued() &&
+                !member->isSquashed() && !member->bypassesIQ())
+                restoring.push_back(member);
+        }
+    }
+    panic_if(std::find(restoring.begin(), restoring.end(), inst) ==
+                 restoring.end(),
+             "Suspended scheduler group is missing its ready action");
+    const auto findRestoreIQ = [&]() -> IQUnit * {
+        IQUnit *owner = nullptr;
+        for (auto *iq : iqs) {
+            if (iq->hasGroup(inst->schedulerKey())) {
+                owner = iq;
+                break;
+            }
+        }
+        for (auto *iq : iqs) {
+            if (owner && iq != owner)
+                continue;
+            unsigned categories = 0;
+            bool compatible = true;
+            for (const auto &member : restoring) {
+                if (!iq->allows(member) ||
+                    (member->opClass() != No_OpClass &&
+                     !iq->fuPool()->isCapable(member->opClass()))) {
+                    compatible = false;
+                    break;
+                }
+                categories |= IQUnit::categoryMask(member);
+            }
+            if (!compatible)
+                continue;
+            categories &= ~iq->groupCategoryMask(inst->schedulerKey());
+            for (unsigned c = 0; c < IQUnit::NumCategories; ++c) {
+                if ((categories & (1u << c)) && !iq->categoryFree(c)) {
+                    compatible = false;
+                    break;
+                }
+            }
+            const unsigned demand = iq->reservationDemand(inst);
+            if (compatible && iq->numFreeEntries() >= demand &&
+                iq->numFreeEntries(inst->threadNumber) >= demand)
+                return iq;
+        }
+        return nullptr;
+    };
+
+    if (auto *iq = findRestoreIQ())
         return iq;
 
     // A suspended action can be older than every resident entry. Younger
@@ -942,6 +1077,13 @@ InstructionQueue::findOrReclaimIQ(const DynInstPtr &inst)
     // deadlock. Move only a whole unissued allocation; dependencies and
     // ready-list membership remain intact and no extra credit is created.
     auto &thread_insts = instList[inst->threadNumber];
+    // Keep the single-candidate path free of index construction. If more
+    // candidates must be checked, build a temporary index once rather than
+    // scanning every unrelated instruction for each candidate. Its pointers
+    // refer to list elements, which remain in instList throughout this call.
+    bool scanned_first_candidate = false;
+    bool indexed_groups = false;
+    std::unordered_map<InstSeqNum, std::vector<const DynInstPtr *>> groups;
     for (auto it = thread_insts.rbegin(); it != thread_insts.rend(); ++it) {
         const auto &victim = *it;
         if (!victim->isInIQ() || !victim->iqSlots() ||
@@ -954,9 +1096,9 @@ InstructionQueue::findOrReclaimIQ(const DynInstPtr &inst)
         const auto key = victim->schedulerKey();
         std::vector<DynInstPtr> members;
         bool suspendable = true;
-        for (const auto &member : thread_insts) {
+        const auto inspect_member = [&](const DynInstPtr &member) {
             if (member->schedulerKey() != key)
-                continue;
+                return true;
             // Issued members normally leave the IQ immediately but remain
             // in instList until retirement. Inspect them too: their absence
             // from the resident allocation does not make the group unissued.
@@ -966,16 +1108,37 @@ InstructionQueue::findOrReclaimIQ(const DynInstPtr &inst)
                         "action [sn:%llu].\n", key, member->seqNum,
                         inst->seqNum);
                 suspendable = false;
-                break;
+                return false;
             }
             if (!member->isInIQ() || member->iq != owner)
-                continue;
+                return true;
             if (member->isIssued() || member->isSquashed() ||
                 member->seqNum <= inst->seqNum) {
                 suspendable = false;
-                break;
+                return false;
             }
             members.push_back(member);
+            return true;
+        };
+        if (!scanned_first_candidate) {
+            scanned_first_candidate = true;
+            for (const auto &member : thread_insts) {
+                if (!inspect_member(member))
+                    break;
+            }
+        } else {
+            if (!indexed_groups) {
+                groups.reserve(thread_insts.size());
+                for (const auto &member : thread_insts)
+                    groups[member->schedulerKey()].push_back(&member);
+                indexed_groups = true;
+            }
+            const auto group = groups.find(key);
+            assert(group != groups.end());
+            for (const auto *member : group->second) {
+                if (!inspect_member(*member))
+                    break;
+            }
         }
         // Reservations for members not yet dispatched must stay in place.
         if (!suspendable || members.size() != owner->groupMembers(key))
@@ -986,7 +1149,7 @@ InstructionQueue::findOrReclaimIQ(const DynInstPtr &inst)
                 "for older action [sn:%llu] [key:%llu] [members:%u].\n",
                 victim->seqNum, inst->seqNum, key,
                 static_cast<unsigned>(members.size()));
-        if (auto *iq = findIQ(inst))
+        if (auto *iq = findRestoreIQ())
             return iq;
     }
     return nullptr;
@@ -1002,7 +1165,6 @@ InstructionQueue::restoreAllocation(IQUnit *iq, const DynInstPtr &inst)
     unsigned restored = 0;
     if (!inst->stageDemand.schedulerGroup) {
         iq->insert(inst);
-        iq->fuPool()->bindPort(inst, cpu->curCycle());
         DPRINTF(IQ, "Restored scheduler allocation [key:%llu] [members:1] "
                 "for action [sn:%llu].\n", key, inst->seqNum);
         return;
@@ -1015,7 +1177,6 @@ InstructionQueue::restoreAllocation(IQUnit *iq, const DynInstPtr &inst)
                  !iq->fuPool()->isCapable(member->opClass())),
                  "Restored scheduler group has incompatible member");
         iq->insert(member);
-        iq->fuPool()->bindPort(member, cpu->curCycle());
         ++restored;
     }
     panic_if(!inst->isInIQ(), "Restored scheduler group is missing its action");
@@ -1044,7 +1205,6 @@ InstructionQueue::insert(const DynInstPtr &new_inst)
     auto iq = findIQ(new_inst);
     assert(iq);
     iq->insert(new_inst);
-    iq->fuPool()->bindPort(new_inst, cpu->curCycle());
 
     // Look through its source registers (physical regs), and mark any
     // dependencies.
@@ -1128,7 +1288,6 @@ InstructionQueue::insertNonSpec(const DynInstPtr &new_inst)
     auto iq = findIQ(new_inst);
     assert(iq);
     iq->insert(new_inst);
-    iq->fuPool()->bindPort(new_inst, cpu->curCycle());
 
     // Have this instruction set itself as the producer of its destination
     // register(s).
@@ -1396,11 +1555,10 @@ InstructionQueue::scheduleReadyInsts()
             continue;
         }
         bool path_blocked = false;
-        if (!managed && cpu->resultForwarding) {
+        if (!managed && cpu->resultForwarding &&
+            (op_class == No_OpClass || issuing_inst->repFunctional())) {
             auto pathAvailable = [this](const DynInstPtr &inst) {
-                const unsigned port = inst->boundExecutionPort >= 0 ?
-                    inst->boundExecutionPort : 12;
-                const Tick ready = cpu->resultForwarding->availableAt(inst, port);
+                const Tick ready = cpu->resultForwarding->availableAt(inst, 12);
                 if (ready > curTick() && ready != std::numeric_limits<Tick>::max())
                     cpu->resultForwarding->defer(inst, ready);
                 else if (ready <= curTick())
@@ -1433,8 +1591,7 @@ InstructionQueue::scheduleReadyInsts()
                                    op_latency,
                                    issuing_inst->isStore() &&
                                    !issuing_inst->isStoreAddress(),
-                                   issuing_inst->isControl() && op_class == IntAluOp,
-                                   issuing_inst->boundExecutionPort);
+                                   issuing_inst->isControl() && op_class == IntAluOp);
             if (issuing_inst->isFloating()) {
                 iqIOStats.fpAluAccesses++;
             } else if (issuing_inst->isVector()) {
@@ -1552,19 +1709,15 @@ InstructionQueue::scheduleReadyInsts()
             assert(idx == FUPool::NoFreeFU);
             iqStats.statFuBusy[op_class]++;
             iqStats.fuBusy[tid]++;
-            if (managed || issuing_inst->boundExecutionPort >= 0) {
-                resourceDeferred.push_back(issuing_inst);
-                readyInsts[op_class].pop();
-                if (!readyInsts[op_class].empty())
-                    moveToYoungerInst(order_it);
-                else {
-                    readyIt[op_class] = listOrder.end();
-                    queueOnList[op_class] = false;
-                }
-                listOrder.erase(order_it++);
-            } else {
-                ++order_it;
+            resourceDeferred.push_back(issuing_inst);
+            readyInsts[op_class].pop();
+            if (!readyInsts[op_class].empty())
+                moveToYoungerInst(order_it);
+            else {
+                readyIt[op_class] = listOrder.end();
+                queueOnList[op_class] = false;
             }
+            listOrder.erase(order_it++);
         }
     }
 
@@ -1572,8 +1725,8 @@ InstructionQueue::scheduleReadyInsts()
         // These operations were already selected from a ready queue. Memory
         // readiness is owned by MemDepUnit, which can leave CanIssue clear
         // after resolving its dependencies. Rechecking readyToIssue() would
-        // silently lose such a memory operation on a busy bound port or a
-        // full issue cycle. Restore it with its existing RS/port reservation.
+        // silently lose such a memory operation on a busy port or a full
+        // issue cycle. Restore it with its existing scheduler reservation.
         if (inst->isMemRef())
             addReadyMemInst(inst);
         else

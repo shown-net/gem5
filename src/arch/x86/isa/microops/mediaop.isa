@@ -146,6 +146,8 @@ let {{
                 'Mxmmsad': ('0x20', 3),
                 'Mxmmpack': ('0x20', 3),
                 'Mxmmshiftcount': ('0x22', 1),
+                'Mxmmshlbytes': ('0x22', 1),
+                'Mxmmshrbytes': ('0x22', 1),
             }
             if Name in ('Mxmmaddi', 'Mxmmsubi'):
                 vector_cost = (
@@ -600,6 +602,21 @@ let {{
                     (lane(right, (ext >> 6) & 3) << 32);
             }
         '''
+
+    class Mxmmshlbytes(MediaOp):
+        operand_types = (FloatDestOp, FloatDestHiOp, FloatSrc1Op, FloatSrc2Op)
+        op_class = 'SimdMiscOp'
+        code = '''
+            const unsigned shift = (ext & 0xff) * 8;
+            const __uint128_t input =
+                (__uint128_t(FpSrcReg2_uqw) << 64) | FpSrcReg1_uqw;
+            const __uint128_t result = shift < 128 ? input << shift : 0;
+            FpDestReg_uqw = uint64_t(result);
+            FpDestHiReg_uqw = uint64_t(result >> 64);
+        '''
+
+    class Mxmmshrbytes(Mxmmshlbytes):
+        code = Mxmmshlbytes.code.replace('input << shift', 'input >> shift')
 
     class Mxmmunpack(Mxmmxor):
         op_class = 'SimdMiscOp'

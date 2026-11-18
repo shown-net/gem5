@@ -425,7 +425,7 @@ void CPU::recordMemoryRetirement(const DynInstPtr &inst)
         if (lower & retirement::L2Miss) source |= 8;
         if (lower & retirement::L3Hit) source |= 16;
         if (lower & retirement::L3Miss) source |= 32;
-        if (upper & retirement::FillBuffer) source |= 64;
+        if (extension && extension->fillHitBeforeReady) source |= 64;
         if (upper & retirement::Forwarded) source |= 128;
         pending.sources |= source;
         pending.sequencerShared |= native.sequencer_shared != 0;
@@ -1018,13 +1018,18 @@ CPU::recordRetiredUops(const DynInstPtr &inst)
         pending.microcodeUops += inst->stageDemand.retirementUops;
     if (inst->staticInst->getName().rfind("repprogress", 0) == 0) {
         for (int i = 0; i < inst->numSrcRegs(); ++i) {
-            if (inst->srcRegIdx(i).is(IntRegClass) &&
-                inst->srcRegIdx(i).index() == X86ISA::intRegMicro(3)) {
+            if (inst->srcRegIdx(i) != X86ISA::int_reg::Rcx)
+                continue;
+            for (int j = 0; j < inst->numDestRegs(); ++j) {
+                if (inst->destRegIdx(j) != X86ISA::int_reg::Rcx)
+                    continue;
+                const auto before = inst->getRegOperand(inst->staticInst.get(), i);
+                const auto after = getReg(inst->renamedDestIdx(j), tid);
                 ++instRetiredStats.repProgressUpdates;
-                instRetiredStats.repProgressElements +=
-                    inst->getRegOperand(inst->staticInst.get(), i);
+                instRetiredStats.repProgressElements += before - after;
                 break;
             }
+            break;
         }
     }
     pending.dsbMiss |= inst->frontendDsbMiss;

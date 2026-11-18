@@ -138,6 +138,8 @@ class LSQUnit : public CapacityReadObserver
         uint32_t _size = 0;
         /** Valid entry. */
         bool _valid = false;
+        /** Count a blocked load once even if it waits on both SQ and SB. */
+        bool _forwardBlockObserved = false;
 
       public:
         ~LSQEntry()
@@ -158,6 +160,7 @@ class LSQUnit : public CapacityReadObserver
             _request = nullptr;
             _valid = false;
             _size = 0;
+            _forwardBlockObserved = false;
         }
 
         void
@@ -167,6 +170,7 @@ class LSQUnit : public CapacityReadObserver
             _inst = new_inst;
             _valid = true;
             _size = 0;
+            _forwardBlockObserved = false;
         }
 
         LSQRequest* request() { return _request; }
@@ -175,6 +179,14 @@ class LSQUnit : public CapacityReadObserver
         /** Member accessors. */
         /** @{ */
         bool valid() const { return _valid; }
+        bool forwardBlockObserved() const { return _forwardBlockObserved; }
+        bool noteForwardBlock()
+        {
+            if (_forwardBlockObserved)
+                return false;
+            _forwardBlockObserved = true;
+            return true;
+        }
         uint32_t& size() { return _size; }
         const uint32_t& size() const { return _size; }
         const DynInstPtr& instruction() const { return _inst; }
@@ -201,6 +213,7 @@ class LSQUnit : public CapacityReadObserver
         bool _addressReady = false;
         bool _dataReady = false;
         unsigned _dataBytes = 0;
+        Tick _addressReadyTick = MaxTick;
         /** Does this request write all zeros and thus doesn't
          * have any data attached to it. Used for cache block zero
          * style instructs (ARM DC ZVA; ALPHA WH64)
@@ -226,6 +239,7 @@ class LSQUnit : public CapacityReadObserver
             _dataInstruction = nullptr;
             _addressReady = _dataReady = false;
             _dataBytes = 0;
+            _addressReadyTick = MaxTick;
         }
 
         /** Member accessors. */
@@ -237,6 +251,7 @@ class LSQUnit : public CapacityReadObserver
         bool addressReady() const { return _addressReady; }
         bool &dataReady() { return _dataReady; }
         bool dataReady() const { return _dataReady; }
+        Tick &addressReadyTick() { return _addressReadyTick; }
         unsigned &dataBytes() { return _dataBytes; }
         const bool& canWB() const { return _canWB; }
         bool& completed() { return _completed; }
@@ -594,11 +609,17 @@ class LSQUnit : public CapacityReadObserver
     Cycles sprClflushMinCycles = Cycles(0);
     bool sprMemoryDependence = false;
     Cycles sprStoreForwardingLatency = Cycles(0);
+    Cycles sprStoreAddressForwardLatency = Cycles(0);
+    bool sprReplayBlockedLoads = false;
+    Cycles sprBlockedLoadReturnExtraLatency = Cycles(0);
     bool sprMultiStoreForwarding = true;
     Cycles sprContainedForwardingExtraLatency = Cycles(0);
     uint64_t nextStoreBufferId = 1;
     std::deque<CommittedStoreEntry> committedStoreBuffer;
+    // Logical stores remain live until their shared line response returns.
     unsigned committedStores = 0;
+    // One shared SQ credit per uncompleted committed line entry.
+    unsigned committedStoreCredits = 0;
     // Retained issued prefix, including completed entries awaiting front pop.
     unsigned issuedStoreBufferEntries = 0;
     std::map<Addr, unsigned> storeBufferLinesInFlight;
@@ -637,11 +658,13 @@ class LSQUnit : public CapacityReadObserver
         // The LQ still owns the translated request; waking it need not issue
         // the load through the IQ and AGU again.
         bool retainRequest = false;
+        Tick dataWaitStarted = 0;
     };
     // Keyed by load sequence so squash can remove a suffix without relying
     // on SQ/LQ indices that may already have wrapped.
     std::map<InstSeqNum, SelectiveBlockedLoad> selectiveBlockedLoads;
-    void resumeSelectiveBlockedLoad(const SelectiveBlockedLoad &wait);
+    void resumeSelectiveBlockedLoad(const SelectiveBlockedLoad &wait,
+                                    bool replay = false);
     void rescheduleRetainedLoad(const DynInstPtr &load);
     bool canRetainLoadRequest(LSQRequest *request) const;
     struct PartialForwarding {
@@ -759,12 +782,16 @@ class LSQUnit : public CapacityReadObserver
         /** Number of loads that were rescheduled. */
         statistics::Scalar rescheduledLoads;
         statistics::Scalar selectivePartialWaits;
+        statistics::Scalar storeForwardBlockedLoads;
+        statistics::Scalar storeAddressForwardDelayed;
         statistics::Scalar selectivePartialWakeups;
         statistics::Scalar selectivePartialSquashedWaits;
         statistics::Scalar splitStoreAddressFirst;
         statistics::Scalar splitStoreDataFirst;
         statistics::Scalar splitStoreDataWaits;
         statistics::Scalar retainedStoreDataWaits;
+        statistics::Scalar retainedStoreDataWaitCycles;
+        statistics::Scalar retainedStoreDataWaitAtLeast4;
         statistics::Scalar retainedStoreDataResumes;
         statistics::Scalar loadBankConflicts;
         statistics::Scalar storeBufferOffloaded;

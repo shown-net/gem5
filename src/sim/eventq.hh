@@ -41,8 +41,10 @@
 #include <functional>
 #include <iosfwd>
 #include <list>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "base/debug.hh"
 #include "base/flags.hh"
@@ -256,20 +258,12 @@ class Event : public EventBase, public Serializable
     friend class EventQueue;
 
   private:
-    // The event queue is now a linked list of linked lists.  The
-    // 'nextBin' pointer is to find the bin, where a bin is defined as
-    // when+priority.  All events in the same bin will be stored in a
-    // second linked list (a stack) maintained by the 'nextInBin'
-    // pointer.  The list will be accessed in LIFO order.  The end
-    // result is that the insert/removal in 'nextBin' is
-    // linear/constant, and the lookup/removal in 'nextInBin' is
-    // constant/constant.  Hopefully this is a significant improvement
-    // over the current fully linear insertion.
+    // Each (time, priority) bin is a LIFO list. Only a bin's first event
+    // has a valid nextBin pointer. Keeping this chain permits replaceHead()
+    // to temporarily detach and later restore an entire queue.
     Event *nextBin;
     Event *nextInBin;
-
-    static Event *insertBefore(Event *event, Event *curr);
-    static Event *removeItem(Event *event, Event *last);
+    Event *prevInBin;
 
     Tick _when;         //!< timestamp when event should be processed
     Priority _priority; //!< event priority
@@ -405,8 +399,8 @@ class Event : public EventBase, public Serializable
      * @ingroup api_eventq
      */
     Event(Priority p = Default_Pri, Flags f = 0)
-        : nextBin(nullptr), nextInBin(nullptr), _when(0), _priority(p),
-          flags(Initialized | f)
+        : nextBin(nullptr), nextInBin(nullptr), prevInBin(nullptr), _when(0),
+          _priority(p), flags(Initialized | f)
     {
         assert(f.noneSet(~PublicWrite));
 #ifndef NDEBUG
@@ -619,6 +613,11 @@ class EventQueue
 
     std::string objName;
     Event *head;
+    // The value is the first event in each nonempty (time, priority) bin.
+    // The linked bins remain available to replaceHead() while this index
+    // provides logarithmic insertion and lookup of a bin.
+    using BinKey = std::pair<Tick, Event::Priority>;
+    std::map<BinKey, Event *> bins;
     Tick _curTick;
 
     //! Mutex to protect async queue.

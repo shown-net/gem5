@@ -51,6 +51,10 @@ class IQUnit(SimObject):
 
     numEntries = Param.Unsigned(64, "Number of instruction queue entries")
 
+    sprVectorEntries = Param.Unsigned(0, "Vector scheduler group credits; 0 disables limit")
+    sprLoadEntries = Param.Unsigned(0, "Demand load scheduler group credits; 0 disables limit")
+    sprStoreDataEntries = Param.Unsigned(0, "Store-data scheduler group credits; 0 disables limit")
+
     fuPool = Param.FUPool(DefaultFUPool(), "Functional Unit pool")
 
     allowedOpClasses = VectorParam.OpClass(

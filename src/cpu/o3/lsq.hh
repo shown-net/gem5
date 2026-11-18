@@ -950,7 +950,8 @@ class LSQ
                             const RequestPtr &request) const;
     void enqueueLoadCompletion(const DynInstPtr &inst,
                                std::function<void()> complete,
-                               bool same_cycle = false);
+                               bool same_cycle = false,
+                               Cycles delay = Cycles(0));
     /**
      * Handles writing back and completing the load or store that has
      * returned from memory.

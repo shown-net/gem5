@@ -32,6 +32,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <iterator>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -87,27 +88,6 @@ Event::name() const
 }
 
 
-Event *
-Event::insertBefore(Event *event, Event *curr)
-{
-    // Either way, event will be the top element in the 'in bin' list
-    // which is the pointer we need in order to look into the list, so
-    // we need to insert that into the bin list.
-    if (!curr || *event < *curr) {
-        // Insert the event before the current list since it is in the future.
-        event->nextBin = curr;
-        event->nextInBin = NULL;
-    } else {
-        // Since we're on the correct list, we need to point to the next list
-        event->nextBin = curr->nextBin;  // curr->nextBin can now become stale
-
-        // Insert event at the top of the stack
-        event->nextInBin = curr;
-    }
-
-    return event;
-}
-
 void
 Event::acquire()
 {
@@ -137,87 +117,63 @@ Event::releaseImpl()
 void
 EventQueue::insert(Event *event)
 {
-    // Deal with the head case
-    if (!head || *event <= *head) {
-        head = Event::insertBefore(event, head);
-        return;
+    const BinKey key(event->when(), event->priority());
+    auto bin = bins.begin();
+    // Most CPU and service events are inserted into or ahead of the first
+    // bin. Preserve that constant-time path rather than searching the tree.
+    if (bin != bins.end() && key > bin->first)
+        bin = bins.lower_bound(key);
+    event->prevInBin = nullptr;
+    if (bin != bins.end() && bin->first == key) {
+        Event *top = bin->second;
+        event->nextBin = top->nextBin;
+        event->nextInBin = top;
+        top->prevInBin = event;
+        bin->second = event;
+    } else {
+        event->nextBin = bin == bins.end() ? nullptr : bin->second;
+        event->nextInBin = nullptr;
+        bin = bins.emplace_hint(bin, key, event);
     }
 
-    // Figure out either which 'in bin' list we are on, or where a new list
-    // needs to be inserted
-    Event *prev = head;
-    Event *curr = head->nextBin;
-    while (curr && *curr < *event) {
-        prev = curr;
-        curr = curr->nextBin;
-    }
-
-    // Note: this operation may render all nextBin pointers on the
-    // prev 'in bin' list stale (except for the top one)
-    prev->nextBin = Event::insertBefore(event, curr);
-}
-
-Event *
-Event::removeItem(Event *event, Event *top)
-{
-    Event *curr = top;
-    Event *next = top->nextInBin;
-
-    // if we removed the top item, we need to handle things specially
-    // and just remove the top item, fixing up the next bin pointer of
-    // the new top item
-    if (event == top) {
-        if (!next)
-            return top->nextBin;
-        next->nextBin = top->nextBin;
-        return next;
-    }
-
-    // Since we already checked the current element, we're going to
-    // keep checking event against the next element.
-    while (event != next) {
-        if (!next)
-            panic("event not found!");
-
-        curr = next;
-        next = next->nextInBin;
-    }
-
-    // remove next from the 'in bin' list since it's what we're looking for
-    curr->nextInBin = next->nextInBin;
-    return top;
+    if (bin == bins.begin())
+        head = event;
+    else
+        std::prev(bin)->second->nextBin = event;
 }
 
 void
 EventQueue::remove(Event *event)
 {
-    if (head == NULL)
-        panic("event not found!");
-
     assert(event->queue == this);
-
-    // deal with an event on the head's 'in bin' list (event has the same
-    // time as the head)
-    if (*head == *event) {
-        head = Event::removeItem(event, head);
-        return;
-    }
-
-    // Find the 'in bin' list that this event belongs on
-    Event *prev = head;
-    Event *curr = head->nextBin;
-    while (curr && *curr < *event) {
-        prev = curr;
-        curr = curr->nextBin;
-    }
-
-    if (!curr || *curr != *event)
+    auto bin = event == head ? bins.begin() :
+        bins.find(BinKey(event->when(), event->priority()));
+    if (bin == bins.end())
         panic("event not found!");
-
-    // curr points to the top item of the the correct 'in bin' list, when
-    // we remove an item, it returns the new top item (which may be
-    // unchanged)
-    prev->nextBin = Event::removeItem(event, curr);
+    if (event->prevInBin) {
+        event->prevInBin->nextInBin = event->nextInBin;
+        if (event->nextInBin)
+            event->nextInBin->prevInBin = event->prevInBin;
+    } else {
+        if (bin->second != event)
+            panic("event not found!");
+        Event *next = event->nextInBin;
+        Event *next_bin = event->nextBin;
+        if (next) {
+            next->prevInBin = nullptr;
+            next->nextBin = next_bin;
+            bin->second = next;
+        }
+        if (bin == bins.begin())
+            head = next ? next : next_bin;
+        else
+            std::prev(bin)->second->nextBin = next ? next : next_bin;
+        if (!next)
+            bins.erase(bin);
+    }
+    event->nextBin = nullptr;
+    event->nextInBin = nullptr;
+    event->prevInBin = nullptr;
 }
 
 Event *
@@ -225,20 +181,8 @@ EventQueue::serviceOne()
 {
     std::lock_guard<EventQueue> lock(*this);
     Event *event = head;
-    Event *next = head->nextInBin;
+    remove(event);
     event->flags.clear(Event::Scheduled);
-
-    if (next) {
-        // update the next bin pointer since it could be stale
-        next->nextBin = head->nextBin;
-
-        // pop the stack
-        head = next;
-    } else {
-        // this was the only element on the 'in bin' list, so get rid of
-        // the 'in bin' list and point to the next bin list
-        head = head->nextBin;
-    }
 
     // handle action
     if (!event->squashed()) {
@@ -308,8 +252,14 @@ EventQueue::checkpointReschedule(Event *event)
     // It's safe to call insert() directly here since this method
     // should only be called when restoring from a checkpoint (which
     // happens before thread creation).
-    if (event->flags.isSet(Event::Scheduled))
+    if (event->flags.isSet(Event::Scheduled)) {
+        // Restore the debug queue identity as well as the index. Unserialized
+        // events have their tick and flags restored, but not their queue.
+#ifndef NDEBUG
+        event->queue = this;
+#endif
         insert(event);
+    }
 }
 void
 EventQueue::dump() const
@@ -343,16 +293,29 @@ EventQueue::debugVerify() const
 
     Tick time = 0;
     short priority = 0;
+    bool first = true;
+    auto indexed = bins.begin();
 
     Event *nextBin = head;
     while (nextBin) {
+        if (indexed == bins.end() || indexed->second != nextBin ||
+            indexed->first != BinKey(nextBin->when(), nextBin->priority())) {
+            cprintf("event bin index inconsistent!");
+            return false;
+        }
+        Event *prevInBin = nullptr;
         Event *nextInBin = nextBin;
         while (nextInBin) {
-            if (nextInBin->when() < time) {
+            if (nextInBin->prevInBin != prevInBin ||
+                *nextInBin != *nextBin) {
+                cprintf("event bin links inconsistent!");
+                return false;
+            }
+            if (!first && nextInBin->when() < time) {
                 cprintf("time goes backwards!");
                 nextInBin->dump();
                 return false;
-            } else if (nextInBin->when() == time &&
+            } else if (!first && nextInBin->when() == time &&
                        nextInBin->priority() < priority) {
                 cprintf("priority inverted!");
                 nextInBin->dump();
@@ -368,14 +331,17 @@ EventQueue::debugVerify() const
 
             time = nextInBin->when();
             priority = nextInBin->priority();
+            first = false;
 
+            prevInBin = nextInBin;
             nextInBin = nextInBin->nextInBin;
         }
 
         nextBin = nextBin->nextBin;
+        ++indexed;
     }
 
-    return true;
+    return indexed == bins.end();
 }
 
 Event*
@@ -383,6 +349,18 @@ EventQueue::replaceHead(Event* s)
 {
     Event* t = head;
     head = s;
+    bins.clear();
+    for (Event *bin = head; bin; bin = bin->nextBin) {
+        const auto result = bins.emplace(BinKey(bin->when(), bin->priority()),
+                                         bin);
+        if (!result.second)
+            panic("duplicate event queue bin during restore");
+        Event *prev = nullptr;
+        for (Event *event = bin; event; event = event->nextInBin) {
+            event->prevInBin = prev;
+            prev = event;
+        }
+    }
     return t;
 }
 

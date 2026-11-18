@@ -65,6 +65,7 @@ initialDemand(const StaticInst &instruction, const StaticInst *macro)
     const bool rep_helper = rep_parent && !instruction.isMemRef() &&
         !instruction.isFirstMicroop() && !instruction.isLastMicroop();
     if (name == "repstart" || name.rfind("repselect", 0) == 0 ||
+        name.rfind("repcheck", 0) == 0 ||
         name.rfind("repprogress", 0) == 0 || rep_helper) {
         demand.frontendUnits = demand.idqUnits = demand.allocationUnits = 0;
         demand.robUnits = demand.retirementUnits = 0;

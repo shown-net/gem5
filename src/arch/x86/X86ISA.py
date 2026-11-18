@@ -60,6 +60,9 @@ class X86ISA(BaseISA):
     tsc_frequency = Param.UInt64(
         2600000000, "Invariant TSC frequency in Hz, independent of CPU clocks"
     )
+    rep_fast_string = Param.Bool(
+        True, "Enable the bounded REP timing path independently of CPUID"
+    )
 
     # For the functions that return numerical values we use a vector of ints.
     # The order of the values is: EAX, EBX, EDX, ECX.
@@ -88,6 +91,9 @@ class X86ISA(BaseISA):
     ExtendedFeatures = VectorParam.UInt32(
         # FSGSBASE, INVPCID, ERMS and ADCX/ADOX. REP retains ordinary semantics
         # when its bounded path cannot accept an access. FSRM stays hidden.
+        # Four values per subleaf are ordered EAX, EBX, EDX, ECX. Subleaf 0
+        # EAX is the maximum index, and empty intermediate subleaves must be
+        # represented by four zeros.
         [0x00000000, 0x01880601, 0x00000000, 0x00000000], "feature flags"
     )
     # 0000_000Dh - This uses ECX index, so the last entry must be all zeros

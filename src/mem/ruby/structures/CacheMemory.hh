@@ -128,6 +128,18 @@ class CacheMemory : public SimObject
     AbstractCacheEntry* allocateDirectory(Addr address,
                                          AbstractCacheEntry* entry);
     void deallocateDirectory(Addr address);
+    int directorySize() const { return m_directory.size(); }
+
+    // Optional finite snoop-filter index. Only protocol-owned private-copy
+    // responsibility is represented here; LLC-only metadata remains in the
+    // separate directory. A victim is never removed implicitly.
+    bool sfEnabled() const { return !sfSets.empty(); }
+    bool sfContains(Addr address) const;
+    bool sfHasSpace(Addr address) const;
+    Addr sfVictim(Addr address) const;
+    void sfAllocate(Addr address);
+    void sfTouch(Addr address);
+    void sfRelease(Addr address);
 
     Cycles getTagLatency() const { return tagArray.getLatency(); }
     Cycles getDataLatency() const { return dataArray.getLatency(); }
@@ -247,6 +259,7 @@ class CacheMemory : public SimObject
   private:
     // convert a Address to its location in the cache
     int64_t addressToCacheSet(Addr address) const;
+    size_t addressToSfSet(Addr address) const;
 
     // Given a cache tag: returns the index of the tag in a set.
     // returns -1 if the tag is not found.
@@ -266,6 +279,10 @@ class CacheMemory : public SimObject
     std::unordered_map<Addr, int> m_tag_index;
     std::unordered_map<Addr, std::unique_ptr<AbstractCacheEntry>> m_directory;
     std::vector<std::vector<AbstractCacheEntry*> > m_cache;
+    // Each set is ordered least-recently-used to most-recently-used. A scan
+    // is bounded by sfWays and has no side table with independent capacity.
+    std::vector<std::vector<Addr>> sfSets;
+    unsigned sfWays = 0;
 
     /** We use the replacement policies from the Classic memory system. */
     replacement_policy::Base *m_replacementPolicy_ptr;
@@ -284,6 +301,7 @@ class CacheMemory : public SimObject
     int m_block_size;
     std::unordered_map<Addr, int> offcoreOwnership;
     unsigned offcoreDemandRfos = 0;
+    const unsigned llcRequestorCount;
 
     L1DataService l1DataService;
     L2CacheService l2CacheService;
@@ -382,6 +400,8 @@ class CacheMemory : public SimObject
           statistics::Scalar softwarePrefetchFillHits;
           statistics::Scalar offcoreDemandRfoRequests, offcoreDemandRfoCycles;
           statistics::Scalar offcorePrepareRequests, offcoreSoftwareRfoRequests;
+          statistics::Vector llcCoreReferences, llcCoreMisses;
+          statistics::Scalar llcLocalMemoryReads, llcLocalMemoryWrites;
 
           // hardware transactional memory
           statistics::Histogram htmTransCommitReadSet;
@@ -407,6 +427,9 @@ class CacheMemory : public SimObject
       void profileDemandMiss();
       void profileNativeRequest(int role, bool miss, bool ownership);
       void profileNativeReadAccess(int role);
+      void profileLlcLookup(int requestor, bool miss);
+      void profileLlcReadRequest();
+      void profileLlcWriteRequest();
     void beginOffcoreOwnership(Addr address, int role);
     void endOffcoreOwnership(Addr address);
     void profileDataReplacement(Addr address);

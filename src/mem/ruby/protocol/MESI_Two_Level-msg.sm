@@ -33,6 +33,7 @@ enumeration(CoherenceRequestType, desc="...") {
   GETX,      desc="Get eXclusive";
   UPGRADE,   desc="UPGRADE to exclusive";
   GETS,      desc="Get Shared";
+  GETS_CLEAN_PEER, desc="Probe a directory sharer for clean data";
   GET_INSTR, desc="Get Instruction";
   INV,       desc="INValidate";
   PUTX,      desc="Replacement message";
@@ -58,6 +59,7 @@ enumeration(CoherenceResponseType, desc="...") {
   WB_ACK, desc="writeback ack";
   UNBLOCK, desc="unblock";
   EXCLUSIVE_UNBLOCK, desc="exclusive unblock";
+  CLEAN_PEER_NACK, desc="A clean sharer could not provide the line";
   INV, desc="Invalidate from directory";
 
   FLUSH_ACK, desc="Flush ack";

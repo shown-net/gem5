@@ -28,9 +28,13 @@
 
 #include "arch/x86/cpuid.hh"
 
-#include "arch/x86/isa.hh"
+#include <cassert>
+#include <cstddef>
+#include <cstring>
+
 #include "base/bitfield.hh"
-#include "cpu/thread_context.hh"
+#include "base/logging.hh"
+#include "base/trace.hh"
 #include "debug/X86.hh"
 
 namespace gem5
@@ -49,6 +53,14 @@ X86CPUID::X86CPUID(const std::string& vendor, const std::string& name)
 void
 X86CPUID::addStandardFunc(uint32_t func, std::vector<uint32_t> values)
 {
+    if (func == ExtendedFeatures) {
+        // Leaf 7 EAX advertises the largest supported subleaf. Require a
+        // complete four-register entry even for an empty intermediate one.
+        const bool invalid = values.empty() || values.size() % 4 != 0 ||
+                             values[0] >= values.size() / 4;
+        fatal_if(invalid,
+                 "CPUID leaf 7 must provide all advertised subleaves\n");
+    }
     capabilities[func] = values;
 }
 
@@ -112,11 +124,18 @@ X86CPUID::doCpuid(ThreadContext * tc, uint32_t function, uint32_t index,
             (function >= ext && function < ext + NumExtendedCpuidFuncs);
     }
 
-    int cap_offset = 0;
+    // Unlike CPUID leaves with a zero terminator, leaf 7 uses subleaf 0 EAX
+    // as its maximum. Empty intermediate subleaves do not end enumeration.
+    if (function == ExtendedFeatures && index > capabilities[function][0]) {
+        result = CpuidResult();
+        return true;
+    }
+
+    size_t cap_offset = 0;
 
     // Ignore index values for functions that do not take index values.
     if (hasSignificantIndex(function)) {
-        cap_offset = index * 4;
+        cap_offset = size_t(index) * 4;
     }
 
     // Ensure we have the offset and 4 dwords after it.
@@ -152,6 +171,7 @@ X86CPUID::hasSignificantIndex(uint32_t function)
 
     if (family == 0x0000) {
         switch (funcNum) {
+          case ExtendedFeatures:
           case ExtendedState:
             return true;
           default:

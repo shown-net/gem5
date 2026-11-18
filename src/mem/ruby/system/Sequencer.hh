@@ -44,6 +44,7 @@
 #include <iostream>
 #include <deque>
 #include <list>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -372,6 +373,22 @@ class Sequencer : public RubyPort
 
     EventFunctionWrapper deadlockCheckEvent;
     EventFunctionWrapper dataFillResponseEvent;
+
+    // Request-local L1 tag observations can finish before the data array.
+    // Once a hit is observed, preserve the bytes and packet until the single
+    // component event delivers every response due at its deadline.
+    struct PendingDataHit
+    {
+        SequencerRequest request;
+        DataBlock data;
+    };
+    std::unordered_map<PacketPtr, Cycles> dataHitDelay;
+    std::multimap<Tick, PendingDataHit> pendingDataHits;
+    EventFunctionWrapper dataHitResponseEvent;
+    bool servicingDataHits = false;
+    void queueDataHit(SequencerRequest &request, const DataBlock &data,
+                      Cycles delay);
+    void serviceDataHits();
 
     // support for LL/SC
 

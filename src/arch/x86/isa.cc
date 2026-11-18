@@ -164,6 +164,7 @@ RegClass matRegClass(MatRegClass, MatRegClassName, 0, debug::MatRegs);
 
 ISA::ISA(const X86ISAParams &p)
     : BaseISA(p, "x86"), tscFrequency(p.tsc_frequency),
+      repFastString(p.rep_fast_string),
       cpuid(new X86CPUID(p.vendor_string, p.name_string))
 {
     fatal_if(!tscFrequency || tscFrequency > mask(32),

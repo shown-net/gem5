@@ -445,6 +445,10 @@ class Rename
     /** Rename width, in instructions. */
     unsigned renameWidth;
 
+    /** Logical unresolved control-flow credits, shared by the core. */
+    const unsigned branchCheckpointCapacity;
+    std::list<DynInstPtr> branchCheckpoints[MaxThreads];
+
     /** The index of the instruction in the time buffer to IEW that rename is
      * currently using.
      */

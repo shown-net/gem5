@@ -238,7 +238,10 @@ void
 LSQ::tick()
 {
     updateLoadCompletionBudget();
+    // A delayed return is not eligible for a result slot until its ready
+    // edge. The queue is sorted by ready time, then instruction sequence.
     while (!loadCompletions.empty() &&
+           loadCompletions.front().ready <= curTick() &&
            usedLoadCompletions < loadCompletionWidth) {
         auto completion = std::move(loadCompletions.front());
         loadCompletions.pop_front();
@@ -250,7 +253,7 @@ LSQ::tick()
         }
         completion.complete();
     }
-    if (!loadCompletions.empty())
+    if (!loadCompletions.empty() && loadCompletions.front().ready <= curTick())
         ++dcachePort.dcachePortStats.loadCompletionBlockedCycles;
     for (ThreadID tid : *activeThreads) {
         if (thread[tid].hasFastForwardingModel())
@@ -593,14 +596,15 @@ LSQ::updateLoadCompletionBudget()
 
 void
 LSQ::enqueueLoadCompletion(const DynInstPtr &inst,
-                           std::function<void()> complete, bool same_cycle)
+                           std::function<void()> complete, bool same_cycle,
+                           Cycles delay)
 {
     assert(loadCompletionWidth && inst);
     updateLoadCompletionBudget();
     ++dcachePort.dcachePortStats.loadCompletionQueued;
     // A predicted register value has no cache-response handoff. It may use
     // remaining result slots now, but cannot pass older queued responses.
-    if (same_cycle && loadCompletions.empty() &&
+    if (same_cycle && delay == Cycles(0) && loadCompletions.empty() &&
         usedLoadCompletions < loadCompletionWidth) {
         if (!inst->isSquashed()) {
             ++usedLoadCompletions;
@@ -609,7 +613,8 @@ LSQ::enqueueLoadCompletion(const DynInstPtr &inst,
         complete();
         return;
     }
-    LoadCompletion item{curTick(), inst->seqNum, inst, std::move(complete)};
+    LoadCompletion item{delay > Cycles(0) ? cpu->clockEdge(delay) : curTick(),
+                        inst->seqNum, inst, std::move(complete)};
     auto position = std::upper_bound(loadCompletions.begin(),
         loadCompletions.end(), item,
         [](const LoadCompletion &a, const LoadCompletion &b) {
