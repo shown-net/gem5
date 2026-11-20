@@ -118,7 +118,7 @@ Fetch::fetchFrontend(bool &status_change)
             ++fetchStats.repControlWaitCycles;
         return;
     }
-    if (!frontend->canAccept() || checkStall(tid)) return;
+    if (checkStall(tid)) return;
     if (fetchStatus[tid] == IcacheAccessComplete) {
         fetchStatus[tid] = Running;
         status_change = true;
@@ -225,7 +225,12 @@ Fetch::fetchFrontend(bool &status_change)
             !frontend->instructionBytes->contains(successor))
             fetchCacheLine(successor, tid, successor, true);
     }
-    if (!frontend->canAccept(source)) return;
+    if (!frontend->canAccept(source)) {
+        if (source == FrontendSource::Mite && !memReq[tid] &&
+            !frontend->instructionBytes->contains(at.instAddr()))
+            fetchCacheLine(at.instAddr(), tid, at.instAddr());
+        return;
+    }
     unsigned limit = frontend->sourceService(source)->freeBatchOps();
     if (source == FrontendSource::Microcode)
         limit = std::min(limit, frontend->ms->extractionWidth());

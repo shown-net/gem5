@@ -47,6 +47,7 @@
 #include <array>
 #include <deque>
 #include <list>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -94,6 +95,7 @@ class DynInst : public ExecContext, public RefCounted
     {
         size_t numSrcs;
         size_t numDests;
+        bool hasDivideResults = false;
 
         RegId *flatDestIdx;
         PhysRegIdPtr *destIdx;
@@ -121,34 +123,48 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Executes the instruction.*/
     Fault execute();
-    void bindSourceResults();
+    void clearSourceResults() { sourceResultValues.clear(); }
+    void
+    bindSourceResult(RegIndex index, PhysRegIdPtr reg,
+                     const ResultForwarding &forwarding)
+    {
+        auto source = forwarding.source(reg);
+        if (std::holds_alternative<std::monostate>(source))
+            return;
+        if (sourceResultValues.empty())
+            sourceResultValues.resize(numSrcRegs());
+        sourceResultValues[index] = std::move(source);
+    }
     void prepareResultValues(unsigned port, Tick nominal_at);
     void evaluateResultValues(Tick available_at);
     void writeResultValues();
     bool hasResultValue(RegIndex index) const
-    { return index < resultValues.size() && resultValues[index].isValid() &&
-        (!divisionManaged || divideAvailableTicks.at(index) != MaxTick); }
+    { return index < resultValues.size() && resultValues[index].has_value() &&
+        (!divisionManaged || divideResults().published.at(index) != MaxTick); }
     RegVal resultValue(RegIndex index) const
-    { return resultValues.at(index).asRegVal(); }
+    { return resultValues.at(index).value(); }
     Tick resultAvailableAt() const { return resultAvailableTick; }
     Tick resultAvailableAt(RegIndex index) const
-    { return divisionManaged ? divideAvailableTicks.at(index) : resultAvailableTick; }
+    { return divisionManaged ? divideResults().published.at(index) :
+                               resultAvailableTick; }
     Tick resultNominalAt() const { return resultNominalTick; }
     Tick resultNominalAt(RegIndex index) const
-    { return divisionManaged ? divideNominalTicks.at(index) : resultNominalTick; }
+    { return divisionManaged ? divideResults().published.at(index) :
+                               resultNominalTick; }
     bool divisionManaged = false;
     void prepareDivideValues(const std::array<Tick, 2> &times)
     {
-        divideNominalTicks = times;
         prepareResultValues(1, std::max(times[0], times[1]));
     }
     void publishDivideResult(RegIndex index, Tick time)
-    { divideAvailableTicks.at(index) = time; divideNominalTicks.at(index) = time; }
-    bool divideResultWoken(RegIndex index) const { return divideWakeMask & (1u << index); }
-    void markDivideResultWoken(RegIndex index) { divideWakeMask |= 1u << index; }
-    bool allDivideResultsWoken() const { return divideWakeMask == 3; }
+    { divideResults().published.at(index) = time; }
+    bool divideResultWoken(RegIndex index) const
+    { return divideResults().wakeMask & (1u << index); }
+    void markDivideResultWoken(RegIndex index)
+    { divideResults().wakeMask |= 1u << index; }
+    bool allDivideResultsWoken() const { return divideResults().wakeMask == 3; }
     void writeResultValue(RegIndex index)
-    { cpu->setReg(renamedDestIdx(index), resultValues.at(index).asRegVal(), threadNumber); }
+    { cpu->setReg(renamedDestIdx(index), resultValues.at(index).value(), threadNumber); }
     unsigned resultProducerPort() const { return resultPort; }
     const auto &sourceResults() const { return sourceResultValues; }
     bool wasEvaluatedByResource() const { return resourceEvaluated; }
@@ -156,17 +172,20 @@ class DynInst : public ExecContext, public RefCounted
     void setResultsWoken() { resourceResultsWoken = true; }
 
   private:
-    std::vector<InstResult> resultValues;
-    std::vector<ResultForwarding::Reference> sourceResultValues;
+    struct DivideResults
+    {
+        std::array<Tick, 2> published{MaxTick, MaxTick};
+        uint8_t wakeMask = 0;
+    };
+    DivideResults &divideResults() const;
+    std::vector<std::optional<RegVal>> resultValues;
+    std::vector<ResultForwarding::Source> sourceResultValues;
     bool captureResultValues = false;
     bool resourceEvaluated = false;
     bool resourceResultsWoken = false;
     Tick resultAvailableTick = 0;
     Tick resultNominalTick = 0;
     unsigned resultPort = 0;
-    std::array<Tick, 2> divideAvailableTicks{MaxTick, MaxTick};
-    std::array<Tick, 2> divideNominalTicks{};
-    unsigned divideWakeMask = 0;
 
   public:
 
@@ -497,6 +516,9 @@ class DynInst : public ExecContext, public RefCounted
 
     /** Pointer to the data for the memory access. */
     uint8_t *memData = nullptr;
+
+    bool bypassedMemDep = false;
+    bool waitingForDataTranslation = false;
 
     /** Load queue index. */
     ssize_t lqIdx = -1;
@@ -1395,12 +1417,14 @@ class DynInst : public ExecContext, public RefCounted
         if (reg->is(InvalidRegClass))
             return 0;
         RegVal value;
-        if (idx < sourceResultValues.size() && sourceResultValues[idx].producer) {
-            const auto &ref = sourceResultValues[idx];
-            panic_if(!ref.producer->hasResultValue(ref.destination) ||
-                     ref.producer->resultAvailableAt(ref.destination) > curTick(),
+        const auto *ref = idx < sourceResultValues.size() ?
+            std::get_if<ResultForwarding::LiveIntegerSource>(
+                &sourceResultValues[idx]) : nullptr;
+        if (ref) {
+            panic_if(!ref->producer->hasResultValue(ref->destination) ||
+                     ref->producer->resultAvailableAt(ref->destination) > curTick(),
                      "Consumer read a result before its value was available");
-            value = ref.producer->resultValue(ref.destination);
+            value = ref->producer->resultValue(ref->destination);
         } else {
             value = cpu->getReg(reg, threadNumber);
         }
@@ -1436,7 +1460,7 @@ class DynInst : public ExecContext, public RefCounted
         if (reg->is(InvalidRegClass))
             return;
         if (captureResultValues)
-            resultValues.at(idx) = InstResult(reg->regClass(), val);
+            resultValues.at(idx) = val;
         else
             cpu->setReg(reg, val, threadNumber);
         setResult(reg->regClass(), val);

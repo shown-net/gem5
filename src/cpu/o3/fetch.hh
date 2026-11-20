@@ -437,7 +437,6 @@ class Fetch
   private:
     /** Pointer to the O3CPU. */
     CPU *cpu;
-    EventFunctionWrapper wakeEvent;
     FrontendCoordinator *frontend;
 
     /** Time buffer interface. */

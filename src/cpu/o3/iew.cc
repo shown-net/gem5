@@ -75,7 +75,7 @@ std::string IEW::IEWStats::statusStrings[ThreadStatusMax] = {
 // clang-format on
 
 IEW::IEW(CPU *_cpu, const BaseO3CPUParams &params)
-    : issueToExecQueue(params.backComSize, params.forwardComSize),
+    : issueToExecQueue(std::max(1, int(params.issueToExecuteDelay)), 0),
       cpu(_cpu),
       instQueue(_cpu, this, params),
       ldstQueue(_cpu, this, params),
@@ -300,12 +300,6 @@ IEW::clearStates(ThreadID tid)
         iew_struct.branchTaken[tid] = false;
         iew_struct.includeSquashInst[tid] = false;
     }
-
-    // Clear out any of this thread's instructions being sent from
-    // issue to execute.
-    for (int i = -issueToExecQueue.getPast();
-         i <= issueToExecQueue.getFuture(); ++i)
-        removeCommThreadInsts(tid, issueToExecQueue[i]);
 
     // Clear out any of this thread's instructions being sent to prior stages.
     for (int i = -cpu->timeBuffer.getPast();
@@ -1159,38 +1153,12 @@ IEW::dispatchInsts(ThreadID tid)
 }
 
 void
-IEW::printAvailableInsts()
-{
-    int inst = 0;
-
-    std::cout << "Available Instructions: ";
-
-    while (fromIssue->insts[inst]) {
-
-        if (inst%3==0) std::cout << "\n\t";
-
-        std::cout << "PC: " << fromIssue->insts[inst]->pcState()
-             << " TN: " << fromIssue->insts[inst]->threadNumber
-             << " SN: " << fromIssue->insts[inst]->seqNum << " | ";
-
-        inst++;
-
-    }
-
-    std::cout << "\n";
-}
-
-void
 IEW::executeInsts()
 {
 
     for (ThreadID tid : *activeThreads) {
         fetchRedirect[tid] = false;
     }
-
-    // Uncomment this if you want to see all available instructions.
-    // @todo This doesn't actually work anymore, we should fix it.
-//    printAvailableInsts();
 
     // Execute/writeback any instructions that are available.
     int insts_to_execute = fromIssue->size;

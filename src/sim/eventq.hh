@@ -258,10 +258,7 @@ class Event : public EventBase, public Serializable
     friend class EventQueue;
 
   private:
-    // Each (time, priority) bin is a LIFO list. Only a bin's first event
-    // has a valid nextBin pointer. Keeping this chain permits replaceHead()
-    // to temporarily detach and later restore an entire queue.
-    Event *nextBin;
+    // Each (time, priority) bin is a LIFO list.
     Event *nextInBin;
     Event *prevInBin;
 
@@ -399,7 +396,7 @@ class Event : public EventBase, public Serializable
      * @ingroup api_eventq
      */
     Event(Priority p = Default_Pri, Flags f = 0)
-        : nextBin(nullptr), nextInBin(nullptr), prevInBin(nullptr), _when(0),
+        : nextInBin(nullptr), prevInBin(nullptr), _when(0),
           _priority(p), flags(Initialized | f)
     {
         assert(f.noneSet(~PublicWrite));
@@ -612,12 +609,19 @@ class EventQueue
     friend void curEventQueue(EventQueue *);
 
     std::string objName;
-    Event *head;
-    // The value is the first event in each nonempty (time, priority) bin.
-    // The linked bins remain available to replaceHead() while this index
-    // provides logarithmic insertion and lookup of a bin.
     using BinKey = std::pair<Tick, Event::Priority>;
-    std::map<BinKey, Event *> bins;
+
+  public:
+    class PendingEvents
+    {
+        friend class EventQueue;
+        // If populated, the inline bin precedes every bin in the index.
+        Event *first = nullptr;
+        std::map<BinKey, Event *> later;
+    };
+
+  private:
+    PendingEvents pending;
     Tick _curTick;
 
     //! Mutex to protect async queue.
@@ -832,7 +836,7 @@ class EventQueue
             event->trace("rescheduled");
     }
 
-    Tick nextTick() const { return head->when(); }
+    Tick nextTick() const { return getHead()->when(); }
     void setCurTick(Tick newVal) { _curTick = newVal; }
 
     /**
@@ -847,9 +851,16 @@ class EventQueue
      * @ingroup api_eventq
      */
     Tick getCurTick() const { return _curTick; }
-    Event *getHead() const { return head; }
+    Event *getHead() const
+    {
+        if (pending.first)
+            return pending.first;
+        return pending.later.empty() ? nullptr : pending.later.begin()->second;
+    }
 
     Event *serviceOne();
+    // Caller holds the service lock for the entire callback.
+    Event *serviceOneLocked();
 
     /**
      * process all events up to the given timestamp.  we inline a quick test
@@ -875,7 +886,7 @@ class EventQueue
              * @todo this assert is a good bug catcher.  I need to
              * make it true again.
              */
-            //assert(head->when() >= when && "event scheduled in the past");
+            //assert(nextTick() >= when && "event scheduled in the past");
             serviceOne();
         }
 
@@ -887,7 +898,7 @@ class EventQueue
      *
      * @ingroup api_eventq
      */
-    bool empty() const { return head == NULL; }
+    bool empty() const { return !pending.first && pending.later.empty(); }
 
     /**
      * This is a debugging function which will print everything on the event
@@ -922,14 +933,10 @@ class EventQueue
     virtual void wakeup(Tick when = (Tick)-1) { }
 
     /**
-     *  function for replacing the head of the event queue, so that a
-     *  different set of events can run without disturbing events that have
-     *  already been scheduled. Already scheduled events can be processed
-     *  by replacing the original head back.
-     *  USING THIS FUNCTION CAN BE DANGEROUS TO THE HEALTH OF THE SIMULATOR.
-     *  NOT RECOMMENDED FOR USE.
+     * Exchange the scheduled events while simulation is stopped. The owning
+     * queue, event flags, and current tick are unchanged by the exchange.
      */
-    Event* replaceHead(Event* s);
+    void swapPendingEvents(PendingEvents &saved);
 
     /**@{*/
     /**

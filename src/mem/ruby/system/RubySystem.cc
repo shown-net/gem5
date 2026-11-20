@@ -399,8 +399,8 @@ RubySystem::startup()
         DPRINTF(RubyCacheTrace, "Starting ruby cache warmup\n");
         // save the current tick value
         Tick curtick_original = curTick();
-        // save the event queue head
-        Event* eventq_head = eventq->replaceHead(NULL);
+        EventQueue::PendingEvents saved_events;
+        eventq->swapPendingEvents(saved_events);
         // save the exit event pointer
         GlobalSimLoopExitEvent *original_simulate_limit_event = nullptr;
         original_simulate_limit_event = simulate_limit_event;
@@ -416,8 +416,7 @@ RubySystem::startup()
         m_cache_recorder = NULL;
         m_warmup_enabled = false;
 
-        // Restore eventq head
-        eventq->replaceHead(eventq_head);
+        eventq->swapPendingEvents(saved_events);
         // Restore exit event pointer
         simulate_limit_event = original_simulate_limit_event;
         // Restore curTick and Ruby System's clock

@@ -325,7 +325,7 @@ LSQUnit::validateFastForwarding()
                 prediction.physicalStores.count(store->seqNum))
                 continue;
             FastForwarding::StoreBytes bytes;
-            if (!it->request()->physicalBytes(bytes.bytes)) continue;
+            if (!it->request()->physicalLineMasks(bytes.bytes)) continue;
             bytes.secure = it->request()->mainReq()->isSecure();
             bytes.ordinary = isOrdinaryStore(it);
             prediction.physicalStores.emplace(store->seqNum, std::move(bytes));
@@ -339,7 +339,7 @@ LSQUnit::validateFastForwarding()
             continue;
         const auto &source = prediction.store;
         const auto req = load->savedRequest->mainReq();
-        std::vector<Addr> load_bytes;
+        PhysicalLineCoverage::Lines load_bytes;
         const bool ordinary = !load->savedRequest->isSplit() &&
             !req->isMasked() && !req->isLLSC() && !req->isReadModifyWrite() &&
             !req->isAcquire() && !req->isLocalAccess() &&
@@ -352,13 +352,14 @@ LSQUnit::validateFastForwarding()
             !source->isSquashed() &&
             source->fault == NoFault && load->fault == NoFault &&
             load->effSize == prediction.size &&
-            load->savedRequest->physicalBytes(load_bytes) &&
+            load->savedRequest->physicalLineMasks(load_bytes) &&
             producer != prediction.physicalStores.end() &&
             producer->second.ordinary && !producer->second.bytes.empty() &&
             producer->second.secure == req->isSecure() &&
-            producer->second.bytes.front() == req->getPaddr();
+            PhysicalLineCoverage::firstByte(producer->second.bytes) ==
+                req->getPaddr();
         if (correct)
-            correct = PhysicalByteCoverage::contains(producer->second.bytes,
+            correct = PhysicalLineCoverage::contains(producer->second.bytes,
                                                      load_bytes);
         for (const auto &store : prediction.interveningStores) {
             if (store == source || store->isSquashed())
@@ -369,7 +370,7 @@ LSQUnit::validateFastForwarding()
                 continue;
             }
             if (bytes->second.secure != req->isSecure()) continue;
-            if (PhysicalByteCoverage::intersects(load_bytes,
+            if (PhysicalLineCoverage::intersects(load_bytes,
                                                  bytes->second.bytes))
                 correct = false;
         }

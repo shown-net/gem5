@@ -12,6 +12,7 @@
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/o3/cpu.hh"
+#include "cpu/o3/frontend.hh"
 #include "cpu/thread_context.hh"
 #include "sim/core.hh"
 #include "sim/cur_tick.hh"
@@ -49,6 +50,38 @@ CalibrationMarker::CalibrationMarker(TaoTrace &owner, const TaoTraceParams &para
         fatal_if(!end_pcs_.empty() || !workids_.empty(), "Marker lacks fixed-work BEGIN PCs");
     }
     marker_cpu_->markerObservation = true;
+    if (!stat_names_.empty()) {
+        const auto prefix = marker_cpu_->name() + ".";
+        marker_cpu_->collectSplitTranslationDiagnostic =
+            stat_names_.count(prefix + "lsq0.noncontiguousTranslations");
+        const auto stalls = prefix + "RESOURCE_STALLS.";
+        unsigned store_stall_diagnostics = 0;
+        if (stat_names_.count(stalls + "SB"))
+            store_stall_diagnostics |= Rename::StoreBuffer;
+        if (stat_names_.count(stalls + "SB_ROB_OVERLAP"))
+            store_stall_diagnostics |= Rename::StoreBufferAndROB;
+        if (stat_names_.count(stalls + "SB_IQ_OVERLAP"))
+            store_stall_diagnostics |= Rename::StoreBufferAndIQ;
+        if (stat_names_.count(stalls + "SB_FRONTEND_BLOCKED"))
+            store_stall_diagnostics |= Rename::StoreBufferAndFrontend;
+        marker_cpu_->setStoreStallDiagnostics(store_stall_diagnostics);
+        if (auto *frontend = marker_cpu_->frontend) {
+            for (auto *source : {frontend->mite,
+                                 static_cast<MiteService *>(frontend->dsb),
+                                 static_cast<MiteService *>(frontend->ms),
+                                 frontend->lsd}) {
+                if (!source)
+                    continue;
+                source->setWidthDiagnostics(
+                    stat_names_.count(source->name() + ".sourceWidths"),
+                    stat_names_.count(source->name() + ".sourceSlotWidths"));
+            }
+        }
+        if (auto *forwarding = marker_cpu_->resultForwarding) {
+            forwarding->setCollectLateSources(stat_names_.count(
+                forwarding->name() + ".lateSources"));
+        }
+    }
     marker_instances_.insert(this);
     marker_pc_trace_file_ = params.marker_pc_trace_file;
 }

@@ -110,15 +110,19 @@ BAC::BAC(CPU *_cpu, const BaseO3CPUParams &params)
 void
 BAC::cancelWake()
 {
+    if (cpu->frontend)
+        cpu->setFrontendWake(CPU::FrontendWakeSource::BAC, MaxTick);
     if (wakeEvent.scheduled()) cpu->deschedule(wakeEvent);
 }
 
 void
 BAC::refreshWake()
 {
-    cancelWake();
     if (!decoupledFrontEnd || cpu->switchedOut() ||
-        cpu->drainState() == DrainState::Drained) return;
+        cpu->drainState() == DrainState::Drained) {
+        cancelWake();
+        return;
+    }
     const uint64_t now = uint64_t(cpu->curCycle());
     uint64_t due = ~uint64_t(0);
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
@@ -126,9 +130,15 @@ BAC::refreshWake()
         if (!lateTargets[tid].empty()) due = std::min(due, lateTargets[tid].front().ready);
         if (targetReadyCycle[tid] > now) due = std::min(due, targetReadyCycle[tid]);
     }
-    if (due == ~uint64_t(0)) return;
-    const uint64_t delay = due > now ? due - now : 1;
-    cpu->schedule(wakeEvent, cpu->clockEdge(Cycles(delay)));
+    const Tick when = due == MaxTick ? MaxTick :
+        cpu->clockEdge(Cycles(due > now ? due - now : 1));
+    if (cpu->frontend) {
+        cpu->setFrontendWake(CPU::FrontendWakeSource::BAC, when);
+    } else {
+        cancelWake();
+        if (when != MaxTick)
+            cpu->schedule(wakeEvent, when);
+    }
 }
 
 std::string

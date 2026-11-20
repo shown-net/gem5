@@ -94,6 +94,12 @@ CPU::CPU(const BaseO3CPUParams &params)
     : BaseCPU(params), tmaEnabled(params.numThreads == 1),
       mmu(params.mmu),
       tickEvent([this] { tick(); }, "O3CPU tick", false, Event::CPU_Tick_Pri),
+      frontendWakeEvent([this] {
+          for (auto &when : frontendWakeTimes)
+              if (when <= curTick())
+                  when = MaxTick;
+          wakeFrontend();
+      }, "O3 frontend ready", false, Event::CPU_Tick_Pri - 1),
       threadExitEvent([this] { exitThreads(); }, "O3CPU exit threads", false,
                       Event::CPU_Exit_Pri),
 #ifndef NDEBUG
@@ -124,11 +130,19 @@ CPU::CPU(const BaseO3CPUParams &params)
 
       timeBuffer(params.backComSize, params.forwardComSize),
       fetchQueue(params.backComSize, params.forwardComSize),
-      decodeQueue(params.backComSize, params.forwardComSize),
-      renameQueue(params.backComSize, params.forwardComSize),
-      iewQueue(params.backComSize, params.forwardComSize),
+      decodeQueue(params.frontend ? 0 : params.backComSize,
+                  params.frontend ? 0 : params.forwardComSize),
+      renameQueue(params.frontend ?
+                    static_cast<int>(std::max(params.renameToROBDelay,
+                                              params.renameToIEWDelay)) :
+                    params.backComSize,
+                  params.frontend ? 0 : params.forwardComSize),
+      iewQueue(params.frontend ? std::max(1, int(params.iewToCommitDelay)) :
+                                 params.backComSize,
+               params.frontend ? 0 : params.forwardComSize),
       activityRec(name(), NumStages,
-                  params.backComSize + params.forwardComSize, params.activity),
+                  std::max({timeBuffer.getSize(), renameQueue.getSize(),
+                            iewQueue.getSize()}) - 1, params.activity),
 
       globalSeqNum(params.stackEngine ? 2 : 1),
       stackRspShadow(numThreads, 0), stackRspPending(numThreads, false),
@@ -484,7 +498,7 @@ CPU::tick()
 
 //    activity = false;
 
-    //Tick each of the stages
+    // Tick each stage at its existing observation point.
     bac.tick();
 
     fetch.tick();
@@ -492,19 +506,17 @@ CPU::tick()
     if (!frontend) decode.tick();
 
     rename.tick();
-
     iew.tick();
-
     commit.tick();
 
     // Now advance the time buffers
     timeBuffer.advance();
 
-    fetchQueue.advance();
+    if (!frontend)
+        fetchQueue.advance();
     decodeQueue.advance();
     renameQueue.advance();
     iewQueue.advance();
-
     activityRec.advance();
 
     if (removeInstsThisCycle) {
@@ -531,6 +543,8 @@ CPU::tick()
 
     tryDrain();
     tickInProgress = false;
+    if (frontend)
+        refreshFrontendWake();
 }
 
 void
@@ -911,14 +925,15 @@ CPU::drain()
         // particular, there might be some data in flight from the
         // fetch stage that isn't visible in any of the CPU buffers we
         // test in isCpuDrained().
-        for (int i = 0; i < timeBuffer.getSize(); ++i) {
+        const auto slots = std::max({timeBuffer.getSize(), renameQueue.getSize(),
+                                     iewQueue.getSize()});
+        for (unsigned i = 0; i < slots; ++i) {
             timeBuffer.advance();
             fetchQueue.advance();
             decodeQueue.advance();
             renameQueue.advance();
             iewQueue.advance();
         }
-
         drainSanityCheck();
         return DrainState::Drained;
     }
@@ -1364,12 +1379,19 @@ CPU::instDone(ThreadID tid, const DynInstPtr &inst)
 {
     // Keep an instruction count.
     if (!inst->isMicroop() || inst->isLastMicroop()) {
-        thread[tid]->numInst++;
-        thread[tid]->threadStats.numInsts++;
+        auto &state = *thread[tid];
+        ++state.numInst;
+        ++state.threadStats.numInsts;
         commitStats[tid]->numInstsNotNOP++;
 
         // Check for instruction-count-based events.
-        thread[tid]->comInstEventQueue.serviceEvents(thread[tid]->numInst);
+        auto &events = state.comInstEventQueue;
+        if (const Event *head = events.getHead();
+            head && head->when() <= state.numInst) {
+            state.servicingInstCountEvents = true;
+            events.serviceEvents(state.numInst);
+            state.servicingInstCountEvents = false;
+        }
     }
 
     if (inst->isMemRef()) {
@@ -1607,6 +1629,38 @@ CPU::wakeCPU()
     }
 
     schedule(tickEvent, clockEdge());
+}
+
+void
+CPU::setFrontendWake(FrontendWakeSource source, Tick when)
+{
+    auto &saved = frontendWakeTimes[static_cast<unsigned>(source)];
+    if (saved == when)
+        return;
+    saved = when;
+    if (!tickInProgress)
+        refreshFrontendWake();
+}
+
+void
+CPU::refreshFrontendWake()
+{
+    const Tick when = (_status == Running && !activeThreads.empty() &&
+                       drainState() != DrainState::Drained &&
+                       !tickEvent.scheduled()) ?
+        *std::min_element(frontendWakeTimes.begin(), frontendWakeTimes.end()) :
+        MaxTick;
+    if (when == MaxTick) {
+        if (frontendWakeEvent.scheduled())
+            deschedule(frontendWakeEvent);
+        return;
+    }
+
+    const Tick due = std::max(when, clockEdge());
+    if (!frontendWakeEvent.scheduled())
+        schedule(frontendWakeEvent, due);
+    else if (frontendWakeEvent.when() != due)
+        reschedule(frontendWakeEvent, due);
 }
 
 void

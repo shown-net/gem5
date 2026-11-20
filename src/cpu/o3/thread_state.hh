@@ -72,6 +72,7 @@ class ThreadState : public gem5::ThreadState
      * number of instructions committed.
      */
     EventQueue comInstEventQueue;
+    bool servicingInstCountEvents = false;
 
     /* This variable controls if writes to a thread context should cause a all
      * dynamic/speculative state to be thrown away. Nominally this is the

@@ -133,6 +133,7 @@ IQUnit::insert(const DynInstPtr &inst)
     entry.resident = true;
     ++residentCount[inst->threadNumber];
     inst->setInIQ(this);
+    *allocationChanged = true;
 }
 
 void
@@ -145,6 +146,7 @@ IQUnit::remove(const DynInstPtr &inst)
     releaseAllocation(it->second.allocation, it->second.categories);
     entries.erase(it);
     assert(_freeEntries <= _numEntries);
+    *allocationChanged = true;
 }
 
 // A compound divide keeps its remaining hardware actions in this same IQ
@@ -158,6 +160,7 @@ IQUnit::releaseOneAction(const DynInstPtr &inst)
     --allocation.slots;
     ++_freeEntries;
     --count[allocation.thread];
+    *allocationChanged = true;
     return allocation.slots;
 }
 
@@ -190,6 +193,7 @@ IQUnit::reserve(const DynInstPtr &inst)
     ++found->second.members;
     entries.emplace(inst->seqNum,
                     SchedulerEntry{inst->threadNumber, key, false, categories});
+    *allocationChanged = true;
 }
 
 unsigned
@@ -277,6 +281,7 @@ IQUnit::cancelReservation(InstSeqNum seq)
         return;
     releaseAllocation(it->second.allocation, it->second.categories);
     entries.erase(it);
+    *allocationChanged = true;
 }
 
 void
@@ -313,6 +318,7 @@ void
 IQUnit::resetEntries()
 {
     if (iqPolicy != SMTQueuePolicy::Dynamic || numThreads > 1) {
+        *allocationChanged = true;
         int active_threads = activeThreads->size();
 
         for (ThreadID tid : *activeThreads) {
@@ -434,10 +440,12 @@ InstructionQueue::InstructionQueue(CPU *cpu_ptr, IEW *iew_ptr,
     resetState();
     if (params.resultForwarding)
         params.resultForwarding->bindCPU(cpu, numPhysRegs);
-    for (auto iq : iqs)
+    for (auto iq : iqs) {
+        iq->setAllocationChangeFlag(admissionChanged);
         iq->fuPool()->bindIntegerResources(params.executionPorts, params.resultForwarding,
             params.intALU, params.intSHFT, params.intSlow, params.intBM,
             params.intBranch, params.intDivider, params.intALUs);
+    }
 }
 
 InstructionQueue::~InstructionQueue()
@@ -719,9 +727,11 @@ InstructionQueue::resetState()
     nonSpecInsts.clear();
     listOrder.clear();
     deferredMemInsts.clear();
+    deferredTranslationsChanged = false;
     blockedMemInsts.clear();
     retryMemInsts.clear();
     admissionWaitMemInsts.clear();
+    admissionChanged = false;
     readyMoveProjections.clear();
     processingMoveProjections = false;
     wbOutstanding = 0;
@@ -973,7 +983,7 @@ InstructionQueue::allFUPools()
 bool
 InstructionQueue::hasReadyInsts()
 {
-    if (!admissionWaitMemInsts.empty())
+    if (admissionChanged && !admissionWaitMemInsts.empty())
         return true;
     if (!listOrder.empty()) {
         return true;
@@ -1406,6 +1416,13 @@ InstructionQueue::processFUCompletion(const DynInstPtr &inst, FUPool *fu_pool,
 void
 InstructionQueue::scheduleReadyInsts()
 {
+    if (listOrder.empty() && !deferredTranslationsChanged &&
+        retryMemInsts.empty() &&
+        (!admissionChanged || admissionWaitMemInsts.empty())) {
+        iqStats.numIssuedDist.sample(0);
+        return;
+    }
+
     if (cpu->resultForwarding)
         cpu->resultForwarding->beginIssuePass();
     DPRINTF(IQ, "Attempting to schedule ready instructions from "
@@ -1417,15 +1434,23 @@ InstructionQueue::scheduleReadyInsts()
     // These records are already owned by the LSQ. A real replay acquires a
     // fresh scheduler entry; waiting for the response to an accepted request
     // never keeps the original entry occupied.
-    const auto waiting = admissionWaitMemInsts.size();
+    const auto waiting = admissionChanged ? admissionWaitMemInsts.size() : 0;
+    admissionChanged = false;
     for (size_t i = 0; i < waiting; ++i) {
         auto inst = admissionWaitMemInsts.front();
         admissionWaitMemInsts.pop_front();
         addReadyMemInst(inst);
     }
 
-    DynInstPtr mem_inst;
-    while ((mem_inst = getDeferredMemInstToExecute())) {
+    for (auto it = deferredMemInsts.begin();
+         deferredTranslationsChanged && it != deferredMemInsts.end();) {
+        if (!(*it)->translationCompleted() && !(*it)->isSquashed()) {
+            ++it;
+            continue;
+        }
+        auto mem_inst = std::move(*it);
+        it = deferredMemInsts.erase(it);
+        mem_inst->waitingForDataTranslation = false;
         if (mem_inst->isSquashed())
             continue;
         // Translation completed for an address action already accepted by
@@ -1441,8 +1466,10 @@ InstructionQueue::scheduleReadyInsts()
         DPRINTF(IQ, "Resuming memory instruction after translation "
                 "[sn:%llu] PC %s.\n", mem_inst->seqNum, mem_inst->pcState());
     }
+    deferredTranslationsChanged = false;
 
     // See if any cache blocked instructions are able to be executed
+    DynInstPtr mem_inst;
     while ((mem_inst = getBlockedMemInstToExecute())) {
         if (mem_inst->isSquashed())
             continue;
@@ -1735,11 +1762,8 @@ InstructionQueue::scheduleReadyInsts()
     iqStats.numIssuedDist.sample(total_issued);
 
     // If we issued any instructions, tell the CPU we had activity.
-    // @todo If the way deferred memory instructions are handeled due to
-    // translation changes then the deferredMemInsts condition should be
-    // removed from the code below.
-    if (total_issued || i2e_info->size || resumed_memory || !retryMemInsts.empty() || !deferredMemInsts.empty() ||
-        !admissionWaitMemInsts.empty()) {
+    if (total_issued || i2e_info->size || resumed_memory || !retryMemInsts.empty() ||
+        (admissionChanged && !admissionWaitMemInsts.empty())) {
         cpu->activityThisCycle();
     } else {
         DPRINTF(IQ, "Not able to schedule any instructions.\n");
@@ -1808,6 +1832,7 @@ InstructionQueue::commit(const InstSeqNum &inst, ThreadID tid)
 
     while (iq_it != instList[tid].end() &&
            (*iq_it)->seqNum <= inst) {
+        admissionChanged |= !admissionWaitMemInsts.empty();
         ++iq_it;
         instList[tid].pop_front();
     }
@@ -1993,7 +2018,17 @@ InstructionQueue::replayOneMemInst(const DynInstPtr &replay_inst)
 void
 InstructionQueue::deferMemInst(const DynInstPtr &deferred_inst)
 {
+    deferred_inst->waitingForDataTranslation = true;
     deferredMemInsts.push_back(deferred_inst);
+}
+
+void
+InstructionQueue::translationComplete(const DynInstPtr &inst)
+{
+    if (!inst->waitingForDataTranslation)
+        return;
+    deferredTranslationsChanged = true;
+    cpu->wakeCPU();
 }
 
 void
@@ -2021,20 +2056,6 @@ InstructionQueue::cacheUnblocked()
     retryMemInsts.splice(retryMemInsts.end(), blockedMemInsts);
     // Get the CPU ticking again
     cpu->wakeCPU();
-}
-
-DynInstPtr
-InstructionQueue::getDeferredMemInstToExecute()
-{
-    for (ListIt it = deferredMemInsts.begin(); it != deferredMemInsts.end();
-         ++it) {
-        if ((*it)->translationCompleted() || (*it)->isSquashed()) {
-            DynInstPtr mem_inst = std::move(*it);
-            deferredMemInsts.erase(it);
-            return mem_inst;
-        }
-    }
-    return nullptr;
 }
 
 DynInstPtr
@@ -2088,6 +2109,8 @@ InstructionQueue::squash(ThreadID tid)
     cancelReservations(tid, squashedSeqNum[tid]);
 
     doSquash(tid);
+    admissionChanged |= !admissionWaitMemInsts.empty();
+    deferredTranslationsChanged |= !deferredMemInsts.empty();
 
     // Also tell the memory dependence unit to squash.
     memDepUnit[tid].squash(squashedSeqNum[tid], tid);
@@ -2251,19 +2274,26 @@ InstructionQueue::PqCompare::operator()(
 bool
 InstructionQueue::addToDependents(const DynInstPtr &new_inst)
 {
-    new_inst->bindSourceResults();
+    const auto *forwarding = cpu->resultForwarding;
+    if (forwarding)
+        new_inst->clearSourceResults();
     // Loop through the instruction's source registers, adding
     // them to the dependency list if they are not ready.
-    int8_t total_src_regs = new_inst->numSrcRegs();
+    const size_t total_src_regs = new_inst->numSrcRegs();
     bool return_val = false;
 
-    for (int src_reg_idx = 0;
+    for (size_t src_reg_idx = 0;
          src_reg_idx < total_src_regs;
          src_reg_idx++)
     {
-        // Only add it to the dependency graph if it's not ready.
-        if (!new_inst->readySrcIdx(src_reg_idx)) {
-            PhysRegIdPtr src_reg = new_inst->renamedSrcIdx(src_reg_idx);
+        const bool ready = new_inst->readySrcIdx(src_reg_idx);
+        if (ready && !forwarding)
+            continue;
+        PhysRegIdPtr src_reg = new_inst->renamedSrcIdx(src_reg_idx);
+        // A ready operand can still obtain its value from a live producer.
+        if (forwarding)
+            new_inst->bindSourceResult(src_reg_idx, src_reg, *forwarding);
+        if (!ready) {
 
             // Check the IQ's scoreboard to make sure the register
             // hasn't become ready while the instruction was in flight

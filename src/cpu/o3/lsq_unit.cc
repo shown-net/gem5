@@ -290,6 +290,7 @@ LSQUnit::init(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params,
 void
 LSQUnit::resetState()
 {
+    storePrepareChanged = true;
     while (!capacityReadLines.empty())
         releaseCapacityRead(capacityReadLines.begin()->first);
     panic_if(!committedStoreBuffer.empty(),
@@ -467,8 +468,6 @@ LSQUnit::LSQUnitStats::LSQUnitStats(statistics::Group *parent)
                "Buffer-mode permission prefetches rejected for retry"),
       ADD_STAT(storeOverwriteElisions, statistics::units::Count::get(),
                "Committed stores elided by a consecutive full overwrite"),
-      ADD_STAT(storeSameLineReadyPairs, statistics::units::Count::get(),
-               "Adjacent committed ordinary stores to one line at send time"),
       ADD_STAT(storeSameLineConcurrentIssued, statistics::units::Count::get(),
                "TSO stores sent while an older same-line store is in flight"),
       ADD_STAT(storeOrderedCrossLineIssued, statistics::units::Count::get(),
@@ -610,6 +609,7 @@ LSQUnit::insertLoad(const DynInstPtr &load_inst)
 void
 LSQUnit::insertStore(const DynInstPtr& store_inst)
 {
+    storePrepareChanged = true;
     // Make sure it is not full before inserting an instruction.
     assert(!storeQueue.full());
     assert(storeQueue.size() < storeQueue.capacity());
@@ -879,6 +879,36 @@ LSQUnit::notifyCapacityReadWrite(Addr line, const RequestPtr &writer)
     checkSnoop(&packet);
 }
 
+void
+LSQUnit::beginLoadObservation(const DynInstPtr &inst)
+{
+    if (!sprMemoryDependence || !inst->isLoad() || inst->isDataPrefetch())
+        return;
+    auto &entry = loadQueue[inst->lqIdx];
+    entry.observing = true;
+    entry.physicalReady = entry.addressWaitObserved = false;
+    entry.physicalLines.clear();
+}
+
+void
+LSQUnit::refreshLoadCoverage(const DynInstPtr &inst)
+{
+    if (!sprMemoryDependence || !inst->isLoad() || !inst->savedRequest)
+        return;
+    auto &entry = loadQueue[inst->lqIdx];
+    if (entry.observing)
+        entry.physicalReady = inst->savedRequest->physicalLineMasks(
+            entry.physicalLines);
+}
+
+void
+LSQUnit::translationComplete(const DynInstPtr &inst)
+{
+    if (inst->isStore() || inst->isAtomic())
+        storePrepareChanged = true;
+    iewStage->instQueue.translationComplete(inst);
+}
+
 Fault
 LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
         const DynInstPtr& inst)
@@ -886,9 +916,9 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
     // Store/load ordering uses complete physical bytes on SPR. The generic
     // load/load snoop policy retains its independently configured granularity.
     const bool physical = sprMemoryDependence && !inst->isLoad();
-    std::vector<Addr> storeBytes;
+    PhysicalLineCoverage::Lines storeLines;
     if (physical && (!inst->savedRequest ||
-        !inst->savedRequest->physicalBytes(storeBytes)))
+        !inst->savedRequest->physicalLineMasks(storeLines)))
         return NoFault;
     const unsigned shift = depCheckShift;
     Addr inst_eff_addr1 = inst->effAddr >> shift;
@@ -927,15 +957,14 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
         bool overlap = inst_eff_addr2 >= ld_eff_addr1 &&
                        inst_eff_addr1 <= ld_eff_addr2;
         if (physical) {
-            const auto *loadBytes = iewStage->instQueue.memoryDependence(
-                lsqID).physicalReadBytes(ld_inst);
-            if (!loadBytes) {
+            if (!loadIt->physicalReady) {
                 ++loadIt;
                 continue;
             }
             auto *request = loadIt->request();
-            if (request && request->mainReq()->isSecure() !=
-                    inst->savedRequest->mainReq()->isSecure()) {
+            if (request && (request->hasStaleTranslation() ||
+                request->mainReq()->isSecure() !=
+                    inst->savedRequest->mainReq()->isSecure())) {
                 ++loadIt;
                 continue;
             }
@@ -952,7 +981,8 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                 ++loadIt;
                 continue;
             }
-            overlap = PhysicalByteCoverage::intersects(*loadBytes, storeBytes);
+            overlap = PhysicalLineCoverage::intersects(
+                loadIt->physicalLines, storeLines);
         }
         if (overlap) {
             auto partial = partialForwarding.find(ld_inst->seqNum);
@@ -963,7 +993,7 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
                         partial->second.physicalStart + byte :
                         ld_inst->effAddr + byte;
                     const bool intersects = physical ?
-                        std::binary_search(storeBytes.begin(), storeBytes.end(), addr) :
+                        PhysicalLineCoverage::containsByte(storeLines, addr) :
                         addr >= inst->effAddr && addr < inst->effAddr + inst->effSize;
                     if (intersects &&
                         (!partial->second.mask[byte] ||
@@ -1066,6 +1096,8 @@ LSQUnit::checkViolations(typename LoadQueue::iterator& loadIt,
 void
 LSQUnit::noteSplitTranslation(const std::vector<RequestPtr> &fragments)
 {
+    if (!cpu->collectSplitTranslationDiagnostic)
+        return;
     for (size_t i = 1; i < fragments.size(); ++i) {
         const auto &previous = fragments[i - 1];
         const auto &next = fragments[i];
@@ -1140,7 +1172,7 @@ LSQUnit::executeLoad(const DynInstPtr &inst)
         if (fsfp)
             validateFastForwarding();
         if (inst->effAddrValid()) {
-            iewStage->instQueue.memoryDependence(lsqID).addressReady(inst);
+            refreshLoadCoverage(inst);
             auto it = inst->lqIt;
             ++it;
 
@@ -1155,6 +1187,7 @@ LSQUnit::executeLoad(const DynInstPtr &inst)
 Fault
 LSQUnit::executeStore(const DynInstPtr &store_inst)
 {
+    storePrepareChanged = true;
     // Make sure that a store exists.
     assert(storeQueue.size() != 0);
 
@@ -1228,7 +1261,6 @@ LSQUnit::executeStore(const DynInstPtr &store_inst)
         ++storesToWB;
     }
 
-    iewStage->instQueue.memoryDependence(lsqID).addressReady(store_inst);
     wakeSelectiveBlockedLoads(store_inst->seqNum, false, true);
     if (fsfp)
         validateFastForwarding();
@@ -1283,7 +1315,6 @@ LSQUnit::commitLoad()
         trainForwarding(inst);
         fsfp->fastForwarding.erase(inst->seqNum);
     }
-    iewStage->instQueue.memoryDependence(lsqID).loadRetired(inst);
     partialForwarding.erase(inst->seqNum);
     fullForwardingSource.erase(inst->seqNum);
 
@@ -1345,6 +1376,7 @@ LSQUnit::commitStores(InstSeqNum &youngest_inst)
                     x.instruction()->seqNum);
 
             x.canWB() = true;
+            storePrepareChanged = true;
 
             if (x.instruction()->memReqFlags & Request::REP_BULK) {
                 ++stats.repWriteBatches;
@@ -1897,9 +1929,10 @@ LSQUnit::writebackStores()
 void
 LSQUnit::issueStorePrepareRequests()
 {
-    if (lsq->cacheBlocked()) {
+    if (!storePrepareChanged || lsq->cacheBlocked()) {
         return;
     }
+    storePrepareChanged = false;
 
     for (auto store_it = storeQueue.begin();
          store_it != storeQueue.end(); ++store_it) {
@@ -1977,6 +2010,7 @@ LSQUnit::issueStorePrepareRequests()
         prepare_pkt->senderState = new LSQ::StorePrepareSenderState();
 
         if (!dcachePort->sendTimingReq(prepare_pkt)) {
+            storePrepareChanged = true;
             delete prepare_pkt->popSenderState();
             delete prepare_pkt;
             lsq->cacheBlocked(true);
@@ -2133,6 +2167,7 @@ LSQUnit::squash(const InstSeqNum &squashed_num)
         storeQueue.back().clear();
 
         storeQueue.pop_back();
+        storePrepareChanged = true;
         ++stats.squashedStores;
     }
     stats.sqAvgOccupancy = queueOccupancy(storeQueue);
@@ -2151,20 +2186,6 @@ LSQUnit::storePostSend()
 {
     if (needsTSO && !cpu->checker)
         wakeSelectiveBlockedLoads(storeWBIt->instruction()->seqNum);
-    auto younger = storeWBIt;
-    ++younger;
-    if (needsTSO &&
-        isCoalescibleStore(storeWBIt) && isCoalescibleStore(younger) &&
-        !younger->committed() &&
-        !younger->request()->isAnyOutstandingRequest()) {
-        const auto first = storeWBIt->request()->mainReq();
-        const auto second = younger->request()->mainReq();
-        if ((first->getPaddr() & cacheBlockMask) ==
-                (second->getPaddr() & cacheBlockMask) &&
-            first->isSecure() == second->isSecure())
-            ++stats.storeSameLineReadyPairs;
-    }
-
     if (stalled &&
         storeWBIt->instruction()->seqNum == stallingStoreIsn) {
         DPRINTF(LSQUnit, "Unstalling, stalling store [sn:%lli] "
@@ -2335,6 +2356,7 @@ LSQUnit::completeStore(typename StoreQueue::iterator store_idx)
         do {
             storeQueue.front().clear();
             storeQueue.pop_front();
+            storePrepareChanged = true;
         } while (!storeQueue.empty() && storeQueue.front().completed());
 
         iewStage->updateLSQNextCycle = true;
@@ -2500,6 +2522,7 @@ LSQUnit::checkStaleTranslations() const
 void
 LSQUnit::recvRetry()
 {
+    storePrepareChanged = true;
     if (isStoreBlocked) {
         DPRINTF(LSQUnit, "Receiving retry: blocked store\n");
         writebackBlockedStore();
@@ -2938,7 +2961,11 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
             if (store->effAddrValid())
                 continue;
             const bool retain = canRetainLoadRequest(request);
-            iewStage->instQueue.memoryDependence(lsqID).noteAddressWait(load_inst);
+            auto &entry = loadQueue[load_inst->lqIdx];
+            if (entry.observing && !entry.addressWaitObserved) {
+                entry.addressWaitObserved = true;
+                iewStage->instQueue.memoryDependence(lsqID).noteAddressWait();
+            }
             selectiveBlockedLoads.insert_or_assign(load_inst->seqNum,
                 SelectiveBlockedLoad{store->seqNum, load_inst, false, true,
                                      retain});
@@ -2992,7 +3019,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
     assert (store_it >= storeWBIt);
     // Translation state cannot change during this synchronous SQ scan.
     // Reuse the load's physical bytes across older-store comparisons.
-    std::vector<Addr> readBytes;
+    PhysicalLineCoverage::Lines readBytes;
     bool readBytesResolved = false;
     bool readBytesComplete = false;
     // End once we've reached the top of the LSQ
@@ -3061,13 +3088,13 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
 
             if (sprMemoryDependence) {
                 if (!readBytesResolved) {
-                    readBytesComplete = request->physicalBytes(readBytes);
+                    readBytesComplete = request->physicalLineMasks(readBytes);
                     readBytesResolved = true;
                 }
-                std::vector<Addr> writeBytes;
+                PhysicalLineCoverage::Lines writeBytes;
                 auto *store_request = store_it->request();
                 const bool complete = readBytesComplete &&
-                    store_request->physicalBytes(writeBytes);
+                    store_request->physicalLineMasks(writeBytes);
                 coverage = AddrRangeCoverage::NoAddrRangeCoverage;
                 if (!complete) {
                     // A faulting prefix cannot prove non-overlap. Wait for
@@ -3075,7 +3102,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                     coverage = AddrRangeCoverage::PartialAddrRangeCoverage;
                 } else if (store_request->mainReq()->isSecure() ==
                            request->mainReq()->isSecure()) {
-                    const bool overlap = PhysicalByteCoverage::intersects(
+                    const bool overlap = PhysicalLineCoverage::intersects(
                         readBytes, writeBytes);
                     if (overlap) {
                         coverage = AddrRangeCoverage::PartialAddrRangeCoverage;
@@ -3107,8 +3134,8 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                             load_req->getVaddr() == store_req->getVaddr() &&
                             load_size == store_req->getSize() &&
                             (load_req->getVaddr() & 4095) + load_size <= 4096 &&
-                            readBytes.size() == load_size &&
-                            writeBytes.size() == load_size &&
+                            PhysicalLineCoverage::byteCount(readBytes) == load_size &&
+                            PhysicalLineCoverage::byteCount(writeBytes) == load_size &&
                             readBytes == writeBytes &&
                             ordinary(load_req) && ordinary(store_req) &&
                             !cpu->checker &&
@@ -3130,7 +3157,7 @@ LSQUnit::read(LSQRequest *request, ssize_t load_idx)
                             request->mainReq()->getPaddr() -
                                 store_request->mainReq()->getPaddr() +
                                 request->mainReq()->getSize() <= unsigned(store_size) &&
-                            PhysicalByteCoverage::contains(writeBytes, readBytes))
+                            PhysicalLineCoverage::contains(writeBytes, readBytes))
                             coverage = AddrRangeCoverage::FullAddrRangeCoverage;
                         if (split_candidate)
                             coverage = AddrRangeCoverage::FullAddrRangeCoverage;

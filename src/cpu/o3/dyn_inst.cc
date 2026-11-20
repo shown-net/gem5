@@ -220,6 +220,9 @@ DynInst::operator new(size_t count, Arrays &arrays)
 
     // Figure out how much space we need in total.
     size_t total_size = ready_src_idx + ready_src_idx_size;
+    const auto divide_offset = roundUp(total_size, alignof(DivideResults));
+    if (arrays.hasDivideResults)
+        total_size = divide_offset + sizeof(DivideResults);
 
     // Actually allocate it.
     uint8_t *buf = (uint8_t *)::operator new(total_size);
@@ -236,9 +239,21 @@ DynInst::operator new(size_t count, Arrays &arrays)
     new (arrays.destIdx) PhysRegIdPtr[num_dests];
     new (arrays.prevDestIdx) PhysRegIdPtr[num_dests];
     new (arrays.srcIdx) PhysRegIdPtr[num_srcs];
-    new (arrays.readySrcIdx) uint8_t[num_srcs];
+    new (arrays.readySrcIdx) uint8_t[ready_src_idx_size];
+    if (arrays.hasDivideResults)
+        new (buf + divide_offset) DivideResults;
 
     return buf;
+}
+
+DynInst::DivideResults &
+DynInst::divideResults() const
+{
+    assert(staticInst->intDivide().bytes);
+    auto address = reinterpret_cast<uintptr_t>(_readySrcIdx) +
+                   (numSrcRegs() + 7) / 8;
+    return *reinterpret_cast<DivideResults *>(
+        roundUp(address, alignof(DivideResults)));
 }
 
 // Because of the custom "new" operator that allocates more bytes than the
@@ -402,16 +417,6 @@ DynInst::setSquashed()
 }
 
 void
-DynInst::bindSourceResults()
-{
-    if (!cpu->resultForwarding)
-        return;
-    sourceResultValues.resize(numSrcRegs());
-    for (RegIndex i = 0; i < numSrcRegs(); ++i)
-        sourceResultValues[i] = cpu->resultForwarding->source(renamedSrcIdx(i));
-}
-
-void
 DynInst::prepareResultValues(unsigned port, Tick nominal_at)
 {
     resultValues.resize(numDestRegs());
@@ -440,8 +445,8 @@ void
 DynInst::writeResultValues()
 {
     for (RegIndex i = 0; i < resultValues.size(); ++i) {
-        if (resultValues[i].isValid())
-            cpu->setReg(renamedDestIdx(i), resultValues[i].asRegVal(), threadNumber);
+        if (resultValues[i])
+            cpu->setReg(renamedDestIdx(i), *resultValues[i], threadNumber);
     }
 }
 

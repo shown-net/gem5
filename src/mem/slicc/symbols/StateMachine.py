@@ -1485,6 +1485,10 @@ $c_ident::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
         code = self.symtab.codeFormatter()
         ident = self.ident
         gen_filename = f"{self.symtab.slicc.protocol}/{self.ident}"
+        track_empty_inputs = (
+            self.symtab.slicc.protocol == "MESI_Three_Level"
+            and ident == "L0Cache"
+        )
 
         outputRequest_types = True
         if len(self.request_types) == 0:
@@ -1554,7 +1558,18 @@ ${ident}_Controller::wakeup()
     if (getMemReqQueue() && getMemReqQueue()->isReady(clockEdge())) {
         serviceMemoryQueue();
     }
-
+"""
+        )
+        if track_empty_inputs:
+            assert len(self.in_ports) <= 32
+            code(
+                """
+    uint32_t empty_inputs = 0;
+    ScopedEmptyInputs track_empty(*this, empty_inputs);
+"""
+            )
+        code(
+            """
     int counter = 0;
     while (true) {
         unsigned char rejected[${{len(msg_bufs)}}];
@@ -1577,9 +1592,13 @@ ${ident}_Controller::wakeup()
 
         # InPorts
         #
-        for port in self.in_ports:
+        for index, port in enumerate(self.in_ports):
             code.indent()
             code("// ${ident}InPort $port")
+            if track_empty_inputs:
+                bit = f"(uint32_t(1) << {index})"
+                code("if (!(empty_inputs & $bit)) {")
+                code.indent()
             if "rank" in port.pairs:
                 code('m_cur_in_port = ${{port.pairs["rank"]}};')
             else:
@@ -1598,6 +1617,11 @@ ${ident}_Controller::wakeup()
             }
 """
                 )
+            if track_empty_inputs:
+                buf = f"m_{port.pairs['buffer_expr'].name}_ptr"
+                code("if ($buf->isEmpty()) empty_inputs |= $bit;")
+                code.dedent()
+                code("}")
             code.dedent()
             code("")
 

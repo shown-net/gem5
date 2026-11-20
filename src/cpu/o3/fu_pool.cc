@@ -40,6 +40,8 @@
 
 #include "cpu/o3/fu_pool.hh"
 
+#include "base/bitfield.hh"
+
 #include <algorithm>
 #include <limits>
 #include <sstream>
@@ -191,32 +193,43 @@ FUPool::issueInteger(CPU *cpu, const DynInstPtr &inst,
         return info.family == IntExecutionFamily::ALU && individualALUs
             ? integerALUs[port] : integerResources.at(unsigned(info.family));
     };
-    uint16_t eligible = 0;
-    Tick next_path = std::numeric_limits<Tick>::max();
-    for (unsigned port = 0; port < 12; ++port) {
-        if (!(candidates & (1 << port)))
-            continue;
+    const Tick now = curTick();
+    const auto start = executionPorts->rotationStart(grant_family, candidates);
+    unsigned remaining =
+        ((unsigned(candidates) >> start) |
+         (unsigned(candidates) << (12 - start))) & 0xfff;
+    Tick next_path = MaxTick;
+    Tick common_ready = 0;
+    bool common_sources = false;
+    while (remaining) {
+        const auto distance = findLsbSet(remaining);
+        remaining &= remaining - 1;
+        const unsigned offset = start + distance;
+        const unsigned port = offset < 12 ? offset : offset - 12;
         auto resource = resourceAt(port);
         if (!resource)
             continue;
-        const Tick ready = forwarding->availableAt(inst, port);
-        if (ready <= curTick() && !unitBusy[port] &&
-            resource->accepts(info.family, port, curTick()))
-            eligible |= 1 << port;
-        else if (ready > curTick())
-            next_path = std::min(next_path, ready);
+        if (!common_sources)
+            common_ready = forwarding->availableAt(inst, port, &common_sources);
+        if (common_ready > now) {
+            next_path = std::min(next_path, common_ready);
+            if (common_sources)
+                break;
+            continue;
+        }
+        auto *shared_port = executionPorts->get(port);
+        if (unitBusy[port] || !shared_port || !shared_port->available(now) ||
+            !resource->accepts(info.family, port, now))
+            continue;
+        forwarding->clearWait(inst);
+        executionPorts->commit(grant_family, candidates, port, now);
+        resource->admit(cpu, forwarding, inst, port, available, complete);
+        cpu->recordExecutionAction(inst, port);
+        return true;
     }
-    const int port = executionPorts->probe(grant_family, candidates, curTick(), eligible);
-    if (port < 0) {
-        if (next_path != std::numeric_limits<Tick>::max())
-            forwarding->defer(inst, next_path);
-        return false;
-    }
-    forwarding->clearWait(inst);
-    executionPorts->commit(grant_family, candidates, port, curTick());
-    resourceAt(port)->admit(cpu, forwarding, inst, port, available, complete);
-    cpu->recordExecutionAction(inst, port);
-    return true;
+    if (next_path != MaxTick)
+        forwarding->defer(inst, next_path);
+    return false;
 }
 
 void

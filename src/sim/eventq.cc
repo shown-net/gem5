@@ -118,60 +118,56 @@ void
 EventQueue::insert(Event *event)
 {
     const BinKey key(event->when(), event->priority());
-    auto bin = bins.begin();
-    // Most CPU and service events are inserted into or ahead of the first
-    // bin. Preserve that constant-time path rather than searching the tree.
-    if (bin != bins.end() && key > bin->first)
-        bin = bins.lower_bound(key);
-    event->prevInBin = nullptr;
-    if (bin != bins.end() && bin->first == key) {
-        Event *top = bin->second;
-        event->nextBin = top->nextBin;
-        event->nextInBin = top;
-        top->prevInBin = event;
-        bin->second = event;
+    auto &first = pending.first;
+    auto &later = pending.later;
+    Event **bin;
+    if (first) {
+        if (*event < *first) {
+            later.emplace_hint(later.begin(),
+                               BinKey(first->when(), first->priority()),
+                               first);
+            first = nullptr;
+            bin = &first;
+        } else if (*event == *first) {
+            bin = &first;
+        } else {
+            bin = &later.try_emplace(key, nullptr).first->second;
+        }
+    } else if (later.empty() || key < later.begin()->first) {
+        bin = &first;
     } else {
-        event->nextBin = bin == bins.end() ? nullptr : bin->second;
-        event->nextInBin = nullptr;
-        bin = bins.emplace_hint(bin, key, event);
+        bin = &later.try_emplace(key, nullptr).first->second;
     }
-
-    if (bin == bins.begin())
-        head = event;
-    else
-        std::prev(bin)->second->nextBin = event;
+    event->prevInBin = nullptr;
+    event->nextInBin = *bin;
+    if (*bin)
+        (*bin)->prevInBin = event;
+    *bin = event;
 }
 
 void
 EventQueue::remove(Event *event)
 {
     assert(event->queue == this);
-    auto bin = event == head ? bins.begin() :
-        bins.find(BinKey(event->when(), event->priority()));
-    if (bin == bins.end())
-        panic("event not found!");
+    Event *next = event->nextInBin;
     if (event->prevInBin) {
-        event->prevInBin->nextInBin = event->nextInBin;
-        if (event->nextInBin)
-            event->nextInBin->prevInBin = event->prevInBin;
+        event->prevInBin->nextInBin = next;
+    } else if (event == pending.first) {
+        pending.first = next;
     } else {
-        if (bin->second != event)
+        auto &later = pending.later;
+        auto bin = later.begin();
+        if (bin != later.end() && bin->second != event)
+            bin = later.find(BinKey(event->when(), event->priority()));
+        if (bin == later.end() || bin->second != event)
             panic("event not found!");
-        Event *next = event->nextInBin;
-        Event *next_bin = event->nextBin;
-        if (next) {
-            next->prevInBin = nullptr;
-            next->nextBin = next_bin;
+        if (next)
             bin->second = next;
-        }
-        if (bin == bins.begin())
-            head = next ? next : next_bin;
         else
-            std::prev(bin)->second->nextBin = next ? next : next_bin;
-        if (!next)
-            bins.erase(bin);
+            later.erase(bin);
     }
-    event->nextBin = nullptr;
+    if (next)
+        next->prevInBin = event->prevInBin;
     event->nextInBin = nullptr;
     event->prevInBin = nullptr;
 }
@@ -180,7 +176,13 @@ Event *
 EventQueue::serviceOne()
 {
     std::lock_guard<EventQueue> lock(*this);
-    Event *event = head;
+    return serviceOneLocked();
+}
+
+Event *
+EventQueue::serviceOneLocked()
+{
+    Event *event = getHead();
     remove(event);
     event->flags.clear(Event::Scheduled);
 
@@ -270,18 +272,11 @@ EventQueue::dump() const
 
     if (empty())
         cprintf("<No Events>\n");
-    else {
-        Event *nextBin = head;
-        while (nextBin) {
-            Event *nextInBin = nextBin;
-            while (nextInBin) {
-                nextInBin->dump();
-                nextInBin = nextInBin->nextInBin;
-            }
-
-            nextBin = nextBin->nextBin;
-        }
-    }
+    for (Event *event = pending.first; event; event = event->nextInBin)
+        event->dump();
+    for (const auto &[key, first] : pending.later)
+        for (Event *event = first; event; event = event->nextInBin)
+            event->dump();
 
     cprintf("============================================================\n");
 }
@@ -289,79 +284,32 @@ EventQueue::dump() const
 bool
 EventQueue::debugVerify() const
 {
-    std::unordered_map<long, bool> map;
-
-    Tick time = 0;
-    short priority = 0;
-    bool first = true;
-    auto indexed = bins.begin();
-
-    Event *nextBin = head;
-    while (nextBin) {
-        if (indexed == bins.end() || indexed->second != nextBin ||
-            indexed->first != BinKey(nextBin->when(), nextBin->priority())) {
-            cprintf("event bin index inconsistent!");
-            return false;
-        }
-        Event *prevInBin = nullptr;
-        Event *nextInBin = nextBin;
-        while (nextInBin) {
-            if (nextInBin->prevInBin != prevInBin ||
-                *nextInBin != *nextBin) {
-                cprintf("event bin links inconsistent!");
+    std::unordered_map<const Event *, bool> seen;
+    auto check = [&](const Event *first) {
+        const Event *prev = nullptr;
+        for (const Event *event = first; event; event = event->nextInBin) {
+            if (event->prevInBin != prev || *event != *first ||
+                !seen.emplace(event, true).second)
                 return false;
-            }
-            if (!first && nextInBin->when() < time) {
-                cprintf("time goes backwards!");
-                nextInBin->dump();
-                return false;
-            } else if (!first && nextInBin->when() == time &&
-                       nextInBin->priority() < priority) {
-                cprintf("priority inverted!");
-                nextInBin->dump();
-                return false;
-            }
-
-            if (map[reinterpret_cast<long>(nextInBin)]) {
-                cprintf("Node already seen");
-                nextInBin->dump();
-                return false;
-            }
-            map[reinterpret_cast<long>(nextInBin)] = true;
-
-            time = nextInBin->when();
-            priority = nextInBin->priority();
-            first = false;
-
-            prevInBin = nextInBin;
-            nextInBin = nextInBin->nextInBin;
-        }
-
-        nextBin = nextBin->nextBin;
-        ++indexed;
-    }
-
-    return indexed == bins.end();
-}
-
-Event*
-EventQueue::replaceHead(Event* s)
-{
-    Event* t = head;
-    head = s;
-    bins.clear();
-    for (Event *bin = head; bin; bin = bin->nextBin) {
-        const auto result = bins.emplace(BinKey(bin->when(), bin->priority()),
-                                         bin);
-        if (!result.second)
-            panic("duplicate event queue bin during restore");
-        Event *prev = nullptr;
-        for (Event *event = bin; event; event = event->nextInBin) {
-            event->prevInBin = prev;
             prev = event;
         }
+        return true;
+    };
+    if (!check(pending.first))
+        return false;
+    for (const auto &[key, first] : pending.later) {
+        if (!first || BinKey(first->when(), first->priority()) != key ||
+            (pending.first && *pending.first >= *first) || !check(first))
+            return false;
     }
-    return t;
+    return true;
+}
+
+void
+EventQueue::swapPendingEvents(PendingEvents &saved)
+{
+    std::swap(pending.first, saved.first);
+    pending.later.swap(saved.later);
 }
 
 void
@@ -420,7 +368,7 @@ Event::dump() const
 }
 
 EventQueue::EventQueue(const std::string &n)
-    : objName(n), head(NULL), _curTick(0)
+    : objName(n), _curTick(0)
 {
 }
 

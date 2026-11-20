@@ -194,13 +194,19 @@ ExecutionPorts::ExecutionPorts(const ExecutionPortsParams &p)
     }
 }
 
+unsigned
+ExecutionPorts::rotationStart(IntExecutionFamily family, uint16_t candidates) const
+{
+    const unsigned key = (unsigned(family) << 12) | candidates;
+    auto cursor = cursors.find(key);
+    return cursor == cursors.end() ? 0 : cursor->second;
+}
+
 int
 ExecutionPorts::probe(IntExecutionFamily family, uint16_t candidates, Tick now,
                       uint16_t eligible) const
 {
-    const unsigned key = (unsigned(family) << 12) | candidates;
-    auto cursor = cursors.find(key);
-    const unsigned start = cursor == cursors.end() ? 0 : cursor->second;
+    const unsigned start = rotationStart(family, candidates);
     for (unsigned i = 0; i < 12; ++i) {
         const unsigned port = (start + i) % 12;
         if ((candidates & eligible & (1 << port)) && ports[port] &&
@@ -302,16 +308,23 @@ ResultForwarding::dispatched(const DynInstPtr &inst, unsigned port,
     }
 }
 
-ResultForwarding::Reference
+ResultForwarding::Source
 ResultForwarding::source(PhysRegIdPtr reg) const
 {
     if (reg->is(InvalidRegClass) || reg->isAlwaysReady())
         return {};
     const auto &slot = producers[reg->flatIndex()];
     if (!slot.tracked) return {};
-    if (!slot.producer && !slot.vectorResult)
+    if (slot.producer)
+        return LiveIntegerSource{slot.producer, slot.destination};
+    if (slot.vectorResult)
+        return slot.vectorResult;
+    if (collectLateSources)
         stats.lateSources[unsigned(slot.family)]++;
-    return slot;
+    if (paths.empty() && slot.nominal <= curTick())
+        return {};
+    return WrittenIntegerSource{slot.nominal, uint8_t(slot.port),
+                                slot.family, slot.role};
 }
 
 bool
@@ -321,48 +334,64 @@ ResultForwarding::qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick
 }
 
 Tick
-ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) const
+ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port,
+                              bool *port_independent) const
 {
+    if (port_independent)
+        *port_independent = paths.empty();
     Tick ready = 0;
-    RegIndex source = 0;
-    for (const auto &ref : inst->sourceResults()) {
-        if (!ref.tracked) { ++source; continue; }
-        if (ref.vectorResult) {
-            if (!ref.vectorResult->ready || ref.vectorResult->cancelled)
+    const auto &sources = inst->sourceResults();
+    for (RegIndex source = 0; source < sources.size(); ++source) {
+        const auto &ref = sources[source];
+        if (std::holds_alternative<std::monostate>(ref))
+            continue;
+        if (const auto *state =
+                std::get_if<std::shared_ptr<VectorResultState>>(&ref)) {
+            const auto &result = **state;
+            if (port_independent)
+                *port_independent = false;
+            if (!result.ready || result.cancelled)
                 return std::numeric_limits<Tick>::max();
             const Cycles latency = inst->iq ?
                 inst->iq->fuPool()->getOpLatency(inst) : Cycles(0);
             const auto consumer = vectorDomain(inst, consumer_port, latency);
-            int adjustment = vectorBypass(ref.vectorResult->domain, consumer);
+            int adjustment = vectorBypass(result.domain, consumer);
             // These legacy SSE forms use the instruction package's complete
             // 4-cycle MUL latency. Native destination/second-source MUL
             // chains and non-identity ADD/MUL chains confirm no additional
             // cycle on these paths. Keep other Table 2-5 cells unchanged.
             const auto &name = inst->staticInst->getName();
             if (consumer == VectorDomain::Mul &&
-                (ref.vectorResult->domain == VectorDomain::Mul ||
-                 ref.vectorResult->domain == VectorDomain::FastAdder) &&
+                (result.domain == VectorDomain::Mul ||
+                 result.domain == VectorDomain::FastAdder) &&
                 (name == "mxmmmulf" || name == "mxmmmuls"))
                 adjustment = 0;
             const Tick delta = std::abs(adjustment) * cpu->clockPeriod();
             const Tick at = adjustment < 0 ?
-                ref.vectorResult->nominalAt - delta :
-                ref.vectorResult->nominalAt + delta;
-            ready = std::max(ready, std::max(at, ref.vectorResult->readyAt));
-            ++source;
+                result.nominalAt - delta : result.nominalAt + delta;
+            ready = std::max(ready, std::max(at, result.readyAt));
             continue;
         }
-        auto family = ref.family;
-        auto port = ref.port;
-        auto role = ref.role;
-        Tick nominal = ref.nominal;
-        if (ref.producer) {
-            if (ref.producer->isSquashed() || ref.producer->getFault() != NoFault ||
-                !ref.producer->hasResultValue(ref.destination))
+        IntExecutionFamily family;
+        unsigned port;
+        IntResultRole role;
+        Tick nominal;
+        const auto *live = std::get_if<LiveIntegerSource>(&ref);
+        if (live) {
+            const auto &producer = live->producer;
+            if (producer->isSquashed() || producer->getFault() != NoFault ||
+                !producer->hasResultValue(live->destination))
                 return std::numeric_limits<Tick>::max();
-            family = ref.producer->staticInst->intExecution().family;
-            port = ref.producer->resultProducerPort();
-            nominal = ref.producer->resultNominalAt(ref.destination);
+            family = producer->staticInst->intExecution().family;
+            port = producer->resultProducerPort();
+            role = producer->staticInst->intResultRole(live->destination);
+            nominal = producer->resultNominalAt(live->destination);
+        } else {
+            const auto &written = std::get<WrittenIntegerSource>(ref);
+            family = written.family;
+            port = written.port;
+            role = written.role;
+            nominal = written.nominal;
         }
         int adjustment = 0;
         bool matched = false;
@@ -381,10 +410,9 @@ ResultForwarding::availableAt(const DynInstPtr &inst, unsigned consumer_port) co
             Tick(signed_delta < 0 ? -signed_delta : signed_delta) * cpu->clockPeriod();
         panic_if(signed_delta < 0 && nominal < delta, "Result path precedes simulation start");
         const Tick at = signed_delta < 0 ? nominal - delta : nominal + delta;
-        panic_if(ref.producer && at < ref.producer->resultAvailableAt(ref.destination),
+        panic_if(live && at < live->producer->resultAvailableAt(live->destination),
                  "Result path precedes production of its real value");
         ready = std::max(ready, at);
-        ++source;
     }
     return ready;
 }
@@ -609,13 +637,11 @@ IntExecutionResource::accepts(IntExecutionFamily requested, unsigned port, Tick 
 }
 
 void
-IntExecutionResource::finishEvent(const std::shared_ptr<Operation> &operation)
+IntExecutionResource::finishOperation()
 {
-    if (--operation->events == 0) {
-        operations.erase(operation->position);
-        if (operations.empty() && drainState() == DrainState::Draining)
-            signalDrainDone();
-    }
+    assert(inFlight);
+    if (--inFlight == 0 && drainState() == DrainState::Draining)
+        signalDrainDone();
 }
 
 void
@@ -633,19 +659,10 @@ IntExecutionResource::admit(CPU *cpu, ResultForwarding *forwarding,
         forwarding->earliestAdjustment(inst, port);
     panic_if(evaluation < (fused ? 0 : 1), "Result path requires a value before a valid execution cycle");
     inst->prepareResultValues(port, cpu->clockEdge(latency));
-    auto operation = std::make_shared<Operation>();
-    operation->inst = inst;
-    operation->position = operations.insert(operations.end(), operation);
+    ++inFlight;
     stats.admitted++;
     const Tick value_at = cpu->clockEdge(Cycles(evaluation));
-    auto send = [operation, complete] {
-        if (operation->completed && operation->written && !operation->sent) {
-            operation->sent = true;
-            complete();
-        }
-    };
-    cpu->schedule(new EventFunctionWrapper([this, cpu, operation, available, value_at] {
-        auto inst = operation->inst;
+    cpu->schedule(new EventFunctionWrapper([this, cpu, inst, available, value_at] {
         if (!inst->isSquashed() && inst->getFault() == NoFault) {
             inst->evaluateResultValues(value_at);
             stats.values++;
@@ -655,26 +672,37 @@ IntExecutionResource::admit(CPU *cpu, ResultForwarding *forwarding,
                 cpu->wakeCPU();
             }
         }
-        finishEvent(operation);
     }, name() + ".value", true, Event::Default_Pri), value_at);
-    cpu->schedule(new EventFunctionWrapper([this, operation, send] {
-        operation->completed = true;
-        stats.completed++;
-        send();
-        finishEvent(operation);
-    }, name() + ".complete", true, Event::Priority(1)),
-        cpu->clockEdge(latency + completionDelay));
-    cpu->schedule(new EventFunctionWrapper([this, operation, forwarding, send] {
-        auto inst = operation->inst;
+    const Tick completion_at = cpu->clockEdge(latency + completionDelay);
+    const Tick writeback_at = cpu->clockEdge(latency + prfDelay);
+    if (completion_at != writeback_at) {
+        const bool completes_last = completion_at > writeback_at;
+        cpu->schedule(new EventFunctionWrapper(
+            [this, notify = completes_last ? complete : std::function<void()>{}] {
+                ++stats.completed;
+                if (notify) {
+                    notify();
+                    finishOperation();
+                }
+            }, name() + ".complete", true, Event::Priority(1)), completion_at);
+    }
+
+    const bool same_tick = completion_at == writeback_at;
+    cpu->schedule(new EventFunctionWrapper(
+        [this, inst, forwarding, same_tick,
+         notify = writeback_at >= completion_at ? std::move(complete) :
+                  std::function<void()>{}] {
+        if (same_tick)
+            ++stats.completed;
         if (!inst->isSquashed() && inst->getFault() == NoFault)
             inst->writeResultValues();
         forwarding->release(inst);
-        operation->written = true;
-        stats.written++;
-        send();
-        finishEvent(operation);
-    }, name() + ".prf", true, Event::Priority(2)),
-        cpu->clockEdge(latency + prfDelay));
+        ++stats.written;
+        if (notify) {
+            notify();
+            finishOperation();
+        }
+    }, name() + ".prf", true, Event::Priority(2)), writeback_at);
 }
 
 DrainState

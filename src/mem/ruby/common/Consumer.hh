@@ -87,11 +87,35 @@ class Consumer
     void scheduleEventAbsolute(Tick timeAbs);
     void scheduleEvent(Cycles timeDelta);
 
+    void invalidateEmptyInputs()
+    {
+        if (emptyInputs)
+            *emptyInputs = 0;
+    }
+
+  protected:
+    class ScopedEmptyInputs
+    {
+      public:
+        ScopedEmptyInputs(Consumer &consumer, uint32_t &inputs)
+            : consumer(consumer)
+        {
+            assert(!consumer.emptyInputs);
+            consumer.emptyInputs = &inputs;
+        }
+        ~ScopedEmptyInputs() { consumer.emptyInputs = nullptr; }
+
+      private:
+        Consumer &consumer;
+    };
+
   private:
+    uint32_t *emptyInputs = nullptr;
     std::set<Tick> m_wakeup_ticks;
     EventFunctionWrapper m_wakeup_event;
     ClockedObject *em;
 
+    void scheduleWakeupTick(Tick when);
     void scheduleNextWakeup();
     void processCurrentEvent();
 };

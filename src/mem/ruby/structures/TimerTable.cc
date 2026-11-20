@@ -81,6 +81,7 @@ TimerTable::setReady(Addr address, Tick ready_time)
 {
     assert(ready_time == curTick());
     insert(address, ready_time);
+    m_consumer_ptr->invalidateEmptyInputs();
 }
 
 void
@@ -90,11 +91,12 @@ TimerTable::insert(Addr address, Tick ready_time)
     assert(!m_map.count(address));
 
     m_map[address] = ready_time;
-    m_next_valid = false;
-
-    // Don't always recalculate the next ready address
-    if (ready_time <= m_next_time) {
-        m_next_valid = false;
+    if (m_map.size() == 1 ||
+        (m_next_valid && (ready_time < m_next_time ||
+         (ready_time == m_next_time && address < m_next_address)))) {
+        m_next_time = ready_time;
+        m_next_address = address;
+        m_next_valid = true;
     }
 }
 
@@ -105,8 +107,7 @@ TimerTable::unset(Addr address)
     assert(m_map.count(address));
     m_map.erase(address);
 
-    // Don't always recalculate the next ready address
-    if (address == m_next_address) {
+    if (m_next_valid && address == m_next_address) {
         m_next_valid = false;
     }
 }

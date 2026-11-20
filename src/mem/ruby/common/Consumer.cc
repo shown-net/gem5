@@ -55,15 +55,29 @@ Consumer::Consumer(ClockedObject *_em, Event::Priority ev_prio)
 void
 Consumer::scheduleEvent(Cycles timeDelta)
 {
-    m_wakeup_ticks.insert(em->clockEdge(timeDelta));
-    scheduleNextWakeup();
+    scheduleWakeupTick(em->clockEdge(timeDelta));
 }
 
 void
 Consumer::scheduleEventAbsolute(Tick evt_time)
 {
-    m_wakeup_ticks.insert(
-        divCeil(evt_time, em->clockPeriod()) * em->clockPeriod());
+    scheduleWakeupTick(divCeil(evt_time, em->clockPeriod()) *
+                       em->clockPeriod());
+}
+
+void
+Consumer::scheduleWakeupTick(Tick when)
+{
+    invalidateEmptyInputs();
+    if (m_wakeup_event.scheduled()) {
+        if (m_wakeup_event.when() == when)
+            return;
+        m_wakeup_ticks.insert(when);
+        if (m_wakeup_event.when() <= when)
+            return;
+    } else {
+        m_wakeup_ticks.insert(when);
+    }
     scheduleNextWakeup();
 }
 

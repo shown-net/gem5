@@ -94,11 +94,13 @@ TEST_F(EventQueueTest, DetachedQueueCanBeRestored)
     queue.schedule(&one, 10);
     queue.schedule(&two, 10);
     queue.schedule(&three, 20);
-    Event *saved = queue.replaceHead(nullptr);
+    EventQueue::PendingEvents saved;
+    queue.swapPendingEvents(saved);
     EXPECT_TRUE(queue.empty());
     queue.schedule(&temporary, 5);
     queue.serviceEvents(5);
-    EXPECT_EQ(queue.replaceHead(saved), nullptr);
+    EXPECT_TRUE(queue.empty());
+    queue.swapPendingEvents(saved);
     queue.setCurTick(0); // Ruby restores the original clock after warmup.
     queue.deschedule(&one);
     queue.schedule(&inserted, 10);
@@ -138,6 +140,20 @@ TEST_F(EventQueueTest, AsyncMergePreservesSameKeyOrder)
     ASSERT_TRUE(queue.debugVerify());
     queue.serviceEvents(10);
     EXPECT_EQ(order, (std::vector<int>{3, 2, 1}));
+}
+
+TEST_F(EventQueueTest, CallbackInsertsAheadOfRemainingEvents)
+{
+    std::vector<int> order;
+    RecordingEvent first(1, order), inserted(2, order), later(3, order);
+    EventFunctionWrapper callback([&] { queue.schedule(&inserted, 10); },
+                                  "insert another event");
+
+    queue.schedule(&first, 10);
+    queue.schedule(&later, 20);
+    queue.schedule(&callback, 10);
+    queue.serviceEvents(20);
+    EXPECT_EQ(order, (std::vector<int>{2, 1, 3}));
 }
 
 } // anonymous namespace

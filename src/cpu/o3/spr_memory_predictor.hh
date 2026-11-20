@@ -11,6 +11,7 @@
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/physical_byte_coverage.hh"
 
 namespace gem5::o3
 {
@@ -35,7 +36,8 @@ class SprMemoryPredictor
     void loadRetired(const DynInstPtr &load);
     void violation(const DynInstPtr &store, const DynInstPtr &load);
     bool canSpeculate(const DynInstPtr &load);
-    const std::vector<Addr> *physicalReadBytes(const DynInstPtr &load) const;
+    const PhysicalLineCoverage::Lines *physicalReadBytes(
+        const DynInstPtr &load) const;
 
   private:
     LSQ *lsq;
@@ -53,14 +55,14 @@ class SprMemoryPredictor
         DynInstPtr store;
         bool member = false;
         bool physicalReady = false;
-        std::vector<Addr> bytes;
+        PhysicalLineCoverage::Lines bytes;
         bool orderingChecked = false;
         bool secure = false;
     };
     struct LoadObservation {
         DynInstPtr load;
         std::vector<StoreObservation> olderStores;
-        std::vector<Addr> bytes;
+        PhysicalLineCoverage::Lines bytes;
         bool physicalReady = false;
         bool secure = false;
         ObservationResult result = ObservationResult::Pending;
@@ -74,7 +76,7 @@ class SprMemoryPredictor
         StoreObservation *findStore(const DynInstPtr &inst);
     };
     std::unordered_map<InstSeqNum, LoadObservation> loadObservations;
-    std::vector<bool> coverageScratch;
+    std::vector<uint64_t> coverageScratch;
     struct Counters {
         uint64_t localQueries = 0, independencePredictions = 0, addressWaits = 0;
         uint64_t resolvedIndependentLoads = 0, resolvedDependentLoads = 0;

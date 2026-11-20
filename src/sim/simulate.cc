@@ -168,6 +168,7 @@ class SimulatorThreads
 };
 
 static std::unique_ptr<SimulatorThreads> simulatorThreads;
+static bool holdDetailedLoopLock = false;
 
 struct DescheduleDeleter
 {
@@ -284,12 +285,13 @@ terminateEventQueueThreads()
 }
 
 void
-enterSingleEventQueueMode()
+enterSingleEventQueueMode(bool single_owner)
 {
     fatal_if(inParallelMode || curEventQueue() != mainEventQueue[0],
              "single event queue transition requires a stopped main queue");
     fatal_if(!simulatorThreads || global_exit_event == nullptr,
              "single event queue transition requires a completed simulation exit");
+    holdDetailedLoopLock = single_owner;
     if (numMainEventQueues == 1) {
         simQuantum = 0;
         return;
@@ -329,6 +331,11 @@ doSimLoop(EventQueue *eventq)
     eventq->handleAsyncInsertions();
 
     bool mainQueue = eventq == getEventQueue(0);
+    const bool hold_lock = holdDetailedLoopLock && mainQueue &&
+                           numMainEventQueues == 1;
+    std::unique_lock<EventQueue> loop_lock(*eventq, std::defer_lock);
+    if (hold_lock)
+        loop_lock.lock();
 
     while (1) {
         // there should always be at least one event (the SimLoopExitEvent
@@ -341,7 +348,9 @@ doSimLoop(EventQueue *eventq)
             async_event = false;
             // Take the event queue lock in case any of the service
             // routines want to schedule new events.
-            std::lock_guard<EventQueue> lock(*eventq);
+            std::unique_lock<EventQueue> lock(*eventq, std::defer_lock);
+            if (!hold_lock)
+                lock.lock();
             if (async_statdump || async_statreset) {
                 statistics::schedStatEvent(async_statdump, async_statreset);
                 async_statdump = false;
@@ -368,7 +377,8 @@ doSimLoop(EventQueue *eventq)
             }
         }
 
-        Event *exit_event = eventq->serviceOne();
+        Event *exit_event = hold_lock ? eventq->serviceOneLocked() :
+                                       eventq->serviceOne();
         if (exit_event != NULL) {
             return exit_event;
         }

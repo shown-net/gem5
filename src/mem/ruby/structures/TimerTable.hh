@@ -68,6 +68,7 @@ class TimerTable
     }
 
     bool isReady(Tick curTime) const;
+    bool isEmpty() const { return m_map.empty(); }
     Addr nextAddress() const;
     bool isSet(Addr address) const { return !!m_map.count(address); }
     void set(Addr address, Tick ready_time);

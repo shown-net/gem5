@@ -505,11 +505,13 @@ MiteService::deliver(InstructionDeliveryQueue &idq, uint64_t cycle,
         stats.sourceOps[i] += sources[i];
         if (sources[i]) ++stats.sourceCycles[i];
         if (sources[i] >= 6) ++stats.sourceCyclesGe6[i];
-        if (sources[i]) ++stats.sourceWidths[i][sources[i]];
+        if (collectSourceWidths && sources[i])
+            ++stats.sourceWidths[i][sources[i]];
         stats.sourceSlots[i] += allocation_sources[i];
         if (allocation_sources[i]) ++stats.sourceSlotCycles[i];
         if (allocation_sources[i] >= 6) ++stats.sourceSlotCyclesGe6[i];
-        if (allocation_sources[i]) ++stats.sourceSlotWidths[i][allocation_sources[i]];
+        if (collectSourceSlotWidths && allocation_sources[i])
+            ++stats.sourceSlotWidths[i][allocation_sources[i]];
     }
     checkDrain();
     return delivered;
@@ -826,8 +828,7 @@ FrontendCoordinator::Stats::Stats(statistics::Group *parent)
 {}
 
 FrontendCoordinator::FrontendCoordinator(const FrontendCoordinatorParams &p)
-    : SimObject(p), wakeEvent([this] { if (owner) owner->wakeFrontend(); },
-                              name() + ".ready", false, Event::CPU_Tick_Pri - 1),
+    : SimObject(p),
       enableLsdReplay(p.enableLsdReplay),
       stats(this),
       instructionBytes(p.instructionBytes), mite(p.mite), dsb(p.dsb),
@@ -837,22 +838,27 @@ FrontendCoordinator::FrontendCoordinator(const FrontendCoordinatorParams &p)
 void
 FrontendCoordinator::cancelWake()
 {
-    if (owner && wakeEvent.scheduled()) owner->deschedule(wakeEvent);
+    if (owner)
+        owner->setFrontendWake(CPU::FrontendWakeSource::Coordinator, MaxTick);
 }
 
 void
 FrontendCoordinator::refreshWake()
 {
-    cancelWake();
     if (!owner || owner->switchedOut() ||
-        owner->drainState() == DrainState::Drained) return;
+        owner->drainState() == DrainState::Drained) {
+        cancelWake();
+        return;
+    }
     const uint64_t now = uint64_t(owner->curCycle());
     uint64_t due = idq->nextReady(now);
     for (auto *service : {mite, static_cast<MiteService *>(dsb),
-                          static_cast<MiteService *>(ms), lsd})
-        due = std::min(due, service->nextReady(now));
-    if (due != ~uint64_t(0))
-        owner->schedule(wakeEvent, owner->clockEdge(Cycles(due - now)));
+                          static_cast<MiteService *>(ms), lsd}) {
+        if (service != lsd || enableLsdReplay)
+            due = std::min(due, service->nextReady(now));
+    }
+    owner->setFrontendWake(CPU::FrontendWakeSource::Coordinator,
+        due == MaxTick ? MaxTick : owner->clockEdge(Cycles(due - now)));
 }
 
 void
@@ -881,7 +887,8 @@ FrontendCoordinator::configure(unsigned threads, unsigned width, unsigned size)
 bool FrontendCoordinator::canAccept() const
 {
     return !stoppedThisCycle && (mite->freeBatchOps() || dsb->freeBatchOps() ||
-                                ms->freeBatchOps() || lsd->freeBatchOps());
+                                ms->freeBatchOps() ||
+                                (enableLsdReplay && lsd->freeBatchOps()));
 }
 MiteService *FrontendCoordinator::sourceService(FrontendSource source) const
 {
@@ -892,6 +899,8 @@ MiteService *FrontendCoordinator::sourceService(FrontendSource source) const
 }
 bool FrontendCoordinator::canAccept(FrontendSource source) const
 {
+    if (source == FrontendSource::Lsd && !enableLsdReplay)
+        return false;
     return !stoppedThisCycle && sourceService(source)->freeBatchOps();
 }
 void FrontendCoordinator::allocation(unsigned accepted, unsigned slots)
@@ -904,7 +913,8 @@ void FrontendCoordinator::allocation(unsigned accepted, unsigned slots)
 }
 bool FrontendCoordinator::empty() const
 {
-    return mite->idle() && dsb->idle() && ms->idle() && lsd->idle() &&
+    return mite->idle() && dsb->idle() && ms->idle() &&
+        (!enableLsdReplay || lsd->idle()) &&
         idq->empty() && pendingFills.empty();
 }
 
@@ -941,7 +951,8 @@ FrontendCoordinator::advance(uint64_t cycle, bool rename_blocked,
         InstSeqNum before = ~InstSeqNum(0);
         for (auto *service : {mite, static_cast<MiteService *>(dsb),
                               static_cast<MiteService *>(ms), lsd}) {
-            if (service->idle()) continue;
+            if ((service == lsd && !enableLsdReplay) || service->idle())
+                continue;
             if (!oldest || service->headSequence() < oldest->headSequence()) {
                 if (oldest) before = std::min(before, oldest->headSequence());
                 oldest = service;

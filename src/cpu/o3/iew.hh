@@ -362,7 +362,6 @@ class IEW
     bool wroteToTimeBuffer;
 
     /** Debug function to print instructions that are issued this cycle. */
-    void printAvailableInsts();
 
   public:
     /** Instruction queue. */

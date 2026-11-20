@@ -122,13 +122,9 @@ class MemDepUnit
 
     /** Address resolution is distinct from store data/completion. */
     void setLSQ(LSQ *lsq_ptr) { lsq = lsq_ptr; }
-    void addressGenerated(const DynInstPtr &inst);
-    void addressReady(const DynInstPtr &inst);
     void storeOrderChecked(const DynInstPtr &inst, InstSeqNum firstViolation = 0);
-    void noteAddressWait(const DynInstPtr &load);
-    void loadRetired(const DynInstPtr &load);
+    void noteAddressWait();
     bool canSpeculate(const DynInstPtr &inst);
-    const std::vector<Addr> *physicalReadBytes(const DynInstPtr &inst) const;
 
     /** Inserts a memory instruction. */
     void insert(const DynInstPtr &inst);
@@ -259,12 +255,6 @@ class MemDepUnit
     // Select the SPR ordering path; prediction is not enabled by this flag.
     bool sprPredictor = false;
     LSQ *lsq = nullptr;
-    struct LoadObservation {
-        std::vector<Addr> bytes;
-        bool physicalReady = false;
-        bool addressWaitObserved = false;
-    };
-    std::unordered_map<InstSeqNum, LoadObservation, SNHash> loadObservations;
 
     /** Sequence numbers of outstanding load barriers. */
     std::unordered_set<InstSeqNum> loadBarrierSNs;

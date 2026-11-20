@@ -88,7 +88,7 @@ SprMemoryPredictor::observeLoad(const DynInstPtr &inst)
             entry->second->orderingChecked : store->effAddrValid();
         if (store->translationStarted() && store->savedRequest) {
             sample.physicalReady =
-                store->savedRequest->physicalBytes(sample.bytes);
+                store->savedRequest->physicalLineMasks(sample.bytes);
             if (sample.physicalReady)
                 sample.secure = store->savedRequest->mainReq()->isSecure();
         }
@@ -116,12 +116,11 @@ SprMemoryPredictor::trainLoad(LoadObservation &observation)
     bool intersection = false;
     bool dependent = false;
     const auto &stores = observation.olderStores;
-    // The stores are in program order and physicalBytes() returns sorted,
-    // unique byte addresses. Walk younger-to-older once so coverageScratch[j]
-    // denotes the bytes already supplied by a younger, resolved store. This
+    // Walk younger-to-older once so coverageScratch[j] denotes the bytes in
+    // load line j already supplied by a younger, resolved store. This
     // retains the original U-set and unknown-younger-store semantics without
     // repeatedly subtracting every younger range for every older store.
-    coverageScratch.assign(observation.bytes.size(), false);
+    coverageScratch.assign(observation.bytes.size(), 0);
     bool unknownYounger = false;
     for (auto it = stores.rbegin(); it != stores.rend(); ++it) {
         const auto &sample = *it;
@@ -135,7 +134,7 @@ SprMemoryPredictor::trainLoad(LoadObservation &observation)
         }
         if (sample.secure != observation.secure)
             continue;
-        const auto match = PhysicalByteCoverage::cover(
+        const auto match = PhysicalLineCoverage::cover(
             observation.bytes, sample.bytes, coverageScratch);
         if (sample.member)
             intersection |= match.overlap;
@@ -221,7 +220,7 @@ SprMemoryPredictor::canSpeculate(const DynInstPtr &inst)
     return false;
 }
 
-const std::vector<Addr> *
+const PhysicalLineCoverage::Lines *
 SprMemoryPredictor::physicalReadBytes(const DynInstPtr &inst) const
 {
     auto found = loadObservations.find(inst->seqNum);
@@ -266,7 +265,7 @@ SprMemoryPredictor::addressReady(const DynInstPtr &inst)
         auto found = loadObservations.find(inst->seqNum);
         if (found != loadObservations.end()) {
             if (inst->savedRequest) {
-                found->second.physicalReady = inst->savedRequest->physicalBytes(
+                found->second.physicalReady = inst->savedRequest->physicalLineMasks(
                     found->second.bytes);
                 if (found->second.physicalReady)
                     found->second.secure =
@@ -279,7 +278,7 @@ SprMemoryPredictor::addressReady(const DynInstPtr &inst)
     bool captured = false;
     bool physical_ready = false;
     bool secure = false;
-    std::vector<Addr> bytes;
+    PhysicalLineCoverage::Lines bytes;
     for (auto &[sequence, observation] : loadObservations) {
         if (auto *sample = observation.findStore(inst);
             sample && inst->savedRequest) {
@@ -287,7 +286,7 @@ SprMemoryPredictor::addressReady(const DynInstPtr &inst)
             // Failed expansion leaves each observation's old bytes intact.
             if (!captured) {
                 captured = true;
-                physical_ready = inst->savedRequest->physicalBytes(bytes);
+                physical_ready = inst->savedRequest->physicalLineMasks(bytes);
                 if (physical_ready)
                     secure = inst->savedRequest->mainReq()->isSecure();
             }

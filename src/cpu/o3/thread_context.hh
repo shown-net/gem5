@@ -84,6 +84,8 @@ class ThreadContext : public gem5::ThreadContext
     void
     scheduleInstCountEvent(Event *event, Tick count) override
     {
+        if (!thread->servicingInstCountEvents)
+            thread->comInstEventQueue.setCurTick(thread->numInst);
         thread->comInstEventQueue.schedule(event, count);
     }
     void
@@ -94,7 +96,9 @@ class ThreadContext : public gem5::ThreadContext
     Tick
     getCurrentInstCount() override
     {
-        return thread->comInstEventQueue.getCurTick();
+        if (thread->servicingInstCountEvents)
+            return thread->comInstEventQueue.getCurTick();
+        return thread->numInst;
     }
 
     /** Pointer to the thread state that this TC corrseponds to. */

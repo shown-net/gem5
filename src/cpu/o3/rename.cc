@@ -534,7 +534,8 @@ Rename::tick()
 
     toIEWIndex = 0;
 
-    sortInsts();
+    if (fromDecode->size)
+        sortInsts();
 
     unsigned store_stall_reasons = 0;
 
@@ -545,10 +546,12 @@ Rename::tick()
         status_change = checkSignalsAndUpdate(tid) || status_change;
 
         const unsigned first_output = toIEWIndex;
-        unsigned frontend_blocked = 0;
-        int sq_headroom = 0;
         if (cpu->frontend) {
-            sq_headroom = calcFreeSQEntries(tid);
+            const int sq_headroom = calcFreeSQEntries(tid);
+            const int rob_headroom = calcFreeROBEntries(tid);
+            const int iq_headroom = calcFreeIQEntries(tid);
+            const unsigned prf_headroom = renameMap[tid]->minFreeEntries();
+            unsigned frontend_blocked = 0;
             if (stalls[tid].iew || renameStatus[tid] == Blocked)
                 frontend_blocked |= FrontendCoordinator::RenameSignal;
             if (renameStatus[tid] == Squashing ||
@@ -556,13 +559,13 @@ Rename::tick()
                 frontend_blocked |= FrontendCoordinator::Recovery;
             if (renameStatus[tid] == SerializeStall)
                 frontend_blocked |= FrontendCoordinator::Serialize;
-            if (calcFreeROBEntries(tid) <= 0)
+            if (rob_headroom <= 0)
                 frontend_blocked |= FrontendCoordinator::FullROB;
-            if (calcFreeIQEntries(tid) <= 0)
+            if (iq_headroom <= 0)
                 frontend_blocked |= FrontendCoordinator::FullIQ;
-            if (calcFreeLQEntries(tid) <= 0 && calcFreeSQEntries(tid) <= 0)
+            if (sq_headroom <= 0 && calcFreeLQEntries(tid) <= 0)
                 frontend_blocked |= FrontendCoordinator::FullLSQ;
-            if (renameMap[tid]->minFreeEntries() == 0)
+            if (prf_headroom == 0)
                 frontend_blocked |= FrontendCoordinator::FullPRF;
             auto &receiver = toDecode->renameInfo[tid];
             receiver.receiverValid = true;
@@ -570,11 +573,16 @@ Rename::tick()
             receiver.freeSQEntries = std::max(0, sq_headroom);
             receiver.receiverCapacity = frontend_blocked ? 0 :
                 std::min({renameWidth,
-                    unsigned(std::max(0, calcFreeROBEntries(tid))),
-                    unsigned(std::max(0, calcFreeIQEntries(tid))),
-                    renameMap[tid]->minFreeEntries()});
+                    unsigned(rob_headroom), unsigned(iq_headroom),
+                    prf_headroom});
         }
-        rename(status_change, tid);
+        // The input wire is produced by Fetch at offset zero on the SPR
+        // path. A batch it publishes above this phase can run immediately.
+        if (cpu->frontend && insts[tid].empty() &&
+            (renameStatus[tid] == Running || renameStatus[tid] == Idle))
+            ++stats.status[Idle];
+        else
+            rename(status_change, tid);
         if (renameStatus[tid] == SerializeStall)
             ++resourceStallStats.SCOREBOARD;
         cpu->recoveryStats.allocatorState(tid,
@@ -585,34 +593,31 @@ Rename::tick()
             issued_slots += toIEW->insts[i]->allocationSlots();
         if (fromCommit->commitInfo[tid].robSquashing)
             stats.recoveryAllocationSlots += issued_slots;
-        if (issued_slots < renameWidth && toIEWIndex < MaxWidth &&
+        if (storeStallDiagnostics && issued_slots < renameWidth &&
+            toIEWIndex < MaxWidth &&
             renameStatus[tid] != Squashing &&
             renameStatus[tid] != SerializeStall &&
             !fromCommit->commitInfo[tid].squash)
         {
             const auto reasons = storeStallReasons(tid);
             store_stall_reasons |= reasons;
-            if ((reasons & 1) && (blockThisCycle || stalls[tid].iew ||
-                                  renameStatus[tid] == Blocked))
-                store_stall_reasons |= 8;
+            if ((storeStallDiagnostics & StoreBufferAndFrontend) &&
+                (reasons & StoreBuffer) &&
+                (blockThisCycle || stalls[tid].iew || renameStatus[tid] == Blocked))
+                store_stall_reasons |= StoreBufferAndFrontend;
         }
-        if (cpu->frontend) {
-            if (blockThisCycle) frontend_blocked |= FrontendCoordinator::RenameSignal;
-            if (renameStatus[tid] == SerializeStall)
-                frontend_blocked |= FrontendCoordinator::Serialize;
-            unsigned slots = 0;
-            for (unsigned i = first_output; i < toIEWIndex; ++i)
-                slots += toIEW->insts[i]->allocationSlots();
-            cpu->frontend->allocation(toIEWIndex - first_output, slots);
-        }
+        if (cpu->frontend)
+            cpu->frontend->allocation(toIEWIndex - first_output, issued_slots);
     }
 
-    if (store_stall_reasons & 1) {
+    if (store_stall_reasons & storeStallDiagnostics & StoreBuffer)
         ++resourceStallStats.SB;
-        if (store_stall_reasons & 2) ++resourceStallStats.SB_ROB_OVERLAP;
-        if (store_stall_reasons & 4) ++resourceStallStats.SB_IQ_OVERLAP;
-        if (store_stall_reasons & 8) ++resourceStallStats.SB_FRONTEND_BLOCKED;
-    }
+    if (store_stall_reasons & StoreBufferAndROB)
+        ++resourceStallStats.SB_ROB_OVERLAP;
+    if (store_stall_reasons & StoreBufferAndIQ)
+        ++resourceStallStats.SB_IQ_OVERLAP;
+    if (store_stall_reasons & StoreBufferAndFrontend)
+        ++resourceStallStats.SB_FRONTEND_BLOCKED;
 
     if (numThreads == 1 && !activeThreads->empty()) {
         const bool no_candidate = insts[0].empty() && skidBuffer[0].empty();
@@ -673,22 +678,33 @@ Rename::storeStallReasons(ThreadID tid)
         commit_ptr->reorderBuffer().hasReservation(queue->front()))
         return 0;
 
-    std::vector<DynInstPtr> batch;
+    unsigned count = 0;
     unsigned stores = 0;
     const auto end = queue->front()->allocationEnd();
-    for (const auto &inst : *queue) {
+    auto finish = queue->begin();
+    for (; finish != queue->end();) {
+        const auto &inst = *finish++;
         if (inst->isSquashed()) return 0;
-        batch.push_back(inst);
+        ++count;
         stores += inst->isStore() || inst->isAtomic();
-        if (inst->seqNum == end) break;
+        if (inst->seqNum == end)
+            break;
     }
-    if (batch.empty() || batch.back()->seqNum != end || !stores ||
-        batch.size() > MaxWidth - toIEWIndex ||
+    if ((*std::prev(finish))->seqNum != end || !stores ||
+        count > MaxWidth - toIEWIndex ||
         calcFreeSQEntries(tid) >= int(stores))
         return 0;
-    unsigned reasons = 1;
-    if (!commit_ptr->reorderBuffer().canReserve(batch)) reasons |= 2;
-    if (!iew_ptr->instQueue.canReserve(batch)) reasons |= 4;
+
+    unsigned reasons = StoreBuffer;
+    if (storeStallDiagnostics & (StoreBufferAndROB | StoreBufferAndIQ)) {
+        const std::vector<DynInstPtr> batch(queue->begin(), finish);
+        if ((storeStallDiagnostics & StoreBufferAndROB) &&
+            !commit_ptr->reorderBuffer().canReserve(batch))
+            reasons |= StoreBufferAndROB;
+        if ((storeStallDiagnostics & StoreBufferAndIQ) &&
+            !iew_ptr->instQueue.canReserve(batch))
+            reasons |= StoreBufferAndIQ;
+    }
     return reasons;
 }
 

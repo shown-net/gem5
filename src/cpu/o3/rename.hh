@@ -161,6 +161,16 @@ class Rename
     Commit *commit_ptr;
 
   public:
+    enum StoreStallReason : unsigned
+    {
+        StoreBuffer = 1,
+        StoreBufferAndROB = 2,
+        StoreBufferAndIQ = 4,
+        StoreBufferAndFrontend = 8
+    };
+
+    void setStoreStallDiagnostics(unsigned mask) { storeStallDiagnostics = mask; }
+
     /** Initializes variables for the stage. */
     void startupStage();
 
@@ -490,6 +500,9 @@ class Rename
 
     /** Inspect the oldest complete allocation group without changing it. */
     unsigned storeStallReasons(ThreadID tid);
+
+    unsigned storeStallDiagnostics = StoreBuffer | StoreBufferAndROB |
+        StoreBufferAndIQ | StoreBufferAndFrontend;
 
     struct ResourceStallStats : public statistics::Group
     {

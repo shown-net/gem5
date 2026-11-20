@@ -120,8 +120,6 @@ struct IEWStruct
 struct IssueStruct
 {
     int size;
-
-    DynInstPtr insts[MaxWidth];
 };
 
 /** Struct that defines all backwards communication. */

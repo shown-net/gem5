@@ -78,7 +78,7 @@ Tick get_max_tick();
  */
 void terminateEventQueueThreads();
 
-void enterSingleEventQueueMode();
+void enterSingleEventQueueMode(bool single_owner = false);
 
 extern GlobalSimLoopExitEvent *simulate_limit_event;
 

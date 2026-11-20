@@ -84,6 +84,7 @@ class IQUnit : public SimObject
 {
   public:
     IQUnit(const IQUnitParams &p);
+    void setAllocationChangeFlag(bool &flag) { allocationChanged = &flag; }
 
     void insert(const DynInstPtr &inst);
     void remove(const DynInstPtr &inst);
@@ -150,6 +151,8 @@ class IQUnit : public SimObject
     }
 
   private:
+    bool *allocationChanged = nullptr;
+
     /** IQ sharing policy for SMT. */
     SMTQueuePolicy iqPolicy;
 
@@ -343,7 +346,6 @@ class InstructionQueue
     /** Gets a memory instruction that was referred due to a delayed DTB
      *  translation if it is now ready to execute.  NULL if none available.
      */
-    DynInstPtr getDeferredMemInstToExecute();
 
     /** Gets a memory instruction that was blocked on the cache. NULL if none
      *  available.
@@ -405,6 +407,7 @@ class InstructionQueue
      * page table walk.
      */
     void deferMemInst(const DynInstPtr &deferred_inst);
+    void translationComplete(const DynInstPtr &inst);
 
     /**  Defers a memory instruction when it is cache blocked. */
     void blockMemInst(const DynInstPtr &blocked_inst);
@@ -485,9 +488,11 @@ class InstructionQueue
      *  complete (hw page table walk in progress).
      */
     std::list<DynInstPtr> deferredMemInsts;
+    bool deferredTranslationsChanged = false;
     // These records remain owned by the bounded LSQ while waiting for an RS
     // credit. Waiting for data alone never adds an instruction to this list.
     std::list<DynInstPtr> admissionWaitMemInsts;
+    bool admissionChanged = false;
     // Each pending projection belongs to an already reserved ROB entry.
     std::deque<DynInstPtr> readyMoveProjections;
     std::vector<DynInstPtr> resourceDeferred;

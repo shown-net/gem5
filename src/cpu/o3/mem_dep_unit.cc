@@ -135,8 +135,7 @@ bool
 MemDepUnit::isDrained() const
 {
     bool drained = instsToReplay.empty()
-                 && memDepHash.empty()
-                 && loadObservations.empty();
+                 && memDepHash.empty();
     for (int i = 0; i < MaxThreads; ++i)
         drained = drained && instList[i].empty();
 
@@ -148,7 +147,6 @@ MemDepUnit::drainSanityCheck() const
 {
     assert(instsToReplay.empty());
     assert(memDepHash.empty());
-    assert(loadObservations.empty());
     for (int i = 0; i < MaxThreads; ++i)
         assert(instList[i].empty());
     assert(instsToReplay.empty());
@@ -163,7 +161,6 @@ MemDepUnit::takeOverFrom()
     storeBarrierSNs.clear();
     if (depPred)
         depPred->clear();
-    loadObservations.clear();
 }
 
 void
@@ -207,6 +204,22 @@ MemDepUnit::insertBarrierSN(const DynInstPtr &barr_inst)
 void
 MemDepUnit::insert(const DynInstPtr &inst)
 {
+    if (sprPredictor && (inst->isLoad() || inst->isStore()) &&
+        !inst->isAtomic() && !inst->isReadBarrier() &&
+        !inst->isWriteBarrier() && !inst->isHtmCmd() &&
+        !inst->inHtmTransactionalState() &&
+        (!inst->isLoad() || !hasLoadBarrier()) &&
+        (!inst->isStore() || !hasStoreBarrier())) {
+        inst->bypassedMemDep = true;
+        if (inst->isStore())
+            ++stats.insertedStores;
+        else
+            ++stats.insertedLoads;
+        if (inst->readyToIssue())
+            iqPtr->addReadyMemInst(inst);
+        return;
+    }
+
     ThreadID tid = inst->threadNumber;
 
     MemDepEntryPtr inst_entry = std::make_shared<MemDepEntry>(inst);
@@ -366,6 +379,11 @@ MemDepUnit::insertBarrier(const DynInstPtr &barr_inst)
 void
 MemDepUnit::regsReady(const DynInstPtr &inst)
 {
+    if (inst->bypassedMemDep) {
+        iqPtr->addReadyMemInst(inst);
+        return;
+    }
+
     DPRINTF(MemDepUnit, "Marking registers as ready for "
             "instruction PC %s [sn:%lli].\n",
             inst->pcState(), inst->seqNum);
@@ -412,12 +430,13 @@ MemDepUnit::replay()
     while (!instsToReplay.empty()) {
         temp_inst = instsToReplay.front();
 
-        MemDepEntryPtr inst_entry = findInHash(temp_inst);
-
         DPRINTF(MemDepUnit, "Replaying mem instruction PC %s [sn:%lli].\n",
                 temp_inst->pcState(), temp_inst->seqNum);
 
-        moveToReady(inst_entry);
+        if (temp_inst->bypassedMemDep)
+            iqPtr->addReadyMemInst(temp_inst);
+        else
+            moveToReady(findInHash(temp_inst));
 
         instsToReplay.pop_front();
     }
@@ -429,8 +448,10 @@ MemDepUnit::replayOne(const DynInstPtr &inst)
     for (auto it = instsToReplay.begin(); it != instsToReplay.end(); ++it) {
         if ((*it)->seqNum != inst->seqNum)
             continue;
-        MemDepEntryPtr entry = findInHash(*it);
-        moveToReady(entry);
+        if ((*it)->bypassedMemDep)
+            iqPtr->addReadyMemInst(*it);
+        else
+            moveToReady(findInHash(*it));
         instsToReplay.erase(it);
         return true;
     }
@@ -463,6 +484,8 @@ MemDepUnit::completed(const DynInstPtr &inst)
 void
 MemDepUnit::completeInst(const DynInstPtr &inst)
 {
+    if (inst->bypassedMemDep)
+        return;
     wakeDependents(inst);
     completed(inst);
     InstSeqNum barr_sn = inst->seqNum;
@@ -605,12 +628,6 @@ MemDepUnit::squash(const InstSeqNum &squashed_num, ThreadID tid)
     // Tell the dependency predictor to squash as well.
     if (!sprPredictor)
         depPred->squash(squashed_num, tid);
-    for (auto it = loadObservations.begin(); it != loadObservations.end();) {
-        if (it->first > squashed_num)
-            it = loadObservations.erase(it);
-        else
-            ++it;
-    }
 }
 
 void
@@ -645,32 +662,6 @@ MemDepUnit::canSpeculate(const DynInstPtr &)
     return !sprPredictor;
 }
 
-const std::vector<Addr> *
-MemDepUnit::physicalReadBytes(const DynInstPtr &inst) const
-{
-    auto found = loadObservations.find(inst->seqNum);
-    return found != loadObservations.end() && found->second.physicalReady ?
-        &found->second.bytes : nullptr;
-}
-
-void
-MemDepUnit::addressGenerated(const DynInstPtr &inst)
-{
-    if (sprPredictor && inst->isLoad() && !inst->isDataPrefetch())
-        loadObservations.insert_or_assign(inst->seqNum, LoadObservation{});
-}
-
-void
-MemDepUnit::addressReady(const DynInstPtr &inst)
-{
-    if (!sprPredictor || !inst->isLoad())
-        return;
-    auto found = loadObservations.find(inst->seqNum);
-    if (found != loadObservations.end() && inst->savedRequest)
-        found->second.physicalReady =
-            inst->savedRequest->physicalBytes(found->second.bytes);
-}
-
 void
 MemDepUnit::storeOrderChecked(const DynInstPtr &, InstSeqNum)
 {
@@ -678,19 +669,9 @@ MemDepUnit::storeOrderChecked(const DynInstPtr &, InstSeqNum)
 }
 
 void
-MemDepUnit::noteAddressWait(const DynInstPtr &load)
+MemDepUnit::noteAddressWait()
 {
-    auto found = loadObservations.find(load->seqNum);
-    if (found == loadObservations.end() || found->second.addressWaitObserved)
-        return;
-    found->second.addressWaitObserved = true;
     ++stats.addressWaits;
-}
-
-void
-MemDepUnit::loadRetired(const DynInstPtr &load)
-{
-    loadObservations.erase(load->seqNum);
 }
 
 MemDepUnit::MemDepEntryPtr &

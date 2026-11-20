@@ -59,6 +59,7 @@
 #include "base/types.hh"
 #include "cpu/inst_seq.hh"
 #include "cpu/o3/dyn_inst_ptr.hh"
+#include "cpu/o3/physical_byte_coverage.hh"
 #include "cpu/utils.hh"
 #include "enums/SMTQueuePolicy.hh"
 #include "mem/l1_data_access.hh"
@@ -385,7 +386,7 @@ class LSQ
 
         // A complete physical byte set, including split-page mappings and
         // byte enables. Partial translation success is not a complete access.
-        bool physicalBytes(std::vector<Addr> &bytes) const;
+        bool physicalLineMasks(PhysicalLineCoverage::Lines &lines) const;
 
         virtual void markAsStaleTranslation() = 0;
 

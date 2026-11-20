@@ -120,8 +120,6 @@ Fetch::IcachePort::IcachePort(Fetch *_fetch, CPU *_cpu) :
 Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
     : fetchPolicy(params.smtFetchPolicy),
       cpu(_cpu),
-      wakeEvent([this] { cpu->wakeFrontend(); }, "Fetch ready", false,
-                Event::CPU_Tick_Pri - 1),
       frontend(params.frontend),
       bac(nullptr),
       ftq(nullptr),
@@ -196,15 +194,18 @@ Fetch::Fetch(CPU *_cpu, const BaseO3CPUParams &params)
 void
 Fetch::cancelWake()
 {
-    if (wakeEvent.scheduled()) cpu->deschedule(wakeEvent);
+    if (frontend)
+        cpu->setFrontendWake(CPU::FrontendWakeSource::Fetch, MaxTick);
 }
 
 void
 Fetch::refreshWake()
 {
-    cancelWake();
     if (!frontend || cpu->switchedOut() ||
-        cpu->drainState() == DrainState::Drained) return;
+        cpu->drainState() == DrainState::Drained) {
+        cancelWake();
+        return;
+    }
     const uint64_t now = uint64_t(cpu->curCycle());
     uint64_t due = frontend->instructionBytes->nextReady(now);
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
@@ -218,8 +219,8 @@ Fetch::refreshWake()
                 due = std::min(due, head->exitReadyAt());
         }
     }
-    if (due != ~uint64_t(0))
-        cpu->schedule(wakeEvent, cpu->clockEdge(Cycles(due - now)));
+    cpu->setFrontendWake(CPU::FrontendWakeSource::Fetch, due == MaxTick ?
+        MaxTick : cpu->clockEdge(Cycles(due - now)));
 }
 
 std::string Fetch::name() const { return cpu->name() + ".fetch"; }
@@ -1141,6 +1142,8 @@ Fetch::bacResteer(const PCStateBase &new_pc, ThreadID tid)
 
     toBAC->fetchInfo[tid].squash = true;
     set(toBAC->fetchInfo[tid].nextPC, new_pc);
+    if (frontend)
+        wroteToTimeBuffer = true;
     // Also invalidate FTQ. Shall be fixed from BAC.
     ftq->invalidate(tid);
 }
@@ -1477,6 +1480,7 @@ Fetch::buildInst(ThreadID tid, StaticInstPtr staticInst,
     DynInst::Arrays arrays;
     arrays.numSrcs = staticInst->numSrcRegs();
     arrays.numDests = staticInst->numDestRegs();
+    arrays.hasDivideResults = staticInst->intDivide().bytes != 0;
 
     // Create a new DynInst from the instruction fetched.
     DynInstPtr instruction = new (arrays) DynInst(

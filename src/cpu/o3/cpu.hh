@@ -104,6 +104,11 @@ class CPU : public BaseCPU
 {
   public:
     bool markerObservation = false;
+    bool collectSplitTranslationDiagnostic = true;
+    void setStoreStallDiagnostics(unsigned mask)
+    {
+        rename.setStoreStallDiagnostics(mask);
+    }
     // Enabled by the observer constructor before the first Execute request.
     bool instructionTranslationObservation = false;
     // Pure architectural snapshots; never enables marker/fusion behavior.
@@ -140,6 +145,9 @@ class CPU : public BaseCPU
 
     /** The tick event used for scheduling CPU ticks. */
     EventFunctionWrapper tickEvent;
+    EventFunctionWrapper frontendWakeEvent;
+    std::array<Tick, 3> frontendWakeTimes{MaxTick, MaxTick, MaxTick};
+    void refreshFrontendWake();
 
     /** The exit event used for terminating all ready-to-exit threads */
     EventFunctionWrapper threadExitEvent;
@@ -505,6 +513,9 @@ class CPU : public BaseCPU
         CommitIdx,
         NumStages
     };
+
+    enum class FrontendWakeSource { BAC, Fetch, Coordinator };
+    void setFrontendWake(FrontendWakeSource source, Tick when);
 
     /** The main time buffer to do backwards communication. */
     TimeBuffer<TimeStruct> timeBuffer;

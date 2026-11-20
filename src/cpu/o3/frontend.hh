@@ -126,6 +126,8 @@ class MiteService : public SimObject
     struct ReadyRecord { FrontendRecordPtr record; uint64_t ready; };
     std::deque<ReadyRecord> pending;
     InstSeqNum deliveredThrough = 0;
+    bool collectSourceWidths = true;
+    bool collectSourceSlotWidths = true;
   protected:
     struct Stats : statistics::Group
     {
@@ -143,6 +145,11 @@ class MiteService : public SimObject
     void checkDrain();
   public:
     MiteService(const MiteServiceParams &p);
+    void setWidthDiagnostics(bool operations, bool slots)
+    {
+        collectSourceWidths = operations;
+        collectSourceSlotWidths = slots;
+    }
     bool idle() const { return pending.empty(); }
     bool preparingHead(uint64_t cycle) const
     { return !pending.empty() && pending.front().ready > cycle; }
@@ -265,7 +272,6 @@ class DsbTemplates : public MiteService
 class FrontendCoordinator : public SimObject
 {
     CPU *owner = nullptr;
-    EventFunctionWrapper wakeEvent;
     struct CodeLease { Addr virtualBlock, physicalBlock;
         std::optional<fastsim::fst::TranslationFragment> translation; };
     std::deque<CodeLease> leases;

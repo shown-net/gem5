@@ -7,6 +7,7 @@
 #include <list>
 #include <memory>
 #include <unordered_map>
+#include <variant>
 
 #include "base/statistics.hh"
 #include "cpu/int_execution_info.hh"
@@ -71,6 +72,7 @@ class ExecutionPorts : public SimObject
 
   public:
     ExecutionPorts(const ExecutionPortsParams &p);
+    unsigned rotationStart(IntExecutionFamily family, uint16_t candidates) const;
     int probe(IntExecutionFamily family, uint16_t candidates, Tick now,
               uint16_t eligible = 0xfff) const;
     void commit(IntExecutionFamily family, uint16_t candidates,
@@ -105,6 +107,24 @@ class ResultForwarding : public SimObject
         bool tracked = false;
     };
 
+    struct LiveIntegerSource
+    {
+        DynInstPtr producer;
+        RegIndex destination;
+    };
+
+    struct WrittenIntegerSource
+    {
+        Tick nominal;
+        uint8_t port;
+        IntExecutionFamily family;
+        IntResultRole role;
+    };
+
+    using Source = std::variant<std::monostate, LiveIntegerSource,
+                                std::shared_ptr<VectorResultState>,
+                                WrittenIntegerSource>;
+
   private:
     std::vector<Reference> producers;
     struct Waiter { DynInstPtr inst; Tick when; };
@@ -114,6 +134,7 @@ class ResultForwarding : public SimObject
     EventFunctionWrapper wakeEvent;
     bool inIssuePass = false;
     bool issueWaitersClean = false;
+    bool collectLateSources = true;
     struct Stats : statistics::Group
     {
         statistics::Scalar deferred, wakeups, cancelled, unissuedCancelled;
@@ -129,11 +150,13 @@ class ResultForwarding : public SimObject
   public:
     ResultForwarding(const ResultForwardingParams &p);
     void bindCPU(CPU *owner, unsigned num_registers);
+    void setCollectLateSources(bool enabled) { collectLateSources = enabled; }
     void track(const DynInstPtr &inst, bool managed);
     void dispatched(const DynInstPtr &inst, unsigned port, Cycles latency);
-    Reference source(PhysRegIdPtr reg) const;
+    Source source(PhysRegIdPtr reg) const;
     bool qualifies(const DynInstPtr &inst, unsigned consumer_port, Tick now) const;
-    Tick availableAt(const DynInstPtr &inst, unsigned consumer_port) const;
+    Tick availableAt(const DynInstPtr &inst, unsigned consumer_port,
+                     bool *port_independent = nullptr) const;
     int earliestAdjustment(const DynInstPtr &inst, unsigned producer_port) const;
     void beginIssuePass();
     void endIssuePass();
@@ -153,22 +176,13 @@ class IntExecutionResource : public SimObject
     const Cycles completionDelay;
     const Cycles prfDelay;
     std::array<Tick, 12> nextAcceptance{};
-    struct Operation
-    {
-        DynInstPtr inst;
-        std::list<std::shared_ptr<Operation>>::iterator position;
-        bool completed = false;
-        bool written = false;
-        bool sent = false;
-        unsigned events = 3;
-    };
-    std::list<std::shared_ptr<Operation>> operations;
+    unsigned inFlight = 0;
     struct Stats : statistics::Group
     {
         statistics::Scalar admitted, values, completed, written;
         Stats(statistics::Group *parent);
     } stats;
-    void finishEvent(const std::shared_ptr<Operation> &operation);
+    void finishOperation();
 
   public:
     IntExecutionResource(const IntExecutionResourceParams &p);
@@ -176,7 +190,7 @@ class IntExecutionResource : public SimObject
     void admit(CPU *cpu, ResultForwarding *forwarding, const DynInstPtr &inst,
                unsigned port, std::function<void()> available,
                std::function<void()> complete);
-    bool empty() const { return operations.empty(); }
+    bool empty() const { return inFlight == 0; }
     DrainState drain() override;
 };
 

@@ -123,6 +123,7 @@ FrontendRecord::materialize(CPU *cpu)
     DynInst::Arrays arrays;
     arrays.numSrcs = instruction->numSrcRegs();
     arrays.numDests = instruction->numDestRegs();
+    arrays.hasDivideResults = instruction->intDivide().bytes != 0;
     DynInstPtr inst = new (arrays) DynInst(
         arrays, instruction, macroop, *pc, *predictedPC, sequence, cpu);
     inst->functionalBoundary=pc->as<X86ISA::PCState>().functionalBoundary();

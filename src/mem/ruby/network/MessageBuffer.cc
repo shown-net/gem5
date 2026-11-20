@@ -422,6 +422,9 @@ MessageBuffer::recycle(Tick current_time, Tick recycle_latency)
 void
 MessageBuffer::reanalyzeList(std::list<MsgPtr> &lt, Tick schdTick)
 {
+    if (lt.empty())
+        return;
+
     while (!lt.empty()) {
         MsgPtr m = lt.front();
         assert(m->getLastEnqueueTime() <= schdTick);
@@ -430,13 +433,12 @@ MessageBuffer::reanalyzeList(std::list<MsgPtr> &lt, Tick schdTick)
         push_heap(m_prio_heap.begin(), m_prio_heap.end(),
                   std::greater<MsgPtr>());
 
-        m_consumer->scheduleEventAbsolute(schdTick);
-
         DPRINTF(RubyQueue, "Requeue arrival_time: %lld, Message: %s\n",
             schdTick, *(m.get()));
 
         lt.pop_front();
     }
+    m_consumer->scheduleEventAbsolute(schdTick);
 }
 
 void

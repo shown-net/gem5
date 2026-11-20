@@ -138,6 +138,7 @@ LSQ::LSQ(CPU *cpu_ptr, IEW *iew_ptr, const BaseO3CPUParams &params)
       recvRespMaxCachelines(params.recvRespMaxCachelines),
       recvRespBufferSize(params.recvRespBufferSize),
       recvRespBytes(0),
+      recvRespPendBytes(0),
       recvRespCachelines(0),
       recvRespLastCachelineAddr(0),
       recvRespLastActiveCycle(0),
@@ -1019,7 +1020,7 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
 
         // The effective virtual address exists before translation starts.
         // Ordinary LSU retries reuse this request and do not query MDP again.
-        iewStage->instQueue.memoryDependence(tid).addressGenerated(inst);
+        thread[tid].beginLoadObservation(inst);
         const bool prepare_l1_index = sprL1WidthService && isLoad &&
             inst->isLoad() && !inst->isDataPrefetch() && !inst->isAtomic() &&
             !inst->isReadBarrier() && !inst->isWriteBarrier() &&
@@ -1048,7 +1049,7 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
 
             // Preserve physical ranges before forwarding or retirement can
             // release the request that owns its byte-enable information.
-            iewStage->instQueue.memoryDependence(tid).addressReady(inst);
+            thread[tid].refreshLoadCoverage(inst);
 
             if (cpu->checker) {
                 inst->reqToVerify = std::make_shared<Request>(*request->req());
@@ -1079,27 +1080,46 @@ LSQ::pushRequest(const DynInstPtr& inst, bool isLoad, uint8_t *data,
 }
 
 bool
-LSQ::LSQRequest::physicalBytes(std::vector<Addr> &bytes) const
+LSQ::LSQRequest::physicalLineMasks(PhysicalLineCoverage::Lines &lines) const
 {
     if (!flags.isSet(Flag::TranslationFinished) || _hasStaleTranslation ||
         _inst->fault != NoFault || _reqs.empty())
         return false;
-    std::vector<Addr> result;
+
+    lines.clear();
     for (const auto &req : _reqs) {
-        if (!req->hasVaddr() || !req->hasPaddr() ||
-            req->getVaddr() < _addr)
+        if (!req->hasVaddr() || !req->hasPaddr() || req->getVaddr() < _addr)
             return false;
         const Addr offset = req->getVaddr() - _addr;
         if (offset > _size || req->getSize() > _size - offset)
             return false;
-        for (unsigned byte = 0; byte < req->getSize(); ++byte) {
-            if (_byteEnable.empty() || _byteEnable.at(offset + byte))
-                result.push_back(req->getPaddr() + byte);
+
+        unsigned byte = 0;
+        while (byte < req->getSize()) {
+            const Addr pa = req->getPaddr() + byte;
+            const Addr line = pa & ~Addr(63);
+            const unsigned start = pa & 63;
+            const unsigned count = std::min(64 - start, req->getSize() - byte);
+            uint64_t mask = 0;
+            if (_byteEnable.empty()) {
+                mask = (~uint64_t(0) >> (64 - count)) << start;
+            } else {
+                for (unsigned i = 0; i < count; ++i)
+                    if (_byteEnable.at(offset + byte + i))
+                        mask |= uint64_t(1) << (start + i);
+            }
+            byte += count;
+            if (!mask)
+                continue;
+
+            auto slot = std::lower_bound(lines.begin(), lines.end(), line,
+                [](const auto &entry, Addr addr) { return entry.line < addr; });
+            if (slot != lines.end() && slot->line == line)
+                slot->bytes |= mask;
+            else
+                lines.insert(slot, {line, mask});
         }
     }
-    std::sort(result.begin(), result.end());
-    result.erase(std::unique(result.begin(), result.end()), result.end());
-    bytes = std::move(result);
     return true;
 }
 
@@ -1133,6 +1153,7 @@ LSQ::SingleDataRequest::finish(const Fault &fault, const RequestPtr &request,
 
         LSQRequest::_inst->fault = fault;
         LSQRequest::_inst->translationCompleted(true);
+        _port.translationComplete(_inst);
     }
 }
 
@@ -1185,6 +1206,7 @@ LSQ::SplitDataRequest::finish(const Fault &fault, const RequestPtr &req,
                 _inst->fault = _fault[0];
                 setState(State::Fault);
             }
+            _port.translationComplete(_inst);
         }
 
     }

@@ -271,7 +271,22 @@ class LSQUnit : public CapacityReadObserver
         const char* data() const { return _data; }
         /** @} */
     };
-    using LQEntry = LSQEntry;
+    class LQEntry : public LSQEntry
+    {
+      public:
+        PhysicalLineCoverage::Lines physicalLines;
+        bool observing = false;
+        bool physicalReady = false;
+        bool addressWaitObserved = false;
+
+        void
+        clear()
+        {
+            LSQEntry::clear();
+            physicalLines.clear();
+            observing = physicalReady = addressWaitObserved = false;
+        }
+    };
 
     /** Coverage of one address range with another */
     enum class AddrRangeCoverage
@@ -321,6 +336,9 @@ class LSQUnit : public CapacityReadObserver
     /** Inserts a store instruction. */
     void insertStore(const DynInstPtr &store_inst);
     void insertStoreData(const DynInstPtr &store_inst);
+    void beginLoadObservation(const DynInstPtr &inst);
+    void refreshLoadCoverage(const DynInstPtr &inst);
+    void translationComplete(const DynInstPtr &inst);
     Fault writeStoreData(const DynInstPtr &inst, uint8_t *data, unsigned size);
 
     /** Check for ordering violations in the LSQ. For a store squash if we
@@ -494,6 +512,7 @@ class LSQUnit : public CapacityReadObserver
 
     /** Issue buffer-mode exclusive permission prefetches. */
     void issueStorePrepareRequests();
+    bool storePrepareChanged = true;
 
     /** Ordinary store and the committed subset eligible for merge probes. */
     bool isOrdinaryStore(StoreQueue::iterator entry);
@@ -693,7 +712,7 @@ class LSQUnit : public CapacityReadObserver
         unsigned size = 0;
         std::vector<uint8_t> value;
         struct StoreBytes {
-            std::vector<Addr> bytes;
+            PhysicalLineCoverage::Lines bytes;
             bool secure = false;
             bool ordinary = false;
         };
@@ -829,7 +848,6 @@ class LSQUnit : public CapacityReadObserver
         statistics::Scalar storeOverwriteElisions;
 
         /** Same-line adjacent ordinary stores ready when the older is sent. */
-        statistics::Scalar storeSameLineReadyPairs;
         /** Ordinary stores admitted while an older same-line store is in flight. */
         statistics::Scalar storeSameLineConcurrentIssued;
         statistics::Scalar storeOrderedCrossLineIssued;
